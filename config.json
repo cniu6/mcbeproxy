@@ -1,0 +1,10 @@
+{
+    "debug": false,
+    "api_port": 8080,
+    "stats_save_seconds": 30,
+    "inactive_timeout": 5,
+    "max_packet_size": 8192,
+    "buffer_multiple": 10,
+    "stats_file": "stats.json",
+    "api_key": "Q1LntckB-jkYIe1MbbcXvTYTuxmhhhNUglfcxzhAZUc="
+}

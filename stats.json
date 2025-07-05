@@ -1,0 +1,18 @@
+{
+    "online_count": 1,
+    "total_traffic": 4245,
+    "total_packets": 23,
+    "start_time": 1750574241,
+    "last_updated": 1750580357,
+    "clients_traffic": [
+        {
+            "ip": "8.210.128.78",
+            "bytes_sent": 3053,
+            "bytes_received": 578,
+            "packet_count": 38,
+            "conn_time": 1750580082,
+            "last_seen": 1750580134,
+            "is_online": true
+        }
+    ]
+}

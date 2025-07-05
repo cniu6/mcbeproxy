@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minecraft BE 代理管理面板</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        h1, h2 {
+            color: #0056b3;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+            margin-top: 20px;
+        }
+        .section {
+            margin-bottom: 30px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #fdfdfd;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        .form-group input[type="text"],
+        .form-group select {
+            width: calc(100% - 22px);
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            margin-right: 10px;
+        }
+        .btn {
+            padding: 10px 15px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s ease;
+        }
+        .btn-primary {
+            background-color: #007bff;
+            color: white;
+        }
+        .btn-primary:hover {
+            background-color: #0056b3;
+        }
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+        .btn-danger:hover {
+            background-color: #c82333;
+        }
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+        .btn-secondary:hover {
+            background-color: #5a6268;
+        }
+        .log-output, .stats-output, .players-output, .proxies-output {
+            background-color: #e9e9e9;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            white-space: pre-wrap; /* 保持换行 */
+            word-wrap: break-word; /* 避免长单词溢出 */
+            font-family: monospace;
+            font-size: 0.9em;
+            max-height: 400px;
+            line-height: 1.5;
+        }
+        .error {
+            color: #dc3545;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .success {
+            color: #28a745;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        table, th, td {
+            border: 1px solid #ddd;
+        }
+        th, td {
+            padding: 8px;
+            text-align: left;
+        }
+        th {
+            background-color: #007bff;
+            color: white;
+        }
+        tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+        .refresh-btn-container {
+            text-align: right;
+            margin-bottom: 10px;
+        }
+        .action-cell {
+            white-space: nowrap; /* 防止按钮换行 */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Minecraft BE 代理管理面板</h1>
+
+        <div class="section">
+            <h2>API 密钥管理</h2>
+            <div class="form-group">
+                <label for="apiKeyInput">API 密钥:</label>
+                <input type="text" id="apiKeyInput" placeholder="在此输入或粘贴 API 密钥">
+            </div>
+            <button class="btn btn-primary" onclick="saveApiKey()">保存密钥</button>
+            <button class="btn btn-secondary" onclick="clearApiKey()">清除密钥</button>
+            <div id="apiKeyMessage"></div>
+            <p>请从后端启动日志中获取API密钥。如需新密钥，请删除根目录的 'config.json' 后重启后端。</p>
+        </div>
+
+        <div class="section">
+            <h2>服务器统计</h2>
+            <div class="refresh-btn-container">
+                <button class="btn btn-secondary" onclick="fetchStats()">刷新统计</button>
+                <button class="btn btn-danger" onclick="clearStats()">清空统计</button>
+            </div>
+            <div class="stats-output" id="statsOutput">
+                <p>请先输入API密钥并保存。</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>在线玩家</h2>
+            <div class="refresh-btn-container">
+                <button class="btn btn-secondary" onclick="fetchPlayers()">刷新玩家列表</button>
+            </div>
+            <div class="players-output" id="playersOutput">
+                <p>请先输入API密钥并保存。</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>代理规则管理</h2>
+            <div class="refresh-btn-container">
+                 <button class="btn btn-secondary" onclick="fetchProxies()">刷新代理列表</button>
+            </div>
+            <h3>添加新代理</h3>
+            <div class="form-group">
+                <label for="listenAddr">监听地址 (例如: 0.0.0.0:19132):</label>
+                <input type="text" id="listenAddr" value="0.0.0.0:" placeholder="例如: 0.0.0.0:19132">
+            </div>
+            <div class="form-group">
+                <label for="targetAddr">目标服务器地址 (例如: mc.hypixel.net:19132 或 127.0.0.1:19132):</label>
+                <input type="text" id="targetAddr" placeholder="例如: mco.cubecraft.net:19132">
+            </div>
+            <div class="form-group">
+                <label for="protocol">协议:</label>
+                <select id="protocol">
+                    <option value="both" selected>两者 (TCP/UDP)</option>
+                    <option value="udp">UDP</option>
+                    <option value="tcp">TCP</option>
+                </select>
+            </div>
+            <button class="btn btn-primary" onclick="addProxy()">添加代理</button>
+            <div id="addProxyMessage" class="error"></div>
+
+            <h3>现有代理</h3>
+            <div id="proxiesOutputSection" class="proxies-output">
+                <p class="initial-prompt" id="proxiesInitialPrompt">请先输入API密钥并保存。</p>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>监听地址</th>
+                            <th>目标地址</th>
+                            <th>协议</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="proxiesTableBody">
+                        <!-- 代理列表将在这里动态加载 -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = 'http://4xi.top:8080/api'; // 根据你的Go后端端口修改
+        const API_KEY_STORAGE_KEY = 'mc_proxy_api_key';
+
+        // 格式化字节为可读单位
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
+        // 格式化 Unix 时间戳
+        function formatUnixTimestamp(timestamp) {
+            if (!timestamp) return 'N/A';
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleString(); // 本地化日期时间字符串
+        }
+
+        // 显示消息 (成功或错误)
+        function showMessage(elementId, message, isError = true) {
+            const element = document.getElementById(elementId);
+            if (element) {
+                element.textContent = message;
+                element.className = isError ? 'error' : 'success';
+                setTimeout(() => {
+                    element.textContent = '';
+                    element.className = '';
+                }, 5000); // 5秒后清除
+            }
+        }
+        
+        // ===================================
+        // API 密钥管理
+        // ===================================
+        function getApiKey() {
+            return localStorage.getItem(API_KEY_STORAGE_KEY);
+        }
+
+        function saveApiKey() {
+            const apiKey = document.getElementById('apiKeyInput').value.trim();
+            if (apiKey) {
+                localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+                showMessage('apiKeyMessage', 'API 密钥已保存！', false);
+                refreshAll(); // 保存后立即刷新所有数据
+            } else {
+                showMessage('apiKeyMessage', '请输入 API 密钥！', true);
+            }
+        }
+
+        function clearApiKey() {
+            localStorage.removeItem(API_KEY_STORAGE_KEY);
+            document.getElementById('apiKeyInput').value = '';
+            showMessage('apiKeyMessage', 'API 密钥已清除！', false);
+            // 清除数据区域，并显示提示
+            document.getElementById('statsOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+            document.getElementById('playersOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+            document.getElementById('proxiesTableBody').innerHTML = ''; // 清空表格体
+            document.getElementById('proxiesInitialPrompt').style.display = 'block'; // 显示初始提示
+        }
+
+        // 验证API密钥是否存在，如果不存在则提示
+        function checkApiKeyAndPrompt() {
+            const apiKey = getApiKey();
+            if (!apiKey) {
+                showMessage('apiKeyMessage', '请在上方输入 API 密钥并点击“保存密钥”！', true);
+                // 确保没有API密钥时，数据区域显示提示信息
+                document.getElementById('statsOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+                document.getElementById('playersOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+                document.getElementById('proxiesTableBody').innerHTML = ''; // 清空代理表格内容
+                document.getElementById('proxiesInitialPrompt').style.display = 'block'; // 显示代理部分的初始提示
+                return false;
+            }
+            return true;
+        }
+
+        // 加载页面时从 localStorage 读取密钥
+        document.addEventListener('DOMContentLoaded', () => {
+            const storedKey = getApiKey();
+            if (storedKey) {
+                document.getElementById('apiKeyInput').value = storedKey;
+                refreshAll(); // 如果有密钥就自动刷新数据
+            } else {
+                checkApiKeyAndPrompt(); // 没有密钥就提示
+            }
+        });
+
+        // 通用fetch函数，包含授权头和错误处理
+        async function authenticatedFetch(url, options = {}) {
+            if (!checkApiKeyAndPrompt()) {
+                throw new Error("API Key required.");
+            }
+            const apiKey = getApiKey();
+            if (!options.headers) {
+                options.headers = {};
+            }
+            options.headers['Authorization'] = `Bearer ${apiKey}`;
+            options.headers['Content-Type'] = 'application/json'; // 确保发送JSON头部
+
+            const response = await fetch(url, options);
+
+            if (response.status === 401) {
+                showMessage('apiKeyMessage', 'API 密钥无效或已过期，请重新输入!', true);
+                throw new Error('Unauthorized'); // 抛出错误以停止后续处理
+            }
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(`HTTP error! Status: ${response.status}. Message: ${errorData.message || response.statusText}`);
+            }
+            return response;
+        }
+
+        // 刷新所有数据
+        function refreshAll() {
+            if (checkApiKeyAndPrompt()) { // 只有API密钥存在才尝试刷新数据
+                // 隐藏代理部分的初始提示
+                document.getElementById('proxiesInitialPrompt').style.display = 'none';
+                fetchStats();
+                fetchPlayers();
+                fetchProxies();
+            } else {
+                // 如果没有API密钥，确保这些区域显示提示
+                document.getElementById('statsOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+                document.getElementById('playersOutput').innerHTML = '<p>请先输入API密钥并保存。</p>';
+                document.getElementById('proxiesTableBody').innerHTML = ''; // 清空表格内容
+                document.getElementById('proxiesInitialPrompt').style.display = 'block'; // 再次显示提示
+            }
+        }
+
+        // ===================================
+        // 服务器统计功能
+        // ===================================
+        async function fetchStats() {
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/stats`);
+                const data = await response.json();
+                const outputDiv = document.getElementById('statsOutput');
+                
+                let statsHtml = `
+                    <p><strong>服务启动时间:</strong> ${formatUnixTimestamp(data.start_time)}</p>
+                    <p><strong>最后更新时间:</strong> ${formatUnixTimestamp(data.last_updated)}</p>
+                    <p><strong>在线玩家数:</strong> ${data.online_count}</p>
+                    <p><strong>总流量:</strong> ${formatBytes(data.total_traffic)}</p>
+                    <p><strong>总数据包数:</strong> ${data.total_packets}</p>
+                `;
+
+                if (data.clients_traffic && data.clients_traffic.length > 0) {
+                    statsHtml += `<h3>客户端流量统计</h3><table><thead><tr>
+                        <th>IP</th><th>发送 (bytes)</th><th>接收 (bytes)</th><th>数据包数</th>
+                        <th>连接时间</th><th>最后活动</th><th>在线</th>
+                    </tr></thead><tbody>`;
+                    // 排序客户端流量，让在线的排在前面
+                    data.clients_traffic.sort((a, b) => (b.is_online - a.is_online) || a.ip.localeCompare(b.ip));
+
+                    data.clients_traffic.forEach(client => {
+                        statsHtml += `<tr>
+                            <td>${client.ip}</td>
+                            <td>${formatBytes(client.bytes_sent)} (${client.bytes_sent})</td>
+                            <td>${formatBytes(client.bytes_received)} (${client.bytes_received})</td>
+                            <td>${client.packet_count}</td>
+                            <td>${formatUnixTimestamp(client.conn_time)}</td>
+                            <td>${formatUnixTimestamp(client.last_seen)}</td>
+                            <td>${client.is_online ? '是' : '否'}</td>
+                        </tr>`;
+                    });
+                    statsHtml += `</tbody></table>`;
+                } else {
+                    statsHtml += `<p>暂无客户端流量数据。</p>`;
+                }
+                outputDiv.innerHTML = statsHtml;
+
+            } catch (error) {
+                // 如果是认证错误， authenticatedFetch 会处理，这里只处理其他加载错误
+                if (error.message !== "API Key required." && error.message !== "Unauthorized") {
+                    document.getElementById('statsOutput').innerHTML = `<p class="error">加载统计数据失败: ${error.message}</p>`;
+                    console.error('Error fetching stats:', error);
+                } else {
+                    document.getElementById('statsOutput').innerHTML = `<p>请先输入API密钥并保存。</p>`;
+                }
+            }
+        }
+
+        async function clearStats() {
+            if (!confirm("确定要清空所有统计数据吗？此操作不可逆！")) {
+                return;
+            }
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/clear-stats`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    showMessage('statsOutput', result.message, false);
+                    fetchStats(); // 清空后立即刷新统计
+                } else {
+                    showMessage('statsOutput', `清空失败: ${result.message || '未知错误'}`, true);
+                }
+            } catch (error) {
+                showMessage('statsOutput', `清空操作失败: ${error.message}`, true);
+                console.error('Error clearing stats:', error);
+            }
+        }
+
+        // ===================================
+        // 在线玩家功能
+        // ===================================
+        async function fetchPlayers() {
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/players`);
+                const data = await response.json();
+                const outputDiv = document.getElementById('playersOutput');
+                
+                let playersHtml = `<p><strong>在线客户端数量:</strong> ${data.count}</p>`;
+                if (data.players && data.players.length > 0) {
+                    // 排序玩家，按最后活动时间降序
+                    data.players.sort((a, b) => b.last_seen - a.last_seen);
+
+                    playersHtml += `<table><thead><tr><th>IP</th><th>最后活动</th></tr></thead><tbody>`;
+                    data.players.forEach(player => {
+                        playersHtml += `<tr>
+                            <td>${player.ip}</td>
+                            <td>${formatUnixTimestamp(player.last_seen)}</td>
+                        </tr>`;
+                    });
+                    playersHtml += `</tbody></table>`;
+                } else {
+                    playersHtml += `<p>暂无在线客户端。</p>`;
+                }
+                outputDiv.innerHTML = playersHtml;
+
+            } catch (error) {
+                 if (error.message !== "API Key required." && error.message !== "Unauthorized") {
+                    document.getElementById('playersOutput').innerHTML = `<p class="error">加载玩家列表失败: ${error.message}</p>`;
+                    console.error('Error fetching players:', error);
+                } else {
+                    document.getElementById('playersOutput').innerHTML = `<p>请先输入API密钥并保存。</p>`;
+                }
+            }
+        }
+
+        // ===================================
+        // 代理规则管理
+        // ===================================
+        async function fetchProxies() {
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/proxies`);
+                const proxies = await response.json();
+                const tableBody = document.getElementById('proxiesTableBody');
+                tableBody.innerHTML = ''; // 清空现有内容
+
+                if (proxies.length === 0) {
+                    tableBody.innerHTML = '<tr><td colspan="4">暂无代理规则。请添加。</td></tr>';
+                    return;
+                }
+
+                proxies.forEach(proxy => {
+                    const row = tableBody.insertRow();
+                    row.insertCell().textContent = proxy.listen_addr;
+                    row.insertCell().textContent = proxy.target_addr;
+                    row.insertCell().textContent = proxy.protocol;
+                    
+                    const actionCell = row.insertCell();
+                    actionCell.className = 'action-cell';
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.textContent = '删除';
+                    deleteBtn.className = 'btn btn-danger btn-sm';
+                    deleteBtn.onclick = () => deleteProxy(proxy.listen_addr);
+                    actionCell.appendChild(deleteBtn);
+                });
+
+            } catch (error) {
+                // 如果不是认证错误，显示具体加载错误
+                if (error.message !== "API Key required." && error.message !== "Unauthorized") {
+                    const tableBody = document.getElementById('proxiesTableBody');
+                    if (tableBody) {
+                         tableBody.innerHTML = `<tr><td colspan="4" class="error">加载代理规则失败: ${error.message}</td></tr>`;
+                    }
+                    console.error('Error fetching proxies:', error);
+                } else {
+                    // 认证错误已经由 authenticatedFetch 处理，这里只确保显示初始提示
+                    document.getElementById('proxiesTableBody').innerHTML = ''; // 清空表格
+                    document.getElementById('proxiesInitialPrompt').style.display = 'block'; // 显示提示
+                }
+            }
+        }
+
+        async function addProxy() {
+            const listenAddr = document.getElementById('listenAddr').value.trim();
+            const targetAddr = document.getElementById('targetAddr').value.trim();
+            const protocol = document.getElementById('protocol').value;
+            const messageDiv = document.getElementById('addProxyMessage');
+
+            if (!listenAddr || !targetAddr || !protocol) {
+                showMessage(messageDiv.id, "所有字段都不能为空！", true);
+                return;
+            }
+
+            try {
+                const response = await authenticatedFetch(`${API_BASE_URL}/proxies`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        listen_addr: listenAddr,
+                        target_addr: targetAddr,
+                        protocol: protocol
+                    })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    showMessage(messageDiv.id, result.message, false);
+                    fetchProxies(); // 添加成功后刷新列表
+                } else {
+                    showMessage(messageDiv.id, `添加失败: ${result.message || '未知错误'}`, true);
+                }
+            } catch (error) {
+                showMessage(messageDiv.id, `添加操作失败: ${error.message}`, true);
+                console.error('Error adding proxy:', error);
+            }
+        }
+
+        async function deleteProxy(listenAddr) {
+            if (!confirm(`确定要删除代理 ${listenAddr} 吗？`)) {
+                return;
+            }
+            try {
+                const encodedListenAddr = encodeURIComponent(listenAddr);
+                const response = await authenticatedFetch(`${API_BASE_URL}/proxies/${encodedListenAddr}`, {
+                    method: 'DELETE'
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    showMessage('addProxyMessage', result.message, false); // 使用这个消息区域
+                    fetchProxies(); // 删除成功后刷新列表
+                } else {
+                    showMessage('addProxyMessage', `删除失败: ${result.message || '未知错误'}`, true);
+                }
+            } catch (error) {
+                showMessage('addProxyMessage', `删除操作失败: ${error.message}`, true);
+                console.error('Error deleting proxy:', error);
+            }
+        }
+    </script>
+</body>
+</html>
