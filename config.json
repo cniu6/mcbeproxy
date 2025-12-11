@@ -1,0 +1,15 @@
+{
+  "max_session_records": 100,
+  "max_access_log_records": 100,
+  "api_port": 8080,
+  "api_key": "",
+  "api_entry_path": "/mc_admin_114514",
+  "database_path": "data.db",
+  "debug_mode": false,
+  "log_dir": "logs",
+  "log_retention_days": 7,
+  "log_max_size_mb": 100,
+  "auth_verify_enabled": true,
+  "auth_verify_url": "http://127.0.0.1:818/jiasuip/index.php",
+  "auth_cache_minutes": 15
+}

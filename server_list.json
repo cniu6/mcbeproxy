@@ -1,0 +1,40 @@
+[
+  {
+    "id": "server1",
+    "name": "My Server",
+    "target": "127.0.0.1",
+    "port": 19132,
+    "listen_addr": ":19133",
+    "protocol": "udp",
+    "enabled": false,
+    "disabled": false,
+    "send_real_ip": false,
+    "resolve_interval": 0,
+    "idle_timeout": 0,
+    "buffer_size": 0,
+    "disabled_message": "",
+    "custom_motd": "",
+    "proxy_mode": "",
+    "xbox_auth_enabled": false,
+    "xbox_token_path": ""
+  },
+  {
+    "id": "cubecraft",
+    "name": "CubeCraft Games",
+    "target": "dingzhihsc.darzz.cf",
+    "port": 50003,
+    "listen_addr": "0.0.0.0:19132",
+    "protocol": "raknet",
+    "enabled": true,
+    "disabled": false,
+    "send_real_ip": false,
+    "resolve_interval": 300,
+    "idle_timeout": 300,
+    "buffer_size": -1,
+    "disabled_message": "§c服务器维护中§r\n§7请稍后再试",
+    "custom_motd": "MCPE;§aCubeCraft Proxy;712;1.21.50;0;100;12345678901234567;CubeCraft;Survival;1;19132;19132;0;",
+    "proxy_mode": "passthrough",
+    "xbox_auth_enabled": false,
+    "xbox_token_path": "xbox_token.json"
+  }
+]
