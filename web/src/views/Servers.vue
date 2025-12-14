@@ -1,5 +1,5 @@
 <template>
-  <div>
+  <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
       <n-h2 style="margin: 0">服务器管理</n-h2>
       <n-space>
@@ -10,7 +10,17 @@
     </n-space>
     
     <n-card>
-      <n-data-table :columns="columns" :data="servers" :bordered="false" :scroll-x="900" />
+      <div class="table-wrapper">
+        <n-data-table 
+          :columns="columns" 
+          :data="sortedServers" 
+          :bordered="false" 
+          :scroll-x="1100"
+          :pagination="pagination"
+          @update:page="p => pagination.page = p"
+          @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
+        />
+      </div>
     </n-card>
 
     <!-- 编辑 Modal -->
@@ -18,15 +28,18 @@
       <n-form :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="服务器 ID" required><n-input v-model:value="form.id" :disabled="!!editingId" placeholder="唯一标识" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="名称" required><n-input v-model:value="form.name" placeholder="显示名称" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="名称" required><n-input v-model:value="form.name" placeholder="显示名称" @blur="onNameChange" /></n-form-item></n-gi>
           <n-gi><n-form-item label="监听地址" required><n-input v-model:value="form.listen_addr" placeholder="0.0.0.0:19132" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标地址" required><n-input v-model:value="form.target" placeholder="目标服务器" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="协议"><n-select v-model:value="form.protocol" :options="protocolOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
           <n-gi><n-form-item label="Xbox 验证"><n-switch v-model:value="form.xbox_auth_enabled" /></n-form-item></n-gi>
+          <n-gi :span="2"><n-form-item label="代理模式"><n-select v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="空闲超时"><n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="DNS刷新"><n-input-number v-model:value="form.resolve_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
+          <n-gi :span="2"><n-form-item label="代理出站"><n-select v-model:value="form.proxy_outbound" :options="proxyOutboundOptions" placeholder="选择代理节点" filterable clearable /></n-form-item></n-gi>
+          <n-gi><n-form-item label="真实延迟"><n-switch v-model:value="form.show_real_latency" /><template #feedback>在服务器列表显示通过代理的真实延迟</template></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="禁用消息"><n-input v-model:value="form.disabled_message" type="textarea" :rows="2" /></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="自定义MOTD"><n-input v-model:value="form.custom_motd" type="textarea" :rows="2" /></n-form-item></n-gi>
         </n-grid>
@@ -42,6 +55,34 @@
           <n-button @click="copyExport">复制到剪贴板</n-button>
           <n-button type="primary" @click="downloadExport">下载 JSON 文件</n-button>
           <n-button @click="showExportModal = false">关闭</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 代理选择器 Modal -->
+    <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理出站" style="width: 800px">
+      <n-space style="margin-bottom: 12px;">
+        <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" />
+        <n-checkbox v-model:checked="proxyFilter.udpOnly">仅UDP可用</n-checkbox>
+        <n-radio-group v-model:value="proxyFilter.sortBy" size="small">
+          <n-radio-button value="name">名称</n-radio-button>
+          <n-radio-button value="group">分组</n-radio-button>
+          <n-radio-button value="latency">延迟</n-radio-button>
+          <n-radio-button value="type">类型</n-radio-button>
+        </n-radio-group>
+      </n-space>
+      <n-data-table 
+        :columns="proxyColumns" 
+        :data="filteredProxyOutbounds" 
+        :bordered="false" 
+        size="small"
+        :max-height="400"
+        :row-props="(row) => ({ style: 'cursor: pointer', onClick: () => quickSwitchProxy(row.name) })"
+      />
+      <template #footer>
+        <n-space justify="space-between">
+          <n-button @click="quickSwitchProxy('')" type="warning">切换到直连</n-button>
+          <n-button @click="showProxySelector = false">取消</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -65,7 +106,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, h } from 'vue'
+import { ref, computed, onMounted, h } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api } from '../api'
 
@@ -77,16 +118,180 @@ const showImportModal = ref(false)
 const editingId = ref(null)
 const exportJson = ref('')
 const importJson = ref('')
+const pagination = ref({
+  page: 1,
+  pageSize: 100,
+  pageSizes: [100, 200, 500, 1000],
+  showSizePicker: true,
+  prefix: ({ itemCount }) => `共 ${itemCount} 条`
+})
+
+// 按 ID 排序
+const sortedServers = computed(() => {
+  return [...servers.value].sort((a, b) => (a.id || '').localeCompare(b.id || ''))
+})
 
 const protocolOptions = [{ label: 'RakNet', value: 'raknet' }, { label: 'UDP', value: 'udp' }]
-const defaultForm = { id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true, disabled_message: '', custom_motd: '', xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300 }
+const proxyModeOptions = [
+  { label: 'Passthrough (推荐)', value: 'passthrough' },
+  { label: 'Transparent', value: 'transparent' },
+  { label: 'RakNet', value: 'raknet' }
+]
+const proxyOutboundOptions = ref([{ label: '直连 (不使用代理)', value: '' }])
+const defaultForm = { 
+  id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true, 
+  disabled_message: '§c服务器维护中§r\n§7请稍后再试', 
+  custom_motd: '', // 留空则从远程服务器获取
+  xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true 
+}
+
+// 生成默认MOTD
+const generateDefaultMOTD = (name, port) => {
+  const serverUID = Math.floor(Math.random() * 9000000000000000) + 1000000000000000
+  return `MCPE;§a${name || '代理服务器'};712;1.21.50;0;100;${serverUID};${name || '代理服务器'};Survival;1;${port || 19132};${port || 19132};0;`
+}
 const form = ref({ ...defaultForm })
+
+// 存储代理出站详情用于显示类型标签
+const proxyOutboundDetails = ref({})
+
+const loadProxyOutbounds = async () => {
+  const res = await api('/api/proxy-outbounds')
+  if (res.success && res.data) {
+    proxyOutboundOptions.value = [
+      { label: '直连 (不使用代理)', value: '' },
+      ...res.data.filter(o => o.enabled).map(o => ({ label: `${o.name} (${o.type})`, value: o.name }))
+    ]
+    // 存储详情用于显示标签
+    res.data.forEach(o => { proxyOutboundDetails.value[o.name] = o })
+  }
+}
+
+// 跳转到代理出口页面
+const goToProxyOutbound = (name) => {
+  window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'proxy-outbounds', search: name } }))
+}
+
+// 代理选择器表格列
+const proxyColumns = [
+  { title: '名称', key: 'name', width: 150 },
+  { title: '类型', key: 'type', width: 80, render: r => h(NTag, { type: 'info', size: 'small' }, () => r.type?.toUpperCase()) },
+  { title: '分组', key: 'group', width: 100 },
+  { title: '服务器', key: 'server', ellipsis: { tooltip: true } },
+  { 
+    title: 'UDP', 
+    key: 'udp_available', 
+    width: 60, 
+    render: r => h(NTag, { 
+      type: r.udp_available === true ? 'success' : r.udp_available === false ? 'error' : 'default', 
+      size: 'small' 
+    }, () => r.udp_available === true ? '✓' : r.udp_available === false ? '✗' : '?')
+  },
+  { 
+    title: '延迟', 
+    key: 'udp_latency_ms', 
+    width: 80, 
+    render: r => r.udp_latency_ms ? `${r.udp_latency_ms}ms` : '-'
+  }
+]
+
+// 获取代理类型标签
+const getProxyTypeTags = (proxyName) => {
+  if (!proxyName) return [h(NTag, { type: 'default', size: 'small' }, () => '直连')]
+  const detail = proxyOutboundDetails.value[proxyName]
+  if (!detail) return [h(NTag, { type: 'info', size: 'small', style: 'cursor: pointer', onClick: () => goToProxyOutbound(proxyName) }, () => proxyName)]
+  
+  // 先显示代理名称，再显示协议类型
+  const tags = [
+    h(NTag, { type: 'info', size: 'small', style: 'cursor: pointer', onClick: () => goToProxyOutbound(proxyName) }, () => proxyName),
+    h(NTag, { type: 'default', size: 'small', style: 'margin-left: 2px' }, () => detail.type.toUpperCase())
+  ]
+  if (detail.network === 'ws') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 2px' }, () => 'WS'))
+  if (detail.reality) tags.push(h(NTag, { type: 'success', size: 'small', style: 'margin-left: 2px' }, () => 'Reality'))
+  if (detail.flow === 'xtls-rprx-vision') tags.push(h(NTag, { type: 'primary', size: 'small', style: 'margin-left: 2px' }, () => 'Vision'))
+  return tags
+}
+
+// 快速切换代理
+const showProxySelector = ref(false)
+const selectedServerId = ref('')
+const proxyFilter = ref({ group: '', udpOnly: false, sortBy: 'name' })
+
+// 获取所有代理出站（包含详细信息）
+const allProxyOutbounds = computed(() => {
+  return Object.values(proxyOutboundDetails.value).filter(o => o.enabled)
+})
+
+// 获取分组列表
+const proxyGroups = computed(() => {
+  const groups = new Set([''])
+  allProxyOutbounds.value.forEach(o => { if (o.group) groups.add(o.group) })
+  return Array.from(groups).map(g => ({ label: g || '全部', value: g }))
+})
+
+// 过滤和排序后的代理列表
+const filteredProxyOutbounds = computed(() => {
+  let list = [...allProxyOutbounds.value]
+  
+  // 按分组过滤
+  if (proxyFilter.value.group) {
+    list = list.filter(o => o.group === proxyFilter.value.group)
+  }
+  
+  // 只显示支持UDP的
+  if (proxyFilter.value.udpOnly) {
+    list = list.filter(o => o.udp_available !== false)
+  }
+  
+  // 排序
+  const sortBy = proxyFilter.value.sortBy
+  list.sort((a, b) => {
+    if (sortBy === 'name') return (a.name || '').localeCompare(b.name || '')
+    if (sortBy === 'group') return (a.group || '').localeCompare(b.group || '')
+    if (sortBy === 'latency') return (a.udp_latency_ms || 9999) - (b.udp_latency_ms || 9999)
+    if (sortBy === 'type') return (a.type || '').localeCompare(b.type || '')
+    return 0
+  })
+  
+  return list
+})
+
+// 打开代理选择器
+const openProxySelector = (serverId) => {
+  selectedServerId.value = serverId
+  showProxySelector.value = true
+}
+
+// 快速切换代理
+const quickSwitchProxy = async (proxyName) => {
+  if (!selectedServerId.value) return
+  const server = servers.value.find(s => s.id === selectedServerId.value)
+  if (!server) return
+  
+  const res = await api(`/api/servers/${selectedServerId.value}`, 'PUT', { ...server, proxy_outbound: proxyName })
+  if (res.success) {
+    message.success(`已切换到 ${proxyName || '直连'}`)
+    showProxySelector.value = false
+    load()
+  } else {
+    message.error(res.msg || '切换失败')
+  }
+}
 
 const columns = [
   { title: 'ID', key: 'id', width: 100 },
   { title: '名称', key: 'name', width: 140 },
   { title: '监听', key: 'listen_addr', width: 130 },
   { title: '目标', key: 'target', render: r => `${r.target}:${r.port}` },
+  { 
+    title: '代理出站', 
+    key: 'proxy_outbound', 
+    width: 250, 
+    render: r => h(NSpace, { size: 'small', align: 'center' }, () => [
+      h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, getProxyTypeTags(r.proxy_outbound)),
+      h(NButton, { size: 'tiny', quaternary: true, onClick: () => openProxySelector(r.id) }, () => '切换')
+    ])
+  },
   { title: '协议', key: 'protocol', width: 70 },
   { title: '状态', key: 'status', width: 70, render: r => h(NTag, { type: r.status === 'running' ? 'success' : 'error', size: 'small' }, () => r.status === 'running' ? '运行' : '停止') },
   { title: '启用', key: 'enabled', width: 50, render: r => h(NTag, { type: r.enabled ? 'success' : 'warning', size: 'small' }, () => r.enabled ? '是' : '否') },
@@ -100,6 +305,14 @@ const columns = [
 const load = async () => { const res = await api('/api/servers'); if (res.success) servers.value = res.data || [] }
 const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true }
 const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true }
+
+// 监听名称变化，自动生成MOTD（仅新建时且MOTD为空）
+const onNameChange = () => {
+  if (!editingId.value && !form.value.custom_motd && form.value.name) {
+    const port = form.value.listen_addr?.split(':')[1] || 19132
+    form.value.custom_motd = generateDefaultMOTD(form.value.name, port)
+  }
+}
 
 const saveServer = async () => {
   if (!form.value.id || !form.value.name || !form.value.target) { message.warning('请填写必填项'); return }
@@ -141,5 +354,16 @@ const importServers = async () => {
   } catch (e) { message.error('JSON 格式错误: ' + e.message) }
 }
 
-onMounted(load)
+onMounted(() => { load(); loadProxyOutbounds() })
 </script>
+
+<style scoped>
+.page-container {
+  width: 100%;
+  overflow-x: auto;
+}
+.table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+</style>

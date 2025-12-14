@@ -15,6 +15,7 @@ import (
 	"mcpeserverproxy/internal/db"
 	proxyerrors "mcpeserverproxy/internal/errors"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
 )
@@ -29,27 +30,30 @@ type Listener interface {
 // ProxyServer is the main entry point that integrates all proxy components.
 // It manages UDP listeners, session management, configuration, and database persistence.
 type ProxyServer struct {
-	config           *config.GlobalConfig
-	configMgr        *config.ConfigManager
-	sessionMgr       *session.SessionManager
-	db               *db.Database
-	sessionRepo      *db.SessionRepository
-	playerRepo       *db.PlayerRepository
-	bufferPool       *BufferPool
-	forwarder        *Forwarder
-	errorHandler     *proxyerrors.ErrorHandler
-	aclManager       *acl.ACLManager        // ACL manager for access control
-	externalVerifier *auth.ExternalVerifier // External auth verifier
-	listeners        map[string]Listener    // serverID -> listener (can be UDPListener or RakNetProxy)
-	listenersMu      sync.RWMutex
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	running          bool
-	runningMu        sync.RWMutex
+	config                 *config.GlobalConfig
+	configMgr              *config.ConfigManager
+	sessionMgr             *session.SessionManager
+	db                     *db.Database
+	sessionRepo            *db.SessionRepository
+	playerRepo             *db.PlayerRepository
+	bufferPool             *BufferPool
+	forwarder              *Forwarder
+	errorHandler           *proxyerrors.ErrorHandler
+	aclManager             *acl.ACLManager                    // ACL manager for access control
+	externalVerifier       *auth.ExternalVerifier             // External auth verifier
+	outboundMgr            OutboundManager                    // Outbound manager for proxy routing
+	proxyOutboundConfigMgr *config.ProxyOutboundConfigManager // Proxy outbound config manager
+	listeners              map[string]Listener                // serverID -> listener (can be UDPListener or RakNetProxy)
+	listenersMu            sync.RWMutex
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	running                bool
+	runningMu              sync.RWMutex
 }
 
 // NewProxyServer creates a new ProxyServer with all components initialized.
+// Requirements: 8.1 - Initialize OutboundManager in ProxyServer
 func NewProxyServer(
 	globalConfig *config.GlobalConfig,
 	configMgr *config.ConfigManager,
@@ -81,23 +85,42 @@ func NewProxyServer(
 		logger.Info("External auth verification enabled: %s", globalConfig.AuthVerifyURL)
 	}
 
+	// Create proxy outbound config manager
+	// Requirements: 8.1
+	proxyOutboundConfigMgr := config.NewProxyOutboundConfigManager("proxy_outbounds.json")
+	if err := proxyOutboundConfigMgr.Load(); err != nil {
+		logger.Warn("Failed to load proxy outbound config: %v", err)
+		// Continue without proxy outbounds - they can be added via API
+	}
+
+	// Create outbound manager and sync with config
+	// Requirements: 8.1
+	outboundMgr := NewOutboundManager(configMgr)
+	for _, outbound := range proxyOutboundConfigMgr.GetAllOutbounds() {
+		if err := outboundMgr.AddOutbound(outbound); err != nil {
+			logger.Warn("Failed to add outbound %s to manager: %v", outbound.Name, err)
+		}
+	}
+
 	// Set up session end callback for persistence
 	sessionMgr.OnSessionEnd = func(sess *session.Session) {
 		persistSession(sess, sessionRepo, playerRepo, errorHandler)
 	}
 
 	return &ProxyServer{
-		config:           globalConfig,
-		configMgr:        configMgr,
-		sessionMgr:       sessionMgr,
-		db:               database,
-		sessionRepo:      sessionRepo,
-		playerRepo:       playerRepo,
-		bufferPool:       bufferPool,
-		forwarder:        forwarder,
-		errorHandler:     errorHandler,
-		externalVerifier: externalVerifier,
-		listeners:        make(map[string]Listener),
+		config:                 globalConfig,
+		configMgr:              configMgr,
+		sessionMgr:             sessionMgr,
+		db:                     database,
+		sessionRepo:            sessionRepo,
+		playerRepo:             playerRepo,
+		bufferPool:             bufferPool,
+		forwarder:              forwarder,
+		errorHandler:           errorHandler,
+		externalVerifier:       externalVerifier,
+		outboundMgr:            outboundMgr,
+		proxyOutboundConfigMgr: proxyOutboundConfigMgr,
+		listeners:              make(map[string]Listener),
 	}, nil
 }
 
@@ -116,6 +139,23 @@ func (p *ProxyServer) GetACLManager() *acl.ACLManager {
 // GetExternalVerifier returns the external verifier (may be nil if not configured).
 func (p *ProxyServer) GetExternalVerifier() *auth.ExternalVerifier {
 	return p.externalVerifier
+}
+
+// SetOutboundManager sets the outbound manager for proxy routing.
+// This must be called before Start() to enable proxy outbound routing.
+// Requirements: 2.1
+func (p *ProxyServer) SetOutboundManager(outboundMgr OutboundManager) {
+	p.outboundMgr = outboundMgr
+}
+
+// GetOutboundManager returns the outbound manager (may be nil if not set).
+func (p *ProxyServer) GetOutboundManager() OutboundManager {
+	return p.outboundMgr
+}
+
+// GetProxyOutboundConfigManager returns the proxy outbound config manager.
+func (p *ProxyServer) GetProxyOutboundConfigManager() *config.ProxyOutboundConfigManager {
+	return p.proxyOutboundConfigMgr
 }
 
 // persistSession saves session data to the database when a session ends.
@@ -194,6 +234,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 }
 
 // Start starts the proxy server and all configured listeners.
+// Requirements: 8.1 - Initialize sing-box outbound instances on start
 func (p *ProxyServer) Start() error {
 	p.runningMu.Lock()
 	if p.running {
@@ -206,10 +247,24 @@ func (p *ProxyServer) Start() error {
 	p.running = true
 	p.runningMu.Unlock()
 
+	// Initialize sing-box outbound instances for all configured proxy outbounds
+	// Requirements: 8.1
+	if p.outboundMgr != nil {
+		if err := p.outboundMgr.Start(); err != nil {
+			logger.Error("Failed to start outbound manager: %v", err)
+		} else {
+			logger.Info("Outbound manager started")
+		}
+	}
+
 	// Start garbage collection for idle sessions
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		// Track this goroutine as a background task (expected to run for app lifetime)
+		gm := monitor.GetGoroutineManager()
+		gid := gm.TrackBackground("session-gc", "proxy-server", "Session garbage collector", p.cancel)
+		defer gm.Untrack(gid)
 		p.sessionMgr.GarbageCollect(p.ctx)
 	}()
 
@@ -219,6 +274,22 @@ func (p *ProxyServer) Start() error {
 	// Start config file watcher
 	if err := p.configMgr.Watch(p.ctx); err != nil {
 		log.Printf("Warning: failed to start config watcher: %v", err)
+	}
+
+	// Start proxy outbound config file watcher
+	// Requirements: 8.2
+	if p.proxyOutboundConfigMgr != nil {
+		if err := p.proxyOutboundConfigMgr.Watch(p.ctx); err != nil {
+			log.Printf("Warning: failed to start proxy outbound config watcher: %v", err)
+		}
+
+		// Set up proxy outbound config change callback
+		// Requirements: 8.2
+		p.proxyOutboundConfigMgr.SetOnChange(func() {
+			if err := p.reloadProxyOutbounds(); err != nil {
+				logger.Error("Failed to reload proxy outbounds after config change: %v", err)
+			}
+		})
 	}
 
 	// Set up config change callback
@@ -283,6 +354,10 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 		if p.aclManager != nil {
 			raknetProxy.SetACLManager(p.aclManager)
 		}
+		// Inject outbound manager for proxy routing (Requirement 2.1)
+		if p.outboundMgr != nil {
+			raknetProxy.SetOutboundManager(p.outboundMgr)
+		}
 		listener = raknetProxy
 		logger.Info("Using RakNet proxy mode for server %s", serverCfg.ID)
 	case "passthrough":
@@ -300,6 +375,10 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 		// Inject external verifier for auth verification
 		if p.externalVerifier != nil {
 			passthroughProxy.SetExternalVerifier(p.externalVerifier)
+		}
+		// Inject outbound manager for proxy routing (Requirement 2.1)
+		if p.outboundMgr != nil {
+			passthroughProxy.SetOutboundManager(p.outboundMgr)
 		}
 		listener = passthroughProxy
 		logger.Info("Using passthrough proxy mode for server %s (auth forwarded)", serverCfg.ID)
@@ -358,6 +437,7 @@ func (p *ProxyServer) stopListener(serverID string) error {
 }
 
 // Stop gracefully stops the proxy server and all listeners.
+// Requirements: 8.3 - Close all sing-box outbound connections on Stop
 func (p *ProxyServer) Stop() error {
 	p.runningMu.Lock()
 	if !p.running {
@@ -375,6 +455,12 @@ func (p *ProxyServer) Stop() error {
 	// Stop config watcher
 	p.configMgr.StopWatch()
 
+	// Stop proxy outbound config watcher
+	// Requirements: 8.3
+	if p.proxyOutboundConfigMgr != nil {
+		p.proxyOutboundConfigMgr.StopWatch()
+	}
+
 	// Stop all listeners
 	p.listenersMu.Lock()
 	for serverID, listener := range p.listeners {
@@ -389,6 +475,16 @@ func (p *ProxyServer) Stop() error {
 	sessions := p.sessionMgr.GetAllSessions()
 	for _, sess := range sessions {
 		p.sessionMgr.Remove(sess.ClientAddr)
+	}
+
+	// Gracefully close all sing-box outbound connections
+	// Requirements: 8.3
+	if p.outboundMgr != nil {
+		if err := p.outboundMgr.Stop(); err != nil {
+			logger.Error("Error stopping outbound manager: %v", err)
+		} else {
+			logger.Info("Outbound manager stopped")
+		}
 	}
 
 	// Wait for all goroutines to finish
@@ -413,11 +509,11 @@ func (p *ProxyServer) Reload() error {
 		serverMap[s.ID] = s
 	}
 
-	// Get current listeners
+	// Get current listeners and their configs
 	p.listenersMu.RLock()
-	currentListeners := make(map[string]bool)
-	for id := range p.listeners {
-		currentListeners[id] = true
+	currentListeners := make(map[string]Listener)
+	for id, listener := range p.listeners {
+		currentListeners[id] = listener
 	}
 	p.listenersMu.RUnlock()
 
@@ -431,18 +527,96 @@ func (p *ProxyServer) Reload() error {
 		}
 	}
 
-	// Start listeners for new or re-enabled servers
+	// Start or restart listeners for servers
 	for _, serverCfg := range servers {
 		if serverCfg.Enabled {
-			if _, exists := currentListeners[serverCfg.ID]; !exists {
+			existingListener, exists := currentListeners[serverCfg.ID]
+			if !exists {
+				// New server - start listener
 				if err := p.startListener(serverCfg); err != nil {
 					logger.Error("Failed to start listener for server %s: %v", serverCfg.ID, err)
+				}
+			} else {
+				// Existing server - check if config changed (especially proxy_outbound)
+				// Update the listener's config reference
+				if updater, ok := existingListener.(interface{ UpdateConfig(*config.ServerConfig) }); ok {
+					updater.UpdateConfig(serverCfg)
+					logger.Debug("Updated config for server %s", serverCfg.ID)
 				}
 			}
 		}
 	}
 
 	logger.LogConfigReloaded(p.listenerCount())
+	return nil
+}
+
+// reloadProxyOutbounds reloads proxy outbound configurations and recreates sing-box outbounds.
+// Requirements: 8.2 - Recreate sing-box outbounds on config change
+func (p *ProxyServer) reloadProxyOutbounds() error {
+	p.runningMu.RLock()
+	if !p.running {
+		p.runningMu.RUnlock()
+		return fmt.Errorf("proxy server is not running")
+	}
+	p.runningMu.RUnlock()
+
+	if p.proxyOutboundConfigMgr == nil || p.outboundMgr == nil {
+		return nil
+	}
+
+	// Get current outbounds from config manager
+	configOutbounds := p.proxyOutboundConfigMgr.GetAllOutbounds()
+	configMap := make(map[string]*config.ProxyOutbound)
+	for _, cfg := range configOutbounds {
+		configMap[cfg.Name] = cfg
+	}
+
+	// Get current outbounds from outbound manager
+	currentOutbounds := p.outboundMgr.ListOutbounds()
+	currentMap := make(map[string]*config.ProxyOutbound)
+	for _, cfg := range currentOutbounds {
+		currentMap[cfg.Name] = cfg
+	}
+
+	// Remove outbounds that no longer exist in config
+	for name := range currentMap {
+		if _, exists := configMap[name]; !exists {
+			if err := p.outboundMgr.DeleteOutbound(name); err != nil {
+				logger.Error("Failed to delete outbound %s: %v", name, err)
+			} else {
+				logger.Info("Deleted proxy outbound: %s", name)
+			}
+		}
+	}
+
+	// Add or update outbounds from config
+	for name, cfg := range configMap {
+		if _, exists := currentMap[name]; !exists {
+			// Add new outbound
+			if err := p.outboundMgr.AddOutbound(cfg); err != nil {
+				logger.Error("Failed to add outbound %s: %v", name, err)
+			} else {
+				logger.Info("Added proxy outbound: %s", name)
+			}
+		} else {
+			// Update existing outbound
+			if err := p.outboundMgr.UpdateOutbound(name, cfg); err != nil {
+				logger.Error("Failed to update outbound %s: %v", name, err)
+			} else {
+				logger.Info("Updated proxy outbound: %s", name)
+			}
+		}
+	}
+
+	// Reload sing-box outbounds
+	// Requirements: 8.2
+	if err := p.outboundMgr.Reload(); err != nil {
+		logger.Error("Failed to reload outbound manager: %v", err)
+		return err
+	}
+
+	logger.Info("Proxy outbounds reloaded, %d outbounds configured", len(configOutbounds))
 	return nil
 }
 
@@ -656,4 +830,49 @@ func (p *ProxyServer) KickPlayer(playerName string, reason string) int {
 
 	logger.Info("ProxyServer.KickPlayer finished: total kickedCount=%d", kickedCount)
 	return kickedCount
+}
+
+// LatencyProvider interface for listeners that provide latency information
+type LatencyProvider interface {
+	GetCachedLatency() int64
+	GetCachedPong() []byte
+}
+
+// GetServerLatency returns the cached latency for a server.
+// Returns (latency_ms, true) if available, or (0, false) if not.
+func (p *ProxyServer) GetServerLatency(serverID string) (int64, bool) {
+	p.listenersMu.RLock()
+	defer p.listenersMu.RUnlock()
+
+	listener, exists := p.listeners[serverID]
+	if !exists {
+		return 0, false
+	}
+
+	if provider, ok := listener.(LatencyProvider); ok {
+		latency := provider.GetCachedLatency()
+		return latency, true
+	}
+
+	return 0, false
+}
+
+// GetServerLatencyInfoRaw returns detailed latency and MOTD information for a server.
+// This method is used by the API to get raw latency info without type dependencies.
+func (p *ProxyServer) GetServerLatencyInfoRaw(serverID string) (latency int64, online bool, motd string, ok bool) {
+	p.listenersMu.RLock()
+	defer p.listenersMu.RUnlock()
+
+	listener, exists := p.listeners[serverID]
+	if !exists {
+		return 0, false, "", false
+	}
+
+	if provider, ok := listener.(LatencyProvider); ok {
+		latency := provider.GetCachedLatency()
+		pong := provider.GetCachedPong()
+		return latency, latency >= 0, string(pong), true
+	}
+
+	return 0, false, "", false
 }

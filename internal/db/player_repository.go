@@ -101,6 +101,23 @@ func (r *PlayerRepository) List(limit, offset int) ([]*PlayerRecord, error) {
 	return r.scanPlayerRecords(rows)
 }
 
+// DeleteByDisplayName deletes a player record by display name.
+func (r *PlayerRepository) DeleteByDisplayName(displayName string) error {
+	query := `DELETE FROM players WHERE display_name = ?`
+	result, err := r.db.DB().Exec(query, displayName)
+	if err != nil {
+		return fmt.Errorf("failed to delete player: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get affected rows: %w", err)
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // UpdateStats updates a player's statistics after a session ends.
 // This atomically adds bytesAdded to total_bytes and playtimeAdded to total_playtime.
 func (r *PlayerRepository) UpdateStats(displayName string, bytesAdded int64, playtimeAdded time.Duration) error {

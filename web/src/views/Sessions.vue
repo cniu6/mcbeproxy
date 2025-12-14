@@ -1,5 +1,5 @@
 <template>
-  <div>
+  <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
       <n-h2 style="margin: 0">会话记录</n-h2>
       <n-space>
@@ -13,7 +13,17 @@
       </n-space>
     </n-space>
     <n-card>
-      <n-data-table :columns="columns" :data="sessions" :bordered="false" :pagination="{ pageSize: 25 }" :scroll-x="950" />
+      <div class="table-wrapper">
+        <n-data-table 
+          :columns="columns" 
+          :data="sessions" 
+          :bordered="false" 
+          :pagination="pagination"
+          :scroll-x="1100"
+          @update:page="p => pagination.page = p"
+          @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
+        />
+      </div>
     </n-card>
   </div>
 </template>
@@ -26,6 +36,13 @@ import { api, formatTime, formatBytes, formatDuration } from '../api'
 const props = defineProps({ initialSearch: { type: String, default: '' } })
 const message = useMessage()
 const sessions = ref([])
+const pagination = ref({
+  page: 1,
+  pageSize: 100,
+  pageSizes: [100, 200, 500, 1000],
+  showSizePicker: true,
+  prefix: ({ itemCount }) => `共 ${itemCount} 条`
+})
 
 // 确保 search 是字符串
 const getSearchString = (val) => {
@@ -84,3 +101,14 @@ const clearAll = async () => {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.page-container {
+  width: 100%;
+  overflow-x: auto;
+}
+.table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+</style>

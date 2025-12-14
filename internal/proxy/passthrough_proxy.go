@@ -19,6 +19,7 @@ import (
 	"mcpeserverproxy/internal/acl"
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/session"
 
 	"github.com/golang-jwt/jwt/v4"
@@ -69,10 +70,18 @@ type PassthroughProxy struct {
 	listener         *raknet.Listener
 	aclManager       *acl.ACLManager  // ACL manager for access control
 	externalVerifier ExternalVerifier // External auth verifier
+	outboundMgr      OutboundManager  // Outbound manager for proxy routing
 	closed           atomic.Bool
 	wg               sync.WaitGroup
 	activeConns      map[*raknet.Conn]*connInfo // Track active connections with player info
 	activeConnsMu    sync.Mutex
+	// Cached pong data with real latency
+	cachedPong      []byte
+	cachedPongMu    sync.RWMutex
+	lastPongLatency int64 // milliseconds
+	// Context for background goroutines
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewPassthroughProxy creates a new passthrough proxy.
@@ -111,6 +120,24 @@ func (p *PassthroughProxy) GetExternalVerifier() ExternalVerifier {
 	return p.externalVerifier
 }
 
+// SetOutboundManager sets the outbound manager for proxy routing.
+// Requirements: 2.1
+func (p *PassthroughProxy) SetOutboundManager(outboundMgr OutboundManager) {
+	p.outboundMgr = outboundMgr
+}
+
+// GetOutboundManager returns the outbound manager (may be nil if not set).
+func (p *PassthroughProxy) GetOutboundManager() OutboundManager {
+	return p.outboundMgr
+}
+
+// UpdateConfig updates the server configuration.
+// This is called when the config file changes to update proxy_outbound and other settings.
+func (p *PassthroughProxy) UpdateConfig(cfg *config.ServerConfig) {
+	p.config = cfg
+	logger.Debug("PassthroughProxy config updated for server %s, proxy_outbound=%s", p.serverID, cfg.GetProxyOutbound())
+}
+
 // Start begins listening for RakNet connections.
 func (p *PassthroughProxy) Start() error {
 	listener, err := raknet.Listen(p.config.ListenAddr)
@@ -121,6 +148,9 @@ func (p *PassthroughProxy) Start() error {
 	p.listener = listener
 	p.closed.Store(false)
 
+	// Create cancellable context for background goroutines
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+
 	// Set pong data for server list
 	p.updatePongData()
 
@@ -130,12 +160,56 @@ func (p *PassthroughProxy) Start() error {
 
 // updatePongData sets the pong data for server list queries.
 func (p *PassthroughProxy) updatePongData() {
+	// If show_real_latency is enabled, start periodic refresh with latency
+	if p.config.IsShowRealLatency() {
+		// Set initial pong data
+		customMOTD := p.config.GetCustomMOTD()
+		if customMOTD != "" {
+			p.listener.PongData([]byte(customMOTD))
+		}
+		// Immediately fetch once to initialize cache, then start periodic refresh
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			// Track this goroutine as a background task (expected to run for server lifetime)
+			gm := monitor.GetGoroutineManager()
+			gid := gm.TrackBackground("pong-refresh", "passthrough-proxy", "Server: "+p.serverID, p.cancel)
+			defer gm.Untrack(gid)
+
+			p.fetchRemotePongWithLatency()
+			// Then start periodic refresh with cancellable context
+			p.startPongRefresh(p.ctx)
+		}()
+		return
+	}
+
+	// Normal mode: use custom MOTD or fetch from remote
 	customMOTD := p.config.GetCustomMOTD()
 	if customMOTD != "" {
 		p.listener.PongData([]byte(customMOTD))
 	} else {
-		// Fetch pong from remote server
+		// Fetch pong from remote server (one-time, no need to track)
 		go p.fetchRemotePong()
+	}
+}
+
+// startPongRefresh periodically refreshes pong data with real latency.
+// It requires a context to be cancellable when the proxy is stopped or when connections close.
+func (p *PassthroughProxy) startPongRefresh(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Context cancelled, exit goroutine
+			return
+		case <-ticker.C:
+			if p.closed.Load() {
+				return
+			}
+			p.fetchRemotePongWithLatency()
+		}
 	}
 }
 
@@ -143,6 +217,12 @@ func (p *PassthroughProxy) updatePongData() {
 func (p *PassthroughProxy) fetchRemotePong() {
 	serverCfg, exists := p.configMgr.GetServer(p.serverID)
 	if !exists {
+		return
+	}
+
+	// If show_real_latency is enabled, use the latency-aware version
+	if serverCfg.IsShowRealLatency() {
+		p.fetchRemotePongWithLatency()
 		return
 	}
 
@@ -154,6 +234,139 @@ func (p *PassthroughProxy) fetchRemotePong() {
 	}
 
 	p.listener.PongData(pong)
+}
+
+// fetchRemotePongWithLatency fetches pong data through proxy and embeds real latency.
+func (p *PassthroughProxy) fetchRemotePongWithLatency() {
+	serverCfg, exists := p.configMgr.GetServer(p.serverID)
+	if !exists {
+		return
+	}
+
+	targetAddr := serverCfg.GetTargetAddr()
+	var pong []byte
+	var latency time.Duration
+	var err error
+
+	// If using proxy outbound, ping through proxy
+	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
+		pong, latency, err = p.pingThroughProxy(targetAddr, serverCfg.GetProxyOutbound())
+	} else {
+		// Direct ping
+		start := time.Now()
+		pong, err = raknet.Ping(targetAddr)
+		latency = time.Since(start)
+	}
+
+	if err != nil {
+		logger.Debug("Failed to ping remote server %s: %v", targetAddr, err)
+		// If ping fails but we have custom MOTD, use it with error indicator
+		customMOTD := serverCfg.GetCustomMOTD()
+		if customMOTD != "" {
+			pongToSend := p.embedLatencyInMOTD([]byte(customMOTD), -1)
+			p.listener.PongData(pongToSend)
+		}
+		// Cache the failed state
+		p.cachedPongMu.Lock()
+		p.lastPongLatency = -1
+		p.cachedPongMu.Unlock()
+		return
+	}
+
+	// Cache the latency and original pong data (contains player count from remote)
+	p.cachedPongMu.Lock()
+	p.lastPongLatency = latency.Milliseconds()
+	p.cachedPong = pong // Store original pong from remote server
+	p.cachedPongMu.Unlock()
+
+	// Prepare pong to send to client
+	pongToSend := pong
+	// Use custom MOTD if set, otherwise use remote pong
+	customMOTD := serverCfg.GetCustomMOTD()
+	if customMOTD != "" {
+		pongToSend = []byte(customMOTD)
+	}
+
+	// Embed latency into MOTD
+	if len(pongToSend) > 0 {
+		pongToSend = p.embedLatencyInMOTD(pongToSend, latency)
+	}
+
+	p.listener.PongData(pongToSend)
+}
+
+// GetCachedLatency returns the cached latency in milliseconds.
+// Returns -1 if not available or offline.
+func (p *PassthroughProxy) GetCachedLatency() int64 {
+	p.cachedPongMu.RLock()
+	defer p.cachedPongMu.RUnlock()
+	return p.lastPongLatency
+}
+
+// GetCachedPong returns the cached pong data.
+func (p *PassthroughProxy) GetCachedPong() []byte {
+	p.cachedPongMu.RLock()
+	defer p.cachedPongMu.RUnlock()
+	return p.cachedPong
+}
+
+// pingThroughProxy pings the target server through the proxy outbound.
+func (p *PassthroughProxy) pingThroughProxy(targetAddr, proxyName string) ([]byte, time.Duration, error) {
+	// Create a proxy dialer for UDP
+	// Use a longer timeout (15s) for proxy connections since they have additional latency
+	// from QUIC handshake + proxy relay
+	proxyDialer := NewProxyDialer(p.outboundMgr, p.config, 15*time.Second)
+
+	start := time.Now()
+
+	// Use raknet.Dialer with the proxy dialer to ping
+	dialer := raknet.Dialer{
+		UpstreamDialer: proxyDialer,
+	}
+
+	// Ping through the proxy
+	pong, err := dialer.Ping(targetAddr)
+	latency := time.Since(start)
+
+	if err != nil {
+		return nil, latency, err
+	}
+
+	return pong, latency, nil
+}
+
+// embedLatencyInMOTD embeds the latency value into the MOTD string.
+// MCPE MOTD format: MCPE;ServerName;Protocol;Version;Players;MaxPlayers;ServerUID;WorldName;GameMode;...
+// We append the latency to the server name.
+// If latency is negative, shows "离线" instead.
+func (p *PassthroughProxy) embedLatencyInMOTD(pong []byte, latency time.Duration) []byte {
+	motd := string(pong)
+	parts := strings.Split(motd, ";")
+
+	if len(parts) < 2 {
+		return pong
+	}
+
+	// Add latency to server name (parts[1])
+	if latency < 0 {
+		parts[1] = fmt.Sprintf("%s §c[离线]", parts[1])
+	} else {
+		latencyMs := latency.Milliseconds()
+		// Color code based on latency
+		var color string
+		if latencyMs < 50 {
+			color = "§a" // Green
+		} else if latencyMs < 100 {
+			color = "§e" // Yellow
+		} else if latencyMs < 200 {
+			color = "§6" // Orange
+		} else {
+			color = "§c" // Red
+		}
+		parts[1] = fmt.Sprintf("%s %s[%dms]", parts[1], color, latencyMs)
+	}
+
+	return []byte(strings.Join(parts, ";"))
 }
 
 // Listen starts accepting and handling RakNet connections.
@@ -275,6 +488,20 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 	// Step 4: Parse login packet to extract player info
 	playerName, playerUUID, playerXUID := p.parseLoginPacket(loginBytes)
 
+	// Clean up any existing sessions for this player before creating a new one
+	// This prevents "already logged in elsewhere" errors when players reconnect
+	if playerXUID != "" {
+		removed := p.sessionMgr.RemoveByXUID(playerXUID)
+		if removed > 0 {
+			logger.Debug("Cleaned up %d stale session(s) for XUID %s", removed, playerXUID)
+		}
+	} else if playerName != "" {
+		removed := p.sessionMgr.RemoveByPlayerName(playerName)
+		if removed > 0 {
+			logger.Debug("Cleaned up %d stale session(s) for player %s", removed, playerName)
+		}
+	}
+
 	// Create session
 	sess, _ := p.sessionMgr.GetOrCreate(clientAddr, p.serverID)
 	if playerName != "" {
@@ -316,51 +543,114 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 	// Step 5: Connect to remote server
 	targetAddr := serverCfg.GetTargetAddr()
-	remoteConn, err := raknet.Dial(targetAddr)
+	var remoteConn *raknet.Conn
+
+	// Check if we should use proxy outbound
+	// Requirements: 2.1, 2.2, 2.3, 2.4
+	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
+		// Use proxy dialer for outbound connection
+		proxyDialer := NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
+		dialer := raknet.Dialer{
+			UpstreamDialer: proxyDialer,
+		}
+		proxyName := serverCfg.GetProxyOutbound()
+		logger.Info("Connecting to remote %s via proxy outbound %s", targetAddr, proxyName)
+		logger.Debug("ProxyDialer created, attempting RakNet dial to %s", targetAddr)
+		remoteConn, err = dialer.Dial(targetAddr)
+		if err != nil {
+			logger.Error("RakNet dial via proxy failed: %v", err)
+		} else {
+			logger.Info("RakNet connection established via proxy to %s", targetAddr)
+		}
+	} else {
+		// Use direct connection
+		// Requirements: 2.2
+		logger.Debug("Using direct connection to %s", targetAddr)
+		remoteConn, err = raknet.Dial(targetAddr)
+	}
+
 	if err != nil {
-		logger.Error("Failed to connect to remote %s: %v", targetAddr, err)
+		// Requirements: 2.4 - Log warning and handle connection failure
+		if !serverCfg.IsDirectConnection() {
+			logger.Warn("Failed to connect to remote %s via proxy %s: %v", targetAddr, serverCfg.GetProxyOutbound(), err)
+		} else {
+			logger.Error("Failed to connect to remote %s: %v", targetAddr, err)
+		}
 		p.sendDisconnect(clientConn, "§cFailed to connect to server")
 		return
 	}
 	defer remoteConn.Close()
 
 	// Step 6: Forward the NetworkSettings request to remote
+	logger.Debug("Forwarding NetworkSettings to remote (%d bytes)", len(networkBytes))
 	if _, err := remoteConn.Write(networkBytes); err != nil {
 		logger.Error("Failed to forward network settings to remote: %v", err)
 		return
 	}
 
 	// Read and discard remote's NetworkSettings response
-	_, err = remoteConn.ReadPacket()
+	logger.Debug("Waiting for NetworkSettings response from remote...")
+	netResp, err := remoteConn.ReadPacket()
 	if err != nil {
 		logger.Error("Failed to read network settings from remote: %v", err)
 		return
 	}
+	logger.Debug("Received NetworkSettings response from remote (%d bytes)", len(netResp))
 
 	// Step 7: Forward the Login packet to remote (this contains client's auth JWT)
+	logger.Debug("Forwarding Login packet to remote (%d bytes)", len(loginBytes))
 	if _, err := remoteConn.Write(loginBytes); err != nil {
 		logger.Error("Failed to forward login to remote: %v", err)
 		return
 	}
+	logger.Debug("Login packet forwarded, starting bidirectional forwarding")
 
 	// Step 8: Start bidirectional forwarding
+	// Create a connection-level context that will be cancelled when this function returns
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	gm := monitor.GetGoroutineManager()
 
 	// Forward from remote to client
 	go func() {
 		defer wg.Done()
+		defer connCancel() // Cancel context when this goroutine exits to notify the other
+		gid := gm.Track("forward-remote-to-client", "passthrough-proxy", "Player: "+playerName, connCancel)
+		defer gm.Untrack(gid)
+
 		for {
-			if p.closed.Load() {
+			select {
+			case <-connCtx.Done():
+				logger.Debug("Context cancelled, stopping remote->client forwarding for %s", clientAddr)
 				return
-			}
-			pk, err := remoteConn.ReadPacket()
-			if err != nil {
-				return
-			}
-			sess.AddBytesDown(int64(len(pk)))
-			if _, err := clientConn.Write(pk); err != nil {
-				return
+			default:
+				// Set read deadline to allow periodic context checking
+				remoteConn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+				pk, err := remoteConn.ReadPacket()
+				if err != nil {
+					// Check if it's a timeout error
+					if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+						// Timeout is expected, continue to check context
+						gm.UpdateActivity(gid)
+						continue
+					}
+					logger.Debug("Connection closed (remote->client) for %s: %v", clientAddr, err)
+					return
+				}
+				// Clear deadline for write operation
+				remoteConn.SetDeadline(time.Time{})
+
+				sess.AddBytesDown(int64(len(pk)))
+				sess.UpdateLastSeen() // Keep session alive while data is flowing
+				gm.UpdateActivity(gid)
+				if _, err := clientConn.Write(pk); err != nil {
+					logger.Debug("Connection closed (write to client) for %s: %v", clientAddr, err)
+					return
+				}
 			}
 		}
 	}()
@@ -368,30 +658,57 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 	// Forward from client to remote
 	go func() {
 		defer wg.Done()
+		defer connCancel() // Cancel context when this goroutine exits to notify the other
+		gid := gm.Track("forward-client-to-remote", "passthrough-proxy", "Player: "+playerName, connCancel)
+		defer gm.Untrack(gid)
+
 		for {
-			if p.closed.Load() {
+			select {
+			case <-connCtx.Done():
+				logger.Debug("Context cancelled, stopping client->remote forwarding for %s", clientAddr)
 				return
-			}
-			pk, err := clientConn.ReadPacket()
-			if err != nil {
-				return
-			}
-			sess.AddBytesUp(int64(len(pk)))
-			if _, err := remoteConn.Write(pk); err != nil {
-				return
+			default:
+				// Set read deadline to allow periodic context checking
+				clientConn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+				pk, err := clientConn.ReadPacket()
+				if err != nil {
+					// Check if it's a timeout error
+					if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+						// Timeout is expected, continue to check context
+						gm.UpdateActivity(gid)
+						continue
+					}
+					logger.Debug("Connection closed (client->remote) for %s: %v", clientAddr, err)
+					return
+				}
+				// Clear deadline for write operation
+				clientConn.SetDeadline(time.Time{})
+
+				sess.AddBytesUp(int64(len(pk)))
+				sess.UpdateLastSeen() // Keep session alive while data is flowing
+				gm.UpdateActivity(gid)
+				if _, err := remoteConn.Write(pk); err != nil {
+					logger.Debug("Connection closed (write to remote) for %s: %v", clientAddr, err)
+					return
+				}
 			}
 		}
 	}()
 
 	wg.Wait()
 
-	// Log session end
+	// Log session end and remove session from manager
 	duration := time.Since(sess.StartTime)
 	if playerName != "" {
 		logger.Info("Session ended: player=%s, client=%s, duration=%v, up=%d, down=%d",
 			playerName, clientAddr, duration, sess.BytesUp, sess.BytesDown)
 	} else {
 		logger.Info("Session ended: client=%s, duration=%v", clientAddr, duration)
+	}
+
+	// Remove session from manager to prevent "already logged in" errors on reconnect
+	if err := p.sessionMgr.Remove(clientAddr); err != nil {
+		logger.Debug("Failed to remove session for %s: %v", clientAddr, err)
 	}
 }
 
@@ -943,6 +1260,11 @@ func (p *PassthroughProxy) KickPlayer(playerName, reason string) int {
 func (p *PassthroughProxy) Stop() error {
 	p.closed.Store(true)
 
+	// Cancel background goroutines (pong refresh, etc.)
+	if p.cancel != nil {
+		p.cancel()
+	}
+
 	// Close all active connections to unblock ReadPacket calls
 	p.activeConnsMu.Lock()
 	for conn := range p.activeConns {
@@ -957,5 +1279,6 @@ func (p *PassthroughProxy) Stop() error {
 		return err
 	}
 
+	p.wg.Wait()
 	return nil
 }

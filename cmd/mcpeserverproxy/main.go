@@ -130,6 +130,13 @@ func main() {
 	// Inject ACL manager into proxy server for access control (Requirement 4.1, 5.1)
 	proxyServer.SetACLManager(aclManager)
 
+	// Create proxy outbound handler for API
+	// OutboundManager and ProxyOutboundConfigManager are now created inside NewProxyServer
+	proxyOutboundHandler := api.NewProxyOutboundHandler(
+		proxyServer.GetProxyOutboundConfigManager(),
+		proxyServer.GetOutboundManager(),
+	)
+
 	// Create API server
 	apiServer := api.NewAPIServer(
 		globalConfig,
@@ -142,6 +149,7 @@ func main() {
 		mon,
 		proxyServer,
 		aclManager,
+		proxyOutboundHandler,
 	)
 
 	// Start proxy server

@@ -20,18 +20,19 @@ import (
 
 // UDPListener handles UDP packet reception for a specific server configuration.
 type UDPListener struct {
-	conn          *net.UDPConn
-	serverID      string
-	config        *config.ServerConfig
-	bufferPool    *BufferPool
-	sessionMgr    *session.SessionManager
-	forwarder     *Forwarder
-	configMgr     *config.ConfigManager
-	raknetHandler *protocol.RakNetHandler
-	cachedPong    []byte // Cached pong response from remote server
-	cachedPongMu  sync.RWMutex
-	lastPongTime  time.Time
-	closed        atomic.Bool
+	conn            *net.UDPConn
+	serverID        string
+	config          *config.ServerConfig
+	bufferPool      *BufferPool
+	sessionMgr      *session.SessionManager
+	forwarder       *Forwarder
+	configMgr       *config.ConfigManager
+	raknetHandler   *protocol.RakNetHandler
+	cachedPong      []byte // Cached pong response from remote server
+	cachedPongMu    sync.RWMutex
+	lastPongTime    time.Time
+	lastPongLatency int64 // milliseconds
+	closed          atomic.Bool
 }
 
 // NewUDPListener creates a new UDP listener for the specified server configuration.
@@ -267,8 +268,11 @@ func (l *UDPListener) buildCustomPongPacket(pingData []byte, motd string) []byte
 func (l *UDPListener) forwardPingAsync(data []byte, clientAddr *net.UDPAddr, serverCfg *config.ServerConfig) {
 	targetAddr := serverCfg.GetTargetAddr()
 
-	// Use go-raknet to ping the server
+	// Use go-raknet to ping the server with latency measurement
+	start := time.Now()
 	pongData, err := raknet.Ping(targetAddr)
+	latency := time.Since(start)
+
 	if err != nil {
 		logger.Debug("raknet.Ping failed for %s: %v, trying direct UDP", targetAddr, err)
 		// Try direct UDP ping as fallback
@@ -276,15 +280,16 @@ func (l *UDPListener) forwardPingAsync(data []byte, clientAddr *net.UDPAddr, ser
 		return
 	}
 
-	logger.Debug("Got pong from %s: %d bytes", targetAddr, len(pongData))
+	logger.Debug("Got pong from %s: %d bytes, latency=%dms", targetAddr, len(pongData), latency.Milliseconds())
 
 	// Build pong response using the pong data
 	pongPacket := l.buildPongPacket(data, pongData)
 
-	// Cache the pong response
+	// Cache the pong response and latency
 	l.cachedPongMu.Lock()
-	l.cachedPong = pongPacket
+	l.cachedPong = pongData // Store original pong data for API
 	l.lastPongTime = time.Now()
+	l.lastPongLatency = latency.Milliseconds()
 	l.cachedPongMu.Unlock()
 
 	// Forward pong to client
@@ -314,6 +319,7 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 
 	tempConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
+	start := time.Now()
 	_, err = tempConn.Write(data)
 	if err != nil {
 		logger.Warn("Failed to send ping to %s: %v", targetAddr, err)
@@ -322,18 +328,21 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 
 	buf := make([]byte, 2048)
 	n, err := tempConn.Read(buf)
+	latency := time.Since(start)
+
 	if err != nil {
 		logger.Warn("Failed to receive pong from %s: %v", targetAddr, err)
 		return
 	}
 
-	logger.Debug("Got direct pong from %s: %d bytes", targetAddr, n)
+	logger.Debug("Got direct pong from %s: %d bytes, latency=%dms", targetAddr, n, latency.Milliseconds())
 	pongData := buf[:n]
 
 	l.cachedPongMu.Lock()
 	l.cachedPong = make([]byte, n)
 	copy(l.cachedPong, pongData)
 	l.lastPongTime = time.Now()
+	l.lastPongLatency = latency.Milliseconds()
 	l.cachedPongMu.Unlock()
 
 	if !l.closed.Load() {
@@ -492,6 +501,21 @@ func (l *UDPListener) rejectDisabledServer(clientAddr *net.UDPAddr, message stri
 	// Build disconnect packet with custom message
 	disconnectPacket := l.forwarder.BuildDisconnectPacket(message)
 	l.conn.WriteToUDP(disconnectPacket, clientAddr)
+}
+
+// GetCachedLatency returns the cached latency in milliseconds.
+// Returns -1 if not available or offline.
+func (l *UDPListener) GetCachedLatency() int64 {
+	l.cachedPongMu.RLock()
+	defer l.cachedPongMu.RUnlock()
+	return l.lastPongLatency
+}
+
+// GetCachedPong returns the cached pong data.
+func (l *UDPListener) GetCachedPong() []byte {
+	l.cachedPongMu.RLock()
+	defer l.cachedPongMu.RUnlock()
+	return l.cachedPong
 }
 
 // Stop closes the UDP listener.

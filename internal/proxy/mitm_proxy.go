@@ -292,7 +292,8 @@ func (p *MITMProxy) forwardPackets(ctx context.Context, src, dst *minecraft.Conn
 				return
 			}
 
-			// Update stats (approximate packet size)
+			// Update stats (approximate packet size) and keep session alive
+			sess.UpdateLastSeen()
 			if isClientToRemote {
 				sess.AddBytesUp(100) // Approximate
 			} else {

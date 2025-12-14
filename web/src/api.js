@@ -61,3 +61,22 @@ export function formatTime(ts) {
   if (!ts) return '-'
   return new Date(ts).toLocaleString('zh-CN')
 }
+
+export function formatStartTime(ts) {
+  if (!ts) return '-'
+  const d = new Date(ts)
+  const month = (d.getMonth() + 1).toString().padStart(2, '0')
+  const day = d.getDate().toString().padStart(2, '0')
+  const hour = d.getHours().toString().padStart(2, '0')
+  const min = d.getMinutes().toString().padStart(2, '0')
+  return `${month}-${day} ${hour}:${min}`
+}
+
+// 格式化大数字 (K/M/B)
+export function formatNumber(num) {
+  if (!num || num === 0) return '0'
+  if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B'
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
+  return num.toString()
+}

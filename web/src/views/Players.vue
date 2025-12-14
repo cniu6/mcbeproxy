@@ -1,5 +1,5 @@
 <template>
-  <div>
+  <div class="page-container">
     <n-h2>玩家列表</n-h2>
     <n-card>
       <template #header-extra>
@@ -9,14 +9,16 @@
           <n-button @click="clearSearch">清除</n-button>
         </n-space>
       </template>
-      <n-data-table :columns="columns" :data="displayPlayers" :bordered="false" :pagination="{ pageSize: 20 }" :scroll-x="1100" />
+      <div class="table-wrapper">
+        <n-data-table :columns="columns" :data="displayPlayers" :bordered="false" :pagination="pagination" :scroll-x="1200" @update:page="p => pagination.page = p" @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }" />
+      </div>
     </n-card>
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, h } from 'vue'
-import { NButton, NSpace, useMessage } from 'naive-ui'
+import { NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatTime, formatDuration, formatBytes } from '../api'
 
 const props = defineProps({ initialSearch: { type: String, default: '' } })
@@ -31,6 +33,13 @@ const getSearchString = (val) => {
   return String(val)
 }
 const search = ref(getSearchString(props.initialSearch))
+const pagination = ref({
+  page: 1,
+  pageSize: 100,
+  pageSizes: [100, 200, 500, 1000],
+  showSizePicker: true,
+  prefix: ({ itemCount }) => `共 ${itemCount} 条`
+})
 
 const filterPlayers = () => {
   const s = (search.value || '').toLowerCase().trim()
@@ -69,6 +78,13 @@ const viewSessions = (name) => {
   window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'sessions', search: name } }))
 }
 
+const deletePlayer = async (name) => {
+  if (!name) return
+  const res = await api(`/api/players/${encodeURIComponent(name)}`, 'DELETE')
+  if (res.success) { message.success('已删除'); load() }
+  else message.error(res.msg || '删除失败')
+}
+
 const columns = [
   { title: '玩家名', key: 'display_name', width: 120 },
   { title: 'UUID', key: 'uuid', ellipsis: { tooltip: true }, width: 260 },
@@ -78,11 +94,15 @@ const columns = [
   { title: '游戏时长', key: 'total_playtime_seconds', render: r => formatDuration(r.total_playtime_seconds), width: 90 },
   { title: '总流量', key: 'total_bytes', render: r => formatBytes(r.total_bytes), width: 80 },
   {
-    title: '操作', key: 'actions', width: 170,
+    title: '操作', key: 'actions', width: 210,
     render: r => h(NSpace, { size: 'small' }, () => [
       h(NButton, { size: 'tiny', onClick: () => addWhitelist(r.display_name) }, () => '白名单'),
       h(NButton, { size: 'tiny', type: 'error', onClick: () => quickBan(r.display_name) }, () => '封禁'),
-      h(NButton, { size: 'tiny', onClick: () => viewSessions(r.display_name) }, () => '历史')
+      h(NButton, { size: 'tiny', onClick: () => viewSessions(r.display_name) }, () => '历史'),
+      h(NPopconfirm, { onPositiveClick: () => deletePlayer(r.display_name) }, { 
+        trigger: () => h(NButton, { size: 'tiny', type: 'warning' }, () => '删除'), 
+        default: () => '确定删除此玩家记录?' 
+      })
     ])
   }
 ]
@@ -97,3 +117,14 @@ const load = async () => {
 
 onMounted(load)
 </script>
+
+<style scoped>
+.page-container {
+  width: 100%;
+  overflow-x: auto;
+}
+.table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+</style>

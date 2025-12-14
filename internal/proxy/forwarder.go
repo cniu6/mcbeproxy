@@ -35,8 +35,9 @@ func (f *Forwarder) ForwardToRemote(sess *session.Session, data []byte, cfg *con
 		return nil
 	}
 
-	// Update bytes up counter
+	// Update bytes up counter and keep session alive
 	sess.AddBytesUp(int64(len(data)))
+	sess.UpdateLastSeen()
 
 	// Try to extract player info from login packets (read-only operation)
 	f.tryExtractPlayerInfo(sess, data)
@@ -146,8 +147,9 @@ func (f *Forwarder) fixOpenConnectionRequest2(data []byte, cfg *config.ServerCon
 // ForwardToClient forwards a packet from remote server to the client.
 // It operates in transparent mode, preserving original packet bytes without modification.
 func (f *Forwarder) ForwardToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte, sess *session.Session) error {
-	// Update bytes down counter
+	// Update bytes down counter and keep session alive
 	sess.AddBytesDown(int64(len(data)))
+	sess.UpdateLastSeen()
 
 	// Try to extract player info from server responses too
 	// Some servers may echo player info in certain packets

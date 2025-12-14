@@ -120,6 +120,86 @@ func (sm *SessionManager) RemoveByID(sessionID string) bool {
 	return false
 }
 
+// RemoveByPlayerName removes all sessions for a player by display name.
+// This is used to clean up stale sessions when a player reconnects.
+// Returns the number of sessions removed.
+func (sm *SessionManager) RemoveByPlayerName(displayName string) int {
+	if displayName == "" {
+		return 0
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var toRemove []string
+	for addr, session := range sm.sessions {
+		session.mu.Lock()
+		name := session.DisplayName
+		session.mu.Unlock()
+
+		if name == displayName {
+			toRemove = append(toRemove, addr)
+		}
+	}
+
+	for _, addr := range toRemove {
+		session := sm.sessions[addr]
+		// Close remote connection if exists
+		if session.RemoteConn != nil {
+			session.RemoteConn.Close()
+		}
+
+		// Call persistence callback if set
+		if sm.OnSessionEnd != nil {
+			sm.OnSessionEnd(session)
+		}
+
+		delete(sm.sessions, addr)
+	}
+
+	return len(toRemove)
+}
+
+// RemoveByXUID removes all sessions for a player by XUID.
+// This is used to clean up stale sessions when a player reconnects.
+// Returns the number of sessions removed.
+func (sm *SessionManager) RemoveByXUID(xuid string) int {
+	if xuid == "" {
+		return 0
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var toRemove []string
+	for addr, session := range sm.sessions {
+		session.mu.Lock()
+		sessionXUID := session.XUID
+		session.mu.Unlock()
+
+		if sessionXUID == xuid {
+			toRemove = append(toRemove, addr)
+		}
+	}
+
+	for _, addr := range toRemove {
+		session := sm.sessions[addr]
+		// Close remote connection if exists
+		if session.RemoteConn != nil {
+			session.RemoteConn.Close()
+		}
+
+		// Call persistence callback if set
+		if sm.OnSessionEnd != nil {
+			sm.OnSessionEnd(session)
+		}
+
+		delete(sm.sessions, addr)
+	}
+
+	return len(toRemove)
+}
+
 // UpdateActivity updates the last seen timestamp for a session.
 func (sm *SessionManager) UpdateActivity(clientAddr string) {
 	sm.mu.RLock()
@@ -170,6 +250,21 @@ func (sm *SessionManager) SetRemoteConn(clientAddr string, conn *net.UDPConn) er
 // GarbageCollect removes sessions that have been idle longer than the idle timeout.
 // It runs continuously until the context is cancelled.
 func (sm *SessionManager) GarbageCollect(ctx context.Context) {
+	ticker := time.NewTicker(time.Second * 30) // Check every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sm.cleanupIdleSessions()
+		}
+	}
+}
+
+// GarbageCollectWithCancel is like GarbageCollect but accepts a cancel function for tracking.
+func (sm *SessionManager) GarbageCollectWithCancel(ctx context.Context, cancel context.CancelFunc) {
 	ticker := time.NewTicker(time.Second * 30) // Check every 30 seconds
 	defer ticker.Stop()
 

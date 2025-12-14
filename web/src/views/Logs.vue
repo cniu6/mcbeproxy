@@ -7,7 +7,11 @@
         <n-input-number v-model:value="lines" :min="50" :max="5000" style="width: 100px" @update:value="loadLog">
           <template #suffix>行</template>
         </n-input-number>
-        <n-button @click="loadLog">刷新</n-button>
+        <n-switch v-model:value="autoRefresh" @update:value="toggleAutoRefresh">
+          <template #checked>自动刷新</template>
+          <template #unchecked>手动刷新</template>
+        </n-switch>
+        <n-button @click="loadLog" :loading="loading">刷新</n-button>
         <n-button @click="downloadLog" :disabled="!logContent">下载</n-button>
         <n-popconfirm @positive-click="deleteLog" :disabled="!logFile">
           <template #trigger><n-button type="warning" :disabled="!logFile">删除此日志</n-button></template>
@@ -22,7 +26,7 @@
     
     <n-card>
       <n-input v-model:value="filter" placeholder="过滤关键词..." style="margin-bottom: 12px" clearable />
-      <div v-if="logContent" style="max-height: 600px; overflow: auto; background: #1a1a1a; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;">
+      <div ref="logContainer" v-if="logContent" style="height: calc(100vh - 280px); min-height: 400px; overflow: auto; background: #1a1a1a; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;">
         <div v-for="(line, idx) in filteredLines" :key="idx" :style="getLineStyle(line)">{{ line }}</div>
       </div>
       <n-empty v-else description="请选择日志文件" />
@@ -31,7 +35,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api } from '../api'
 
@@ -41,6 +45,10 @@ const logFile = ref('')
 const logContent = ref('')
 const lines = ref(500)
 const filter = ref('')
+const autoRefresh = ref(true)
+const loading = ref(false)
+const logContainer = ref(null)
+let refreshTimer = null
 
 const logFileOptions = computed(() => logFiles.value.map(f => ({ label: f, value: f })))
 
@@ -59,6 +67,20 @@ const getLineStyle = (line) => {
   if (lower.includes('debug')) return { color: '#909399' }
   return { color: '#ddd' }
 }
+
+// 滚动到底部
+const scrollToBottom = () => {
+  nextTick(() => {
+    if (logContainer.value) {
+      logContainer.value.scrollTop = logContainer.value.scrollHeight
+    }
+  })
+}
+
+// 监听日志内容变化，自动滚动到底部
+watch(logContent, () => {
+  scrollToBottom()
+})
 
 const loadLogFiles = async () => {
   const res = await api('/api/logs')
@@ -79,9 +101,42 @@ const loadLogFiles = async () => {
 
 const loadLog = async () => {
   if (!logFile.value) return
-  const res = await api(`/api/logs/${encodeURIComponent(logFile.value)}?lines=${lines.value}`)
-  if (res.success) logContent.value = res.data || ''
-  else message.error(res.error || '加载失败')
+  loading.value = true
+  try {
+    const res = await api(`/api/logs/${encodeURIComponent(logFile.value)}?lines=${lines.value}`)
+    if (res.success) {
+      logContent.value = res.data || ''
+    } else {
+      message.error(res.error || '加载失败')
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+// 自动刷新控制
+const toggleAutoRefresh = (enabled) => {
+  if (enabled) {
+    startAutoRefresh()
+  } else {
+    stopAutoRefresh()
+  }
+}
+
+const startAutoRefresh = () => {
+  stopAutoRefresh()
+  refreshTimer = setInterval(() => {
+    if (logFile.value) {
+      loadLog()
+    }
+  }, 2000) // 2秒刷新一次
+}
+
+const stopAutoRefresh = () => {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 }
 
 const downloadLog = () => {
@@ -117,5 +172,14 @@ const clearAllLogs = async () => {
   }
 }
 
-onMounted(loadLogFiles)
+onMounted(() => {
+  loadLogFiles()
+  if (autoRefresh.value) {
+    startAutoRefresh()
+  }
+})
+
+onUnmounted(() => {
+  stopAutoRefresh()
+})
 </script>

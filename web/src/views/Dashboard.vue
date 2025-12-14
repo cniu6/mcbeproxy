@@ -1,16 +1,16 @@
 <template>
   <div>
-    <n-space justify="space-between" align="center" style="margin-bottom: 16px">
+    <n-space justify="space-between" align="center" style="margin-bottom: 16px" wrap>
       <n-h2 style="margin: 0">仪表盘</n-h2>
-      <n-space align="center">
+      <n-space align="center" wrap>
         <n-text depth="3">自动刷新:</n-text>
-        <n-select v-model:value="refreshInterval" :options="refreshOptions" style="width: 120px" size="small" @update:value="setupAutoRefresh" />
-        <n-button size="small" @click="loadData">立即刷新</n-button>
+        <n-select v-model:value="refreshInterval" :options="refreshOptions" style="width: 100px" size="small" @update:value="setupAutoRefresh" />
+        <n-button size="small" @click="loadData">刷新</n-button>
       </n-space>
     </n-space>
     
     <!-- 系统状态 -->
-    <n-grid :cols="8" :x-gap="10" :y-gap="10" style="margin-bottom: 12px">
+    <n-grid :cols="isMobile ? 2 : 8" :x-gap="10" :y-gap="10" style="margin-bottom: 12px" responsive="screen">
       <n-gi>
         <n-card size="small">
           <n-statistic label="CPU">
@@ -82,52 +82,55 @@
       </n-gi>
       <n-gi>
         <n-card size="small">
-          <n-statistic label="运行时间" :value="formatDuration(stats.uptime_seconds)" />
+          <n-statistic label="运行时间">
+            <template #default>{{ formatDuration(stats.uptime_seconds) }}</template>
+            <template #suffix><n-text depth="3" style="font-size: 10px">启动: {{ formatStartTime(stats.start_time) }}</n-text></template>
+          </n-statistic>
         </n-card>
       </n-gi>
     </n-grid>
 
     <!-- 网络流量 -->
     <n-card size="small" style="margin-bottom: 12px; cursor: pointer" @click="showNetworkDrawer = true">
-      <n-space justify="space-between">
-        <n-space>
+      <n-space :vertical="isMobile" :justify="isMobile ? 'start' : 'space-between'" :size="isMobile ? 8 : 12">
+        <n-space wrap>
           <n-tag type="info" size="small">总上传: {{ formatBytes(stats.network_total?.bytes_sent) }}</n-tag>
           <n-tag type="success" size="small">总下载: {{ formatBytes(stats.network_total?.bytes_recv) }}</n-tag>
         </n-space>
-        <n-space>
+        <n-space wrap>
           <n-tag type="warning" size="small">↑ {{ formatBytes(stats.network_total?.speed_out_bps) }}/s</n-tag>
           <n-tag type="primary" size="small">↓ {{ formatBytes(stats.network_total?.speed_in_bps) }}/s</n-tag>
-          <n-tag size="small">包: ↑{{ stats.network_total?.packets_sent || 0 }} ↓{{ stats.network_total?.packets_recv || 0 }}</n-tag>
-          <n-text depth="3" style="font-size: 12px">点击查看详情</n-text>
+          <n-tag size="small">包: ↑{{ formatNumber(stats.network_total?.packets_sent) }} ↓{{ formatNumber(stats.network_total?.packets_recv) }}</n-tag>
+          <n-text depth="3" style="font-size: 12px">点击详情</n-text>
         </n-space>
       </n-space>
     </n-card>
 
     <!-- 网卡详情抽屉 -->
-    <n-drawer v-model:show="showNetworkDrawer" :width="520" placement="right">
+    <n-drawer v-model:show="showNetworkDrawer" :width="isMobile ? '90%' : 520" placement="right">
       <n-drawer-content title="网卡详细信息">
         <n-space vertical size="large">
           <!-- 汇总信息 -->
-          <n-card size="small" title="总计">
-            <n-descriptions :column="2" label-placement="left" size="small">
-              <n-descriptions-item label="总上传">{{ formatBytes(stats.network_total?.bytes_sent) }}</n-descriptions-item>
-              <n-descriptions-item label="总下载">{{ formatBytes(stats.network_total?.bytes_recv) }}</n-descriptions-item>
-              <n-descriptions-item label="上传速率">{{ formatBytes(stats.network_total?.speed_out_bps) }}/s</n-descriptions-item>
-              <n-descriptions-item label="下载速率">{{ formatBytes(stats.network_total?.speed_in_bps) }}/s</n-descriptions-item>
-              <n-descriptions-item label="发送包">{{ stats.network_total?.packets_sent || 0 }}</n-descriptions-item>
-              <n-descriptions-item label="接收包">{{ stats.network_total?.packets_recv || 0 }}</n-descriptions-item>
-            </n-descriptions>
+          <n-card size="small" title="总计" :bordered="true">
+            <n-grid :cols="2" :x-gap="12" :y-gap="8">
+              <n-gi><n-text depth="3">总上传</n-text><br/><n-text>{{ formatBytes(stats.network_total?.bytes_sent) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">总下载</n-text><br/><n-text>{{ formatBytes(stats.network_total?.bytes_recv) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">上传速率</n-text><br/><n-text type="warning">{{ formatBytes(stats.network_total?.speed_out_bps) }}/s</n-text></n-gi>
+              <n-gi><n-text depth="3">下载速率</n-text><br/><n-text type="primary">{{ formatBytes(stats.network_total?.speed_in_bps) }}/s</n-text></n-gi>
+              <n-gi><n-text depth="3">发送包</n-text><br/><n-text>{{ formatNumber(stats.network_total?.packets_sent) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">接收包</n-text><br/><n-text>{{ formatNumber(stats.network_total?.packets_recv) }}</n-text></n-gi>
+            </n-grid>
           </n-card>
           <!-- 各网卡信息 -->
-          <n-card v-for="(iface, idx) in (stats.network || [])" :key="idx" size="small" :title="iface.name">
-            <n-descriptions :column="2" label-placement="left" size="small">
-              <n-descriptions-item label="上传">{{ formatBytes(iface.bytes_sent) }}</n-descriptions-item>
-              <n-descriptions-item label="下载">{{ formatBytes(iface.bytes_recv) }}</n-descriptions-item>
-              <n-descriptions-item label="上传速率">{{ formatBytes(iface.speed_out_bps) }}/s</n-descriptions-item>
-              <n-descriptions-item label="下载速率">{{ formatBytes(iface.speed_in_bps) }}/s</n-descriptions-item>
-              <n-descriptions-item label="发送包">{{ iface.packets_sent || 0 }}</n-descriptions-item>
-              <n-descriptions-item label="接收包">{{ iface.packets_recv || 0 }}</n-descriptions-item>
-            </n-descriptions>
+          <n-card v-for="(iface, idx) in (stats.network || [])" :key="idx" size="small" :title="iface.name" :bordered="true">
+            <n-grid :cols="2" :x-gap="12" :y-gap="8">
+              <n-gi><n-text depth="3">上传</n-text><br/><n-text>{{ formatBytes(iface.bytes_sent) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">下载</n-text><br/><n-text>{{ formatBytes(iface.bytes_recv) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">上传速率</n-text><br/><n-text type="warning">{{ formatBytes(iface.speed_out_bps) }}/s</n-text></n-gi>
+              <n-gi><n-text depth="3">下载速率</n-text><br/><n-text type="primary">{{ formatBytes(iface.speed_in_bps) }}/s</n-text></n-gi>
+              <n-gi><n-text depth="3">发送包</n-text><br/><n-text>{{ formatNumber(iface.packets_sent) }}</n-text></n-gi>
+              <n-gi><n-text depth="3">接收包</n-text><br/><n-text>{{ formatNumber(iface.packets_recv) }}</n-text></n-gi>
+            </n-grid>
           </n-card>
           <n-empty v-if="!stats.network?.length" description="暂无网卡信息" />
         </n-space>
@@ -147,15 +150,20 @@
       <n-collapse v-model:expanded-names="expandedServers">
         <n-collapse-item v-for="s in servers" :key="s.id" :name="s.id">
           <template #header>
-            <n-space align="center">
+            <n-space align="center" wrap size="small">
               <n-text strong>{{ s.name }}</n-text>
-              <n-tag size="small" :type="s.status === 'running' ? 'success' : 'error'">{{ s.status === 'running' ? '运行中' : '已停止' }}</n-tag>
-              <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">在线: {{ s.active_sessions || 0 }}</n-tag>
-              <n-text depth="3" style="font-size: 12px">{{ s.listen_addr }} → {{ s.target }}:{{ s.port }}</n-text>
+              <n-tag size="small" :type="s.status === 'running' ? 'success' : 'error'">{{ s.status === 'running' ? '运行' : '停止' }}</n-tag>
+              <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
+              <n-tag size="small" :type="getLatencyType(s.id)">{{ getLatencyText(s.id) }}</n-tag>
+              <n-tag v-if="getMotdPlayers(s.id)" size="small" type="info">在线: {{ getMotdPlayers(s.id) }}</n-tag>
+              <n-tag v-if="getMotdServerName(s.id)" size="small" type="warning">标题: {{ getMotdServerName(s.id) }}</n-tag>
             </n-space>
           </template>
-          <div v-if="activeSessions[s.id]?.length" style="overflow-x: auto">
-            <n-table size="small" :bordered="false" :single-line="false" style="min-width: 600px">
+          <template #header-extra>
+            <n-text v-if="!isMobile" depth="3" style="font-size: 12px">{{ s.listen_addr }} → {{ s.target }}:{{ s.port }}</n-text>
+          </template>
+          <div class="table-wrapper">
+            <n-table v-if="activeSessions[s.id]?.length" size="small" :bordered="false" :single-line="false" style="min-width: 600px">
               <thead><tr><th>玩家</th><th>客户端</th><th>连接时间</th><th>流量</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="sess in activeSessions[s.id]" :key="sess.id">
@@ -164,18 +172,17 @@
                   <td>{{ formatTime(sess.start_time) }}</td>
                   <td>↑{{ formatBytes(sess.bytes_up) }} ↓{{ formatBytes(sess.bytes_down) }}</td>
                   <td>
-                    <n-space size="small">
+                    <n-space size="small" wrap>
                       <n-button size="tiny" type="warning" @click="showKickDialog(sess)">踢出</n-button>
                       <n-button size="tiny" @click="addToWhitelist(sess.display_name)">白名单</n-button>
                       <n-button size="tiny" type="error" @click="addToBlacklist(sess.display_name)">封禁</n-button>
-                      <n-button size="tiny" @click="goToSessions(sess.display_name)">历史</n-button>
                     </n-space>
                   </td>
                 </tr>
               </tbody>
             </n-table>
+            <n-empty v-else description="暂无在线玩家" size="small" />
           </div>
-          <n-empty v-else description="暂无在线玩家" size="small" />
         </n-collapse-item>
       </n-collapse>
       <n-empty v-if="!servers.length" description="暂无服务器" />
@@ -186,36 +193,51 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useMessage } from 'naive-ui'
-import { api, formatBytes, formatDuration, formatTime } from '../api'
+import { api, formatBytes, formatDuration, formatTime, formatStartTime } from '../api'
 
 const message = useMessage()
 const stats = reactive({})
 const servers = ref([])
 const activeSessions = reactive({})
+const serverPings = reactive({})
 const refreshInterval = ref(15)
 const expandedServers = ref([])
 const showNetworkDrawer = ref(false)
 const kickDialogVisible = ref(false)
 const kickTarget = ref(null)
 const kickReason = ref('')
+const windowWidth = ref(window.innerWidth)
 let timer = null
+
+const isMobile = computed(() => windowWidth.value < 768)
 
 const refreshOptions = [
   { label: '关闭', value: 0 },
-  { label: '5 秒', value: 5 },
-  { label: '10 秒', value: 10 },
-  { label: '15 秒', value: 15 },
-  { label: '30 秒', value: 30 },
-  { label: '60 秒', value: 60 },
-  { label: '自定义...', value: -1 }
+  { label: '5秒', value: 5 },
+  { label: '10秒', value: 10 },
+  { label: '15秒', value: 15 },
+  { label: '30秒', value: 30 },
+  { label: '60秒', value: 60 }
 ]
+
+// 格式化大数字 (K/M/B)
+const formatNumber = (num) => {
+  if (!num || num === 0) return '0'
+  if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B'
+  if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M'
+  if (num >= 1000) return (num / 1000).toFixed(1) + 'K'
+  return num.toString()
+}
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 
 const loadData = async () => {
   const [st, sv, sess] = await Promise.all([api('/api/stats/system'), api('/api/servers'), api('/api/sessions')])
   if (st.success) Object.assign(stats, st.data)
-  if (sv.success) servers.value = sv.data || []
+  if (sv.success) {
+    servers.value = sv.data || []
+    loadServerPings(sv.data || [])
+  }
   if (sess.success) {
     const grouped = {}
     for (const s of sess.data || []) {
@@ -224,72 +246,96 @@ const loadData = async () => {
     }
     Object.keys(activeSessions).forEach(k => delete activeSessions[k])
     Object.assign(activeSessions, grouped)
-    // 自动展开有玩家的服务器
     const serversWithPlayers = Object.keys(grouped).filter(k => grouped[k].length > 0)
-    if (serversWithPlayers.length > 0) {
-      expandedServers.value = serversWithPlayers
+    if (serversWithPlayers.length > 0) expandedServers.value = serversWithPlayers
+  }
+}
+
+const loadServerPings = async (serverList) => {
+  for (const s of serverList) {
+    if (s.show_real_latency) {
+      try {
+        const res = await api(`/api/servers/${encodeURIComponent(s.id)}/latency`)
+        if (res.success && res.data) {
+          serverPings[s.id] = { online: res.data.online, latency: res.data.latency, isRealLatency: true, parsed_motd: res.data.parsed_motd }
+          continue
+        }
+      } catch (e) { /* Fall through */ }
+    }
+    if (s.listen_addr) {
+      let addr = s.listen_addr
+      if (addr.startsWith('0.0.0.0:') || addr.startsWith(':')) addr = `127.0.0.1:${addr.split(':').pop()}`
+      try {
+        const res = await api('/api/ping', 'POST', { address: addr })
+        if (res.success && res.data) serverPings[s.id] = res.data
+      } catch (e) { serverPings[s.id] = { online: false, error: e.message } }
     }
   }
+}
+
+const getLatencyText = (serverId) => {
+  const ping = serverPings[serverId]
+  if (!ping) return '检测中...'
+  if (!ping.online) return '离线'
+  return ping.isRealLatency ? `${ping.latency}ms (代理)` : `${ping.latency}ms`
+}
+
+const getLatencyType = (serverId) => {
+  const ping = serverPings[serverId]
+  if (!ping || !ping.online) return 'error'
+  if (ping.latency < 50) return 'success'
+  if (ping.latency < 100) return 'info'
+  if (ping.latency < 200) return 'warning'
+  return 'error'
+}
+
+const getMotdPlayers = (serverId) => {
+  const ping = serverPings[serverId]
+  if (!ping || !ping.parsed_motd) return ''
+  return `${ping.parsed_motd.player_count || 0}/${ping.parsed_motd.max_players || 0}`
+}
+
+const getMotdServerName = (serverId) => {
+  const ping = serverPings[serverId]
+  if (!ping || !ping.parsed_motd || !ping.parsed_motd.server_name) return ''
+  return ping.parsed_motd.server_name
 }
 
 const setupAutoRefresh = (val) => {
   if (timer) clearInterval(timer)
-  if (val === -1) {
-    const custom = prompt('请输入刷新间隔（秒）:', '15')
-    if (custom && !isNaN(custom) && parseInt(custom) > 0) {
-      refreshInterval.value = parseInt(custom)
-    } else {
-      refreshInterval.value = 15
-    }
-  }
-  if (refreshInterval.value > 0) {
-    timer = setInterval(loadData, refreshInterval.value * 1000)
-  }
+  if (val > 0) timer = setInterval(loadData, val * 1000)
 }
 
 const goToPlayer = (name) => window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'players', search: name } }))
-const goToSessions = (name) => window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'sessions', search: name } }))
 
 const addToBlacklist = async (name) => {
   const res = await api('/api/acl/blacklist', 'POST', { player_name: name })
-  if (res.success) {
-    const kickedCount = res.data?.kicked_count || 0
-    message.success(`已将 ${name} 加入黑名单` + (kickedCount > 0 ? `，已踢出 ${kickedCount} 个连接` : ''))
-    loadData()
-  } else {
-    message.error(res.msg || '操作失败')
-  }
+  if (res.success) { message.success(`已将 ${name} 加入黑名单`); loadData() }
+  else message.error(res.msg || '操作失败')
 }
 
 const addToWhitelist = async (name) => {
   const res = await api('/api/acl/whitelist', 'POST', { player_name: name })
-  if (res.success) {
-    message.success(`已将 ${name} 加入白名单`)
-  } else {
-    message.error(res.msg || '操作失败')
-  }
+  if (res.success) message.success(`已将 ${name} 加入白名单`)
+  else message.error(res.msg || '操作失败')
 }
 
-const showKickDialog = (sess) => {
-  kickTarget.value = sess
-  kickReason.value = ''
-  kickDialogVisible.value = true
-}
+const showKickDialog = (sess) => { kickTarget.value = sess; kickReason.value = ''; kickDialogVisible.value = true }
 
 const confirmKick = async () => {
   if (!kickTarget.value) return
-  const playerName = kickTarget.value.display_name
-  const res = await api(`/api/players/${encodeURIComponent(playerName)}/kick`, 'POST', { reason: kickReason.value })
-  if (res.success) {
-    const reasonText = kickReason.value ? `，原因: ${kickReason.value}` : ''
-    message.success(`已踢出 ${playerName}${reasonText}`)
-    loadData()
-  } else {
-    message.error(res.msg || '踢出失败')
-  }
+  const res = await api(`/api/players/${encodeURIComponent(kickTarget.value.display_name)}/kick`, 'POST', { reason: kickReason.value })
+  if (res.success) { message.success(`已踢出 ${kickTarget.value.display_name}`); loadData() }
+  else message.error(res.msg || '踢出失败')
   kickDialogVisible.value = false
 }
 
-onMounted(() => { loadData(); setupAutoRefresh(refreshInterval.value) })
-onUnmounted(() => { if (timer) clearInterval(timer) })
+const handleResize = () => { windowWidth.value = window.innerWidth }
+
+onMounted(() => { loadData(); setupAutoRefresh(refreshInterval.value); window.addEventListener('resize', handleResize) })
+onUnmounted(() => { if (timer) clearInterval(timer); window.removeEventListener('resize', handleResize) })
 </script>
+
+<style scoped>
+.table-wrapper { width: 100%; overflow-x: auto; }
+</style>

@@ -64,13 +64,13 @@ func TestProperty_PlayerStatsAccumulation(t *testing.T) {
 			sessionTotalBytes := sessionBytesUp + sessionBytesDown
 			sessionDuration := time.Duration(sessionDurationSec) * time.Second
 
-			if err := repo.UpdateStats(uuid, sessionTotalBytes, sessionDuration); err != nil {
+			if err := repo.UpdateStats(displayName, sessionTotalBytes, sessionDuration); err != nil {
 				t.Logf("Failed to update stats: %v", err)
 				return false
 			}
 
 			// Verify: retrieve player and check accumulated stats
-			updatedPlayer, err := repo.GetByUUID(uuid)
+			updatedPlayer, err := repo.GetByDisplayName(displayName)
 			if err != nil {
 				t.Logf("Failed to get player: %v", err)
 				return false

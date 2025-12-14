@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-//go:embed dist/*
+//go:embed dist
 var distFS embed.FS
 
 // getEntryPath returns the current entry path from config

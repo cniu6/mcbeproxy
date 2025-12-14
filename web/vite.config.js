@@ -6,7 +6,16 @@ export default defineConfig({
   base: './',
   build: {
     outDir: '../internal/api/dist',
-    emptyOutDir: true
+    emptyOutDir: true,
+    // 确保生成 index.html
+    rollupOptions: {
+      output: {
+        // 保持文件名一致性
+        entryFileNames: 'assets/[name]-[hash].js',
+        chunkFileNames: 'assets/[name]-[hash].js',
+        assetFileNames: 'assets/[name]-[hash].[ext]'
+      }
+    }
   },
   server: {
     proxy: {

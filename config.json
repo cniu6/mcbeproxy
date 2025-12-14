@@ -9,7 +9,7 @@
   "log_dir": "logs",
   "log_retention_days": 7,
   "log_max_size_mb": 100,
-  "auth_verify_enabled": true,
+  "auth_verify_enabled": false,
   "auth_verify_url": "http://127.0.0.1:818/jiasuip/index.php",
   "auth_cache_minutes": 15
 }

@@ -33,6 +33,8 @@ type ServerConfig struct {
 	ProxyMode       string `json:"proxy_mode"`        // "transparent" (default) or "raknet" (full RakNet proxy)
 	XboxAuthEnabled bool   `json:"xbox_auth_enabled"` // Enable Xbox Live authentication for remote connections
 	XboxTokenPath   string `json:"xbox_token_path"`   // Custom token file path for Xbox Live tokens (optional)
+	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name, empty or "direct" for direct connection
+	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy in server list ping
 	resolvedIP      string
 	lastResolved    time.Time
 }
@@ -124,9 +126,12 @@ type ServerConfigDTO struct {
 	BufferSize      int    `json:"buffer_size"`
 	DisabledMessage string `json:"disabled_message"`
 	CustomMOTD      string `json:"custom_motd"`
+	ProxyMode       string `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
 	XboxAuthEnabled bool   `json:"xbox_auth_enabled"`
 	XboxTokenPath   string `json:"xbox_token_path"`
-	Status          string `json:"status"` // running, stopped
+	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name
+	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy
+	Status          string `json:"status"`            // running, stopped
 	ActiveSessions  int    `json:"active_sessions"`
 }
 
@@ -147,11 +152,19 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		BufferSize:      sc.BufferSize,
 		DisabledMessage: sc.DisabledMessage,
 		CustomMOTD:      sc.CustomMOTD,
+		ProxyMode:       sc.ProxyMode,
 		XboxAuthEnabled: sc.XboxAuthEnabled,
 		XboxTokenPath:   sc.XboxTokenPath,
+		ProxyOutbound:   sc.ProxyOutbound,
+		ShowRealLatency: sc.ShowRealLatency,
 		Status:          status,
 		ActiveSessions:  activeSessions,
 	}
+}
+
+// IsShowRealLatency returns whether to show real latency through proxy.
+func (sc *ServerConfig) IsShowRealLatency() bool {
+	return sc.ShowRealLatency
 }
 
 // GetCustomMOTD returns the custom MOTD or empty string if not set.
@@ -187,6 +200,18 @@ func (sc *ServerConfig) GetXboxTokenPath() string {
 		return "xbox_token.json"
 	}
 	return sc.XboxTokenPath
+}
+
+// GetProxyOutbound returns the proxy outbound node name.
+// Returns empty string for direct connection.
+func (sc *ServerConfig) GetProxyOutbound() string {
+	return sc.ProxyOutbound
+}
+
+// IsDirectConnection returns true if the server should use direct connection (no proxy).
+// This is the case when ProxyOutbound is empty or "direct".
+func (sc *ServerConfig) IsDirectConnection() bool {
+	return sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct"
 }
 
 // DNSResolver handles DNS resolution for server targets.
@@ -369,6 +394,22 @@ func (cm *ConfigManager) DeleteServer(id string) error {
 	}
 
 	delete(cm.servers, id)
+	return cm.saveToFile()
+}
+
+// UpdateServerProxyOutbound updates the proxy_outbound field for a server.
+// This is used for cascade updates when deleting proxy outbounds.
+// Requirements: 1.4
+func (cm *ConfigManager) UpdateServerProxyOutbound(serverID string, proxyOutbound string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	server, exists := cm.servers[serverID]
+	if !exists {
+		return fmt.Errorf("server with ID %s not found", serverID)
+	}
+
+	server.ProxyOutbound = proxyOutbound
 	return cm.saveToFile()
 }
 

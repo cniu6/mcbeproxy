@@ -100,6 +100,7 @@ type SystemStats struct {
 	Process      ProcessInfo    `json:"process"`
 	GoRuntime    RuntimeStats   `json:"go_runtime"`
 	Uptime       int64          `json:"uptime_seconds"`
+	StartTime    string         `json:"start_time"` // ISO 8601 format
 }
 
 // NetworkTotal represents total network statistics across all interfaces.
@@ -333,5 +334,6 @@ func (m *Monitor) GetSystemStats() (*SystemStats, error) {
 		Process:      *procInfo,
 		GoRuntime:    *runtimeStats,
 		Uptime:       int64(time.Since(m.startTime).Seconds()),
+		StartTime:    m.startTime.Format(time.RFC3339),
 	}, nil
 }

@@ -102,6 +102,7 @@ func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {
 		mon,
 		&mockProxyController{},
 		aclManager,
+		nil, // proxyOutboundHandler - not needed for these tests
 	)
 
 	cleanup := func() {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sandertv/go-raknet"
 
 	"mcpeserverproxy/internal/acl"
 	"mcpeserverproxy/internal/config"
@@ -41,6 +43,8 @@ type APIServer struct {
 	proxyController ProxyController
 	// ACL manager for access control
 	aclManager *acl.ACLManager
+	// Proxy outbound handler for managing proxy outbound nodes
+	proxyOutboundHandler *ProxyOutboundHandler
 }
 
 // ProxyController defines the interface for controlling proxy servers.
@@ -53,6 +57,12 @@ type ProxyController interface {
 	GetActiveSessionsForServer(serverID string) int
 	GetAllServerStatuses() []config.ServerConfigDTO
 	KickPlayer(playerName string, reason string) int // Kick player by name with reason, returns count of kicked sessions
+	GetServerLatency(serverID string) (int64, bool)  // Get cached latency for a server, returns (latency_ms, ok)
+}
+
+// LatencyInfoProvider is an optional interface for getting detailed latency info with MOTD
+type LatencyInfoProvider interface {
+	GetServerLatencyInfoRaw(serverID string) (latency int64, online bool, motd string, ok bool)
 }
 
 // NewAPIServer creates a new API server instance.
@@ -67,6 +77,7 @@ func NewAPIServer(
 	mon *monitor.Monitor,
 	proxyController ProxyController,
 	aclManager *acl.ACLManager,
+	proxyOutboundHandler *ProxyOutboundHandler,
 ) *APIServer {
 	// Set Gin to release mode for production
 	gin.SetMode(gin.ReleaseMode)
@@ -78,18 +89,19 @@ func NewAPIServer(
 	}
 
 	api := &APIServer{
-		router:          gin.New(),
-		globalConfig:    globalConfig,
-		configMgr:       configMgr,
-		sessionMgr:      sessionMgr,
-		db:              database,
-		keyRepo:         keyRepo,
-		playerRepo:      playerRepo,
-		sessionRepo:     sessionRepo,
-		monitor:         mon,
-		promMetrics:     promMetrics,
-		proxyController: proxyController,
-		aclManager:      aclManager,
+		router:               gin.New(),
+		globalConfig:         globalConfig,
+		configMgr:            configMgr,
+		sessionMgr:           sessionMgr,
+		db:                   database,
+		keyRepo:              keyRepo,
+		playerRepo:           playerRepo,
+		sessionRepo:          sessionRepo,
+		monitor:              mon,
+		promMetrics:          promMetrics,
+		proxyController:      proxyController,
+		aclManager:           aclManager,
+		proxyOutboundHandler: proxyOutboundHandler,
 	}
 
 	api.setupRoutes()
@@ -123,6 +135,7 @@ func (a *APIServer) setupRoutes() {
 		api.POST("/servers/:id/reload", a.reloadServer)
 		api.POST("/servers/:id/disable", a.disableServer)
 		api.POST("/servers/:id/enable", a.enableServer)
+		api.GET("/servers/:id/latency", a.getServerLatency)
 
 		// Session endpoints
 		api.GET("/sessions", a.getSessions)
@@ -141,6 +154,7 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/players", a.getPlayers)
 		api.GET("/players/:name", a.getPlayer)
 		api.POST("/players/:name/kick", a.kickPlayer)
+		api.DELETE("/players/:name", a.deletePlayer)
 
 		// API key management endpoints
 		api.POST("/keys", a.createAPIKey)
@@ -149,7 +163,24 @@ func (a *APIServer) setupRoutes() {
 		// System stats endpoints
 		api.GET("/stats/system", a.getSystemStats)
 		api.GET("/config", a.getConfig)
+		api.PUT("/config", a.updateConfig)
 		api.PUT("/config/entry-path", a.updateEntryPath)
+
+		// Goroutine management endpoints (for debugging)
+		debugGroup := api.Group("/debug")
+		{
+			debugGroup.GET("/goroutines", a.getGoroutines)
+			debugGroup.GET("/goroutines/stats", a.getGoroutineStats)
+			debugGroup.GET("/goroutines/pprof", a.getGoroutinePprof)
+			debugGroup.POST("/goroutines/cancel/:id", a.cancelGoroutine)
+			debugGroup.POST("/goroutines/cancel-all", a.cancelAllGoroutines)
+			debugGroup.POST("/goroutines/cancel-component/:component", a.cancelGoroutinesByComponent)
+			debugGroup.POST("/gc", a.forceGC)
+		}
+
+		// Ping endpoint for checking remote server status
+		api.GET("/ping/:address", a.pingServer)
+		api.POST("/ping", a.pingServerPost)
 
 		// ACL (Access Control List) endpoints
 		// Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8
@@ -168,6 +199,30 @@ func (a *APIServer) setupRoutes() {
 			// Settings endpoints
 			aclGroup.GET("/settings", a.getACLSettings)
 			aclGroup.PUT("/settings", a.updateACLSettings)
+		}
+
+		// Proxy outbound endpoints
+		// Requirements: 4.3, 5.3
+		if a.proxyOutboundHandler != nil {
+			proxyOutboundGroup := api.Group("/proxy-outbounds")
+			{
+				proxyOutboundGroup.GET("", a.proxyOutboundHandler.ListProxyOutbounds)
+				proxyOutboundGroup.POST("", a.proxyOutboundHandler.CreateProxyOutbound)
+				// New endpoints with name in body (recommended for special characters)
+				proxyOutboundGroup.POST("/test", a.proxyOutboundHandler.TestProxyOutboundByBody)
+				proxyOutboundGroup.POST("/detailed-test", a.proxyOutboundHandler.DetailedTestProxyOutbound)
+				proxyOutboundGroup.POST("/test-mcbe", a.proxyOutboundHandler.TestMCBEUDP)
+				proxyOutboundGroup.POST("/health", a.proxyOutboundHandler.GetProxyOutboundHealthByBody)
+				proxyOutboundGroup.POST("/get", a.proxyOutboundHandler.GetProxyOutboundByBody)
+				proxyOutboundGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
+				proxyOutboundGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)
+				// Legacy endpoints with name in URL (kept for compatibility)
+				proxyOutboundGroup.GET("/:name", a.proxyOutboundHandler.GetProxyOutbound)
+				proxyOutboundGroup.PUT("/:name", a.proxyOutboundHandler.UpdateProxyOutbound)
+				proxyOutboundGroup.DELETE("/:name", a.proxyOutboundHandler.DeleteProxyOutbound)
+				proxyOutboundGroup.POST("/:name/test", a.proxyOutboundHandler.TestProxyOutbound)
+				proxyOutboundGroup.GET("/:name/health", a.proxyOutboundHandler.GetProxyOutboundHealth)
+			}
 		}
 	}
 }
@@ -476,6 +531,51 @@ func (a *APIServer) enableServer(c *gin.Context) {
 	respondSuccess(c, map[string]bool{"disabled": false})
 }
 
+// getServerLatency returns the cached latency for a server.
+// GET /api/servers/:id/latency
+func (a *APIServer) getServerLatency(c *gin.Context) {
+	serverID := c.Param("id")
+
+	// Try to get detailed latency info with MOTD if available
+	if provider, ok := a.proxyController.(LatencyInfoProvider); ok {
+		latency, online, motd, found := provider.GetServerLatencyInfoRaw(serverID)
+		if found {
+			response := map[string]interface{}{
+				"server_id": serverID,
+				"latency":   latency,
+				"online":    online,
+				"motd":      motd,
+			}
+			// Parse MOTD if available
+			if motd != "" {
+				response["parsed_motd"] = parseMOTD(motd)
+			}
+			respondSuccess(c, response)
+			return
+		}
+	}
+
+	// Fallback to simple latency
+	latency, ok := a.proxyController.GetServerLatency(serverID)
+	if !ok {
+		// Return 200 with not_found flag instead of 404 to avoid browser console errors
+		respondSuccess(c, map[string]interface{}{
+			"server_id": serverID,
+			"latency":   -1,
+			"online":    false,
+			"not_found": true,
+		})
+		return
+	}
+
+	online := latency >= 0
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"latency":   latency,
+		"online":    online,
+	})
+}
+
 // Session and Player Handlers
 
 // getSessions returns the list of all active sessions.
@@ -608,6 +708,27 @@ func (a *APIServer) kickPlayer(c *gin.Context) {
 	})
 }
 
+// deletePlayer deletes a player record from the database.
+// DELETE /api/players/:name
+func (a *APIServer) deletePlayer(c *gin.Context) {
+	name := c.Param("name")
+	if name == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		return
+	}
+
+	if err := a.playerRepo.DeleteByDisplayName(name); err != nil {
+		if err == sql.ErrNoRows {
+			respondError(c, http.StatusNotFound, "玩家不存在", "Player not found")
+			return
+		}
+		respondError(c, http.StatusInternalServerError, "删除失败", err.Error())
+		return
+	}
+
+	respondSuccessWithMsg(c, "玩家记录已删除", nil)
+}
+
 // API Key Management Handlers
 
 // CreateAPIKeyRequest represents the request body for creating an API key.
@@ -700,16 +821,83 @@ func (a *APIServer) getConfig(c *gin.Context) {
 
 	// Return a safe subset of config (no sensitive data)
 	configDTO := map[string]interface{}{
-		"api_port":            a.globalConfig.APIPort,
-		"api_entry_path":      a.globalConfig.APIEntryPath,
-		"database_path":       a.globalConfig.DatabasePath,
-		"log_dir":             a.globalConfig.LogDir,
-		"log_retention_days":  a.globalConfig.LogRetentionDays,
-		"auth_verify_enabled": a.globalConfig.AuthVerifyEnabled,
-		"auth_verify_url":     a.globalConfig.AuthVerifyURL,
-		"auth_cache_minutes":  a.globalConfig.AuthCacheMinutes,
+		"api_port":               a.globalConfig.APIPort,
+		"api_entry_path":         a.globalConfig.APIEntryPath,
+		"database_path":          a.globalConfig.DatabasePath,
+		"log_dir":                a.globalConfig.LogDir,
+		"log_retention_days":     a.globalConfig.LogRetentionDays,
+		"log_max_size_mb":        a.globalConfig.LogMaxSizeMB,
+		"debug_mode":             a.globalConfig.DebugMode,
+		"max_session_records":    a.globalConfig.MaxSessionRecords,
+		"max_access_log_records": a.globalConfig.MaxAccessLogRecords,
+		"auth_verify_enabled":    a.globalConfig.AuthVerifyEnabled,
+		"auth_verify_url":        a.globalConfig.AuthVerifyURL,
+		"auth_cache_minutes":     a.globalConfig.AuthCacheMinutes,
 	}
 	respondSuccess(c, configDTO)
+}
+
+// updateConfig updates the global configuration.
+// PUT /api/config
+func (a *APIServer) updateConfig(c *gin.Context) {
+	if a.globalConfig == nil {
+		respondError(c, http.StatusInternalServerError, "Config not available", "")
+		return
+	}
+
+	var req struct {
+		APIPort             int    `json:"api_port"`
+		APIEntryPath        string `json:"api_entry_path"`
+		LogDir              string `json:"log_dir"`
+		LogRetentionDays    int    `json:"log_retention_days"`
+		LogMaxSizeMB        int    `json:"log_max_size_mb"`
+		DebugMode           bool   `json:"debug_mode"`
+		MaxSessionRecords   int    `json:"max_session_records"`
+		MaxAccessLogRecords int    `json:"max_access_log_records"`
+		AuthVerifyEnabled   bool   `json:"auth_verify_enabled"`
+		AuthVerifyURL       string `json:"auth_verify_url"`
+		AuthCacheMinutes    int    `json:"auth_cache_minutes"`
+		Restart             bool   `json:"restart"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	// Update config in memory
+	if req.APIPort > 0 {
+		a.globalConfig.APIPort = req.APIPort
+	}
+	if req.APIEntryPath != "" {
+		a.globalConfig.APIEntryPath = req.APIEntryPath
+	}
+	if req.LogDir != "" {
+		a.globalConfig.LogDir = req.LogDir
+	}
+	if req.LogRetentionDays > 0 {
+		a.globalConfig.LogRetentionDays = req.LogRetentionDays
+	}
+	if req.LogMaxSizeMB > 0 {
+		a.globalConfig.LogMaxSizeMB = req.LogMaxSizeMB
+	}
+	a.globalConfig.DebugMode = req.DebugMode
+	if req.MaxSessionRecords > 0 {
+		a.globalConfig.MaxSessionRecords = req.MaxSessionRecords
+	}
+	if req.MaxAccessLogRecords > 0 {
+		a.globalConfig.MaxAccessLogRecords = req.MaxAccessLogRecords
+	}
+	a.globalConfig.AuthVerifyEnabled = req.AuthVerifyEnabled
+	if req.AuthVerifyURL != "" {
+		a.globalConfig.AuthVerifyURL = req.AuthVerifyURL
+	}
+	if req.AuthCacheMinutes > 0 {
+		a.globalConfig.AuthCacheMinutes = req.AuthCacheMinutes
+	}
+
+	// Note: Actual restart would require additional implementation
+	// For now, just acknowledge the config update
+	respondSuccessWithMsg(c, "配置已更新", nil)
 }
 
 // updateEntryPath updates the API entry path dynamically.
@@ -1240,4 +1428,251 @@ func (a *APIServer) clearAllLogs(c *gin.Context) {
 	}
 
 	respondSuccess(c, gin.H{"message": fmt.Sprintf("Deleted %d log files", deleted)})
+}
+
+// PingResponse represents the response from a ping request.
+type PingResponse struct {
+	Address    string      `json:"address"`
+	Latency    int64       `json:"latency"`               // Latency in milliseconds
+	Online     bool        `json:"online"`                // Whether the server is online
+	MOTD       string      `json:"motd"`                  // Raw MOTD string
+	ParsedMOTD *ParsedMOTD `json:"parsed_motd,omitempty"` // Parsed MOTD fields
+	Error      string      `json:"error,omitempty"`
+}
+
+// ParsedMOTD represents parsed MCPE MOTD fields.
+type ParsedMOTD struct {
+	Edition         string `json:"edition"`          // MCPE or MCEE
+	ServerName      string `json:"server_name"`      // Server name/description
+	ProtocolVersion string `json:"protocol_version"` // Protocol version number
+	GameVersion     string `json:"game_version"`     // Game version string
+	PlayerCount     string `json:"player_count"`     // Current player count
+	MaxPlayers      string `json:"max_players"`      // Maximum players
+	ServerUID       string `json:"server_uid"`       // Server unique ID
+	WorldName       string `json:"world_name"`       // World/level name
+	GameMode        string `json:"game_mode"`        // Game mode (Survival, Creative, etc.)
+	Port            string `json:"port"`             // IPv4 port
+	PortV6          string `json:"port_v6"`          // IPv6 port
+}
+
+// parseMOTD parses an MCPE MOTD string into structured fields.
+func parseMOTD(motd string) *ParsedMOTD {
+	parts := strings.Split(motd, ";")
+	if len(parts) < 6 {
+		return nil
+	}
+
+	parsed := &ParsedMOTD{
+		Edition: parts[0],
+	}
+
+	if len(parts) > 1 {
+		parsed.ServerName = parts[1]
+	}
+	if len(parts) > 2 {
+		parsed.ProtocolVersion = parts[2]
+	}
+	if len(parts) > 3 {
+		parsed.GameVersion = parts[3]
+	}
+	if len(parts) > 4 {
+		parsed.PlayerCount = parts[4]
+	}
+	if len(parts) > 5 {
+		parsed.MaxPlayers = parts[5]
+	}
+	if len(parts) > 6 {
+		parsed.ServerUID = parts[6]
+	}
+	if len(parts) > 7 {
+		parsed.WorldName = parts[7]
+	}
+	if len(parts) > 8 {
+		parsed.GameMode = parts[8]
+	}
+	if len(parts) > 10 {
+		parsed.Port = parts[10]
+	}
+	if len(parts) > 11 {
+		parsed.PortV6 = parts[11]
+	}
+
+	return parsed
+}
+
+// pingServer pings a Minecraft Bedrock server and returns status info.
+// GET /api/ping/:address
+// The address should be in format "host:port" or just "host" (default port 19132)
+func (a *APIServer) pingServer(c *gin.Context) {
+	address := c.Param("address")
+	if address == "" {
+		respondError(c, http.StatusBadRequest, "Address is required", "")
+		return
+	}
+
+	// Add default port if not specified
+	if !strings.Contains(address, ":") {
+		address = address + ":19132"
+	}
+
+	response := a.doPing(address)
+	respondSuccess(c, response)
+}
+
+// PingRequest represents the request body for POST ping.
+type PingRequest struct {
+	Address string `json:"address" binding:"required"`
+}
+
+// pingServerPost pings a Minecraft Bedrock server using POST request.
+// POST /api/ping
+// Body: {"address": "host:port"}
+func (a *APIServer) pingServerPost(c *gin.Context) {
+	var req PingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+
+	address := req.Address
+	// Add default port if not specified
+	if !strings.Contains(address, ":") {
+		address = address + ":19132"
+	}
+
+	response := a.doPing(address)
+	respondSuccess(c, response)
+}
+
+// doPing performs the actual ping operation.
+func (a *APIServer) doPing(address string) *PingResponse {
+	response := &PingResponse{
+		Address: address,
+		Online:  false,
+	}
+
+	start := time.Now()
+	pong, err := raknet.Ping(address)
+	latency := time.Since(start).Milliseconds()
+
+	if err != nil {
+		response.Error = err.Error()
+		response.Latency = -1
+		return response
+	}
+
+	response.Online = true
+	response.Latency = latency
+	response.MOTD = string(pong)
+	response.ParsedMOTD = parseMOTD(string(pong))
+
+	return response
+}
+
+// Goroutine Management Handlers
+
+// getGoroutines returns all tracked goroutines.
+// GET /api/debug/goroutines
+func (a *APIServer) getGoroutines(c *gin.Context) {
+	gm := monitor.GetGoroutineManager()
+	goroutines := gm.GetTrackedGoroutines()
+	respondSuccess(c, map[string]interface{}{
+		"total_runtime": runtime.NumGoroutine(),
+		"tracked":       len(goroutines),
+		"goroutines":    goroutines,
+	})
+}
+
+// getGoroutineStats returns comprehensive goroutine statistics.
+// GET /api/debug/goroutines/stats
+// Query params: stacks=true to include runtime stacks
+func (a *APIServer) getGoroutineStats(c *gin.Context) {
+	includeStacks := c.Query("stacks") == "true"
+	gm := monitor.GetGoroutineManager()
+	stats := gm.GetStats(includeStacks)
+
+	// Build response with process info
+	response := map[string]interface{}{
+		"total_count":     stats.TotalCount,
+		"tracked_count":   stats.TrackedCount,
+		"by_component":    stats.ByComponent,
+		"by_state":        stats.ByState,
+		"long_running":    stats.LongRunning,
+		"potential_leaks": stats.PotentialLeaks,
+		"runtime_stacks":  stats.RuntimeStacks,
+	}
+
+	// Add process CPU/memory info if monitor is available
+	if a.monitor != nil {
+		if procInfo, err := a.monitor.GetProcessInfo(); err == nil {
+			response["process_cpu_percent"] = procInfo.CPUPercent
+			response["process_memory_bytes"] = procInfo.MemoryBytes
+		}
+	}
+
+	respondSuccess(c, response)
+}
+
+// getGoroutinePprof returns pprof goroutine profile data.
+// GET /api/debug/goroutines/pprof
+func (a *APIServer) getGoroutinePprof(c *gin.Context) {
+	gm := monitor.GetGoroutineManager()
+	pprofData := gm.GetPprofGoroutines()
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, pprofData)
+}
+
+// cancelGoroutine attempts to cancel a specific tracked goroutine.
+// POST /api/debug/goroutines/cancel/:id
+func (a *APIServer) cancelGoroutine(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid goroutine ID", err.Error())
+		return
+	}
+
+	gm := monitor.GetGoroutineManager()
+	if gm.Cancel(id) {
+		respondSuccessWithMsg(c, "协程已取消", map[string]int64{"id": id})
+	} else {
+		respondError(c, http.StatusNotFound, "协程未找到或无法取消", "")
+	}
+}
+
+// cancelAllGoroutines attempts to cancel all tracked goroutines.
+// POST /api/debug/goroutines/cancel-all
+func (a *APIServer) cancelAllGoroutines(c *gin.Context) {
+	gm := monitor.GetGoroutineManager()
+	cancelled := gm.CancelAll()
+	respondSuccessWithMsg(c, fmt.Sprintf("已取消 %d 个协程", cancelled), map[string]int{"cancelled": cancelled})
+}
+
+// cancelGoroutinesByComponent cancels all goroutines of a specific component.
+// POST /api/debug/goroutines/cancel-component/:component
+func (a *APIServer) cancelGoroutinesByComponent(c *gin.Context) {
+	component := c.Param("component")
+	if component == "" {
+		respondError(c, http.StatusBadRequest, "Component name is required", "")
+		return
+	}
+
+	gm := monitor.GetGoroutineManager()
+	cancelled := gm.CancelByComponent(component)
+	respondSuccessWithMsg(c, fmt.Sprintf("已取消 %s 组件的 %d 个协程", component, cancelled), map[string]interface{}{
+		"component": component,
+		"cancelled": cancelled,
+	})
+}
+
+// forceGC forces a garbage collection.
+// POST /api/debug/gc
+func (a *APIServer) forceGC(c *gin.Context) {
+	before := runtime.NumGoroutine()
+	runtime.GC()
+	after := runtime.NumGoroutine()
+	respondSuccessWithMsg(c, "GC completed", map[string]interface{}{
+		"goroutines_before": before,
+		"goroutines_after":  after,
+	})
 }
