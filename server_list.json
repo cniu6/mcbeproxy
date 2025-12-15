@@ -38,7 +38,7 @@
     "proxy_mode": "passthrough",
     "xbox_auth_enabled": false,
     "xbox_token_path": "",
-    "proxy_outbound": "direct",
+    "proxy_outbound": "",
     "show_real_latency": true
   },
   {

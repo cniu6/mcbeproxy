@@ -60,29 +60,37 @@
     </n-modal>
 
     <!-- 代理选择器 Modal -->
-    <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理出站" style="width: 800px">
-      <n-space style="margin-bottom: 12px;">
-        <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" />
-        <n-checkbox v-model:checked="proxyFilter.udpOnly">仅UDP可用</n-checkbox>
-        <n-radio-group v-model:value="proxyFilter.sortBy" size="small">
-          <n-radio-button value="name">名称</n-radio-button>
-          <n-radio-button value="group">分组</n-radio-button>
-          <n-radio-button value="latency">延迟</n-radio-button>
-          <n-radio-button value="type">类型</n-radio-button>
-        </n-radio-group>
-      </n-space>
-      <n-data-table 
-        :columns="proxyColumns" 
-        :data="filteredProxyOutbounds" 
-        :bordered="false" 
-        size="small"
-        :max-height="400"
-        :row-props="(row) => ({ style: 'cursor: pointer', onClick: () => quickSwitchProxy(row.name) })"
-      />
+    <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理出站" style="width: 1100px; max-width: 95vw">
+      <n-spin :show="proxySelectorLoading">
+        <n-space style="margin-bottom: 12px;" align="center">
+          <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable />
+          <n-select v-model:value="proxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable />
+          <n-checkbox v-model:checked="proxyFilter.udpOnly">仅UDP可用</n-checkbox>
+          <n-input v-model:value="proxyFilter.search" placeholder="搜索" style="width: 150px" clearable />
+          <n-tag v-if="filteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
+            {{ filteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
+          </n-tag>
+        </n-space>
+        <n-data-table 
+          :columns="proxyColumns" 
+          :data="filteredProxyOutbounds" 
+          :bordered="false" 
+          size="small"
+          :max-height="400"
+          :scroll-x="900"
+          :pagination="proxySelectorPagination"
+          @update:page="p => proxySelectorPagination.page = p"
+          @update:page-size="s => { proxySelectorPagination.pageSize = s; proxySelectorPagination.page = 1 }"
+          :row-props="(row) => ({ style: 'cursor: pointer', onClick: () => quickSwitchProxy(row.name) })"
+        />
+      </n-spin>
       <template #footer>
         <n-space justify="space-between">
           <n-button @click="quickSwitchProxy('')" type="warning">切换到直连</n-button>
-          <n-button @click="showProxySelector = false">取消</n-button>
+          <n-space>
+            <n-button @click="refreshProxyList" :loading="proxySelectorLoading">刷新</n-button>
+            <n-button @click="showProxySelector = false">取消</n-button>
+          </n-space>
         </n-space>
       </template>
     </n-modal>
@@ -172,27 +180,65 @@ const goToProxyOutbound = (name) => {
   window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'proxy-outbounds', search: name } }))
 }
 
-// 代理选择器表格列
+// 代理选择器表格列（和代理出站管理页面一致）
 const proxyColumns = [
-  { title: '名称', key: 'name', width: 150 },
-  { title: '类型', key: 'type', width: 80, render: r => h(NTag, { type: 'info', size: 'small' }, () => r.type?.toUpperCase()) },
-  { title: '分组', key: 'group', width: 100 },
-  { title: '服务器', key: 'server', ellipsis: { tooltip: true } },
-  { 
-    title: 'UDP', 
-    key: 'udp_available', 
-    width: 60, 
-    render: r => h(NTag, { 
-      type: r.udp_available === true ? 'success' : r.udp_available === false ? 'error' : 'default', 
-      size: 'small' 
-    }, () => r.udp_available === true ? '✓' : r.udp_available === false ? '✗' : '?')
-  },
-  { 
-    title: '延迟', 
-    key: 'udp_latency_ms', 
-    width: 80, 
-    render: r => r.udp_latency_ms ? `${r.udp_latency_ms}ms` : '-'
-  }
+  { title: '名称', key: 'name', width: 160, ellipsis: { tooltip: true }, sorter: (a, b) => a.name.localeCompare(b.name) },
+  { title: '分组', key: 'group', width: 100, ellipsis: { tooltip: true }, sorter: (a, b) => {
+    if (!a.group && !b.group) return 0
+    if (!a.group) return -1
+    if (!b.group) return 1
+    return a.group.localeCompare(b.group)
+  }, render: r => r.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => r.group) : '-' },
+  { title: '协议', key: 'type', width: 140, sorter: (a, b) => (a.type || '').localeCompare(b.type || ''), render: r => {
+    const tags = [h(NTag, { type: 'info', size: 'small' }, () => r.type?.toUpperCase())]
+    if (r.network === 'ws') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'WS'))
+    if (r.network === 'grpc') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'gRPC'))
+    if (r.reality) tags.push(h(NTag, { type: 'success', size: 'small', style: 'margin-left: 4px' }, () => 'Reality'))
+    if (r.flow === 'xtls-rprx-vision') tags.push(h(NTag, { type: 'primary', size: 'small', style: 'margin-left: 4px' }, () => 'Vision'))
+    return h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, tags)
+  }},
+  { title: '服务器', key: 'server', width: 160, ellipsis: { tooltip: true }, render: r => `${r.server}:${r.port}` },
+  { title: 'TCP', key: 'latency_ms', width: 70, sorter: (a, b) => (a.latency_ms || 9999) - (b.latency_ms || 9999), render: r => {
+    if (r.latency_ms > 0) {
+      const type = r.latency_ms < 200 ? 'success' : r.latency_ms < 500 ? 'warning' : 'error'
+      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.latency_ms}ms`)
+    }
+    return '-'
+  }},
+  { title: 'HTTP', key: 'http_latency_ms', width: 70, sorter: (a, b) => (a.http_latency_ms || 9999) - (b.http_latency_ms || 9999), render: r => {
+    if (r.http_latency_ms > 0) {
+      const type = r.http_latency_ms < 500 ? 'success' : r.http_latency_ms < 1500 ? 'warning' : 'error'
+      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.http_latency_ms}ms`)
+    }
+    return '-'
+  }},
+  { title: 'UDP', key: 'udp_available', width: 80, sorter: (a, b) => {
+    const getScore = (o) => {
+      if (o.udp_available === true && o.udp_latency_ms > 0) return o.udp_latency_ms
+      if (o.udp_available === true) return 10000
+      if (o.udp_available === false) return 99999
+      return 50000
+    }
+    return getScore(a) - getScore(b)
+  }, render: r => {
+    if (r.udp_available === true) {
+      const latencyText = r.udp_latency_ms > 0 ? `${r.udp_latency_ms}ms` : '✓'
+      const type = r.udp_latency_ms > 0 ? (r.udp_latency_ms < 200 ? 'success' : r.udp_latency_ms < 500 ? 'warning' : 'error') : 'success'
+      return h(NTag, { type, size: 'small', bordered: false }, () => latencyText)
+    }
+    if (r.udp_available === false) return h(NTag, { type: 'error', size: 'small' }, () => '✗')
+    return '-'
+  }},
+  { title: '启用', key: 'enabled', width: 50, render: r => h(NTag, { type: r.enabled ? 'success' : 'default', size: 'small' }, () => r.enabled ? '是' : '否') }
+]
+
+// 协议筛选选项
+const proxyProtocolOptions = [
+  { label: 'Shadowsocks', value: 'shadowsocks' },
+  { label: 'VMess', value: 'vmess' },
+  { label: 'Trojan', value: 'trojan' },
+  { label: 'VLESS', value: 'vless' },
+  { label: 'Hysteria2', value: 'hysteria2' }
 ]
 
 // 获取代理类型标签
@@ -215,7 +261,15 @@ const getProxyTypeTags = (proxyName) => {
 // 快速切换代理
 const showProxySelector = ref(false)
 const selectedServerId = ref('')
-const proxyFilter = ref({ group: '', udpOnly: false, sortBy: 'name' })
+const proxySelectorLoading = ref(false)
+const proxyFilter = ref({ group: '', protocol: '', udpOnly: false, search: '' })
+const proxySelectorPagination = ref({
+  page: 1,
+  pageSize: 100,
+  pageSizes: [100, 200, 300, 500, 1000],
+  showSizePicker: true,
+  prefix: ({ itemCount }) => `共 ${itemCount} 条`
+})
 
 // 获取所有代理出站（包含详细信息）
 const allProxyOutbounds = computed(() => {
@@ -224,12 +278,12 @@ const allProxyOutbounds = computed(() => {
 
 // 获取分组列表
 const proxyGroups = computed(() => {
-  const groups = new Set([''])
+  const groups = new Set()
   allProxyOutbounds.value.forEach(o => { if (o.group) groups.add(o.group) })
-  return Array.from(groups).map(g => ({ label: g || '全部', value: g }))
+  return Array.from(groups).sort().map(g => ({ label: g, value: g }))
 })
 
-// 过滤和排序后的代理列表
+// 过滤后的代理列表
 const filteredProxyOutbounds = computed(() => {
   let list = [...allProxyOutbounds.value]
   
@@ -238,28 +292,61 @@ const filteredProxyOutbounds = computed(() => {
     list = list.filter(o => o.group === proxyFilter.value.group)
   }
   
+  // 按协议过滤
+  if (proxyFilter.value.protocol) {
+    list = list.filter(o => o.type === proxyFilter.value.protocol)
+  }
+  
   // 只显示支持UDP的
   if (proxyFilter.value.udpOnly) {
     list = list.filter(o => o.udp_available !== false)
   }
   
-  // 排序
-  const sortBy = proxyFilter.value.sortBy
-  list.sort((a, b) => {
-    if (sortBy === 'name') return (a.name || '').localeCompare(b.name || '')
-    if (sortBy === 'group') return (a.group || '').localeCompare(b.group || '')
-    if (sortBy === 'latency') return (a.udp_latency_ms || 9999) - (b.udp_latency_ms || 9999)
-    if (sortBy === 'type') return (a.type || '').localeCompare(b.type || '')
-    return 0
-  })
+  // 搜索过滤
+  if (proxyFilter.value.search) {
+    const kw = proxyFilter.value.search.toLowerCase()
+    list = list.filter(o => 
+      o.name.toLowerCase().includes(kw) || 
+      o.server.toLowerCase().includes(kw) ||
+      (o.group && o.group.toLowerCase().includes(kw))
+    )
+  }
   
-  return list
+  // 默认排序：先按分组，再按名称
+  return list.sort((a, b) => {
+    if (!a.group && b.group) return -1
+    if (a.group && !b.group) return 1
+    if (a.group && b.group && a.group !== b.group) return a.group.localeCompare(b.group)
+    return a.name.localeCompare(b.name)
+  })
 })
 
-// 打开代理选择器
+// 刷新代理列表
+const refreshProxyList = async () => {
+  proxySelectorLoading.value = true
+  try {
+    const res = await api('/api/proxy-outbounds')
+    if (res.success && res.data) {
+      proxyOutboundOptions.value = [
+        { label: '直连 (不使用代理)', value: '' },
+        ...res.data.filter(o => o.enabled).map(o => ({ label: `${o.name} (${o.type})`, value: o.name }))
+      ]
+      res.data.forEach(o => { proxyOutboundDetails.value[o.name] = o })
+    }
+  } finally {
+    proxySelectorLoading.value = false
+  }
+}
+
+// 打开代理选择器（先弹窗再加载）
 const openProxySelector = (serverId) => {
   selectedServerId.value = serverId
+  proxySelectorLoading.value = true
   showProxySelector.value = true
+  // 使用 setTimeout 确保弹窗先渲染，再加载数据
+  setTimeout(() => {
+    refreshProxyList()
+  }, 50)
 }
 
 // 快速切换代理

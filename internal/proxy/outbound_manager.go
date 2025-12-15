@@ -305,8 +305,15 @@ func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) erro
 		return ErrOutboundNotFound
 	}
 
-	// Get or create sing-box outbound instance
-	singboxOutbound, err := m.getOrCreateSingboxOutbound(cfg)
+	// If the node is unhealthy, recreate the singbox outbound to get a fresh connection
+	// This helps recover from transient DNS/connection issues
+	var singboxOutbound *SingboxOutbound
+	var err error
+	if !cfg.GetHealthy() && cfg.GetLastError() != "" {
+		singboxOutbound, err = m.recreateSingboxOutbound(name)
+	} else {
+		singboxOutbound, err = m.getOrCreateSingboxOutbound(cfg)
+	}
 	m.mu.Unlock()
 
 	startTime := time.Now()
@@ -390,10 +397,20 @@ func (m *outboundManagerImpl) DialPacketConn(ctx context.Context, outboundName s
 	}
 
 	// Fast-fail for unhealthy nodes - skip retries
+	// But allow retry after 30 seconds to recover from transient issues
 	// Requirements: 6.4
 	if !cfg.GetHealthy() && cfg.GetLastError() != "" {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s - %s", ErrOutboundUnhealthy, outboundName, cfg.GetLastError())
+		lastCheck := cfg.GetLastCheck()
+		// Allow retry after 30 seconds of being unhealthy
+		if time.Since(lastCheck) < 30*time.Second {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s - %s", ErrOutboundUnhealthy, outboundName, cfg.GetLastError())
+		}
+		// Time to retry - recreate the singbox outbound
+		if _, err := m.recreateSingboxOutbound(outboundName); err != nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s - failed to recreate: %v", ErrOutboundUnhealthy, outboundName, err)
+		}
 	}
 	m.mu.Unlock()
 
