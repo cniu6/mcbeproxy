@@ -159,16 +159,31 @@ func (gm *GoroutineManager) SetState(id int64, state string) {
 }
 
 // Cancel attempts to cancel a tracked goroutine.
+// The goroutine will be automatically removed after a short delay to allow cleanup.
 func (gm *GoroutineManager) Cancel(id int64) bool {
 	gm.mu.Lock()
-	defer gm.mu.Unlock()
-
-	if g, ok := gm.goroutines[id]; ok && g.cancelFunc != nil {
-		g.cancelFunc()
-		g.info.State = "cancelled"
-		return true
+	g, ok := gm.goroutines[id]
+	if !ok || g.cancelFunc == nil {
+		gm.mu.Unlock()
+		return false
 	}
-	return false
+	g.cancelFunc()
+	g.info.State = "cancelled"
+	gm.mu.Unlock()
+
+	// Schedule automatic cleanup after 5 seconds
+	// This gives the goroutine time to exit gracefully via defer Untrack
+	go func() {
+		time.Sleep(5 * time.Second)
+		gm.mu.Lock()
+		defer gm.mu.Unlock()
+		// Only remove if still in cancelled state (not re-tracked)
+		if g, exists := gm.goroutines[id]; exists && g.info.State == "cancelled" {
+			delete(gm.goroutines, id)
+		}
+	}()
+
+	return true
 }
 
 // GetStats returns comprehensive goroutine statistics.
@@ -333,33 +348,61 @@ func (gm *GoroutineManager) GetPprofGoroutines() string {
 // CancelAll attempts to cancel all tracked goroutines.
 func (gm *GoroutineManager) CancelAll() int {
 	gm.mu.Lock()
-	defer gm.mu.Unlock()
-
-	cancelled := 0
-	for _, g := range gm.goroutines {
+	cancelledIDs := make([]int64, 0)
+	for id, g := range gm.goroutines {
 		if g.cancelFunc != nil {
 			g.cancelFunc()
 			g.info.State = "cancelled"
-			cancelled++
+			cancelledIDs = append(cancelledIDs, id)
 		}
 	}
-	return cancelled
+	gm.mu.Unlock()
+
+	// Schedule automatic cleanup
+	if len(cancelledIDs) > 0 {
+		go func() {
+			time.Sleep(5 * time.Second)
+			gm.mu.Lock()
+			defer gm.mu.Unlock()
+			for _, id := range cancelledIDs {
+				if g, exists := gm.goroutines[id]; exists && g.info.State == "cancelled" {
+					delete(gm.goroutines, id)
+				}
+			}
+		}()
+	}
+
+	return len(cancelledIDs)
 }
 
 // CancelByComponent cancels all goroutines of a specific component.
 func (gm *GoroutineManager) CancelByComponent(component string) int {
 	gm.mu.Lock()
-	defer gm.mu.Unlock()
-
-	cancelled := 0
-	for _, g := range gm.goroutines {
+	cancelledIDs := make([]int64, 0)
+	for id, g := range gm.goroutines {
 		if g.info.Component == component && g.cancelFunc != nil {
 			g.cancelFunc()
 			g.info.State = "cancelled"
-			cancelled++
+			cancelledIDs = append(cancelledIDs, id)
 		}
 	}
-	return cancelled
+	gm.mu.Unlock()
+
+	// Schedule automatic cleanup
+	if len(cancelledIDs) > 0 {
+		go func() {
+			time.Sleep(5 * time.Second)
+			gm.mu.Lock()
+			defer gm.mu.Unlock()
+			for _, id := range cancelledIDs {
+				if g, exists := gm.goroutines[id]; exists && g.info.State == "cancelled" {
+					delete(gm.goroutines, id)
+				}
+			}
+		}()
+	}
+
+	return len(cancelledIDs)
 }
 
 // Enable enables goroutine tracking.

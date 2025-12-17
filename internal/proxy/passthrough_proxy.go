@@ -375,26 +375,46 @@ func (p *PassthroughProxy) Listen(ctx context.Context) error {
 		return fmt.Errorf("listener not started")
 	}
 
+	// Use a channel to receive connections with context cancellation support
+	connChan := make(chan *raknet.Conn)
+	errChan := make(chan error)
+
+	// Start a goroutine to accept connections
+	go func() {
+		for {
+			if p.closed.Load() {
+				return
+			}
+			conn, err := p.listener.Accept()
+			if err != nil {
+				if p.closed.Load() {
+					return
+				}
+				// Send error but don't block if channel is full
+				select {
+				case errChan <- err:
+				default:
+				}
+				continue
+			}
+			select {
+			case connChan <- conn.(*raknet.Conn):
+			case <-ctx.Done():
+				conn.Close()
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			if p.closed.Load() {
-				return nil
-			}
-
-			conn, err := p.listener.Accept()
-			if err != nil {
-				if p.closed.Load() {
-					return nil
-				}
-				logger.Debug("Accept error: %v", err)
-				continue
-			}
-
+		case conn := <-connChan:
 			p.wg.Add(1)
-			go p.handleConnection(ctx, conn.(*raknet.Conn))
+			go p.handleConnection(ctx, conn)
+		case err := <-errChan:
+			logger.Debug("Accept error: %v", err)
 		}
 	}
 }

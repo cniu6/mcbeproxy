@@ -321,30 +321,48 @@ func (p *RakNetProxy) Listen(ctx context.Context) error {
 		return fmt.Errorf("listener not started")
 	}
 
+	// Use a channel to receive connections with context cancellation support
+	connChan := make(chan *raknet.Conn)
+	errChan := make(chan error)
+
+	// Start a goroutine to accept connections
+	go func() {
+		for {
+			if p.closed.Load() {
+				return
+			}
+			conn, err := p.listener.Accept()
+			if err != nil {
+				if p.closed.Load() {
+					return
+				}
+				// Send error but don't block if channel is full
+				select {
+				case errChan <- err:
+				default:
+				}
+				continue
+			}
+			select {
+			case connChan <- conn.(*raknet.Conn):
+			case <-ctx.Done():
+				conn.Close()
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			if p.closed.Load() {
-				return nil
-			}
-
-			// Accept new connection
-			conn, err := p.listener.Accept()
-			if err != nil {
-				if p.closed.Load() {
-					return nil
-				}
-				if !strings.Contains(err.Error(), "use of closed") {
-					logger.Debug("RakNet accept error: %v", err)
-				}
-				continue
-			}
-
-			// Handle connection in a goroutine
+		case conn := <-connChan:
 			p.wg.Add(1)
-			go p.handleConnection(ctx, conn.(*raknet.Conn))
+			go p.handleConnection(ctx, conn)
+		case err := <-errChan:
+			if !strings.Contains(err.Error(), "use of closed") {
+				logger.Debug("RakNet accept error: %v", err)
+			}
 		}
 	}
 }
