@@ -655,6 +655,9 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		gid := gm.Track("forward-remote-to-client", "passthrough-proxy", "Player: "+playerName, connCancel)
 		defer gm.Untrack(gid)
 
+		consecutiveTimeouts := 0
+		const maxConsecutiveTimeouts = 300 // 30 seconds of no data (100ms * 300)
+
 		for {
 			select {
 			case <-connCtx.Done():
@@ -667,6 +670,12 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 				if err != nil {
 					// Check if it's a timeout error
 					if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+						consecutiveTimeouts++
+						// Check if we've exceeded max consecutive timeouts (connection likely dead)
+						if consecutiveTimeouts >= maxConsecutiveTimeouts {
+							logger.Debug("Connection timeout (remote->client) for %s: no data for 30s", clientAddr)
+							return
+						}
 						// Timeout is expected, continue to check context
 						gm.UpdateActivity(gid)
 						continue
@@ -674,6 +683,8 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					logger.Debug("Connection closed (remote->client) for %s: %v", clientAddr, err)
 					return
 				}
+				// Reset timeout counter on successful read
+				consecutiveTimeouts = 0
 				// Clear deadline for write operation
 				remoteConn.SetDeadline(time.Time{})
 
@@ -695,6 +706,9 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		gid := gm.Track("forward-client-to-remote", "passthrough-proxy", "Player: "+playerName, connCancel)
 		defer gm.Untrack(gid)
 
+		consecutiveTimeouts := 0
+		const maxConsecutiveTimeouts = 300 // 30 seconds of no data (100ms * 300)
+
 		for {
 			select {
 			case <-connCtx.Done():
@@ -707,6 +721,12 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 				if err != nil {
 					// Check if it's a timeout error
 					if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+						consecutiveTimeouts++
+						// Check if we've exceeded max consecutive timeouts (connection likely dead)
+						if consecutiveTimeouts >= maxConsecutiveTimeouts {
+							logger.Debug("Connection timeout (client->remote) for %s: no data for 30s", clientAddr)
+							return
+						}
 						// Timeout is expected, continue to check context
 						gm.UpdateActivity(gid)
 						continue
@@ -714,6 +734,8 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					logger.Debug("Connection closed (client->remote) for %s: %v", clientAddr, err)
 					return
 				}
+				// Reset timeout counter on successful read
+				consecutiveTimeouts = 0
 				// Clear deadline for write operation
 				clientConn.SetDeadline(time.Time{})
 
