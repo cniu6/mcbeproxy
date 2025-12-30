@@ -17,6 +17,7 @@ const (
 	ProtocolTrojan      = "trojan"
 	ProtocolVLESS       = "vless"
 	ProtocolHysteria2   = "hysteria2"
+	ProtocolAnyTLS      = "anytls"
 )
 
 // Supported Shadowsocks encryption methods
@@ -122,8 +123,10 @@ func (p *ProxyOutbound) Validate() error {
 		return p.validateVLESS()
 	case ProtocolHysteria2:
 		return p.validateHysteria2()
+	case ProtocolAnyTLS:
+		return p.validateAnyTLS()
 	default:
-		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, hysteria2, got %s", p.Type)
+		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, hysteria2, anytls, got %s", p.Type)
 	}
 }
 
@@ -164,6 +167,16 @@ func (p *ProxyOutbound) validateVLESS() error {
 func (p *ProxyOutbound) validateHysteria2() error {
 	if p.Password == "" {
 		return errors.New("missing required field: password (required for hysteria2)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateAnyTLS() error {
+	if p.Password == "" {
+		return errors.New("missing required field: password (required for anytls)")
+	}
+	if !p.TLS {
+		return errors.New("missing required field: tls must be enabled for anytls")
 	}
 	return nil
 }

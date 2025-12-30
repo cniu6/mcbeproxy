@@ -58,6 +58,7 @@ func NewUDPListener(
 		forwarder:     forwarder,
 		configMgr:     configMgr,
 		raknetHandler: raknetHandler,
+		lastPongLatency: -1,
 	}
 }
 
@@ -84,6 +85,9 @@ func (l *UDPListener) Listen(ctx context.Context) error {
 		return fmt.Errorf("listener not started")
 	}
 
+	// Use longer timeout to reduce CPU usage from frequent deadline checks
+	const readTimeout = 500 * time.Millisecond
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -96,7 +100,7 @@ func (l *UDPListener) Listen(ctx context.Context) error {
 
 			buf := l.bufferPool.Get()
 			// Set read deadline to allow checking context
-			l.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			l.conn.SetReadDeadline(time.Now().Add(readTimeout))
 			n, clientAddr, err := l.conn.ReadFromUDP(*buf)
 			if err != nil {
 				l.bufferPool.Put(buf)
@@ -307,12 +311,14 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 	remoteAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 	if err != nil {
 		logger.Warn("Failed to resolve %s for ping: %v", targetAddr, err)
+		l.markPingFailure()
 		return
 	}
 
 	tempConn, err := net.DialUDP("udp", nil, remoteAddr)
 	if err != nil {
 		logger.Warn("Failed to dial %s for ping: %v", targetAddr, err)
+		l.markPingFailure()
 		return
 	}
 	defer tempConn.Close()
@@ -323,15 +329,21 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 	_, err = tempConn.Write(data)
 	if err != nil {
 		logger.Warn("Failed to send ping to %s: %v", targetAddr, err)
+		l.markPingFailure()
 		return
 	}
 
-	buf := make([]byte, 2048)
+	// Use buffer pool to reduce GC pressure
+	bufPtr := GetSmallBuffer()
+	buf := *bufPtr
+	defer PutSmallBuffer(bufPtr)
+
 	n, err := tempConn.Read(buf)
 	latency := time.Since(start)
 
 	if err != nil {
 		logger.Warn("Failed to receive pong from %s: %v", targetAddr, err)
+		l.markPingFailure()
 		return
 	}
 
@@ -349,6 +361,13 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 		l.conn.WriteToUDP(pongData, clientAddr)
 		logger.Debug("Sent direct pong to client %s", clientAddr)
 	}
+}
+
+func (l *UDPListener) markPingFailure() {
+	l.cachedPongMu.Lock()
+	l.cachedPong = nil
+	l.lastPongLatency = -1
+	l.cachedPongMu.Unlock()
 }
 
 // buildPongPacket builds a RakNet unconnected pong packet.
@@ -440,8 +459,16 @@ func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.S
 
 // receiveFromRemote handles packets received from the remote server.
 func (l *UDPListener) receiveFromRemote(sess *session.Session) {
-	buf := make([]byte, l.bufferPool.Size())
+	// Use buffer pool to reduce GC pressure
+	bufPtr := l.bufferPool.Get()
+	buf := *bufPtr
+	defer l.bufferPool.Put(bufPtr)
+
 	logger.Debug("Started receiving from remote for client %s", sess.ClientAddr)
+
+	// Use longer timeout to reduce CPU usage from frequent deadline checks
+	// 500ms timeout means max 2 iterations per second when idle
+	const readTimeout = 500 * time.Millisecond
 
 	for {
 		if l.closed.Load() {
@@ -449,7 +476,7 @@ func (l *UDPListener) receiveFromRemote(sess *session.Session) {
 		}
 
 		// Set read deadline to allow checking closed state
-		sess.RemoteConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		sess.RemoteConn.SetReadDeadline(time.Now().Add(readTimeout))
 		n, err := sess.RemoteConn.Read(buf)
 		if err != nil {
 			if l.closed.Load() {

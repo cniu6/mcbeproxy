@@ -15,10 +15,25 @@ type Database struct {
 
 // NewDatabase creates a new database connection.
 func NewDatabase(path string) (*Database, error) {
-	db, err := sql.Open("sqlite", path)
+	// Add SQLite connection parameters for better concurrency:
+	// - _journal_mode=WAL: Write-Ahead Logging for better concurrent read/write
+	// - _busy_timeout=5000: Wait up to 5 seconds when database is locked
+	// - _synchronous=NORMAL: Balance between safety and performance
+	// - _cache_size=-8000: 8MB cache size (reduced from 64MB to save memory)
+	//   Note: modernc.org/sqlite uses non-Go memory via modernc.org/libc
+	// - _foreign_keys=ON: Enable foreign key constraints
+	connStr := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-8000&_foreign_keys=ON", path)
+
+	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// Configure connection pool for SQLite
+	// SQLite works best with a single writer, but can handle multiple readers
+	db.SetMaxOpenConns(1) // SQLite only supports one writer at a time
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0) // Don't close idle connections
 
 	// Test the connection
 	if err := db.Ping(); err != nil {

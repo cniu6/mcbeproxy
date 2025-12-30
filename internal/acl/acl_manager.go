@@ -106,17 +106,19 @@ func (m *ACLManager) CheckAccessWithError(playerName, serverID string) (allowed 
 	if err != nil && err != ErrNotFound {
 		lastErr = err
 	}
-	if err == nil && entry != nil && !entry.IsExpired() {
-		reason := entry.Reason
-		if reason == "" {
-			settings, _ := m.settingsRepo.Get("")
-			if settings != nil {
-				reason = settings.DefaultMessage
-			} else {
-				reason = "You are banned from this server"
+	if err == nil && entry != nil {
+		if !entry.IsExpired() {
+			reason := entry.Reason
+			if reason == "" {
+				settings, _ := m.settingsRepo.Get("")
+				if settings != nil {
+					reason = settings.DefaultMessage
+				} else {
+					reason = "You are banned from this server"
+				}
 			}
+			return false, reason, nil
 		}
-		return false, reason, nil
 	}
 
 	// Step 2: Check server-specific blacklist
@@ -125,17 +127,19 @@ func (m *ACLManager) CheckAccessWithError(playerName, serverID string) (allowed 
 		if err != nil && err != ErrNotFound {
 			lastErr = err
 		}
-		if err == nil && entry != nil && !entry.IsExpired() {
-			reason := entry.Reason
-			if reason == "" {
-				settings, _ := m.settingsRepo.Get(serverID)
-				if settings != nil {
-					reason = settings.DefaultMessage
-				} else {
-					reason = "You are banned from this server"
+		if err == nil && entry != nil {
+			if !entry.IsExpired() {
+				reason := entry.Reason
+				if reason == "" {
+					settings, _ := m.settingsRepo.Get(serverID)
+					if settings != nil {
+						reason = settings.DefaultMessage
+					} else {
+						reason = "You are banned from this server"
+					}
 				}
+				return false, reason, nil
 			}
-			return false, reason, nil
 		}
 	}
 

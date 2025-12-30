@@ -85,6 +85,12 @@
             <span style="font-size: 13px; color: var(--n-text-color-3)">排序:</span>
             <n-select v-model:value="quickLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 110px" size="small" />
           </n-space>
+          <n-space align="center" wrap>
+            <span style="font-size: 12px; color: var(--n-text-color-3)">HTTP 测试地址:</span>
+            <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" style="width: 220px" size="small" clearable />
+            <span style="font-size: 12px; color: var(--n-text-color-3)">UDP(MCBE) 地址:</span>
+            <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" style="width: 200px" size="small" />
+          </n-space>
           <n-space align="center" v-if="proxyViewMode === 'list'">
             <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable />
             <n-select v-model:value="proxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable />
@@ -260,6 +266,12 @@
             <span style="font-size: 13px; color: var(--n-text-color-3)">排序:</span>
             <n-select v-model:value="formLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 100px" size="small" />
           </template>
+        </n-space>
+        <n-space style="margin-bottom: 12px" align="center" wrap>
+          <span style="font-size: 12px; color: var(--n-text-color-3)">HTTP 测试地址:</span>
+          <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" style="width: 220px" size="small" clearable />
+          <span style="font-size: 12px; color: var(--n-text-color-3)">UDP(MCBE) 地址:</span>
+          <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" style="width: 200px" size="small" />
         </n-space>
 
         <!-- 直连模式 -->
@@ -671,7 +683,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, h } from 'vue'
+import { ref, computed, onMounted, h, nextTick } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
 import { api } from '../api'
 
@@ -698,7 +710,8 @@ const sortedServers = computed(() => {
 
 const protocolOptions = [{ label: 'RakNet', value: 'raknet' }, { label: 'UDP', value: 'udp' }]
 const proxyModeOptions = [
-  { label: 'Passthrough (推荐)', value: 'passthrough' },
+  { label: 'Raw UDP (反检测推荐)', value: 'raw_udp' },
+  { label: 'Passthrough', value: 'passthrough' },
   { label: 'Transparent', value: 'transparent' },
   { label: 'RakNet', value: 'raknet' }
 ]
@@ -839,6 +852,7 @@ const proxyProtocolOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
 
@@ -980,7 +994,15 @@ const batchTestOptions = [
 
 // 批量测试配置
 const batchHttpTarget = ref('cloudflare')
+const customHttpUrl = ref('')
 const batchMcbeAddress = ref('mco.cubecraft.net:19132')
+
+const buildHttpTestRequest = (name) => {
+  if (customHttpUrl.value) {
+    return { name, custom_http: { url: customHttpUrl.value, method: 'GET' } }
+  }
+  return { name, targets: [batchHttpTarget.value] }
+}
 
 // 更新代理出站数据
 const updateProxyOutboundData = (name, updates) => {
@@ -998,7 +1020,7 @@ const runBatchTestType = async (names, type, progressRef) => {
         res = await api('/api/proxy-outbounds/test', 'POST', { name })
         handleBatchTestResult(name, res, 'tcp', progressRef)
       } else if (type === 'http') {
-        res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, targets: [batchHttpTarget.value] })
+        res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildHttpTestRequest(name))
         handleBatchTestResult(name, res, 'http', progressRef)
       } else {
         res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
@@ -1115,9 +1137,9 @@ const testSingleProxy = async (name, type) => {
         message.error(`TCP 测试失败: ${res.data?.error || res.msg || '未知错误'}`)
       }
     } else if (type === 'http') {
-      res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, targets: ['cloudflare'] })
+      res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildHttpTestRequest(name))
       if (res?.success && res.data?.success) {
-        const httpTest = res.data.http_tests?.find(t => t.success)
+        const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
         updateProxyOutboundData(name, { http_latency_ms: httpTest?.latency_ms || 0 })
         message.success(`HTTP 测试成功: ${httpTest?.latency_ms || 0}ms`)
       } else {
@@ -1451,7 +1473,10 @@ const openFormProxySelector = async () => {
     formLoadBalanceSort.value = form.value.load_balance_sort || ''
   }
   
-  await refreshFormProxyList()
+  await nextTick()
+  setTimeout(() => {
+    refreshFormProxyList()
+  }, 0)
 }
 
 // 刷新表单代理列表
@@ -2148,6 +2173,11 @@ const columns = [
       h(NButton, { size: 'tiny', quaternary: true, onClick: () => openProxySelector(r.id) }, () => '切换')
     ])
   },
+  { title: '模式', key: 'proxy_mode', width: 85, render: r => {
+    const modeMap = { 'raw_udp': { label: 'Raw UDP', type: 'success' }, 'passthrough': { label: 'Pass', type: 'info' }, 'transparent': { label: 'Trans', type: 'warning' }, 'raknet': { label: 'RakNet', type: 'default' } }
+    const mode = modeMap[r.proxy_mode] || { label: r.proxy_mode || '-', type: 'default' }
+    return h(NTag, { type: mode.type, size: 'small' }, () => mode.label)
+  }},
   { title: '协议', key: 'protocol', width: 70 },
   { title: '状态', key: 'status', width: 70, render: r => h(NTag, { type: r.status === 'running' ? 'success' : 'error', size: 'small' }, () => r.status === 'running' ? '运行' : '停止') },
   { title: '启用', key: 'enabled', width: 50, render: r => h(NTag, { type: r.enabled ? 'success' : 'warning', size: 'small' }, () => r.enabled ? '是' : '否') },

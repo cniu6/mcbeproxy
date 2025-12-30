@@ -4,7 +4,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -275,20 +277,32 @@ func (p *MITMProxy) handleConnection(ctx context.Context, clientConn *minecraft.
 	wg.Wait()
 
 	// Log session end
-	duration := time.Since(sess.StartTime)
+	snap := sess.Snapshot()
+	duration := time.Since(snap.StartTime)
 	logger.Info("Session ended: player=%s, client=%s, duration=%v, up=%d, down=%d",
-		playerName, clientAddr, duration, sess.BytesUp, sess.BytesDown)
+		playerName, clientAddr, duration, snap.BytesUp, snap.BytesDown)
 }
 
 // forwardPackets forwards packets between two Minecraft connections.
 func (p *MITMProxy) forwardPackets(ctx context.Context, src, dst *minecraft.Conn, sess *session.Session, isClientToRemote bool, playerName string) {
+	const readTimeout = 5 * time.Second
+	const writeTimeout = 5 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
+			_ = src.Close()
 			return
 		default:
+			_ = src.SetReadDeadline(time.Now().Add(readTimeout))
 			pk, err := src.ReadPacket()
 			if err != nil {
+				if ctx.Err() != nil {
+					_ = src.Close()
+					return
+				}
+				if isMITMTimeout(err) {
+					continue
+				}
 				return
 			}
 
@@ -313,11 +327,20 @@ func (p *MITMProxy) forwardPackets(ctx context.Context, src, dst *minecraft.Conn
 			}
 
 			// Forward packet
+			_ = dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if err := dst.WritePacket(pk); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func isMITMTimeout(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // handleConnectionError handles connection errors and sends appropriate disconnect messages to the client.

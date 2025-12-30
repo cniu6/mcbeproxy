@@ -75,12 +75,13 @@ func (sm *SessionManager) Get(clientAddr string) (*Session, bool) {
 // Returns an error if the session doesn't exist.
 func (sm *SessionManager) Remove(clientAddr string) error {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	session, exists := sm.sessions[clientAddr]
 	if !exists {
+		sm.mu.Unlock()
 		return fmt.Errorf("session not found for client: %s", clientAddr)
 	}
+	delete(sm.sessions, clientAddr)
+	sm.mu.Unlock()
 
 	// Close remote connection if exists
 	if session.RemoteConn != nil {
@@ -91,33 +92,35 @@ func (sm *SessionManager) Remove(clientAddr string) error {
 	if sm.OnSessionEnd != nil {
 		sm.OnSessionEnd(session)
 	}
-
-	delete(sm.sessions, clientAddr)
 	return nil
 }
 
 // RemoveByID removes a session by session ID and returns true if found.
 func (sm *SessionManager) RemoveByID(sessionID string) bool {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
+	var removed *Session
 	for addr, session := range sm.sessions {
 		if session.ID == sessionID {
-			// Close remote connection if exists
-			if session.RemoteConn != nil {
-				session.RemoteConn.Close()
-			}
-
-			// Call persistence callback if set
-			if sm.OnSessionEnd != nil {
-				sm.OnSessionEnd(session)
-			}
-
 			delete(sm.sessions, addr)
-			return true
+			removed = session
+			break
 		}
 	}
-	return false
+	sm.mu.Unlock()
+
+	if removed == nil {
+		return false
+	}
+
+	if removed.RemoteConn != nil {
+		removed.RemoteConn.Close()
+	}
+
+	if sm.OnSessionEnd != nil {
+		sm.OnSessionEnd(removed)
+	}
+
+	return true
 }
 
 // RemoveByPlayerName removes all sessions for a player by display name.
@@ -129,9 +132,8 @@ func (sm *SessionManager) RemoveByPlayerName(displayName string) int {
 	}
 
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	var toRemove []string
+	var removed []*Session
 	for addr, session := range sm.sessions {
 		session.mu.Lock()
 		name := session.DisplayName
@@ -144,17 +146,18 @@ func (sm *SessionManager) RemoveByPlayerName(displayName string) int {
 
 	for _, addr := range toRemove {
 		session := sm.sessions[addr]
-		// Close remote connection if exists
+		delete(sm.sessions, addr)
+		removed = append(removed, session)
+	}
+	sm.mu.Unlock()
+
+	for _, session := range removed {
 		if session.RemoteConn != nil {
 			session.RemoteConn.Close()
 		}
-
-		// Call persistence callback if set
 		if sm.OnSessionEnd != nil {
 			sm.OnSessionEnd(session)
 		}
-
-		delete(sm.sessions, addr)
 	}
 
 	return len(toRemove)
@@ -169,9 +172,8 @@ func (sm *SessionManager) RemoveByXUID(xuid string) int {
 	}
 
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	var toRemove []string
+	var removed []*Session
 	for addr, session := range sm.sessions {
 		session.mu.Lock()
 		sessionXUID := session.XUID
@@ -184,17 +186,18 @@ func (sm *SessionManager) RemoveByXUID(xuid string) int {
 
 	for _, addr := range toRemove {
 		session := sm.sessions[addr]
-		// Close remote connection if exists
+		delete(sm.sessions, addr)
+		removed = append(removed, session)
+	}
+	sm.mu.Unlock()
+
+	for _, session := range removed {
 		if session.RemoteConn != nil {
 			session.RemoteConn.Close()
 		}
-
-		// Call persistence callback if set
 		if sm.OnSessionEnd != nil {
 			sm.OnSessionEnd(session)
 		}
-
-		delete(sm.sessions, addr)
 	}
 
 	return len(toRemove)

@@ -1,8 +1,8 @@
 [
   {
-    "id": "mco.cubecraft.net",
-    "name": "mco.cubecraft.net",
-    "target": "mco.cubecraft.net",
+    "id": "play.venitymc.com",
+    "name": "play.venitymc.com",
+    "target": "play.venitymc.com",
     "port": 19132,
     "listen_addr": "0.0.0.0:50103",
     "protocol": "raknet",
@@ -11,14 +11,17 @@
     "send_real_ip": false,
     "resolve_interval": 300,
     "idle_timeout": 300,
-    "buffer_size": -1,
+    "buffer_size": 0,
     "disabled_message": "§c服务器维护中§r\n§7请稍后再试",
-    "custom_motd": "MCPE;§a官方-代理1;712;1.21.50;0;100;12345678901234568;CubeCraft;Survival;1;50103;50103;0;",
+    "custom_motd": "MCPE;§aplay.venitymc.com;712;1.21.50;0;100;8921364132687100;play.venitymc.com;Survival;1;50013;50013;0;",
     "proxy_mode": "passthrough",
     "xbox_auth_enabled": false,
     "xbox_token_path": "",
-    "proxy_outbound": "全三网入口IPLC专线节点",
-    "show_real_latency": true
+    "proxy_outbound": "@ofoNET",
+    "show_real_latency": true,
+    "load_balance": "",
+    "load_balance_sort": "",
+    "protocol_version": 0
   },
   {
     "id": "play.plural.top",
@@ -39,7 +42,10 @@
     "xbox_auth_enabled": false,
     "xbox_token_path": "",
     "proxy_outbound": "",
-    "show_real_latency": true
+    "show_real_latency": true,
+    "load_balance": "",
+    "load_balance_sort": "",
+    "protocol_version": 0
   },
   {
     "id": "cubecraft",
@@ -48,7 +54,7 @@
     "port": 19132,
     "listen_addr": "0.0.0.0:19132",
     "protocol": "raknet",
-    "enabled": false,
+    "enabled": true,
     "disabled": false,
     "send_real_ip": false,
     "resolve_interval": 300,
@@ -59,7 +65,10 @@
     "proxy_mode": "passthrough",
     "xbox_auth_enabled": false,
     "xbox_token_path": "xbox_token.json",
-    "proxy_outbound": "direct",
-    "show_real_latency": true
+    "proxy_outbound": "@布丁猫",
+    "show_real_latency": true,
+    "load_balance": "",
+    "load_balance_sort": "",
+    "protocol_version": 0
   }
 ]

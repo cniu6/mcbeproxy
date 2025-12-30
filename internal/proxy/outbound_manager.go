@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/logger"
 )
 
 // Error definitions for OutboundManager operations.
@@ -27,10 +28,14 @@ var (
 // Retry configuration constants
 // Requirements: 6.1
 const (
-	MaxRetryAttempts     = 3                      // Maximum number of retry attempts
-	InitialRetryDelay    = 100 * time.Millisecond // Initial delay before first retry
-	MaxRetryDelay        = 2 * time.Second        // Maximum delay between retries
-	RetryBackoffMultiple = 2                      // Multiplier for exponential backoff
+	MaxRetryAttempts     = 2                     // Maximum number of retry attempts (reduced from 3 to save CPU)
+	InitialRetryDelay    = 50 * time.Millisecond // Initial delay before first retry (reduced from 100ms)
+	MaxRetryDelay        = 1 * time.Second       // Maximum delay between retries (reduced from 2s)
+	RetryBackoffMultiple = 2                     // Multiplier for exponential backoff
+
+	// OutboundIdleTimeout is the time after which an unused singbox outbound is closed
+	// to release TLS connections and other resources
+	OutboundIdleTimeout = 5 * time.Minute
 )
 
 // HealthStatus represents the health status of a proxy outbound.
@@ -157,7 +162,10 @@ type outboundManagerImpl struct {
 	mu                  sync.RWMutex
 	outbounds           map[string]*config.ProxyOutbound
 	singboxOutbounds    map[string]*SingboxOutbound
+	singboxLastUsed     map[string]time.Time // Track last usage time for idle cleanup
 	serverConfigUpdater ServerConfigUpdater
+	cleanupCtx          context.Context
+	cleanupCancel       context.CancelFunc
 }
 
 // NewOutboundManager creates a new OutboundManager instance.
@@ -166,6 +174,7 @@ func NewOutboundManager(serverConfigUpdater ServerConfigUpdater) OutboundManager
 	return &outboundManagerImpl{
 		outbounds:           make(map[string]*config.ProxyOutbound),
 		singboxOutbounds:    make(map[string]*SingboxOutbound),
+		singboxLastUsed:     make(map[string]time.Time),
 		serverConfigUpdater: serverConfigUpdater,
 	}
 }
@@ -215,9 +224,8 @@ func (m *outboundManagerImpl) GetOutbound(name string) (*config.ProxyOutbound, b
 // Requirements: 1.4
 func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if _, exists := m.outbounds[name]; !exists {
+		m.mu.Unlock()
 		return ErrOutboundNotFound
 	}
 
@@ -225,17 +233,17 @@ func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
 		singboxOutbound.Close()
 		delete(m.singboxOutbounds, name)
+		delete(m.singboxLastUsed, name)
 	}
 
 	// Delete the outbound
 	delete(m.outbounds, name)
+	m.mu.Unlock()
 
-	// Cascade update server configs if updater is available
-	// This is done outside the lock to avoid deadlocks
+	// Cascade update server configs after releasing the lock to avoid deadlocks
 	if m.serverConfigUpdater != nil {
 		m.cascadeUpdateServerConfigs(name)
 	}
-
 	return nil
 }
 
@@ -247,21 +255,63 @@ func (m *outboundManagerImpl) cascadeUpdateServerConfigs(deletedOutboundName str
 		return
 	}
 
+	m.mu.RLock()
+	remainingNames := make(map[string]struct{}, len(m.outbounds))
+	groupCounts := make(map[string]int)
+	for name, cfg := range m.outbounds {
+		remainingNames[name] = struct{}{}
+		groupCounts[cfg.Group]++
+	}
+	m.mu.RUnlock()
+
 	servers := m.serverConfigUpdater.GetAllServers()
 	for _, server := range servers {
-		// Check if this server references the deleted outbound
-		if server.ProxyOutbound == deletedOutboundName {
-			// Update to "direct" connection
-			if err := m.serverConfigUpdater.UpdateServerProxyOutbound(server.ID, "direct"); err != nil {
-				// Log warning for affected servers
-				// In production, this would use a proper logger
-				fmt.Printf("warning: failed to update server %s proxy_outbound after deleting outbound %s: %v\n",
-					server.ID, deletedOutboundName, err)
-			} else {
-				// Log warning about the cascade update
-				fmt.Printf("warning: server %s proxy_outbound updated to 'direct' because outbound %s was deleted\n",
-					server.ID, deletedOutboundName)
+		current := strings.TrimSpace(server.ProxyOutbound)
+		if current == "" || current == "direct" {
+			continue
+		}
+
+		next := current
+		if strings.HasPrefix(current, "@") {
+			group := strings.TrimPrefix(current, "@")
+			if groupCounts[group] == 0 {
+				next = "direct"
 			}
+		} else if strings.Contains(current, ",") {
+			nodes := strings.Split(current, ",")
+			kept := make([]string, 0, len(nodes))
+			for _, n := range nodes {
+				n = strings.TrimSpace(n)
+				if n == "" {
+					continue
+				}
+				if _, ok := remainingNames[n]; ok {
+					kept = append(kept, n)
+				}
+			}
+			if len(kept) == 0 {
+				next = "direct"
+			} else if len(kept) == 1 {
+				next = kept[0]
+			} else {
+				next = strings.Join(kept, ",")
+			}
+		} else {
+			if _, ok := remainingNames[current]; !ok {
+				next = "direct"
+			}
+		}
+
+		if next == current {
+			continue
+		}
+
+		if err := m.serverConfigUpdater.UpdateServerProxyOutbound(server.ID, next); err != nil {
+			fmt.Printf("warning: failed to update server %s proxy_outbound after deleting outbound %s: %v\n",
+				server.ID, deletedOutboundName, err)
+		} else {
+			fmt.Printf("warning: server %s proxy_outbound updated to '%s' because outbound %s was deleted\n",
+				server.ID, next, deletedOutboundName)
 		}
 	}
 }
@@ -313,6 +363,7 @@ func (m *outboundManagerImpl) UpdateOutbound(name string, cfg *config.ProxyOutbo
 	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
 		singboxOutbound.Close()
 		delete(m.singboxOutbounds, name)
+		delete(m.singboxLastUsed, name)
 	}
 
 	// Store the updated configuration
@@ -529,16 +580,16 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 // dialPacketConnOnce performs a single connection attempt without retry.
 func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	// Get the outbound configuration
 	cfg, exists := m.outbounds[outboundName]
 	if !exists {
+		m.mu.Unlock()
 		return nil, ErrOutboundNotFound
 	}
 
 	// Get or create sing-box outbound instance
 	singboxOutbound, err := m.getOrCreateSingboxOutbound(cfg)
+	m.mu.Unlock()
 	if err != nil {
 		// Mark as unhealthy on creation failure
 		cfg.SetHealthy(false)
@@ -558,17 +609,15 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 			strings.Contains(errStr, "after retries")
 
 		if cfg.Type == config.ProtocolHysteria2 && isTemporaryError {
-			// Try to recreate the Hysteria2 outbound
+			m.mu.Lock()
 			newOutbound, recreateErr := m.recreateSingboxOutbound(outboundName)
+			m.mu.Unlock()
 			if recreateErr == nil {
-				// Try again with the new outbound
 				conn, err = newOutbound.ListenPacket(ctx, destination)
 				if err == nil {
-					// Success! Continue to the success path below
 					goto success
 				}
 			}
-			// Still failed, but don't mark as permanently unhealthy
 			cfg.SetLastCheck(time.Now())
 			return nil, fmt.Errorf("failed to dial packet connection: %w", err)
 		}
@@ -582,13 +631,22 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 
 success:
 
-	// Increment connection count
-	cfg.IncrConnCount()
-
-	// Mark as healthy on success
-	cfg.SetHealthy(true)
-	cfg.SetLastError("")
-	cfg.SetLastCheck(time.Now())
+	m.mu.Lock()
+	if cfg, ok := m.outbounds[outboundName]; ok {
+		// Increment connection count
+		cfg.IncrConnCount()
+		// Mark as healthy on success
+		cfg.SetHealthy(true)
+		cfg.SetLastError("")
+		cfg.SetLastCheck(time.Now())
+		m.mu.Unlock()
+	} else {
+		m.mu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, ErrOutboundNotFound
+	}
 
 	// Wrap connection to track when it's closed
 	return &trackedPacketConn{
@@ -607,6 +665,8 @@ success:
 func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) {
 	// Check if we already have a sing-box outbound for this config
 	if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+		// Update last used time
+		m.singboxLastUsed[cfg.Name] = time.Now()
 		return existing, nil
 	}
 
@@ -616,8 +676,9 @@ func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbou
 		return nil, err
 	}
 
-	// Cache the outbound
+	// Cache the outbound and record creation time
 	m.singboxOutbounds[cfg.Name] = singboxOutbound
+	m.singboxLastUsed[cfg.Name] = time.Now()
 	return singboxOutbound, nil
 }
 
@@ -633,6 +694,7 @@ func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*SingboxOutb
 	if existing, ok := m.singboxOutbounds[name]; ok {
 		existing.Close()
 		delete(m.singboxOutbounds, name)
+		delete(m.singboxLastUsed, name)
 	}
 
 	// Create new sing-box outbound
@@ -641,8 +703,9 @@ func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*SingboxOutb
 		return nil, err
 	}
 
-	// Cache the outbound
+	// Cache the outbound and record creation time
 	m.singboxOutbounds[name] = singboxOutbound
+	m.singboxLastUsed[name] = time.Now()
 	return singboxOutbound, nil
 }
 
@@ -672,37 +735,71 @@ func (m *outboundManagerImpl) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Initialize sing-box outbounds for all configured outbounds
+	// NOTE: We use lazy initialization for sing-box outbounds to save memory.
+	// Each Hysteria2 client can consume 16MB+ of memory for QUIC buffers.
+	// With 200+ proxy nodes, eager initialization would consume 3GB+ of memory.
+	// Instead, outbounds are created on-demand when first used via getOrCreateSingboxOutbound().
+
+	// Just mark all enabled outbounds as ready (healthy status will be set on first use)
 	for name, cfg := range m.outbounds {
 		if !cfg.Enabled {
 			continue
 		}
 
-		// Create sing-box outbound instance
-		singboxOutbound, err := CreateSingboxOutbound(cfg)
-		if err != nil {
-			// Log error and mark as unhealthy, but continue with other outbounds
-			cfg.SetHealthy(false)
-			cfg.SetLastError(fmt.Sprintf("failed to create outbound: %v", err))
-			cfg.SetLastCheck(time.Now())
-			fmt.Printf("warning: failed to initialize sing-box outbound %s: %v\n", name, err)
-			continue
-		}
-
-		// Cache the outbound
-		m.singboxOutbounds[name] = singboxOutbound
-		cfg.SetHealthy(true)
-		cfg.SetLastError("")
-		cfg.SetLastCheck(time.Now())
+		// Don't create the outbound yet - it will be created lazily on first use
+		// Just log that it's configured
+		logger.Info("Outbound configured (lazy init): %s (%s)", name, cfg.Type)
 	}
 
+	// Start idle outbound cleanup goroutine
+	m.cleanupCtx, m.cleanupCancel = context.WithCancel(context.Background())
+	go m.cleanupIdleOutbounds()
+
 	return nil
+}
+
+// cleanupIdleOutbounds periodically closes singbox outbounds that haven't been used recently.
+// This helps release TLS connections and other resources for unused proxy nodes.
+func (m *outboundManagerImpl) cleanupIdleOutbounds() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.cleanupCtx.Done():
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			now := time.Now()
+			for name, lastUsed := range m.singboxLastUsed {
+				// Skip if outbound has active connections
+				if cfg, ok := m.outbounds[name]; ok && cfg.GetConnCount() > 0 {
+					continue
+				}
+				// Close if idle for too long
+				if now.Sub(lastUsed) > OutboundIdleTimeout {
+					if outbound, ok := m.singboxOutbounds[name]; ok {
+						logger.Debug("Closing idle outbound: %s (idle for %v)", name, now.Sub(lastUsed))
+						outbound.Close()
+						delete(m.singboxOutbounds, name)
+						delete(m.singboxLastUsed, name)
+					}
+				}
+			}
+			m.mu.Unlock()
+		}
+	}
 }
 
 // Stop gracefully closes all sing-box outbound connections.
 // It waits for pending connections to complete before closing.
 // Requirements: 8.3
 func (m *outboundManagerImpl) Stop() error {
+	// Cancel cleanup goroutine first
+	if m.cleanupCancel != nil {
+		m.cleanupCancel()
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -734,6 +831,7 @@ func (m *outboundManagerImpl) Stop() error {
 
 	// Clear the cached outbounds
 	m.singboxOutbounds = make(map[string]*SingboxOutbound)
+	m.singboxLastUsed = make(map[string]time.Time)
 
 	return nil
 }
@@ -753,6 +851,7 @@ func (m *outboundManagerImpl) Reload() error {
 			if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
 				singboxOutbound.Close()
 				delete(m.singboxOutbounds, name)
+				delete(m.singboxLastUsed, name)
 			}
 			continue
 		}
@@ -769,6 +868,7 @@ func (m *outboundManagerImpl) Reload() error {
 				continue
 			}
 			m.singboxOutbounds[name] = singboxOutbound
+			m.singboxLastUsed[name] = time.Now()
 			cfg.SetHealthy(true)
 			cfg.SetLastError("")
 			cfg.SetLastCheck(time.Now())
@@ -780,6 +880,7 @@ func (m *outboundManagerImpl) Reload() error {
 		if _, exists := m.outbounds[name]; !exists {
 			m.singboxOutbounds[name].Close()
 			delete(m.singboxOutbounds, name)
+			delete(m.singboxLastUsed, name)
 		}
 	}
 

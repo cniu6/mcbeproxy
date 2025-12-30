@@ -2,20 +2,27 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"runtime"
+	runtimePprof "runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/pprof/profile"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sandertv/go-raknet"
 
@@ -169,9 +176,11 @@ func (a *APIServer) setupRoutes() {
 		// Goroutine management endpoints (for debugging)
 		debugGroup := api.Group("/debug")
 		{
+			debugGroup.Use(a.requireAdminMiddleware())
 			debugGroup.GET("/goroutines", a.getGoroutines)
 			debugGroup.GET("/goroutines/stats", a.getGoroutineStats)
 			debugGroup.GET("/goroutines/pprof", a.getGoroutinePprof)
+			debugGroup.Any("/pprof/*action", a.handlePprof)
 			debugGroup.POST("/goroutines/cancel/:id", a.cancelGoroutine)
 			debugGroup.POST("/goroutines/cancel-all", a.cancelAllGoroutines)
 			debugGroup.POST("/goroutines/cancel-component/:component", a.cancelGoroutinesByComponent)
@@ -303,46 +312,66 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get API key from header
 		apiKey := c.GetHeader("X-API-Key")
+		isLocal := isLocalRequest(c)
+		c.Set(ctxAuthIsLocal, isLocal)
 
 		// Check config.json api_key first
-		if a.globalConfig != nil && a.globalConfig.APIKey != "" {
+		configKeySet := a.globalConfig != nil && a.globalConfig.APIKey != ""
+		if configKeySet {
 			if apiKey == a.globalConfig.APIKey {
+				c.Set(ctxAuthAnyKeyConfigured, true)
+				c.Set(ctxAuthIsAdmin, true)
 				c.Next()
 				return
 			}
 		}
 
 		// Check if any API keys exist in database
-		keys, err := a.keyRepo.List()
-		if err != nil {
-			respondError(c, http.StatusInternalServerError, "Failed to check API keys", err.Error())
-			c.Abort()
-			return
+		dbHasKeys := false
+		if a.keyRepo != nil {
+			keys, err := a.keyRepo.List()
+			if err != nil {
+				respondError(c, http.StatusInternalServerError, "检查 API Key 失败", err.Error())
+				c.Abort()
+				return
+			}
+			dbHasKeys = len(keys) > 0
 		}
 
 		// If no API keys configured (neither in config nor database), skip authentication
-		configKeySet := a.globalConfig != nil && a.globalConfig.APIKey != ""
-		if len(keys) == 0 && !configKeySet {
+		anyKeyConfigured := configKeySet || dbHasKeys
+		c.Set(ctxAuthAnyKeyConfigured, anyKeyConfigured)
+		if !anyKeyConfigured {
+			if !isLocal {
+				respondError(c, http.StatusUnauthorized, "未配置 API Key，禁止远程访问", "")
+				c.Abort()
+				return
+			}
 			c.Next()
 			return
 		}
 
 		// API key is required at this point
 		if apiKey == "" {
-			respondError(c, http.StatusUnauthorized, "API key required", "X-API-Key header is missing")
+			respondError(c, http.StatusUnauthorized, "需要 API Key", "缺少 X-API-Key 请求头")
 			c.Abort()
 			return
 		}
 
 		// Validate API key from database
+		if a.keyRepo == nil {
+			respondError(c, http.StatusInternalServerError, "API Key 存储未初始化", "")
+			c.Abort()
+			return
+		}
 		key, err := a.keyRepo.GetByKey(apiKey)
 		if err != nil {
 			if err == sql.ErrNoRows {
-				respondError(c, http.StatusUnauthorized, "Invalid API key", "The provided API key is not valid")
+				respondError(c, http.StatusUnauthorized, "API Key 无效", "提供的 API Key 不正确")
 				c.Abort()
 				return
 			}
-			respondError(c, http.StatusInternalServerError, "Failed to validate API key", err.Error())
+			respondError(c, http.StatusInternalServerError, "验证 API Key 失败", err.Error())
 			c.Abort()
 			return
 		}
@@ -355,7 +384,19 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 
 		// Store key info in context for later use
 		c.Set("api_key", key)
+		c.Set(ctxAuthIsAdmin, key.IsAdmin)
 		c.Next()
+	}
+}
+
+func (a *APIServer) requireAdminMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isAdminRequest(c) {
+			c.Next()
+			return
+		}
+		respondError(c, http.StatusForbidden, "需要管理员权限", "")
+		c.Abort()
 	}
 }
 
@@ -425,6 +466,15 @@ func (a *APIServer) updateServer(c *gin.Context) {
 	if err := a.configMgr.UpdateServer(serverID, &serverCfg); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to update server", err.Error())
 		return
+	}
+
+	// Reload the server to apply new configuration
+	// This will stop and restart the listener with the new config
+	if a.proxyController.IsServerRunning(serverID) {
+		if err := a.proxyController.ReloadServer(serverCfg.ID); err != nil {
+			// Log the error but don't fail the request - config was saved successfully
+			fmt.Printf("Warning: failed to reload server %s after config update: %v\n", serverCfg.ID, err)
+		}
 	}
 
 	// Return the updated server with status
@@ -549,6 +599,7 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 				"latency":   latency,
 				"online":    online,
 				"motd":      motd,
+				"source":    "proxy",
 			}
 			// Parse MOTD if available
 			if motd != "" {
@@ -561,22 +612,55 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 
 	// Fallback to simple latency
 	latency, ok := a.proxyController.GetServerLatency(serverID)
-	if !ok {
-		// Return 200 with not_found flag instead of 404 to avoid browser console errors
+	if ok {
+		online := latency >= 0
 		respondSuccess(c, map[string]interface{}{
 			"server_id": serverID,
-			"latency":   -1,
-			"online":    false,
-			"not_found": true,
+			"latency":   latency,
+			"online":    online,
+			"source":    "proxy",
 		})
 		return
 	}
 
-	online := latency >= 0
+	if a.configMgr != nil {
+		if serverCfg, exists := a.configMgr.GetServer(serverID); exists {
+			host := serverCfg.GetResolvedIP()
+			if host == "" {
+				host = serverCfg.Target
+			}
+			port := serverCfg.Port
+			if port <= 0 {
+				port = 19132
+			}
+			if strings.TrimSpace(host) != "" {
+				address := net.JoinHostPort(host, strconv.Itoa(port))
+				ping := a.doPing(address)
+				response := map[string]interface{}{
+					"server_id": serverID,
+					"latency":   ping.Latency,
+					"online":    ping.Online,
+					"motd":      ping.MOTD,
+					"source":    "direct",
+				}
+				if ping.ParsedMOTD != nil {
+					response["parsed_motd"] = ping.ParsedMOTD
+				}
+				if ping.Error != "" {
+					response["error"] = ping.Error
+				}
+				respondSuccess(c, response)
+				return
+			}
+		}
+	}
+
+	// Return 200 with not_found flag instead of 404 to avoid browser console errors
 	respondSuccess(c, map[string]interface{}{
 		"server_id": serverID,
-		"latency":   latency,
-		"online":    online,
+		"latency":   -1,
+		"online":    false,
+		"not_found": true,
 	})
 }
 
@@ -749,6 +833,9 @@ func (a *APIServer) createAPIKey(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
+	if !isAdminRequest(c) {
+		req.IsAdmin = false
+	}
 
 	// Generate a random API key
 	keyBytes := make([]byte, 32)
@@ -776,6 +863,10 @@ func (a *APIServer) createAPIKey(c *gin.Context) {
 // deleteAPIKey deletes an API key.
 // DELETE /api/keys/:key
 func (a *APIServer) deleteAPIKey(c *gin.Context) {
+	if !isAdminRequest(c) {
+		respondError(c, http.StatusForbidden, "需要管理员权限", "")
+		return
+	}
 	key := c.Param("key")
 
 	if err := a.keyRepo.Delete(key); err != nil {
@@ -1277,10 +1368,15 @@ func (a *APIServer) getLogContent(c *gin.Context) {
 	filepath := logDir + "/" + filename
 
 	// Get lines parameter
+	const maxLines = 2000
 	lines := 500
 	if linesStr := c.Query("lines"); linesStr != "" {
 		if l, err := strconv.Atoi(linesStr); err == nil && l > 0 {
-			lines = l
+			if l > maxLines {
+				lines = maxLines
+			} else {
+				lines = l
+			}
 		}
 	}
 
@@ -1328,7 +1424,7 @@ func readLastLines(filepath string, n int) (string, error) {
 
 	buf := make([]byte, bufSize)
 	_, err = file.ReadAt(buf, stat.Size()-bufSize)
-	if err != nil && err.Error() != "EOF" {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
 
@@ -1508,18 +1604,18 @@ func parseMOTD(motd string) *ParsedMOTD {
 // GET /api/ping/:address
 // The address should be in format "host:port" or just "host" (default port 19132)
 func (a *APIServer) pingServer(c *gin.Context) {
-	address := c.Param("address")
+	address := ensurePingAddress(c.Param("address"))
 	if address == "" {
 		respondError(c, http.StatusBadRequest, "Address is required", "")
 		return
 	}
-
-	// Add default port if not specified
-	if !strings.Contains(address, ":") {
-		address = address + ":19132"
+	resolvedAddress, err := resolvePingAddressForRequest(address, allowPrivateTargets(c))
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "目标地址不可用", err.Error())
+		return
 	}
 
-	response := a.doPing(address)
+	response := a.doPing(resolvedAddress)
 	respondSuccess(c, response)
 }
 
@@ -1538,14 +1634,39 @@ func (a *APIServer) pingServerPost(c *gin.Context) {
 		return
 	}
 
-	address := req.Address
-	// Add default port if not specified
-	if !strings.Contains(address, ":") {
-		address = address + ":19132"
+	address := ensurePingAddress(req.Address)
+	if address == "" {
+		respondError(c, http.StatusBadRequest, "Address is required", "")
+		return
+	}
+	resolvedAddress, err := resolvePingAddressForRequest(address, allowPrivateTargets(c))
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "目标地址不可用", err.Error())
+		return
 	}
 
-	response := a.doPing(address)
+	response := a.doPing(resolvedAddress)
 	respondSuccess(c, response)
+}
+
+func ensurePingAddress(address string) string {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return ""
+	}
+
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if port == "" {
+			port = "19132"
+		}
+		return net.JoinHostPort(host, port)
+	}
+
+	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+		address = strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
+	}
+
+	return net.JoinHostPort(address, "19132")
 }
 
 // doPing performs the actual ping operation.
@@ -1614,6 +1735,79 @@ func (a *APIServer) getGoroutineStats(c *gin.Context) {
 		}
 	}
 
+	// Add runtime memory stats
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	response["memory"] = map[string]interface{}{
+		"alloc":           memStats.Alloc,         // 当前分配的内存
+		"total_alloc":     memStats.TotalAlloc,    // 累计分配的内存
+		"sys":             memStats.Sys,           // 从系统获取的内存
+		"heap_alloc":      memStats.HeapAlloc,     // 堆分配的内存
+		"heap_sys":        memStats.HeapSys,       // 堆从系统获取的内存
+		"heap_idle":       memStats.HeapIdle,      // 堆空闲内存
+		"heap_inuse":      memStats.HeapInuse,     // 堆使用中的内存
+		"heap_released":   memStats.HeapReleased,  // 释放给系统的内存
+		"heap_objects":    memStats.HeapObjects,   // 堆对象数量
+		"stack_inuse":     memStats.StackInuse,    // 栈使用中的内存
+		"stack_sys":       memStats.StackSys,      // 栈从系统获取的内存
+		"gc_cpu_fraction": memStats.GCCPUFraction, // GC CPU 占用比例
+		"num_gc":          memStats.NumGC,         // GC 次数
+		"last_gc":         memStats.LastGC,        // 上次 GC 时间 (纳秒)
+		"pause_total_ns":  memStats.PauseTotalNs,  // GC 暂停总时间
+		"num_forced_gc":   memStats.NumForcedGC,   // 强制 GC 次数
+	}
+
+	// Add server stats if proxy controller is available
+	if a.proxyController != nil {
+		serverStats := a.proxyController.GetAllServerStatuses()
+		response["servers"] = serverStats
+	}
+
+	// Add session stats if session manager is available
+	if a.sessionMgr != nil {
+		sessions := a.sessionMgr.GetAllSessions()
+		activeSessions := 0
+		totalBytesUp := int64(0)
+		totalBytesDown := int64(0)
+		for _, sess := range sessions {
+			activeSessions++
+			snap := sess.Snapshot()
+			totalBytesUp += snap.BytesUp
+			totalBytesDown += snap.BytesDown
+		}
+		response["sessions"] = map[string]interface{}{
+			"active":           activeSessions,
+			"total_bytes_up":   totalBytesUp,
+			"total_bytes_down": totalBytesDown,
+		}
+	}
+
+	// Add outbound stats if proxy outbound handler is available
+	if a.proxyOutboundHandler != nil && a.proxyOutboundHandler.outboundMgr != nil {
+		outbounds := a.proxyOutboundHandler.outboundMgr.ListOutbounds()
+		healthyCount := 0
+		unhealthyCount := 0
+		udpAvailable := 0
+		for _, ob := range outbounds {
+			if ob.Enabled {
+				if ob.GetHealthy() {
+					healthyCount++
+				} else {
+					unhealthyCount++
+				}
+				if ob.UDPAvailable != nil && *ob.UDPAvailable {
+					udpAvailable++
+				}
+			}
+		}
+		response["outbounds"] = map[string]interface{}{
+			"total":         len(outbounds),
+			"healthy":       healthyCount,
+			"unhealthy":     unhealthyCount,
+			"udp_available": udpAvailable,
+		}
+	}
+
 	respondSuccess(c, response)
 }
 
@@ -1624,6 +1818,128 @@ func (a *APIServer) getGoroutinePprof(c *gin.Context) {
 	pprofData := gm.GetPprofGoroutines()
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.String(http.StatusOK, pprofData)
+}
+
+// handlePprof exposes net/http/pprof under authenticated routes.
+// GET|POST /api/debug/pprof/*action
+func (a *APIServer) handlePprof(c *gin.Context) {
+	action := strings.TrimPrefix(c.Param("action"), "/")
+
+	// Special handling for profile with debug=1 to return text format
+	if action == "profile" && c.Query("debug") == "1" {
+		a.handleCPUProfileText(c)
+		return
+	}
+
+	switch action {
+	case "", "/":
+		pprof.Index(c.Writer, c.Request)
+	case "cmdline":
+		pprof.Cmdline(c.Writer, c.Request)
+	case "profile":
+		pprof.Profile(c.Writer, c.Request)
+	case "symbol":
+		pprof.Symbol(c.Writer, c.Request)
+	case "trace":
+		pprof.Trace(c.Writer, c.Request)
+	default:
+		pprof.Handler(action).ServeHTTP(c.Writer, c.Request)
+	}
+}
+
+// handleCPUProfileText captures CPU profile and returns a text summary
+func (a *APIServer) handleCPUProfileText(c *gin.Context) {
+	seconds := 5
+	if s := c.Query("seconds"); s != "" {
+		if v, err := strconv.Atoi(s); err == nil && v > 0 && v <= 120 {
+			seconds = v
+		}
+	}
+
+	// Capture CPU profile to buffer
+	var buf bytes.Buffer
+	if err := runtimePprof.StartCPUProfile(&buf); err != nil {
+		c.String(http.StatusInternalServerError, "Failed to start CPU profile: %v", err)
+		return
+	}
+
+	time.Sleep(time.Duration(seconds) * time.Second)
+	runtimePprof.StopCPUProfile()
+
+	// Parse the profile and generate text output
+	profile, err := profile.Parse(&buf)
+	if err != nil {
+		c.String(http.StatusInternalServerError, "Failed to parse CPU profile: %v", err)
+		return
+	}
+
+	// Generate text report
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("CPU Profile (%d seconds)\n", seconds))
+	result.WriteString(fmt.Sprintf("Duration: %v\n", profile.DurationNanos/1e9))
+	result.WriteString(fmt.Sprintf("Samples: %d\n", len(profile.Sample)))
+	result.WriteString("=" + strings.Repeat("=", 79) + "\n\n")
+
+	// Calculate total samples
+	var totalSamples int64
+	for _, sample := range profile.Sample {
+		if len(sample.Value) > 0 {
+			totalSamples += sample.Value[0]
+		}
+	}
+
+	// Aggregate by function
+	funcSamples := make(map[string]int64)
+	for _, sample := range profile.Sample {
+		if len(sample.Location) > 0 && len(sample.Value) > 0 {
+			loc := sample.Location[0]
+			if len(loc.Line) > 0 && loc.Line[0].Function != nil {
+				funcName := loc.Line[0].Function.Name
+				funcSamples[funcName] += sample.Value[0]
+			}
+		}
+	}
+
+	// Sort by samples
+	type funcStat struct {
+		name    string
+		samples int64
+	}
+	var stats []funcStat
+	for name, samples := range funcSamples {
+		stats = append(stats, funcStat{name, samples})
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		return stats[i].samples > stats[j].samples
+	})
+
+	// Output top functions
+	result.WriteString("Top Functions by CPU Time:\n")
+	result.WriteString(fmt.Sprintf("%-60s %10s %8s\n", "Function", "Samples", "Percent"))
+	result.WriteString(strings.Repeat("-", 80) + "\n")
+
+	maxShow := 50
+	if len(stats) < maxShow {
+		maxShow = len(stats)
+	}
+	for i := 0; i < maxShow; i++ {
+		stat := stats[i]
+		percent := float64(stat.samples) / float64(totalSamples) * 100
+		funcName := stat.name
+		if len(funcName) > 58 {
+			funcName = "..." + funcName[len(funcName)-55:]
+		}
+		result.WriteString(fmt.Sprintf("%-60s %10d %7.2f%%\n", funcName, stat.samples, percent))
+	}
+
+	if len(stats) > maxShow {
+		result.WriteString(fmt.Sprintf("\n... and %d more functions\n", len(stats)-maxShow))
+	}
+
+	result.WriteString(fmt.Sprintf("\nTotal Samples: %d\n", totalSamples))
+
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, result.String())
 }
 
 // cancelGoroutine attempts to cancel a specific tracked goroutine.

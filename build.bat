@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
+pushd "%~dp0"
 
 echo ========================================
 echo   MCPE Server Proxy - Cross Compile
@@ -42,9 +43,14 @@ echo [2/3] Building web frontend...
 pushd "%WEB_DIR%"
 if not exist "node_modules" (
     echo       Installing dependencies...
-    call npm install
+    if exist "package-lock.json" (
+        call npm ci
+    ) else (
+        call npm install
+    )
     if !errorlevel! neq 0 (
         echo [ERROR] npm install failed
+        popd
         popd
         exit /b 1
     )
@@ -54,9 +60,15 @@ call npm run build
 if !errorlevel! neq 0 (
     echo [ERROR] Web build failed
     popd
+    popd
     exit /b 1
 )
 popd
+if not exist "%DIST_DIR%\\index.html" (
+    echo [ERROR] Web dist output not found: %DIST_DIR%\index.html
+    popd
+    exit /b 1
+)
 echo       Done.
 echo.
 
@@ -69,24 +81,24 @@ set "FAIL_COUNT=0"
 
 :: Windows
 call :build_target windows amd64 .exe
-call :build_target windows 386 .exe
-call :build_target windows arm64 .exe
+@REM call :build_target windows 386 .exe
+@REM call :build_target windows arm64 .exe
 
 :: Linux
 call :build_target linux amd64
-call :build_target linux 386
-call :build_target linux arm64
-call :build_target linux arm
+@REM call :build_target linux 386
+@REM call :build_target linux arm64
+@REM call :build_target linux arm
 
-:: macOS
-call :build_target darwin amd64
-call :build_target darwin arm64
+@REM :: macOS
+@REM call :build_target darwin amd64
+@REM call :build_target darwin arm64
 
-:: FreeBSD
-call :build_target freebsd amd64
-call :build_target freebsd arm64
+@REM :: FreeBSD
+@REM call :build_target freebsd amd64
+@REM call :build_target freebsd arm64
 
-echo.
+@REM echo.
 echo ========================================
 echo   Build Complete!
 echo   Success: %SUCCESS_COUNT%  Failed: %FAIL_COUNT%
@@ -103,6 +115,7 @@ for %%F in ("%BUILD_DIR%\*") do (
 
 endlocal
 pause
+popd
 exit /b 0
 
 :: 编译函数
@@ -115,7 +128,7 @@ set "OUTPUT=%BUILD_DIR%\%PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%"
 echo       Building %GOOS%/%GOARCH%...
 
 set "CGO_ENABLED=0"
-go build -ldflags="-s -w" -o "%OUTPUT%" "%MAIN_FILE%"
+go build -tags=with_utls -ldflags="-s -w" -o "%OUTPUT%" "%MAIN_FILE%"
 
 if %errorlevel% equ 0 (
     echo       [OK] %PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%

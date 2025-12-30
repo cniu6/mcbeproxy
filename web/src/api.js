@@ -1,6 +1,9 @@
 const BASE_URL = ''
 const API_KEY_STORAGE_KEY = 'mcpe_proxy_api_key'
 
+// 导出 API 基础 URL
+export const apiBase = BASE_URL || window.location.origin
+
 // 获取存储的 API Key
 export function getApiKey() {
   return localStorage.getItem(API_KEY_STORAGE_KEY) || ''

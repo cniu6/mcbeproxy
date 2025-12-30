@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -142,7 +143,9 @@ func (p *RakNetProxy) updatePongData() {
 // startPongRefresh periodically refreshes pong data with real latency.
 // It requires a context to be cancellable when the proxy is stopped or when connections close.
 func (p *RakNetProxy) startPongRefresh(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Use longer interval (30s) to reduce memory usage from connection creation
+	// Each ping creates a new UDP connection through the proxy which consumes resources
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -270,15 +273,34 @@ func (p *RakNetProxy) pingThroughProxy(targetAddr, proxyName string) ([]byte, ti
 		UpstreamDialer: proxyDialer,
 	}
 
-	// Ping through the proxy
-	pong, err := dialer.Ping(targetAddr)
-	latency := time.Since(start)
+	// Ping through the proxy with a timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	if err != nil {
-		return nil, latency, err
+	// Create a channel for the ping result
+	type pingResult struct {
+		pong []byte
+		err  error
 	}
+	resultCh := make(chan pingResult, 1)
 
-	return pong, latency, nil
+	go func() {
+		pong, err := dialer.Ping(targetAddr)
+		select {
+		case resultCh <- pingResult{pong, err}:
+		default:
+			// Nobody listening, just return
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		latency := time.Since(start)
+		return nil, latency, ctx.Err()
+	case result := <-resultCh:
+		latency := time.Since(start)
+		return result.pong, latency, result.err
+	}
 }
 
 // embedLatencyInMOTD embeds the latency value into the MOTD string.
@@ -492,8 +514,9 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 
 	// Log session end and remove session from manager
 	duration := time.Since(sess.StartTime)
-	if sess.DisplayName != "" {
-		logger.Info("Session ended: player=%s, client=%s, duration=%v", sess.DisplayName, clientAddr, duration)
+	displayName := sess.GetDisplayName()
+	if displayName != "" {
+		logger.Info("Session ended: player=%s, client=%s, duration=%v", displayName, clientAddr, duration)
 	} else {
 		logger.Info("Session ended: client=%s, duration=%v", clientAddr, duration)
 	}
@@ -511,20 +534,30 @@ func (p *RakNetProxy) forwardPackets(ctx context.Context, src, dst *raknet.Conn,
 
 // forwardPacketsTracked forwards packets between two RakNet connections with goroutine tracking.
 func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *raknet.Conn, sess *session.Session, isClientToRemote bool, gid int64) {
-	buf := make([]byte, 65536)
+	// Use buffer pool to reduce GC pressure
+	bufPtr := GetRakNetBuffer()
+	buf := *bufPtr
+	defer PutRakNetBuffer(bufPtr)
+
 	gm := monitor.GetGoroutineManager()
+	// Use longer timeout to reduce CPU usage from frequent deadline checks
+	const readTimeout = 500 * time.Millisecond
+	activityUpdateCounter := 0
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			src.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			src.SetReadDeadline(time.Now().Add(readTimeout))
 			n, err := src.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					if gid != 0 {
+					// Update activity less frequently (every 5 timeouts = 2.5 seconds)
+					activityUpdateCounter++
+					if gid != 0 && activityUpdateCounter >= 5 {
 						gm.UpdateActivity(gid)
+						activityUpdateCounter = 0
 					}
 					continue
 				}
@@ -536,6 +569,7 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 			}
 
 			data := buf[:n]
+			activityUpdateCounter = 0
 
 			// Update session stats and keep session alive
 			sess.UpdateLastSeen()
@@ -548,6 +582,10 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 			} else {
 				sess.AddBytesDown(int64(n))
 				p.tryExtractPlayerInfoFromServer(sess, data)
+				// Try to detect and log disconnect packets from remote server
+				if disconnectMsg := p.tryParseDisconnectPacket(data); disconnectMsg != "" {
+					logger.Info("Remote server disconnect for %s: %s", sess.ClientAddr, disconnectMsg)
+				}
 			}
 
 			// Forward packet
@@ -605,7 +643,7 @@ func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 		uuid := extractJSONString(dataStr, idx, "identity")
 		if uuid != "" && len(uuid) == 36 {
 			logger.Info("Player UUID found: uuid=%s, client=%s", uuid, sess.ClientAddr)
-			sess.SetPlayerInfo(uuid, sess.DisplayName)
+			sess.SetPlayerInfo(uuid, sess.GetDisplayName())
 			return
 		}
 	}
@@ -615,7 +653,7 @@ func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 		xuid := extractJSONString(dataStr, idx, "XUID")
 		if xuid != "" && len(xuid) > 0 {
 			logger.Info("Player XUID found: xuid=%s, client=%s", xuid, sess.ClientAddr)
-			if sess.DisplayName == "" {
+			if sess.GetDisplayName() == "" {
 				sess.SetPlayerInfo(xuid, "")
 			}
 		}
@@ -714,4 +752,114 @@ func (p *RakNetProxy) Stop() error {
 
 	p.wg.Wait()
 	return nil
+}
+
+// tryParseDisconnectPacket attempts to parse a packet as a Disconnect packet.
+// Returns the disconnect message if it's a disconnect packet, empty string otherwise.
+// This is used to log the reason when the remote server disconnects the player.
+func (p *RakNetProxy) tryParseDisconnectPacket(data []byte) string {
+	if len(data) < 3 {
+		return ""
+	}
+
+	// Check for packet header (0xfe)
+	if data[0] != 0xfe {
+		return ""
+	}
+
+	// Get compression algorithm ID (second byte)
+	compressionID := data[1]
+	compressedData := data[2:]
+
+	var decompressed []byte
+	var err error
+
+	switch compressionID {
+	case 0x00: // Flate compression
+		decompressed, err = p.decompressFlate(compressedData)
+	case 0x01: // Snappy compression
+		decompressed, err = p.decompressSnappy(compressedData)
+	default:
+		return ""
+	}
+
+	if err != nil {
+		return ""
+	}
+
+	// Parse the decompressed data to find disconnect packet
+	return p.parseDisconnectData(decompressed)
+}
+
+// decompressFlate decompresses flate-compressed packet data.
+func (p *RakNetProxy) decompressFlate(data []byte) ([]byte, error) {
+	return decompressFlateLimited(data)
+}
+
+// decompressSnappy decompresses snappy-compressed packet data.
+func (p *RakNetProxy) decompressSnappy(data []byte) ([]byte, error) {
+	return decompressSnappyLimited(data)
+}
+
+// parseDisconnectData parses decompressed packet data to extract disconnect message.
+func (p *RakNetProxy) parseDisconnectData(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+
+	buf := bytes.NewBuffer(data)
+
+	// Read packet length (varuint32)
+	var packetLen uint32
+	if err := readVaruint32(buf, &packetLen); err != nil {
+		return ""
+	}
+
+	// Read packet ID (varuint32)
+	var packetID uint32
+	if err := readVaruint32(buf, &packetID); err != nil {
+		return ""
+	}
+
+	// Disconnect packet ID is 0x05
+	if packetID&0x3FF != 0x05 {
+		return ""
+	}
+
+	// Read disconnect reason (varint32)
+	var reason int32
+	if err := readVarint32(buf, &reason); err != nil {
+		return ""
+	}
+
+	// Read hide disconnect screen (bool)
+	hideScreen, err := buf.ReadByte()
+	if err != nil {
+		return ""
+	}
+
+	// If hide screen is true, there's no message
+	if hideScreen != 0 {
+		return fmt.Sprintf("(reason code: %d, no message)", reason)
+	}
+
+	// Read message length (varuint32)
+	var msgLen uint32
+	if err := readVaruint32(buf, &msgLen); err != nil {
+		return fmt.Sprintf("(reason code: %d)", reason)
+	}
+
+	if msgLen == 0 || msgLen > uint32(buf.Len()) {
+		return fmt.Sprintf("(reason code: %d)", reason)
+	}
+
+	// Read message
+	msgBytes := buf.Next(int(msgLen))
+	message := string(msgBytes)
+
+	if message == "" {
+		return fmt.Sprintf("(reason code: %d)", reason)
+	}
+
+	return message
 }

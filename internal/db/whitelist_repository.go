@@ -24,10 +24,18 @@ func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 		VALUES (?, ?, ?, ?, ?)
 	`
 
+	// Convert empty string to NULL for server_id (global whitelist)
+	var serverID interface{}
+	if entry.ServerID == "" {
+		serverID = nil
+	} else {
+		serverID = entry.ServerID
+	}
+
 	result, err := r.db.DB().Exec(query,
 		entry.DisplayName,
 		strings.ToLower(entry.DisplayName),
-		entry.ServerID,
+		serverID,
 		entry.AddedAt,
 		entry.AddedBy,
 	)
@@ -50,10 +58,14 @@ func (r *WhitelistRepository) GetByName(displayName, serverID string) (*Whitelis
 	query := `
 		SELECT id, display_name, server_id, added_at, added_by
 		FROM whitelist 
-		WHERE display_name_lower = ? AND (server_id = ? OR (server_id IS NULL AND ? = ''))
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR 
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
 	`
 
-	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID)
+	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	return r.scanWhitelistEntry(row)
 }
 
@@ -61,10 +73,14 @@ func (r *WhitelistRepository) GetByName(displayName, serverID string) (*Whitelis
 func (r *WhitelistRepository) Delete(displayName, serverID string) error {
 	query := `
 		DELETE FROM whitelist 
-		WHERE display_name_lower = ? AND (server_id = ? OR (server_id IS NULL AND ? = ''))
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR 
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
 	`
 
-	result, err := r.db.DB().Exec(query, strings.ToLower(displayName), serverID, serverID)
+	result, err := r.db.DB().Exec(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	if err != nil {
 		return fmt.Errorf("failed to delete whitelist entry: %w", err)
 	}

@@ -18,6 +18,7 @@ type ProxyOutboundConfigManager struct {
 	mu         sync.RWMutex
 	configPath string
 	watcher    *fsnotify.Watcher
+	watcherMu  sync.Mutex
 	onChange   func() // callback when config changes
 }
 
@@ -203,7 +204,9 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 		return fmt.Errorf("failed to create file watcher: %w", err)
 	}
 
+	m.watcherMu.Lock()
 	m.watcher = watcher
+	m.watcherMu.Unlock()
 
 	// Ensure the config file exists before watching
 	if _, err := os.Stat(m.configPath); os.IsNotExist(err) {
@@ -216,12 +219,12 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 
 	// Add the config file to the watcher
 	if err := watcher.Add(m.configPath); err != nil {
-		watcher.Close()
+		m.closeWatcher()
 		return fmt.Errorf("failed to watch proxy outbound config file: %w", err)
 	}
 
 	go func() {
-		defer watcher.Close()
+		defer m.closeWatcher()
 
 		for {
 			select {
@@ -256,13 +259,21 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 
 // StopWatch stops watching the configuration file.
 func (m *ProxyOutboundConfigManager) StopWatch() {
-	if m.watcher != nil {
-		m.watcher.Close()
-		m.watcher = nil
-	}
+	m.closeWatcher()
 }
 
 // IsWatching returns true if the config manager is watching for file changes.
 func (m *ProxyOutboundConfigManager) IsWatching() bool {
+	m.watcherMu.Lock()
+	defer m.watcherMu.Unlock()
 	return m.watcher != nil
+}
+
+func (m *ProxyOutboundConfigManager) closeWatcher() {
+	m.watcherMu.Lock()
+	defer m.watcherMu.Unlock()
+	if m.watcher != nil {
+		m.watcher.Close()
+		m.watcher = nil
+	}
 }

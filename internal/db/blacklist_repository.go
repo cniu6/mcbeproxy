@@ -31,11 +31,19 @@ func (r *BlacklistRepository) Create(entry *BlacklistEntry) error {
 			added_by = excluded.added_by
 	`
 
+	// Convert empty string to NULL for server_id (global blacklist)
+	var serverID interface{}
+	if entry.ServerID == "" {
+		serverID = nil
+	} else {
+		serverID = entry.ServerID
+	}
+
 	result, err := r.db.DB().Exec(query,
 		entry.DisplayName,
 		strings.ToLower(entry.DisplayName),
 		entry.Reason,
-		entry.ServerID,
+		serverID,
 		entry.AddedAt,
 		entry.ExpiresAt,
 		entry.AddedBy,
@@ -59,10 +67,14 @@ func (r *BlacklistRepository) GetByName(displayName, serverID string) (*Blacklis
 	query := `
 		SELECT id, display_name, reason, server_id, added_at, expires_at, added_by
 		FROM blacklist 
-		WHERE display_name_lower = ? AND (server_id = ? OR (server_id IS NULL AND ? = ''))
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR 
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
 	`
 
-	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID)
+	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	return r.scanBlacklistEntry(row)
 }
 
@@ -70,10 +82,14 @@ func (r *BlacklistRepository) GetByName(displayName, serverID string) (*Blacklis
 func (r *BlacklistRepository) Delete(displayName, serverID string) error {
 	query := `
 		DELETE FROM blacklist 
-		WHERE display_name_lower = ? AND (server_id = ? OR (server_id IS NULL AND ? = ''))
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR 
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
 	`
 
-	result, err := r.db.DB().Exec(query, strings.ToLower(displayName), serverID, serverID)
+	result, err := r.db.DB().Exec(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	if err != nil {
 		return fmt.Errorf("failed to delete blacklist entry: %w", err)
 	}
@@ -95,11 +111,11 @@ func (r *BlacklistRepository) List(serverID string) ([]*BlacklistEntry, error) {
 	query := `
 		SELECT id, display_name, reason, server_id, added_at, expires_at, added_by
 		FROM blacklist 
-		WHERE server_id = ? OR (server_id IS NULL AND ? = '')
+		WHERE server_id = ? OR (server_id IS NULL AND ? = '') OR (server_id = '' AND ? = '')
 		ORDER BY added_at DESC
 	`
 
-	rows, err := r.db.DB().Query(query, serverID, serverID)
+	rows, err := r.db.DB().Query(query, serverID, serverID, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list blacklist entries: %w", err)
 	}

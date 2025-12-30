@@ -1,12 +1,13 @@
 module mcpeserverproxy
 
-go 1.24.0
+go 1.24.9
 
-toolchain go1.24.5
+toolchain go1.24.11
 
 require (
 	github.com/apernet/hysteria/core/v2 v2.6.5
 	github.com/apernet/hysteria/extras/v2 v2.6.5
+	github.com/anytls/sing-anytls v0.0.11
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.11.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
@@ -49,6 +50,7 @@ require (
 	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/goccy/go-yaml v1.18.0 // indirect
 	github.com/gofrs/uuid/v5 v5.3.2 // indirect
+	github.com/google/pprof v0.0.0-20251213031049-b05bdaca462f // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
@@ -69,7 +71,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/quic-go/quic-go v0.54.0 // indirect
-	github.com/refraction-networking/utls v1.8.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sagernet/reality v0.0.0-20230406110435-ee17307e7691 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect

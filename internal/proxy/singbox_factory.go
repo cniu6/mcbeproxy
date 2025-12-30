@@ -8,9 +8,12 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/rand"
+	"crypto/ed25519"
+	"crypto/hmac"
+	crand "crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -31,29 +34,35 @@ import (
 
 	hy2 "github.com/apernet/hysteria/core/v2/client"
 	hy2obfs "github.com/apernet/hysteria/extras/v2/obfs"
-	utls "github.com/refraction-networking/utls"
+	utls "github.com/metacubex/utls"
 	shadowsocks "github.com/sagernet/sing-shadowsocks"
 	"github.com/sagernet/sing-shadowsocks/shadowaead"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	vmess "github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing-vmess/vless"
 	"github.com/sagernet/sing/common/buf"
+	slog "github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/uot"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
+
+	anytls "github.com/anytls/sing-anytls"
 )
 
 // SingboxOutbound wraps a sing protocol client for UDP connections.
 type SingboxOutbound struct {
-	config    *config.ProxyOutbound
-	dialer    N.Dialer
-	ssMethod  ssMethod
-	ssKey     []byte                                // Shadowsocks master key
-	ssKeyLen  int                                   // Key/salt length
-	ssCipher  func(key []byte) (cipher.AEAD, error) // Cipher constructor
-	hy2Client hy2.Client
-	hy2Mu     sync.Mutex // Protects hy2Client for reconnection
+	config          *config.ProxyOutbound
+	dialer          N.Dialer
+	ssMethod        ssMethod
+	ssKey           []byte                                // Shadowsocks master key
+	ssKeyLen        int                                   // Key/salt length
+	ssCipher        func(key []byte) (cipher.AEAD, error) // Cipher constructor
+	hy2Client       hy2.Client
+	hy2Mu           sync.Mutex // Protects hy2Client for reconnection
+	anytlsClient    *anytls.Client
+	anytlsUOTClient *uot.Client
 	// Hysteria2 uses per-destination UDP connections
 	// Each destination gets its own HyUDPConn to avoid demultiplexing issues
 }
@@ -87,6 +96,18 @@ func (d *directDialer) ListenPacket(ctx context.Context, destination M.Socksaddr
 
 var _ N.Dialer = (*directDialer)(nil)
 
+type anytlsProxyDialer func(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
+
+func (d anytlsProxyDialer) DialContext(ctx context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
+	return d(ctx, destination)
+}
+
+func (d anytlsProxyDialer) ListenPacket(_ context.Context, _ M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("anytls dialer does not support ListenPacket")
+}
+
+var _ N.Dialer = (anytlsProxyDialer)(nil)
+
 // CreateSingboxOutbound creates a sing-box outbound adapter from a ProxyOutbound config.
 // Requirements: 1.2, 3.1, 3.2
 func CreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) {
@@ -111,6 +132,8 @@ func CreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) 
 		err = outbound.initVLESS(cfg)
 	case config.ProtocolHysteria2:
 		err = outbound.initHysteria2(cfg)
+	case config.ProtocolAnyTLS:
+		err = outbound.initAnyTLS(cfg)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, cfg.Type)
 	}
@@ -472,8 +495,8 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 					MaxStreamReceiveWindow:         8 * 1024 * 1024,
 					InitialConnectionReceiveWindow: 8 * 1024 * 1024,
 					MaxConnectionReceiveWindow:     16 * 1024 * 1024,
-					MaxIdleTimeout:                 60 * time.Second,
-					KeepAlivePeriod:                15 * time.Second,
+					MaxIdleTimeout:                 90 * time.Second, // Increased from 60s to reduce reconnection frequency
+					KeepAlivePeriod:                30 * time.Second, // Increased from 15s to reduce CPU usage
 					DisablePathMTUDiscovery:        cfg.DisableMTU,
 				},
 				BandwidthConfig: hy2.BandwidthConfig{
@@ -520,6 +543,50 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 	return nil
 }
 
+// initAnyTLS initializes an AnyTLS client with TLS support.
+func (s *SingboxOutbound) initAnyTLS(cfg *config.ProxyOutbound) error {
+	if !cfg.TLS {
+		return errors.New("anytls requires tls enabled")
+	}
+
+	serverAddr := M.ParseSocksaddrHostPort(cfg.Server, uint16(cfg.Port))
+
+	dialOut := func(ctx context.Context) (net.Conn, error) {
+		conn, err := s.dialer.DialContext(ctx, "tcp", serverAddr)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
+		tlsConn, err := dialTLSWithFingerprint(ctx, conn, cfg)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	client, err := anytls.NewClient(context.Background(), anytls.ClientConfig{
+		Password: cfg.Password,
+		DialOut:  dialOut,
+		Logger:   slog.NOP(),
+	})
+	if err != nil {
+		return err
+	}
+
+	s.anytlsClient = client
+	s.anytlsUOTClient = &uot.Client{
+		Dialer:  anytlsProxyDialer(client.CreateProxy),
+		Version: uot.Version,
+	}
+	return nil
+}
+
 // ListenPacket creates a UDP PacketConn through the sing-box outbound.
 // The destination should be in the format "host:port".
 // Requirements: 3.1, 3.3, 3.4
@@ -548,6 +615,8 @@ func (s *SingboxOutbound) ListenPacket(ctx context.Context, destination string) 
 		return s.dialVLESSUDP(ctx, serverAddr, dest)
 	case config.ProtocolHysteria2:
 		return s.dialHysteria2UDP(ctx, serverAddr, dest)
+	case config.ProtocolAnyTLS:
+		return s.dialAnyTLSUDP(ctx, serverAddr, dest)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, s.config.Type)
 	}
@@ -673,6 +742,11 @@ func (s *SingboxOutbound) dialTrojanUDP(ctx context.Context, serverAddr, dest M.
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TCP connection: %w", err)
 	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	var finalConn net.Conn = conn
 
@@ -694,8 +768,18 @@ func (s *SingboxOutbound) dialTrojanUDP(ctx context.Context, serverAddr, dest M.
 
 	return &trojanPacketConn{
 		Conn:        finalConn,
+		r:           bufio.NewReaderSize(finalConn, 32*1024),
 		destination: dest,
 	}, nil
+}
+
+// dialAnyTLSUDP creates a UDP connection through AnyTLS.
+// AnyTLS transports UDP via UoT (UDP over TCP).
+func (s *SingboxOutbound) dialAnyTLSUDP(ctx context.Context, _, dest M.Socksaddr) (net.PacketConn, error) {
+	if s.anytlsUOTClient == nil {
+		return nil, errors.New("anytls client not initialized")
+	}
+	return s.anytlsUOTClient.ListenPacket(ctx, dest)
 }
 
 // dialVLESSUDP creates a UDP connection through VLESS using sing-vmess/vless library.
@@ -704,6 +788,11 @@ func (s *SingboxOutbound) dialVLESSUDP(ctx context.Context, serverAddr, dest M.S
 	conn, err := s.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TCP connection: %w", err)
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	// Determine if we're using Vision flow
@@ -737,15 +826,15 @@ func (s *SingboxOutbound) dialVLESSUDP(ctx context.Context, serverAddr, dest M.S
 	}
 
 	// Determine flow to use
-	// For UDP, we don't use vision flow (it's for TCP streams)
-	// XUDP is used for UDP over VLESS
+	// For Vision nodes, UDP still needs the Vision flow so that the underlying
+	// connection is wrapped with the XTLS Vision transport (XUDP runs on top of it).
 	flow := ""
-	if s.config.Reality {
-		flow = "" // Reality uses standard XUDP
+	if isVisionFlow {
+		flow = s.config.Flow
 	}
 
 	// Create VLESS client using sing-vmess/vless library
-	client, err := vless.NewClient(s.config.UUID, flow, nil)
+	client, err := vless.NewClient(s.config.UUID, flow, slog.NOP())
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create vless client: %w", err)
@@ -810,14 +899,18 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 		return nil, fmt.Errorf("invalid reality public key length: %d (expected 32)", len(publicKeyBytes))
 	}
 
-	// Decode short ID (hex string)
-	shortID, err := hex.DecodeString(cfg.RealityShortID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode reality short id: %w", err)
+	// Decode short ID (hex string, optional)
+	var shortID []byte
+	if cfg.RealityShortID != "" {
+		shortID, err = hex.DecodeString(cfg.RealityShortID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode reality short id: %w", err)
+		}
+		// Xray allows 0..16 hex chars (i.e. 0..8 bytes), keep it lenient but bounded.
+		if len(shortID) > 16 {
+			return nil, fmt.Errorf("invalid reality short id length: %d bytes (max 16)", len(shortID))
+		}
 	}
-	// Pad shortID to 8 bytes if needed
-	var shortIDBytes [8]byte
-	copy(shortIDBytes[:], shortID)
 
 	// Get SNI
 	sni := cfg.SNI
@@ -828,40 +921,6 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 	// Get fingerprint
 	fingerprint := getUTLSFingerprint(cfg.Fingerprint)
 
-	// Generate client's ephemeral X25519 key pair
-	x25519Curve := ecdh.X25519()
-	privKey, err := x25519Curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate X25519 key pair: %w", err)
-	}
-	clientPublicKey := privKey.PublicKey().Bytes()
-
-	// Parse server's public key
-	serverPubKey, err := x25519Curve.NewPublicKey(publicKeyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse server public key: %w", err)
-	}
-
-	// Compute shared secret using ECDH
-	sharedSecret, err := privKey.ECDH(serverPubKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compute shared secret: %w", err)
-	}
-
-	// Derive authentication key from shared secret using HKDF
-	// This matches the Xray-core implementation
-	hkdfReader := hkdf.New(sha256.New, sharedSecret, []byte("REALITY"), nil)
-	authKey := make([]byte, 32)
-	if _, err := io.ReadFull(hkdfReader, authKey); err != nil {
-		return nil, fmt.Errorf("failed to derive auth key: %w", err)
-	}
-
-	// Build sessionId (32 bytes):
-	// The sessionId contains the client's public key which the server uses
-	// to derive the same shared secret and verify the client
-	sessionId := make([]byte, 32)
-	copy(sessionId, clientPublicKey)
-
 	// Create uTLS config
 	utlsConfig := &utls.Config{
 		ServerName:             sni,
@@ -869,31 +928,111 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 		SessionTicketsDisabled: true,
 	}
 
-	// Create uTLS connection with fingerprint
 	utlsConn := utls.UClient(conn, utlsConfig, fingerprint)
 
-	// Build handshake state first
+	// Build handshake state first so we can access ClientHello fields & TLS 1.3 keyshare.
 	if err := utlsConn.BuildHandshakeState(); err != nil {
 		return nil, fmt.Errorf("failed to build handshake state: %w", err)
 	}
 
-	// Set the sessionId in ClientHello
-	// This is the key for Reality authentication - server extracts client's public key from here
-	utlsConn.HandshakeState.Hello.SessionId = sessionId
+	hello := utlsConn.HandshakeState.Hello
 
-	// Perform TLS handshake
+	// Construct plaintext session ID (first 16 bytes are authenticated & encrypted).
+	hello.SessionId = make([]byte, 32)
+	if len(hello.Raw) < 39+len(hello.SessionId) {
+		return nil, fmt.Errorf("unexpected client hello length: %d", len(hello.Raw))
+	}
+	copy(hello.Raw[39:], hello.SessionId) // fixed SessionId location in ClientHello
+
+	// Version bytes are used for optional server-side min/max client version checks.
+	// Use a plausible Xray-like version to maximize compatibility.
+	const (
+		realityVersionX = 1
+		realityVersionY = 8
+		realityVersionZ = 0
+	)
+	hello.SessionId[0] = realityVersionX
+	hello.SessionId[1] = realityVersionY
+	hello.SessionId[2] = realityVersionZ
+	hello.SessionId[3] = 0 // reserved
+	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+	if len(shortID) > 0 {
+		copy(hello.SessionId[8:], shortID)
+	}
+
+	// Compute auth key based on TLS 1.3 ECDHE keyshare and server's public key.
+	publicKey, err := ecdh.X25519().NewPublicKey(publicKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse reality public key: %w", err)
+	}
+
+	ecdhe := utlsConn.HandshakeState.State13.KeyShareKeys.Ecdhe
+	if ecdhe == nil {
+		ecdhe = utlsConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
+	}
+	if ecdhe == nil {
+		return nil, errors.New("current fingerprint does not support TLS 1.3, reality handshake cannot establish")
+	}
+
+	authKey, err := ecdhe.ECDH(publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute reality shared key: %w", err)
+	}
+	if len(authKey) == 0 {
+		return nil, errors.New("failed to compute reality shared key")
+	}
+
+	// HKDF(authKey, hello.Random[:20], "REALITY") -> authKey (in place)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")), authKey); err != nil {
+		return nil, fmt.Errorf("failed to derive reality auth key: %w", err)
+	}
+
+	// Encrypt first 16 bytes of plaintext session ID into 32-byte ciphertext.
+	block, err := aes.NewCipher(authKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reality cipher: %w", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reality AEAD: %w", err)
+	}
+	nonceSize := aead.NonceSize()
+	if len(hello.Random) < 20+nonceSize {
+		return nil, fmt.Errorf("unexpected client hello random length: %d", len(hello.Random))
+	}
+	nonce := hello.Random[20 : 20+nonceSize]
+	sealed := aead.Seal(hello.SessionId[:0], nonce, hello.SessionId[:16], hello.Raw)
+	if len(sealed) != 32 {
+		return nil, fmt.Errorf("unexpected reality session id length: %d", len(sealed))
+	}
+	copy(hello.SessionId, sealed)
+	copy(hello.Raw[39:], hello.SessionId)
+
+	// Perform TLS handshake.
 	if err := utlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("Reality TLS handshake failed: %w", err)
 	}
 
-	// After handshake, we need to verify the server's response
-	// The server should have recognized our authentication and established the connection
-	// If authentication failed, the server would have returned the fallback website content
+	// Verify REALITY "temporary trusted certificate" signature.
+	state := utlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		utlsConn.Close()
+		return nil, errors.New("reality: no peer certificates")
+	}
+	peerCert := state.PeerCertificates[0]
+	pubKey, ok := peerCert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		utlsConn.Close()
+		return nil, errors.New("reality: server returned non-reality certificate (check pbk/sid/sni/fp)")
+	}
+	h := hmac.New(sha512.New, authKey)
+	h.Write(pubKey)
+	if !bytes.Equal(h.Sum(nil), peerCert.Signature) {
+		utlsConn.Close()
+		return nil, errors.New("reality: invalid certificate signature (check pbk/sid/sni/fp)")
+	}
 
-	logger.Debug("Reality: TLS handshake completed with %s, fingerprint=%s, shortId=%x", sni, cfg.Fingerprint, shortIDBytes)
-
-	// Return a wrapped connection that handles Reality protocol
-	// For now, return the raw TLS connection - the VLESS protocol will handle the rest
+	logger.Debug("Reality: verified certificate for %s, fingerprint=%s, shortId=%s", sni, cfg.Fingerprint, cfg.RealityShortID)
 	return utlsConn, nil
 }
 
@@ -938,44 +1077,83 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 	logger.Debug("Hysteria2: creating UDP session for %s", dest.String())
 
 	// Create UDP session with timeout
-	type udpResult struct {
-		conn hy2.HyUDPConn
-		err  error
+	// Note: We call UDP() directly without a goroutine because:
+	// 1. The Hysteria2 client should handle timeouts internally
+	// 2. Creating a goroutine for each call can lead to goroutine leaks if the call blocks
+	// 3. The context timeout will be respected by the underlying QUIC connection
+
+	// Use a longer timeout for UDP session creation
+	udpTimeout := 15 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < udpTimeout {
+			udpTimeout = remaining
+		}
 	}
 
 	// Try up to 2 times (initial + 1 retry after reconnect)
+	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		resultCh := make(chan udpResult, 1)
-
-		go func() {
-			conn, err := s.hy2Client.UDP()
-			resultCh <- udpResult{conn, err}
-		}()
-
-		// Use a longer timeout for UDP session creation
-		udpTimeout := 15 * time.Second
-		if deadline, ok := ctx.Deadline(); ok {
-			remaining := time.Until(deadline)
-			if remaining < udpTimeout {
-				udpTimeout = remaining
-			}
+		currentClient := s.hy2Client
+		if currentClient == nil {
+			return nil, errors.New("hysteria2 client not initialized")
 		}
 
+		// Check context before attempting
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("hysteria2 UDP timeout: %w", ctx.Err())
-		case <-time.After(udpTimeout):
+			return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
+		default:
+		}
+
+		attemptCtx, cancel := context.WithTimeout(ctx, udpTimeout)
+		type udpResult struct {
+			conn hy2.HyUDPConn
+			err  error
+		}
+		resultCh := make(chan udpResult, 1)
+		go func() {
+			conn, err := currentClient.UDP()
+			if conn != nil {
+				select {
+				case <-attemptCtx.Done():
+					conn.Close()
+					return
+				case resultCh <- udpResult{conn: conn, err: err}:
+					return
+				}
+			}
+			select {
+			case <-attemptCtx.Done():
+				return
+			case resultCh <- udpResult{conn: conn, err: err}:
+				return
+			}
+		}()
+
+		select {
+		case <-attemptCtx.Done():
+			cancel()
 			logger.Warn("Hysteria2: UDP session creation timeout for %s (attempt %d)", dest.String(), attempt+1)
+			lastErr = fmt.Errorf("hysteria2 UDP timeout after %v", udpTimeout)
 			if attempt == 0 {
-				// Wait a bit and retry
+				if currentClient != nil {
+					_ = currentClient.Close()
+				}
+				s.hy2Client = nil
+				if err := s.initHysteria2(s.config); err != nil {
+					return nil, fmt.Errorf("failed to recreate hysteria2 client: %w", err)
+				}
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			return nil, fmt.Errorf("hysteria2 UDP timeout after %v", udpTimeout)
+			return nil, lastErr
 		case result := <-resultCh:
+			cancel()
 			if result.err != nil {
 				errStr := result.err.Error()
 				logger.Debug("Hysteria2: UDP session error: %s (attempt %d)", errStr, attempt+1)
+				lastErr = result.err
 
 				// Check for specific errors that indicate we should not retry
 				if strings.Contains(errStr, "UDP not enabled") {
@@ -989,7 +1167,6 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 					strings.Contains(errStr, "closed") ||
 					strings.Contains(errStr, "EOF")) {
 					logger.Info("Hysteria2: connection issue detected, retrying... (attempt %d)", attempt+1)
-					// Small delay before retry to allow reconnection
 					time.Sleep(500 * time.Millisecond)
 					continue
 				}
@@ -1006,14 +1183,24 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 		}
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("hysteria2 UDP failed after retries: %w", lastErr)
+	}
 	return nil, errors.New("hysteria2 UDP failed after retries")
 }
 
 // Close closes the sing-box outbound.
 func (s *SingboxOutbound) Close() error {
-	// Clean up Hysteria2 client if it exists
+	s.hy2Mu.Lock()
+	defer s.hy2Mu.Unlock()
 	if s.hy2Client != nil {
 		s.hy2Client.Close()
+		s.hy2Client = nil
+	}
+	if s.anytlsClient != nil {
+		s.anytlsClient.Close()
+		s.anytlsClient = nil
+		s.anytlsUOTClient = nil
 	}
 	return nil
 }
@@ -1135,8 +1322,11 @@ func ssKdf(key, salt []byte, keyLen int) []byte {
 
 // ReadFrom reads a Shadowsocks UDP packet from the connection.
 func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	// Read raw encrypted packet from server
-	rawBuf := make([]byte, 65535)
+	// Read raw encrypted packet from server - use buffer pool to reduce GC pressure
+	rawBufPtr := GetLargeBuffer()
+	rawBuf := *rawBufPtr
+	defer PutLargeBuffer(rawBufPtr)
+
 	n, _, err = c.UDPConn.ReadFromUDP(rawBuf)
 	if err != nil {
 		logger.Debug("Shadowsocks UDP read error: %v", err)
@@ -1157,7 +1347,7 @@ func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err er
 		return 0, nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
-	// Decrypt
+	// Decrypt - nonce is typically 12 bytes, use stack allocation
 	nonce := make([]byte, aead.NonceSize())
 	plaintext, err := aead.Open(nil, nonce, rawBuf[c.keySaltLen:n], nil)
 	if err != nil {
@@ -1166,7 +1356,7 @@ func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err er
 	}
 
 	// Parse destination address from plaintext
-	buffer := buf.With(plaintext)
+	buffer := buf.As(plaintext)
 	dest, err := M.SocksaddrSerializer.ReadAddrPort(buffer)
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to read destination: %w", err)
@@ -1194,7 +1384,7 @@ func (c *ssNativeUDPPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err err
 
 	// Generate random salt
 	salt := make([]byte, c.keySaltLen)
-	if _, err = rand.Read(salt); err != nil {
+	if _, err = crand.Read(salt); err != nil {
 		return 0, fmt.Errorf("failed to generate salt: %w", err)
 	}
 
@@ -1254,14 +1444,19 @@ func (c *ssNativeUDPPacketConn) Close() error {
 // Trojan UDP packet format: [ATYP][DST.ADDR][DST.PORT][Length][CRLF][Payload]
 type trojanPacketConn struct {
 	net.Conn
+	r           *bufio.Reader
 	destination M.Socksaddr
 }
 
 // ReadFrom reads a Trojan UDP packet from the connection.
 func (c *trojanPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	if c.r == nil {
+		c.r = bufio.NewReaderSize(c.Conn, 32*1024)
+	}
+
 	// Read address type
-	header := make([]byte, 1)
-	if _, err = c.Conn.Read(header); err != nil {
+	var header [1]byte
+	if _, err = io.ReadFull(c.r, header[:]); err != nil {
 		return 0, nil, err
 	}
 
@@ -1270,63 +1465,75 @@ func (c *trojanPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 
 	switch atyp {
 	case 0x01: // IPv4
-		addrBuf := make([]byte, 4)
-		if _, err = c.Conn.Read(addrBuf); err != nil {
+		var addrBuf [4]byte
+		if _, err = io.ReadFull(c.r, addrBuf[:]); err != nil {
 			return 0, nil, err
 		}
-		ip, _ := netip.AddrFromSlice(addrBuf)
+		ip, _ := netip.AddrFromSlice(addrBuf[:])
 		destAddr.Addr = ip
 	case 0x03: // Domain
-		lenBuf := make([]byte, 1)
-		if _, err = c.Conn.Read(lenBuf); err != nil {
+		var lenBuf [1]byte
+		if _, err = io.ReadFull(c.r, lenBuf[:]); err != nil {
 			return 0, nil, err
 		}
-		domainBuf := make([]byte, lenBuf[0])
-		if _, err = c.Conn.Read(domainBuf); err != nil {
+		dLen := int(lenBuf[0])
+		var domainBuf [255]byte
+		if dLen > len(domainBuf) {
+			return 0, nil, fmt.Errorf("invalid domain length: %d", dLen)
+		}
+		if _, err = io.ReadFull(c.r, domainBuf[:dLen]); err != nil {
 			return 0, nil, err
 		}
-		destAddr.Fqdn = string(domainBuf)
+		destAddr.Fqdn = string(domainBuf[:dLen])
 	case 0x04: // IPv6
-		addrBuf := make([]byte, 16)
-		if _, err = c.Conn.Read(addrBuf); err != nil {
+		var addrBuf [16]byte
+		if _, err = io.ReadFull(c.r, addrBuf[:]); err != nil {
 			return 0, nil, err
 		}
-		ip, _ := netip.AddrFromSlice(addrBuf)
+		ip, _ := netip.AddrFromSlice(addrBuf[:])
 		destAddr.Addr = ip
 	default:
 		return 0, nil, fmt.Errorf("unknown address type: %d", atyp)
 	}
 
 	// Read port
-	portBuf := make([]byte, 2)
-	if _, err = c.Conn.Read(portBuf); err != nil {
+	var portBuf [2]byte
+	if _, err = io.ReadFull(c.r, portBuf[:]); err != nil {
 		return 0, nil, err
 	}
 	destAddr.Port = uint16(portBuf[0])<<8 | uint16(portBuf[1])
 
 	// Read length
-	lenBuf := make([]byte, 2)
-	if _, err = c.Conn.Read(lenBuf); err != nil {
+	var lenBuf2 [2]byte
+	if _, err = io.ReadFull(c.r, lenBuf2[:]); err != nil {
 		return 0, nil, err
 	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1])
+	length := int(lenBuf2[0])<<8 | int(lenBuf2[1])
 
 	// Read CRLF
-	crlfBuf := make([]byte, 2)
-	if _, err = c.Conn.Read(crlfBuf); err != nil {
+	var crlfBuf [2]byte
+	if _, err = io.ReadFull(c.r, crlfBuf[:]); err != nil {
 		return 0, nil, err
 	}
 
-	// Read payload
-	if length > len(p) {
-		length = len(p)
+	// Read payload (must consume the full frame from the TCP stream)
+	toCopy := length
+	if toCopy > len(p) {
+		toCopy = len(p)
 	}
-	n, err = c.Conn.Read(p[:length])
-	if err != nil {
-		return 0, nil, err
+	if toCopy > 0 {
+		if _, err = io.ReadFull(c.r, p[:toCopy]); err != nil {
+			return 0, nil, err
+		}
+	}
+	remaining := length - toCopy
+	if remaining > 0 {
+		if _, err = io.CopyN(io.Discard, c.r, int64(remaining)); err != nil {
+			return 0, nil, err
+		}
 	}
 
-	return n, destAddr.UDPAddr(), nil
+	return toCopy, destAddr.UDPAddr(), nil
 }
 
 // WriteTo writes a Trojan UDP packet to the connection.
@@ -1604,11 +1811,12 @@ func appendSocksaddrWithoutPort(buf []byte, addr M.Socksaddr) []byte {
 
 // SingboxDialer wraps a sing-box outbound for TCP connections (used for HTTP).
 type SingboxDialer struct {
-	config    *config.ProxyOutbound
-	dialer    N.Dialer
-	hy2Client hy2.Client // Cached Hysteria2 client for TCP connections
-	hy2Mu     sync.Mutex
-	hy2Closed bool
+	config       *config.ProxyOutbound
+	dialer       N.Dialer
+	hy2Client    hy2.Client // Cached Hysteria2 client for TCP connections
+	hy2Mu        sync.Mutex
+	hy2Closed    bool
+	anytlsClient *anytls.Client // Cached AnyTLS client for TCP connections
 }
 
 // CreateSingboxDialer creates a TCP dialer that routes through the proxy.
@@ -1631,6 +1839,10 @@ func (d *SingboxDialer) Close() error {
 	if d.hy2Client != nil {
 		d.hy2Client.Close()
 		d.hy2Client = nil
+	}
+	if d.anytlsClient != nil {
+		d.anytlsClient.Close()
+		d.anytlsClient = nil
 	}
 	return nil
 }
@@ -1662,6 +1874,56 @@ func (d *SingboxDialer) getOrCreateHy2Client() (hy2.Client, error) {
 	return d.hy2Client, nil
 }
 
+// getOrCreateAnyTLSClient gets or creates a cached AnyTLS client.
+func (d *SingboxDialer) getOrCreateAnyTLSClient() (*anytls.Client, error) {
+	d.hy2Mu.Lock()
+	defer d.hy2Mu.Unlock()
+
+	if d.hy2Closed {
+		return nil, errors.New("dialer is closed")
+	}
+
+	if d.anytlsClient != nil {
+		return d.anytlsClient, nil
+	}
+
+	if !d.config.TLS {
+		return nil, errors.New("anytls requires tls enabled")
+	}
+
+	serverAddr := M.ParseSocksaddrHostPort(d.config.Server, uint16(d.config.Port))
+	dialOut := func(ctx context.Context) (net.Conn, error) {
+		conn, err := d.dialer.DialContext(ctx, "tcp", serverAddr)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
+		tlsConn, err := dialTLSWithFingerprint(ctx, conn, d.config)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	client, err := anytls.NewClient(context.Background(), anytls.ClientConfig{
+		Password: d.config.Password,
+		DialOut:  dialOut,
+		Logger:   slog.NOP(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	d.anytlsClient = client
+	return d.anytlsClient, nil
+}
+
 // DialContext establishes a TCP connection through the proxy.
 func (d *SingboxDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	// Parse destination
@@ -1684,6 +1946,8 @@ func (d *SingboxDialer) DialContext(ctx context.Context, network, address string
 		return d.dialVLESSTCP(ctx, serverAddr, dest)
 	case config.ProtocolHysteria2:
 		return d.dialHysteria2TCP(ctx, serverAddr, dest)
+	case config.ProtocolAnyTLS:
+		return d.dialAnyTLSTCP(ctx, serverAddr, dest)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, d.config.Type)
 	}
@@ -1836,15 +2100,15 @@ func (d *SingboxDialer) dialVLESSTCP(ctx context.Context, serverAddr, dest M.Soc
 	}
 
 	// Determine flow to use
-	// For TCP with Vision, we pass the flow to the client
-	// For Reality or non-Vision, use empty flow
+	// For TCP with Vision (including Reality+Vision), pass the flow to the client.
+	// For non-Vision, use empty flow.
 	flow := ""
-	if isVisionFlow && !d.config.Reality {
+	if isVisionFlow {
 		flow = d.config.Flow // Pass vision flow for TCP
 	}
 
 	// Create VLESS client (pass nil logger)
-	client, err := vless.NewClient(d.config.UUID, flow, nil)
+	client, err := vless.NewClient(d.config.UUID, flow, slog.NOP())
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create vless client: %w", err)
@@ -1890,6 +2154,15 @@ func (d *SingboxDialer) dialHysteria2TCP(_ context.Context, _, dest M.Socksaddr)
 	return conn, nil
 }
 
+// dialAnyTLSTCP creates a TCP connection through AnyTLS.
+func (d *SingboxDialer) dialAnyTLSTCP(ctx context.Context, _, dest M.Socksaddr) (net.Conn, error) {
+	client, err := d.getOrCreateAnyTLSClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get anytls client: %w", err)
+	}
+	return client.CreateProxy(ctx, dest)
+}
+
 // hysteria2PacketConn wraps a Hysteria2 UDP connection.
 type hysteria2PacketConn struct {
 	conn         hy2.HyUDPConn
@@ -1898,6 +2171,54 @@ type hysteria2PacketConn struct {
 	closed       bool
 	readDeadline time.Time
 	mu           sync.Mutex
+	// Persistent receive goroutine to avoid goroutine leak
+	recvCh     chan hy2RecvResult
+	recvCtx    context.Context
+	recvCancel context.CancelFunc
+	recvOnce   sync.Once
+}
+
+// hy2RecvResult holds the result of a Hysteria2 receive operation.
+type hy2RecvResult struct {
+	data []byte
+	addr string
+	err  error
+}
+
+// startReceiver starts a persistent receiver goroutine that reads from the Hysteria2 connection.
+// This avoids creating a new goroutine for each ReadFrom call, preventing goroutine leaks.
+func (c *hysteria2PacketConn) startReceiver() {
+	c.recvOnce.Do(func() {
+		c.recvCtx, c.recvCancel = context.WithCancel(context.Background())
+		c.recvCh = make(chan hy2RecvResult, 1)
+
+		go func() {
+			for {
+				// Check if we should stop
+				select {
+				case <-c.recvCtx.Done():
+					return
+				default:
+				}
+
+				// Receive data from Hysteria2 connection
+				data, addrStr, err := c.conn.Receive()
+
+				// Try to send result, but don't block if channel is full or context is cancelled
+				select {
+				case <-c.recvCtx.Done():
+					return
+				case c.recvCh <- hy2RecvResult{data, addrStr, err}:
+					// Successfully sent result
+				}
+
+				// If there was an error (including EOF), stop the receiver
+				if err != nil {
+					return
+				}
+			}
+		}()
+	})
 }
 
 // ReadFrom reads a packet from the Hysteria2 UDP connection.
@@ -1910,18 +2231,8 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 	deadline := c.readDeadline
 	c.mu.Unlock()
 
-	// Channel for receive result
-	type result struct {
-		data []byte
-		addr string
-		err  error
-	}
-	ch := make(chan result, 1)
-
-	go func() {
-		data, addrStr, err := c.conn.Receive()
-		ch <- result{data, addrStr, err}
-	}()
+	// Start the persistent receiver goroutine (only once)
+	c.startReceiver()
 
 	// Apply timeout if deadline is set, otherwise use a default timeout
 	var timeout <-chan time.Time
@@ -1937,7 +2248,7 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 	}
 
 	select {
-	case r := <-ch:
+	case r := <-c.recvCh:
 		if r.err != nil {
 			errStr := r.err.Error()
 			// EOF means the UDP session was closed
@@ -1994,6 +2305,12 @@ func (c *hysteria2PacketConn) Close() error {
 		return nil
 	}
 	c.closed = true
+
+	// Cancel the receiver goroutine first
+	if c.recvCancel != nil {
+		c.recvCancel()
+	}
+
 	if c.conn != nil {
 		return c.conn.Close()
 	}
@@ -2027,7 +2344,7 @@ func (c *hysteria2PacketConn) SetWriteDeadline(_ time.Time) error {
 func upgradeToWebSocket(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
 	// Generate WebSocket key
 	keyBytes := make([]byte, 16)
-	if _, err := rand.Read(keyBytes); err != nil {
+	if _, err := crand.Read(keyBytes); err != nil {
 		return nil, fmt.Errorf("failed to generate WebSocket key: %w", err)
 	}
 	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
@@ -2201,7 +2518,7 @@ func (c *wsConn) writeFrame(opcode byte, payload []byte) (n int, err error) {
 
 	// Generate masking key
 	maskKey := make([]byte, 4)
-	if _, err := rand.Read(maskKey); err != nil {
+	if _, err := crand.Read(maskKey); err != nil {
 		return 0, err
 	}
 	header = append(header, maskKey...)

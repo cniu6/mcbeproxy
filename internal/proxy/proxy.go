@@ -163,24 +163,25 @@ func (p *ProxyServer) GetProxyOutboundConfigManager() *config.ProxyOutboundConfi
 func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, playerRepo *db.PlayerRepository, errorHandler *proxyerrors.ErrorHandler) {
 	// Create session record
 	endTime := time.Now()
-	duration := endTime.Sub(sess.StartTime)
+	snap := sess.Snapshot()
+	duration := endTime.Sub(snap.StartTime)
 	record := &session.SessionRecord{
-		ID:          sess.ID,
-		ClientAddr:  sess.ClientAddr,
-		ServerID:    sess.ServerID,
-		UUID:        sess.UUID,
-		DisplayName: sess.DisplayName,
-		BytesUp:     sess.BytesUp,
-		BytesDown:   sess.BytesDown,
-		StartTime:   sess.StartTime,
+		ID:          snap.ID,
+		ClientAddr:  snap.ClientAddr,
+		ServerID:    snap.ServerID,
+		UUID:        snap.UUID,
+		DisplayName: snap.DisplayName,
+		BytesUp:     snap.BytesUp,
+		BytesDown:   snap.BytesDown,
+		StartTime:   snap.StartTime,
 		EndTime:     endTime,
 	}
 
 	// Log player disconnect event (requirement 9.5)
-	if sess.UUID != "" {
-		logger.LogPlayerDisconnect(sess.UUID, sess.DisplayName, sess.ServerID, sess.ClientAddr, duration, sess.BytesUp, sess.BytesDown)
+	if snap.UUID != "" {
+		logger.LogPlayerDisconnect(snap.UUID, snap.DisplayName, snap.ServerID, snap.ClientAddr, duration, snap.BytesUp, snap.BytesDown)
 	}
-	logger.LogSessionEnded(sess.ClientAddr, sess.ServerID, duration)
+	logger.LogSessionEnded(snap.ClientAddr, snap.ServerID, duration)
 
 	// Save session record with retry (requirement 9.3)
 	err := errorHandler.RetryOperation("persist session", func() error {
@@ -199,18 +200,18 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 	}
 
 	// Update player stats if we have player info (use DisplayName as primary key)
-	if sess.DisplayName != "" {
-		totalBytes := sess.BytesUp + sess.BytesDown
+	if snap.DisplayName != "" {
+		totalBytes := snap.BytesUp + snap.BytesDown
 
 		// Try to get existing player by display name
-		player, err := playerRepo.GetByDisplayName(sess.DisplayName)
+		player, err := playerRepo.GetByDisplayName(snap.DisplayName)
 		if err != nil {
 			// Create new player record with retry
 			player = &db.PlayerRecord{
-				DisplayName:   sess.DisplayName,
-				UUID:          sess.UUID,
-				XUID:          sess.XUID,
-				FirstSeen:     sess.StartTime,
+				DisplayName:   snap.DisplayName,
+				UUID:          snap.UUID,
+				XUID:          snap.XUID,
+				FirstSeen:     snap.StartTime,
 				LastSeen:      endTime,
 				TotalBytes:    totalBytes,
 				TotalPlaytime: int64(duration.Seconds()),
@@ -224,7 +225,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 		} else {
 			// Update existing player stats with retry
 			err = errorHandler.RetryOperation("update player stats", func() error {
-				return playerRepo.UpdateStats(sess.DisplayName, totalBytes, duration)
+				return playerRepo.UpdateStats(snap.DisplayName, totalBytes, duration)
 			})
 			if err != nil {
 				logger.LogDatabaseError("update player stats", err)
@@ -382,6 +383,28 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 		}
 		listener = passthroughProxy
 		logger.Info("Using passthrough proxy mode for server %s (auth forwarded)", serverCfg.ID)
+	case "raw_udp":
+		// Use raw UDP forwarding proxy (no RakNet processing, pure UDP forwarding)
+		rawUDPProxy := NewRawUDPProxy(
+			serverCfg.ID,
+			serverCfg,
+			p.configMgr,
+			p.sessionMgr,
+		)
+		// Inject ACL manager for access control
+		if p.aclManager != nil {
+			rawUDPProxy.SetACLManager(p.aclManager)
+		}
+		// Inject external verifier for auth verification
+		if p.externalVerifier != nil {
+			rawUDPProxy.SetExternalVerifier(p.externalVerifier)
+		}
+		// Inject outbound manager for proxy routing
+		if p.outboundMgr != nil {
+			rawUDPProxy.SetOutboundManager(p.outboundMgr)
+		}
+		listener = rawUDPProxy
+		logger.Info("Using raw UDP forwarding mode for server %s (no RakNet processing)", serverCfg.ID)
 	default:
 		// Use transparent UDP proxy (default)
 		udpListener := NewUDPListener(
@@ -791,10 +814,17 @@ func (p *ProxyServer) GetServerStatus(serverID string) string {
 func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 	servers := p.configMgr.GetAllServers()
 	result := make([]config.ServerConfigDTO, 0, len(servers))
+	sessionCounts := make(map[string]int, len(servers))
+	if p.sessionMgr != nil {
+		sessions := p.sessionMgr.GetAllSessions()
+		for _, sess := range sessions {
+			sessionCounts[sess.ServerID]++
+		}
+	}
 
 	for _, server := range servers {
 		status := p.GetServerStatus(server.ID)
-		activeSessions := p.GetActiveSessionsForServer(server.ID)
+		activeSessions := sessionCounts[server.ID]
 		result = append(result, server.ToDTO(status, activeSessions))
 	}
 
@@ -832,7 +862,8 @@ func (p *ProxyServer) KickPlayer(playerName string, reason string) int {
 	// Also remove from session manager
 	sessions := p.sessionMgr.GetAllSessions()
 	for _, sess := range sessions {
-		if sess.DisplayName != "" && strings.EqualFold(sess.DisplayName, playerName) {
+		name := sess.GetDisplayName()
+		if name != "" && strings.EqualFold(name, playerName) {
 			p.sessionMgr.Remove(sess.ClientAddr)
 			logger.Info("Removed session for kicked player %s", playerName)
 		}
@@ -848,6 +879,25 @@ type LatencyProvider interface {
 	GetCachedPong() []byte
 }
 
+func extractMotdFromPong(pong []byte) string {
+	if len(pong) == 0 {
+		return ""
+	}
+
+	if _, advertisement, ok := parseUnconnectedPong(pong); ok {
+		return string(advertisement)
+	}
+
+	text := string(pong)
+	if idx := strings.Index(text, "MCPE;"); idx >= 0 {
+		return text[idx:]
+	}
+	if idx := strings.Index(text, "MCEE;"); idx >= 0 {
+		return text[idx:]
+	}
+	return text
+}
+
 // GetServerLatency returns the cached latency for a server.
 // Returns (latency_ms, true) if available, or (0, false) if not.
 func (p *ProxyServer) GetServerLatency(serverID string) (int64, bool) {
@@ -861,6 +911,10 @@ func (p *ProxyServer) GetServerLatency(serverID string) (int64, bool) {
 
 	if provider, ok := listener.(LatencyProvider); ok {
 		latency := provider.GetCachedLatency()
+		pong := provider.GetCachedPong()
+		if latency == 0 && len(pong) == 0 {
+			return 0, false
+		}
 		return latency, true
 	}
 
@@ -880,8 +934,12 @@ func (p *ProxyServer) GetServerLatencyInfoRaw(serverID string) (latency int64, o
 
 	if provider, ok := listener.(LatencyProvider); ok {
 		latency := provider.GetCachedLatency()
-		pong := provider.GetCachedPong()
-		return latency, latency >= 0, string(pong), true
+		motd := extractMotdFromPong(provider.GetCachedPong())
+		if latency <= 0 && motd == "" {
+			return 0, false, "", false
+		}
+		online := latency >= 0 || motd != ""
+		return latency, online, motd, true
 	}
 
 	return 0, false, "", false

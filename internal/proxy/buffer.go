@@ -16,6 +16,95 @@ const MaxBufferSize = 65535
 // AutoBufferSize indicates automatic buffer sizing based on received packets.
 const AutoBufferSize = -1
 
+// Global buffer pools for different sizes to reduce GC pressure
+// Note: sync.Pool items are cleared on every GC cycle, so these pools
+// help reduce allocations but don't cause memory leaks.
+var (
+	// SmallBufferPool for small packets (2KB) - ping/pong, small control packets
+	SmallBufferPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 2048)
+			return &buf
+		},
+	}
+
+	// MediumBufferPool for medium packets (8KB) - typical game packets
+	MediumBufferPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 8192)
+			return &buf
+		},
+	}
+
+	// LargeBufferPool for large packets (32KB) - reduced from 64KB to save memory
+	LargeBufferPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 32768)
+			return &buf
+		},
+	}
+
+	// RakNetBufferPool for RakNet packets (32KB) - reduced from 64KB to save memory
+	RakNetBufferPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 32768)
+			return &buf
+		},
+	}
+)
+
+// GetSmallBuffer gets a 2KB buffer from the pool
+func GetSmallBuffer() *[]byte {
+	return SmallBufferPool.Get().(*[]byte)
+}
+
+// PutSmallBuffer returns a 2KB buffer to the pool
+func PutSmallBuffer(buf *[]byte) {
+	if buf != nil && cap(*buf) >= 2048 {
+		*buf = (*buf)[:2048]
+		SmallBufferPool.Put(buf)
+	}
+}
+
+// GetMediumBuffer gets an 8KB buffer from the pool
+func GetMediumBuffer() *[]byte {
+	return MediumBufferPool.Get().(*[]byte)
+}
+
+// PutMediumBuffer returns an 8KB buffer to the pool
+func PutMediumBuffer(buf *[]byte) {
+	if buf != nil && cap(*buf) >= 8192 {
+		*buf = (*buf)[:8192]
+		MediumBufferPool.Put(buf)
+	}
+}
+
+// GetLargeBuffer gets a 64KB buffer from the pool
+func GetLargeBuffer() *[]byte {
+	return LargeBufferPool.Get().(*[]byte)
+}
+
+// PutLargeBuffer returns a 32KB buffer to the pool
+func PutLargeBuffer(buf *[]byte) {
+	if buf != nil && cap(*buf) >= 32768 {
+		*buf = (*buf)[:32768]
+		LargeBufferPool.Put(buf)
+	}
+}
+
+// GetRakNetBuffer gets a 32KB buffer from the pool (for RakNet)
+func GetRakNetBuffer() *[]byte {
+	return RakNetBufferPool.Get().(*[]byte)
+}
+
+// PutRakNetBuffer returns a RakNet buffer to the pool
+func PutRakNetBuffer(buf *[]byte) {
+	if buf != nil && cap(*buf) >= 32768 {
+		*buf = (*buf)[:32768]
+		RakNetBufferPool.Put(buf)
+	}
+}
+
 // BufferPool provides a pool of reusable byte buffers to minimize memory allocations
 // during packet forwarding operations.
 type BufferPool struct {

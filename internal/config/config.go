@@ -53,6 +53,7 @@ type ServerConfig struct {
 	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy in server list ping
 	LoadBalance     string `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
 	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
+	ProtocolVersion int    `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
 	resolvedIP      string
 	lastResolved    time.Time
 }
@@ -278,6 +279,12 @@ func (sc *ServerConfig) GetGroupName() string {
 	return ""
 }
 
+// GetProtocolVersion returns the protocol version override.
+// Returns 0 if not set (don't modify).
+func (sc *ServerConfig) GetProtocolVersion() int {
+	return sc.ProtocolVersion
+}
+
 // GetLoadBalance returns the load balance strategy, defaulting to "least-latency".
 func (sc *ServerConfig) GetLoadBalance() string {
 	if sc.LoadBalance == "" {
@@ -330,6 +337,7 @@ type ConfigManager struct {
 	mu         sync.RWMutex
 	configPath string
 	watcher    *fsnotify.Watcher
+	watcherMu  sync.Mutex
 	resolver   *DNSResolver
 	onChange   func() // callback when config changes
 }
@@ -490,6 +498,10 @@ func (cm *ConfigManager) UpdateServerProxyOutbound(serverID string, proxyOutboun
 	}
 
 	server.ProxyOutbound = proxyOutbound
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		server.LoadBalance = ""
+		server.LoadBalanceSort = ""
+	}
 	return cm.saveToFile()
 }
 
@@ -672,16 +684,18 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 		return fmt.Errorf("failed to create file watcher: %w", err)
 	}
 
+	cm.watcherMu.Lock()
 	cm.watcher = watcher
+	cm.watcherMu.Unlock()
 
 	// Add the config file to the watcher
 	if err := watcher.Add(cm.configPath); err != nil {
-		watcher.Close()
+		cm.closeWatcher()
 		return fmt.Errorf("failed to watch config file: %w", err)
 	}
 
 	go func() {
-		defer watcher.Close()
+		defer cm.closeWatcher()
 
 		for {
 			select {
@@ -717,13 +731,21 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 
 // StopWatch stops watching the configuration file.
 func (cm *ConfigManager) StopWatch() {
-	if cm.watcher != nil {
-		cm.watcher.Close()
-		cm.watcher = nil
-	}
+	cm.closeWatcher()
 }
 
 // IsWatching returns true if the config manager is watching for file changes.
 func (cm *ConfigManager) IsWatching() bool {
+	cm.watcherMu.Lock()
+	defer cm.watcherMu.Unlock()
 	return cm.watcher != nil
+}
+
+func (cm *ConfigManager) closeWatcher() {
+	cm.watcherMu.Lock()
+	defer cm.watcherMu.Unlock()
+	if cm.watcher != nil {
+		cm.watcher.Close()
+		cm.watcher = nil
+	}
 }

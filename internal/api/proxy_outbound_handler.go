@@ -692,6 +692,7 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 		Name:      req.Name,
 		HTTPTests: make([]HTTPTestResult, 0),
 	}
+	allowPrivate := allowPrivateTargets(c)
 
 	// 1. Ping test to proxy server using configured port
 	pingResult := h.testPing(cfg)
@@ -756,19 +757,39 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 		if speedURL == "" {
 			speedURL = DefaultSpeedTestURL
 		}
-		speedResult := h.testDownloadSpeed(dialer, speedURL)
-		result.SpeedTest = &speedResult
-		if !speedResult.Success {
+		if err := validateURLForRequest(speedURL, allowPrivate); err != nil {
+			speedResult := SpeedTestResult{
+				URL:     speedURL,
+				Success: false,
+				Error:   err.Error(),
+			}
+			result.SpeedTest = &speedResult
 			allSuccess = false
+		} else {
+			speedResult := h.testDownloadSpeed(dialer, speedURL)
+			result.SpeedTest = &speedResult
+			if !speedResult.Success {
+				allSuccess = false
+			}
 		}
 	}
 
 	// 4. Custom HTTP request if provided
 	if req.CustomHTTP != nil && req.CustomHTTP.URL != "" {
-		customResult := h.testCustomHTTP(dialer, req.CustomHTTP)
-		result.CustomHTTP = &customResult
-		if !customResult.Success {
+		if err := validateURLForRequest(req.CustomHTTP.URL, allowPrivate); err != nil {
+			customResult := HTTPTestResult{
+				URL:     req.CustomHTTP.URL,
+				Success: false,
+				Error:   err.Error(),
+			}
+			result.CustomHTTP = &customResult
 			allSuccess = false
+		} else {
+			customResult := h.testCustomHTTP(dialer, req.CustomHTTP)
+			result.CustomHTTP = &customResult
+			if !customResult.Success {
+				allSuccess = false
+			}
 		}
 	}
 

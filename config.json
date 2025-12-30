@@ -1,7 +1,7 @@
 {
   "max_session_records": 100,
   "max_access_log_records": 100,
-  "api_port": 8080,
+  "api_port": 8081,
   "api_key": "",
   "api_entry_path": "/mc_admin_114514",
   "database_path": "data.db",

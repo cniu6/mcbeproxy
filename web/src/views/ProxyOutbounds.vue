@@ -147,7 +147,7 @@
           <n-gi><n-form-item label="端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
           <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
           
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
@@ -164,6 +164,11 @@
           
           <!-- Trojan 字段 -->
           <template v-if="form.type === 'trojan'">
+            <n-gi :span="2"><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+          </template>
+
+          <!-- AnyTLS 字段 -->
+          <template v-if="form.type === 'anytls'">
             <n-gi :span="2"><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
           </template>
           
@@ -214,7 +219,7 @@
     <!-- 导入 Modal -->
     <n-modal v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
       <n-alert type="info" style="margin-bottom: 12px">
-        支持以下格式：vmess://、ss://、trojan://、vless://、hysteria2://<br/>
+        支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、hysteria2://<br/>
         每行一个链接，支持批量导入，支持 Base64 编码的订阅内容
       </n-alert>
       <n-form-item label="导入分组" style="margin-bottom: 12px">
@@ -568,6 +573,7 @@ const protocolFilterOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
 
@@ -676,6 +682,7 @@ const protocolOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
 
@@ -887,7 +894,7 @@ const openEditModal = (o) => {
 const onProtocolChange = () => {
   form.value.method = form.value.type === 'shadowsocks' ? 'aes-256-gcm' : ''
   form.value.security = form.value.type === 'vmess' ? 'auto' : ''
-  form.value.tls = ['trojan', 'vless'].includes(form.value.type)
+  form.value.tls = ['trojan', 'vless', 'anytls'].includes(form.value.type)
 }
 
 const saveOutbound = async () => {
@@ -906,10 +913,94 @@ const saveOutbound = async () => {
   }
 }
 
+const syncServersAfterDelete = async (names) => {
+  const deletedNames = new Set(names.filter(Boolean))
+  if (deletedNames.size === 0) return
+
+  const remainingOutbounds = outbounds.value.filter(o => !deletedNames.has(o.name))
+  const remainingGroups = new Map()
+  remainingOutbounds.forEach(o => {
+    const groupName = o.group || ''
+    remainingGroups.set(groupName, (remainingGroups.get(groupName) || 0) + 1)
+  })
+
+  let res
+  try {
+    res = await api('/api/servers')
+  } catch (e) {
+    message.warning('获取服务器列表失败，未能同步代理设置')
+    return
+  }
+  if (!res.success || !Array.isArray(res.data)) return
+
+  const updates = []
+  for (const server of res.data) {
+    const current = server.proxy_outbound || ''
+    if (!current) continue
+
+    let nextProxy = current
+    let nextLoadBalance = server.load_balance || ''
+    let nextLoadBalanceSort = server.load_balance_sort || ''
+
+    if (current.startsWith('@')) {
+      const groupName = current.substring(1)
+      const remainingCount = remainingGroups.get(groupName) || 0
+      if (remainingCount === 0) {
+        nextProxy = ''
+        nextLoadBalance = ''
+        nextLoadBalanceSort = ''
+      }
+    } else if (current.includes(',')) {
+      const nodes = current.split(',').map(n => n.trim()).filter(Boolean)
+      const kept = nodes.filter(n => !deletedNames.has(n))
+      if (kept.length === 0) {
+        nextProxy = ''
+        nextLoadBalance = ''
+        nextLoadBalanceSort = ''
+      } else if (kept.length === 1) {
+        nextProxy = kept[0]
+        nextLoadBalance = ''
+        nextLoadBalanceSort = ''
+      } else if (kept.length !== nodes.length) {
+        nextProxy = kept.join(',')
+      }
+    } else if (deletedNames.has(current)) {
+      nextProxy = ''
+      nextLoadBalance = ''
+      nextLoadBalanceSort = ''
+    }
+
+    if (
+      nextProxy !== current ||
+      nextLoadBalance !== (server.load_balance || '') ||
+      nextLoadBalanceSort !== (server.load_balance_sort || '')
+    ) {
+      updates.push({
+        ...server,
+        proxy_outbound: nextProxy,
+        load_balance: nextLoadBalance,
+        load_balance_sort: nextLoadBalanceSort
+      })
+    }
+  }
+
+  if (updates.length === 0) return
+  let success = 0
+  let failed = 0
+  for (const s of updates) {
+    const updateRes = await api(`/api/servers/${encodeURIComponent(s.id)}`, 'PUT', s)
+    if (updateRes.success) success++
+    else failed++
+  }
+  if (success > 0) message.success(`已同步 ${success} 个服务器的代理设置`)
+  if (failed > 0) message.warning(`${failed} 个服务器同步失败`)
+}
+
 const deleteOutbound = async (name) => {
   const res = await api('/api/proxy-outbounds/delete', 'POST', { name })
   if (res.success) {
     message.success('已删除')
+    await syncServersAfterDelete([name])
     load()
   } else {
     message.error(res.msg || '删除失败')
@@ -919,10 +1010,17 @@ const deleteOutbound = async (name) => {
 // 批量删除
 const batchDelete = async () => {
   let success = 0, failed = 0
+  const deletedNames = []
   for (const name of checkedRowKeys.value) {
     const res = await api('/api/proxy-outbounds/delete', 'POST', { name })
-    if (res.success) success++
+    if (res.success) {
+      success++
+      deletedNames.push(name)
+    }
     else failed++
+  }
+  if (deletedNames.length > 0) {
+    await syncServersAfterDelete(deletedNames)
   }
   message.success(`删除完成: ${success} 成功, ${failed} 失败`)
   checkedRowKeys.value = []
@@ -1400,6 +1498,29 @@ const parseTrojan = (link) => {
   }
 }
 
+// 解析 AnyTLS 链接
+const parseAnyTLS = (link) => {
+  try {
+    const url = new URL(link)
+    const originalName = url.hash ? decodeURIComponent(url.hash.slice(1)) : `${url.hostname}:${url.port}`
+    return {
+      name: originalName,
+      type: 'anytls',
+      server: url.hostname,
+      port: parseInt(url.port) || 443,
+      password: decodeURIComponent(url.username),
+      tls: true,
+      sni: url.searchParams.get('sni') || url.hostname,
+      fingerprint: url.searchParams.get('fp') || '',
+      insecure: url.searchParams.get('allowInsecure') === '1' || url.searchParams.get('insecure') === '1',
+      enabled: true
+    }
+  } catch (e) {
+    console.error('AnyTLS parse error:', e)
+    return null
+  }
+}
+
 // 解析 VLESS 链接
 const parseVless = (link) => {
   try {
@@ -1481,6 +1602,7 @@ const parseLink = (link) => {
   if (link.startsWith('vmess://')) return parseVmess(link)
   if (link.startsWith('ss://')) return parseShadowsocks(link)
   if (link.startsWith('trojan://')) return parseTrojan(link)
+  if (link.startsWith('anytls://')) return parseAnyTLS(link)
   if (link.startsWith('vless://')) return parseVless(link)
   if (link.startsWith('hysteria2://') || link.startsWith('hy2://')) return parseHysteria2(link.replace('hy2://', 'hysteria2://'))
   

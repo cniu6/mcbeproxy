@@ -3,8 +3,10 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -116,6 +118,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	logger.Debug("ProxyDialer: Wrapping PacketConn, remoteAddr=%v", remoteAddr)
 	return &packetConnWrapper{
 		PacketConn: packetConn,
+		nodeName:   proxyOutbound,
 		remoteAddr: remoteAddr,
 	}, nil
 }
@@ -211,6 +214,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 		remoteAddr := parseUDPAddr(address)
 		return &packetConnWrapper{
 			PacketConn: packetConn,
+			nodeName:   nodeName,
 			remoteAddr: remoteAddr,
 		}, nil
 	}
@@ -246,6 +250,7 @@ func parseUDPAddr(address string) *net.UDPAddr {
 // This is needed because go-raknet expects a net.Conn but we have a PacketConn.
 type packetConnWrapper struct {
 	net.PacketConn
+	nodeName      string
 	remoteAddr    *net.UDPAddr
 	readMu        sync.Mutex
 	writeMu       sync.Mutex
@@ -264,12 +269,18 @@ func (c *packetConnWrapper) Read(b []byte) (n int, err error) {
 	c.closedMu.Lock()
 	if c.closed {
 		c.closedMu.Unlock()
-		return 0, fmt.Errorf("connection closed")
+		return 0, net.ErrClosed
 	}
 	c.closedMu.Unlock()
 
 	n, addr, err := c.PacketConn.ReadFrom(b)
 	if err != nil {
+		// Normalize close-related errors to net.ErrClosed so go-raknet's Dialer.clientListen
+		// can exit cleanly instead of spinning/logging forever.
+		if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+			return 0, net.ErrClosed
+		}
+
 		// Only log the first error after close to avoid spam
 		c.errorLoggedMu.Lock()
 		if !c.errorLogged {
@@ -325,8 +336,15 @@ func (c *packetConnWrapper) SetWriteDeadline(t time.Time) error {
 // Close closes the connection.
 func (c *packetConnWrapper) Close() error {
 	c.closedMu.Lock()
+	if c.closed {
+		c.closedMu.Unlock()
+		return nil
+	}
 	c.closed = true
 	c.closedMu.Unlock()
+	if logger.IsLevelEnabled(logger.LevelDebug) {
+		logger.Debug("packetConnWrapper.Close: node=%s local=%v remote=%v stack=%s", c.nodeName, c.PacketConn.LocalAddr(), c.remoteAddr, strings.TrimSpace(string(debug.Stack())))
+	}
 	return c.PacketConn.Close()
 }
 

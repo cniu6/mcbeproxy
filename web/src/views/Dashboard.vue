@@ -153,6 +153,7 @@
             <n-space align="center" wrap size="small">
               <n-text strong>{{ s.name }}</n-text>
               <n-tag size="small" :type="s.status === 'running' ? 'success' : 'error'">{{ s.status === 'running' ? '运行' : '停止' }}</n-tag>
+              <n-tag size="small" :type="getProxyModeType(s.proxy_mode)">{{ getProxyModeLabel(s.proxy_mode) }}</n-tag>
               <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
               <n-tag size="small" :type="getLatencyType(s.id)">{{ getLatencyText(s.id) }}</n-tag>
               <n-tag v-if="getMotdPlayers(s.id)" size="small" type="info">在线: {{ getMotdPlayers(s.id) }}</n-tag>
@@ -208,6 +209,8 @@ const kickTarget = ref(null)
 const kickReason = ref('')
 const windowWidth = ref(window.innerWidth)
 let timer = null
+let loadSeq = 0
+let pingSeq = 0
 
 const isMobile = computed(() => windowWidth.value < 768)
 
@@ -229,60 +232,131 @@ const formatNumber = (num) => {
   return num.toString()
 }
 
+// 代理模式显示
+const getProxyModeLabel = (mode) => {
+  const modeMap = { 'raw_udp': 'Raw UDP', 'passthrough': 'Pass', 'transparent': 'Trans', 'raknet': 'RakNet' }
+  return modeMap[mode] || mode || '-'
+}
+
+const getProxyModeType = (mode) => {
+  const typeMap = { 'raw_udp': 'success', 'passthrough': 'info', 'transparent': 'warning', 'raknet': 'default' }
+  return typeMap[mode] || 'default'
+}
+
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 
-const loadData = async () => {
-  const [st, sv, sess] = await Promise.all([api('/api/stats/system'), api('/api/servers'), api('/api/sessions')])
-  if (st.success) Object.assign(stats, st.data)
-  if (sv.success) {
-    servers.value = sv.data || []
-    loadServerPings(sv.data || [])
+const loadData = () => {
+  const currentLoadSeq = ++loadSeq
+  api('/api/stats/system')
+    .then((st) => {
+      if (currentLoadSeq !== loadSeq) return
+      if (st.success) Object.assign(stats, st.data)
+    })
+    .catch(() => {})
+  api('/api/servers')
+    .then((sv) => {
+      if (currentLoadSeq !== loadSeq) return
+      if (sv.success) {
+        servers.value = sv.data || []
+        const serverIds = new Set(servers.value.map(s => s.id))
+        Object.keys(serverPings).forEach((id) => {
+          if (!serverIds.has(id)) delete serverPings[id]
+        })
+        loadServerPings(sv.data || [])
+      }
+    })
+    .catch(() => {})
+  api('/api/sessions')
+    .then((sess) => {
+      if (currentLoadSeq !== loadSeq) return
+      if (sess.success) {
+        const grouped = {}
+        for (const s of sess.data || []) {
+          if (!grouped[s.server_id]) grouped[s.server_id] = []
+          grouped[s.server_id].push(s)
+        }
+        Object.keys(activeSessions).forEach(k => delete activeSessions[k])
+        Object.assign(activeSessions, grouped)
+        const serversWithPlayers = Object.keys(grouped).filter(k => grouped[k].length > 0)
+        if (serversWithPlayers.length > 0) expandedServers.value = serversWithPlayers
+      }
+    })
+    .catch(() => {})
+}
+
+const getPingAddress = (server) => {
+  if (server?.target) {
+    if (server.target.includes(':')) return server.target
+    const port = server.port || 19132
+    return `${server.target}:${port}`
   }
-  if (sess.success) {
-    const grouped = {}
-    for (const s of sess.data || []) {
-      if (!grouped[s.server_id]) grouped[s.server_id] = []
-      grouped[s.server_id].push(s)
+  if (!server?.listen_addr) return ''
+  let addr = server.listen_addr
+  if (addr.startsWith('0.0.0.0:') || addr.startsWith(':')) addr = `127.0.0.1:${addr.split(':').pop()}`
+  return addr
+}
+
+const fetchServerPing = async (server, currentPingSeq) => {
+  const applyPing = (payload) => {
+    if (currentPingSeq !== pingSeq) return
+    serverPings[server.id] = payload
+  }
+  if (!server || server.status !== 'running') {
+    applyPing({ online: false, stopped: true })
+    return
+  }
+  if (server.show_real_latency) {
+    let latencyRes = null
+    try {
+      latencyRes = await api(`/api/servers/${encodeURIComponent(server.id)}/latency`)
+    } catch (e) {
+      latencyRes = null
     }
-    Object.keys(activeSessions).forEach(k => delete activeSessions[k])
-    Object.assign(activeSessions, grouped)
-    const serversWithPlayers = Object.keys(grouped).filter(k => grouped[k].length > 0)
-    if (serversWithPlayers.length > 0) expandedServers.value = serversWithPlayers
+    if (latencyRes && latencyRes.success && latencyRes.data) {
+      const latency = Number(latencyRes.data.latency ?? -1)
+      const hasMotd = !!latencyRes.data.parsed_motd || !!latencyRes.data.motd
+      const isRealLatency = latencyRes.data.source ? latencyRes.data.source === 'proxy' : true
+      if (latencyRes.data.online && (latency > 0 || hasMotd)) {
+        applyPing({ online: latencyRes.data.online, latency: latencyRes.data.latency, isRealLatency, parsed_motd: latencyRes.data.parsed_motd })
+        return
+      }
+      if (latencyRes.data.source === 'direct') {
+        applyPing({ online: !!latencyRes.data.online, latency, isRealLatency, parsed_motd: latencyRes.data.parsed_motd })
+        return
+      }
+    }
+  }
+
+  const addr = getPingAddress(server)
+  if (!addr) return
+  try {
+    const res = await api('/api/ping', 'POST', { address: addr })
+    if (res.success && res.data) applyPing(res.data)
+  } catch (e) {
+    applyPing({ online: false, error: e.message })
   }
 }
 
 const loadServerPings = async (serverList) => {
-  for (const s of serverList) {
-    if (s.show_real_latency) {
-      try {
-        const res = await api(`/api/servers/${encodeURIComponent(s.id)}/latency`)
-        if (res.success && res.data) {
-          serverPings[s.id] = { online: res.data.online, latency: res.data.latency, isRealLatency: true, parsed_motd: res.data.parsed_motd }
-          continue
-        }
-      } catch (e) { /* Fall through */ }
-    }
-    if (s.listen_addr) {
-      let addr = s.listen_addr
-      if (addr.startsWith('0.0.0.0:') || addr.startsWith(':')) addr = `127.0.0.1:${addr.split(':').pop()}`
-      try {
-        const res = await api('/api/ping', 'POST', { address: addr })
-        if (res.success && res.data) serverPings[s.id] = res.data
-      } catch (e) { serverPings[s.id] = { online: false, error: e.message } }
-    }
-  }
+  const currentPingSeq = ++pingSeq
+  await Promise.all(serverList.map(server => fetchServerPing(server, currentPingSeq)))
 }
 
 const getLatencyText = (serverId) => {
   const ping = serverPings[serverId]
   if (!ping) return '检测中...'
+  if (ping.stopped) return '已停止'
   if (!ping.online) return '离线'
+  if (ping.latency <= 0) return '检测中...'
   return ping.isRealLatency ? `${ping.latency}ms (代理)` : `${ping.latency}ms`
 }
 
 const getLatencyType = (serverId) => {
   const ping = serverPings[serverId]
-  if (!ping || !ping.online) return 'error'
+  if (!ping) return 'default'
+  if (ping.stopped) return 'default'
+  if (!ping.online) return 'error'
+  if (ping.latency <= 0) return 'default'
   if (ping.latency < 50) return 'success'
   if (ping.latency < 100) return 'info'
   if (ping.latency < 200) return 'warning'

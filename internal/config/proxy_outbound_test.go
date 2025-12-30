@@ -50,6 +50,7 @@ func genProtocolType() gopter.Gen {
 		ProtocolTrojan,
 		ProtocolVLESS,
 		ProtocolHysteria2,
+		ProtocolAnyTLS,
 	)
 }
 
@@ -205,6 +206,33 @@ func genValidHysteria2Outbound() gopter.Gen {
 	})
 }
 
+// genValidAnyTLSOutbound generates valid AnyTLS ProxyOutbound configurations
+func genValidAnyTLSOutbound() gopter.Gen {
+	return gopter.CombineGens(
+		genNonEmptyString(), // name
+		genNonEmptyString(), // server
+		genValidPort(),      // port
+		gen.Bool(),          // enabled
+		genNonEmptyString(), // password
+		gen.AnyString(),     // sni
+		gen.Bool(),          // insecure
+		gen.AnyString(),     // fingerprint
+	).Map(func(values []any) *ProxyOutbound {
+		return &ProxyOutbound{
+			Name:        values[0].(string),
+			Type:        ProtocolAnyTLS,
+			Server:      values[1].(string),
+			Port:        values[2].(int),
+			Enabled:     values[3].(bool),
+			Password:    values[4].(string),
+			TLS:         true,
+			SNI:         values[5].(string),
+			Insecure:    values[6].(bool),
+			Fingerprint: values[7].(string),
+		}
+	})
+}
+
 // genValidProxyOutbound generates valid ProxyOutbound configurations for any protocol
 func genValidProxyOutbound() gopter.Gen {
 	return gen.OneGenOf(
@@ -213,6 +241,7 @@ func genValidProxyOutbound() gopter.Gen {
 		genValidTrojanOutbound(),
 		genValidVLESSOutbound(),
 		genValidHysteria2Outbound(),
+		genValidAnyTLSOutbound(),
 	)
 }
 
@@ -439,6 +468,45 @@ func TestProperty14_ValidationErrorContainsFieldName(t *testing.T) {
 			err := p.Validate()
 			return err != nil && strings.Contains(err.Error(), "password")
 		},
+		genNonEmptyString(),
+		genNonEmptyString(),
+		genValidPort(),
+	))
+
+	// Test missing password for AnyTLS
+	properties.Property("missing AnyTLS password error contains 'password'", prop.ForAll(
+		func(name, server string, port int) bool {
+			p := &ProxyOutbound{
+				Name:     name,
+				Type:     ProtocolAnyTLS,
+				Server:   server,
+				Port:     port,
+				TLS:      true,
+				Password: "", // Missing
+			}
+			err := p.Validate()
+			return err != nil && strings.Contains(err.Error(), "password")
+		},
+		genNonEmptyString(),
+		genNonEmptyString(),
+		genValidPort(),
+	))
+
+	// Test missing tls for AnyTLS
+	properties.Property("missing AnyTLS tls error contains 'tls'", prop.ForAll(
+		func(name, server, password string, port int) bool {
+			p := &ProxyOutbound{
+				Name:     name,
+				Type:     ProtocolAnyTLS,
+				Server:   server,
+				Port:     port,
+				TLS:      false, // Missing/disabled
+				Password: password,
+			}
+			err := p.Validate()
+			return err != nil && strings.Contains(err.Error(), "tls")
+		},
+		genNonEmptyString(),
 		genNonEmptyString(),
 		genNonEmptyString(),
 		genValidPort(),

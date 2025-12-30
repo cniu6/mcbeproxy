@@ -34,15 +34,65 @@ type GoroutineStats struct {
 	LongRunning    []*GoroutineInfo       `json:"long_running,omitempty"`    // Running > 1 minute
 	PotentialLeaks []*GoroutineInfo       `json:"potential_leaks,omitempty"` // Running > 5 minutes with no activity
 	RuntimeStacks  []RuntimeGoroutineInfo `json:"runtime_stacks,omitempty"`
+	// Enhanced memory stats
+	MemStats *GoMemoryStats `json:"mem_stats,omitempty"`
+	// Goroutine state summary from runtime
+	RuntimeStateSummary map[string]int `json:"runtime_state_summary,omitempty"`
+}
+
+// GoMemoryStats provides detailed Go runtime memory statistics.
+type GoMemoryStats struct {
+	// General stats
+	Alloc       uint64 `json:"alloc"`        // Bytes allocated and still in use
+	TotalAlloc  uint64 `json:"total_alloc"`  // Bytes allocated (even if freed)
+	Sys         uint64 `json:"sys"`          // Bytes obtained from system
+	Mallocs     uint64 `json:"mallocs"`      // Number of mallocs
+	Frees       uint64 `json:"frees"`        // Number of frees
+	LiveObjects uint64 `json:"live_objects"` // Mallocs - Frees
+
+	// Heap stats
+	HeapAlloc    uint64 `json:"heap_alloc"`    // Bytes allocated and still in use
+	HeapSys      uint64 `json:"heap_sys"`      // Bytes obtained from system for heap
+	HeapIdle     uint64 `json:"heap_idle"`     // Bytes in idle spans
+	HeapInuse    uint64 `json:"heap_inuse"`    // Bytes in non-idle spans
+	HeapReleased uint64 `json:"heap_released"` // Bytes released to OS
+	HeapObjects  uint64 `json:"heap_objects"`  // Number of allocated objects
+
+	// Stack stats
+	StackInuse uint64 `json:"stack_inuse"` // Bytes used by stack allocator
+	StackSys   uint64 `json:"stack_sys"`   // Bytes obtained from system for stack
+
+	// Off-heap stats
+	MSpanInuse  uint64 `json:"mspan_inuse"`  // Bytes used by mspan structures
+	MSpanSys    uint64 `json:"mspan_sys"`    // Bytes obtained from system for mspan
+	MCacheInuse uint64 `json:"mcache_inuse"` // Bytes used by mcache structures
+	MCacheSys   uint64 `json:"mcache_sys"`   // Bytes obtained from system for mcache
+	BuckHashSys uint64 `json:"buckhash_sys"` // Bytes used by profiling bucket hash table
+	GCSys       uint64 `json:"gc_sys"`       // Bytes used by GC metadata
+	OtherSys    uint64 `json:"other_sys"`    // Bytes used by other system allocations
+
+	// GC stats
+	NextGC        uint64  `json:"next_gc"`         // Target heap size for next GC
+	LastGC        uint64  `json:"last_gc"`         // Time of last GC (nanoseconds since epoch)
+	NumGC         uint32  `json:"num_gc"`          // Number of completed GC cycles
+	NumForcedGC   uint32  `json:"num_forced_gc"`   // Number of forced GC cycles
+	GCCPUFraction float64 `json:"gc_cpu_fraction"` // Fraction of CPU time used by GC
+
+	// Pause stats
+	PauseTotalNs uint64 `json:"pause_total_ns"` // Total GC pause time
+	LastPauseNs  uint64 `json:"last_pause_ns"`  // Last GC pause duration
 }
 
 // RuntimeGoroutineInfo represents a goroutine from runtime stack.
 type RuntimeGoroutineInfo struct {
-	ID       int64  `json:"id"`
-	State    string `json:"state"`
-	WaitTime string `json:"wait_time,omitempty"`
-	Stack    string `json:"stack"`
-	Function string `json:"function"`
+	ID             int64  `json:"id"`
+	State          string `json:"state"`
+	WaitTime       string `json:"wait_time,omitempty"`
+	Stack          string `json:"stack"`
+	Function       string `json:"function"`
+	LockedToThread bool   `json:"locked_to_thread,omitempty"`
+	CreatedBy      string `json:"created_by,omitempty"`
+	StackLines     int    `json:"stack_lines"`
 }
 
 // GoroutineManager tracks and manages goroutines for debugging and leak detection.
@@ -237,12 +287,88 @@ func (gm *GoroutineManager) GetStats(includeStacks bool) *GoroutineStats {
 		return stats.PotentialLeaks[i].StartTime.Before(stats.PotentialLeaks[j].StartTime)
 	})
 
+	// Always include memory stats for debugging
+	stats.MemStats = gm.getMemoryStats()
+
 	// Include runtime stacks if requested
 	if includeStacks {
-		stats.RuntimeStacks = gm.getRuntimeStacks()
+		stats.RuntimeStacks, stats.RuntimeStateSummary = gm.getRuntimeStacksWithSummary()
 	}
 
 	return stats
+}
+
+// getMemoryStats returns detailed memory statistics.
+func (gm *GoroutineManager) getMemoryStats() *GoMemoryStats {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	return &GoMemoryStats{
+		// General stats
+		Alloc:       m.Alloc,
+		TotalAlloc:  m.TotalAlloc,
+		Sys:         m.Sys,
+		Mallocs:     m.Mallocs,
+		Frees:       m.Frees,
+		LiveObjects: m.Mallocs - m.Frees,
+
+		// Heap stats
+		HeapAlloc:    m.HeapAlloc,
+		HeapSys:      m.HeapSys,
+		HeapIdle:     m.HeapIdle,
+		HeapInuse:    m.HeapInuse,
+		HeapReleased: m.HeapReleased,
+		HeapObjects:  m.HeapObjects,
+
+		// Stack stats
+		StackInuse: m.StackInuse,
+		StackSys:   m.StackSys,
+
+		// Off-heap stats
+		MSpanInuse:  m.MSpanInuse,
+		MSpanSys:    m.MSpanSys,
+		MCacheInuse: m.MCacheInuse,
+		MCacheSys:   m.MCacheSys,
+		BuckHashSys: m.BuckHashSys,
+		GCSys:       m.GCSys,
+		OtherSys:    m.OtherSys,
+
+		// GC stats
+		NextGC:        m.NextGC,
+		LastGC:        m.LastGC,
+		NumGC:         m.NumGC,
+		NumForcedGC:   m.NumForcedGC,
+		GCCPUFraction: m.GCCPUFraction,
+
+		// Pause stats
+		PauseTotalNs: m.PauseTotalNs,
+		LastPauseNs:  m.PauseNs[(m.NumGC+255)%256],
+	}
+}
+
+// getRuntimeStacksWithSummary parses runtime goroutine stacks and returns state summary.
+func (gm *GoroutineManager) getRuntimeStacksWithSummary() ([]RuntimeGoroutineInfo, map[string]int) {
+	stacks := gm.getRuntimeStacks()
+	summary := make(map[string]int)
+
+	for _, s := range stacks {
+		// Normalize state for summary
+		state := s.State
+		if strings.Contains(state, "wait") || strings.Contains(state, "select") {
+			state = "waiting"
+		} else if strings.Contains(state, "chan") {
+			state = "chan_blocked"
+		} else if strings.Contains(state, "syscall") || strings.Contains(state, "IO") {
+			state = "syscall/IO"
+		} else if strings.Contains(state, "sleep") {
+			state = "sleeping"
+		} else if strings.Contains(state, "semacquire") {
+			state = "mutex_blocked"
+		}
+		summary[state]++
+	}
+
+	return stacks, summary
 }
 
 // getRuntimeStacks parses runtime goroutine stacks.
@@ -268,7 +394,8 @@ func (gm *GoroutineManager) getRuntimeStacks() []RuntimeGoroutineInfo {
 		// Parse header line: "goroutine 1 [running]:" or "goroutine 1 [chan receive, 5 minutes]:"
 		header := lines[0]
 		info := RuntimeGoroutineInfo{
-			Stack: block,
+			Stack:      block,
+			StackLines: len(lines),
 		}
 
 		// Extract goroutine ID
@@ -288,6 +415,11 @@ func (gm *GoroutineManager) getRuntimeStacks() []RuntimeGoroutineInfo {
 				}
 			}
 			info.State = state
+
+			// Check if locked to thread
+			if strings.Contains(header, "locked to thread") {
+				info.LockedToThread = true
+			}
 		}
 
 		// Extract main function name
@@ -297,6 +429,14 @@ func (gm *GoroutineManager) getRuntimeStacks() []RuntimeGoroutineInfo {
 				info.Function = strings.TrimSpace(funcLine[:idx])
 			} else {
 				info.Function = strings.TrimSpace(funcLine)
+			}
+		}
+
+		// Extract created by info (last lines often contain "created by ...")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.Contains(lines[i], "created by ") {
+				info.CreatedBy = strings.TrimSpace(strings.TrimPrefix(lines[i], "created by "))
+				break
 			}
 		}
 

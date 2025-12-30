@@ -30,6 +30,38 @@ type Session struct {
 	LoginExtracted  bool       `json:"-"` // Whether we've already extracted login info
 }
 
+// SessionSnapshot provides a consistent view of session fields.
+type SessionSnapshot struct {
+	ID          string
+	ClientAddr  string
+	ServerID    string
+	UUID        string
+	DisplayName string
+	XUID        string
+	BytesUp     int64
+	BytesDown   int64
+	StartTime   time.Time
+	LastSeen    time.Time
+}
+
+// Snapshot returns a copy of session fields under lock.
+func (s *Session) Snapshot() SessionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SessionSnapshot{
+		ID:          s.ID,
+		ClientAddr:  s.ClientAddr,
+		ServerID:    s.ServerID,
+		UUID:        s.UUID,
+		DisplayName: s.DisplayName,
+		XUID:        s.XUID,
+		BytesUp:     s.BytesUp,
+		BytesDown:   s.BytesDown,
+		StartTime:   s.StartTime,
+		LastSeen:    s.LastSeen,
+	}
+}
+
 // AddBytesUp adds bytes to the upload counter in a thread-safe manner.
 func (s *Session) AddBytesUp(n int64) {
 	s.mu.Lock()
@@ -94,6 +126,13 @@ func (s *Session) GetXUID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.XUID
+}
+
+// GetDisplayName returns the player's display name safely.
+func (s *Session) GetDisplayName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.DisplayName
 }
 
 // AppendLoginData appends data to the login buffer for packet reassembly.

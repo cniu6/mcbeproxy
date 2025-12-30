@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,7 +73,7 @@ func DefaultLogConfig() *LogConfig {
 // Logger provides structured logging with levels and file output.
 type Logger struct {
 	mu            sync.Mutex
-	level         Level
+	level         atomic.Int32
 	consoleOutput io.Writer
 	fileOutput    *os.File
 	config        *LogConfig
@@ -83,21 +84,24 @@ type Logger struct {
 // defaultLogger is the package-level logger instance.
 var defaultLogger = NewLogger(os.Stdout, LevelInfo, "")
 
+func IsLevelEnabled(level Level) bool {
+	return level >= Level(defaultLogger.level.Load())
+}
+
 // NewLogger creates a new logger instance.
 func NewLogger(output io.Writer, level Level, prefix string) *Logger {
-	return &Logger{
-		level:         level,
+	l := &Logger{
 		consoleOutput: output,
 		prefix:        prefix,
 		config:        DefaultLogConfig(),
 	}
+	l.level.Store(int32(level))
+	return l
 }
 
 // SetLevel sets the logging level.
 func (l *Logger) SetLevel(level Level) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.level = level
+	l.level.Store(int32(level))
 }
 
 // SetOutput sets the console output writer.
@@ -213,10 +217,14 @@ func (l *Logger) cleanupOldLogs() {
 
 // log writes a log message at the specified level.
 func (l *Logger) log(level Level, format string, args ...any) {
+	if level < Level(l.level.Load()) {
+		return
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if level < l.level {
+	if level < Level(l.level.Load()) {
 		return
 	}
 

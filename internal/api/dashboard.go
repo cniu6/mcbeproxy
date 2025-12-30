@@ -17,7 +17,7 @@ func (a *APIServer) getEntryPath() string {
 	if a.globalConfig != nil && a.globalConfig.APIEntryPath != "" {
 		return a.globalConfig.APIEntryPath
 	}
-	return "/mc_admin_114514"
+	return "/mcpe-admin"
 }
 
 // dynamicDashboardHandler handles dynamic routing based on config
@@ -71,8 +71,7 @@ func (a *APIServer) serveDashboardHTML(c *gin.Context) {
 		c.String(http.StatusInternalServerError, "Dashboard not found")
 		return
 	}
-	c.Header("Content-Type", "text/html; charset=utf-8")
-	c.String(http.StatusOK, string(data))
+	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
 func (a *APIServer) serveAsset(c *gin.Context, subFS fs.FS, filepath string) {
@@ -83,18 +82,22 @@ func (a *APIServer) serveAsset(c *gin.Context, subFS fs.FS, filepath string) {
 	}
 
 	// Set correct Content-Type
+	contentType := ""
 	if strings.HasSuffix(filepath, ".js") {
-		c.Header("Content-Type", "application/javascript")
+		contentType = "application/javascript"
 	} else if strings.HasSuffix(filepath, ".css") {
-		c.Header("Content-Type", "text/css")
+		contentType = "text/css"
 	} else if strings.HasSuffix(filepath, ".svg") {
-		c.Header("Content-Type", "image/svg+xml")
+		contentType = "image/svg+xml"
 	} else if strings.HasSuffix(filepath, ".png") {
-		c.Header("Content-Type", "image/png")
+		contentType = "image/png"
 	} else if strings.HasSuffix(filepath, ".ico") {
-		c.Header("Content-Type", "image/x-icon")
+		contentType = "image/x-icon"
 	}
-	c.String(http.StatusOK, string(data))
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	c.Data(http.StatusOK, contentType, data)
 }
 
 func (a *APIServer) serveStaticFiles() gin.HandlerFunc {
