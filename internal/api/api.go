@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -122,6 +123,12 @@ func (a *APIServer) setupRoutes() {
 
 	// Dynamic dashboard routing - checks config on each request
 	a.router.NoRoute(a.dynamicDashboardHandler())
+
+	// Public (no-auth) endpoints for status display
+	public := a.router.Group("/api/public")
+	{
+		public.GET("/status", a.getPublicStatus)
+	}
 
 	// API routes group
 	api := a.router.Group("/api")
@@ -585,11 +592,8 @@ func (a *APIServer) enableServer(c *gin.Context) {
 	respondSuccess(c, map[string]bool{"disabled": false})
 }
 
-// getServerLatency returns the cached latency for a server.
-// GET /api/servers/:id/latency
-func (a *APIServer) getServerLatency(c *gin.Context) {
-	serverID := c.Param("id")
-
+// buildServerLatencyInfo builds latency/MOTD info for a server without writing a response.
+func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface{} {
 	// Try to get detailed latency info with MOTD if available
 	if provider, ok := a.proxyController.(LatencyInfoProvider); ok {
 		latency, online, motd, found := provider.GetServerLatencyInfoRaw(serverID)
@@ -605,8 +609,7 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 			if motd != "" {
 				response["parsed_motd"] = parseMOTD(motd)
 			}
-			respondSuccess(c, response)
-			return
+			return response
 		}
 	}
 
@@ -614,13 +617,12 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 	latency, ok := a.proxyController.GetServerLatency(serverID)
 	if ok {
 		online := latency >= 0
-		respondSuccess(c, map[string]interface{}{
+		return map[string]interface{}{
 			"server_id": serverID,
 			"latency":   latency,
 			"online":    online,
 			"source":    "proxy",
-		})
-		return
+		}
 	}
 
 	if a.configMgr != nil {
@@ -649,19 +651,25 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 				if ping.Error != "" {
 					response["error"] = ping.Error
 				}
-				respondSuccess(c, response)
-				return
+				return response
 			}
 		}
 	}
 
-	// Return 200 with not_found flag instead of 404 to avoid browser console errors
-	respondSuccess(c, map[string]interface{}{
+	// Return not_found flag to avoid browser console errors
+	return map[string]interface{}{
 		"server_id": serverID,
 		"latency":   -1,
 		"online":    false,
 		"not_found": true,
-	})
+	}
+}
+
+// getServerLatency returns the cached latency for a server.
+// GET /api/servers/:id/latency
+func (a *APIServer) getServerLatency(c *gin.Context) {
+	serverID := c.Param("id")
+	respondSuccess(c, a.buildServerLatencyInfo(serverID))
 }
 
 // Session and Player Handlers
@@ -906,6 +914,161 @@ func (a *APIServer) getSystemStats(c *gin.Context) {
 	respondSuccess(c, stats)
 }
 
+// getPublicStatus returns a consolidated status snapshot without authentication.
+// GET /api/public/status
+func (a *APIServer) getPublicStatus(c *gin.Context) {
+	var (
+		stats    interface{}
+		statsErr error
+	)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if a.monitor == nil {
+			return
+		}
+		stats, statsErr = a.monitor.GetSystemStats()
+	}()
+
+	servers := a.proxyController.GetAllServerStatuses()
+
+	// Build active sessions snapshot
+	sessions := a.sessionMgr.GetAllSessions()
+	sessionDTOs := make([]session.SessionDTO, 0, len(sessions))
+	activeSessions := make(map[string][]session.SessionDTO)
+	for _, sess := range sessions {
+		dto := sess.ToDTO()
+		sessionDTOs = append(sessionDTOs, dto)
+		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)
+	}
+
+	// Fetch all server pings concurrently and wait for completion
+	type pingResult struct {
+		id   string
+		info map[string]interface{}
+	}
+	results := make(chan pingResult, len(servers))
+	var pingWG sync.WaitGroup
+	for _, srv := range servers {
+		s := srv
+		pingWG.Add(1)
+		go func(server config.ServerConfigDTO) {
+			defer pingWG.Done()
+			info := a.buildServerPingFromConfig(server)
+			results <- pingResult{id: server.ID, info: info}
+		}(s)
+	}
+	go func() {
+		pingWG.Wait()
+		close(results)
+	}()
+
+	pings := make(map[string]map[string]interface{}, len(servers))
+	for res := range results {
+		pings[res.id] = res.info
+	}
+
+	wg.Wait()
+
+	response := map[string]interface{}{
+		"stats":           stats,
+		"servers":         servers,
+		"sessions":        sessionDTOs,
+		"active_sessions": activeSessions,
+		"pings":           pings,
+		"generated_at":    time.Now(),
+	}
+	if statsErr != nil {
+		response["stats_error"] = statsErr.Error()
+	}
+
+	respondSuccess(c, response)
+}
+
+// buildServerPingFromConfig builds ping info based on the provided server config.
+// It avoids config lookup races and keeps the result tied to the server entry.
+func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map[string]interface{} {
+	serverID := server.ID
+	publicPingTimeout := 5 * time.Second
+	if a.globalConfig != nil {
+		if a.globalConfig.PublicPingTimeoutSeconds == 0 {
+			publicPingTimeout = 0
+		} else if a.globalConfig.PublicPingTimeoutSeconds > 0 {
+			publicPingTimeout = time.Duration(a.globalConfig.PublicPingTimeoutSeconds) * time.Second
+		}
+	}
+
+	// If server isn't running, avoid direct ping.
+	if server.Status != "running" {
+		info := map[string]interface{}{
+			"server_id": serverID,
+			"online":    false,
+			"stopped":   true,
+			"source":    "stopped",
+		}
+		if server.CustomMOTD != "" {
+			info["motd"] = server.CustomMOTD
+			info["parsed_motd"] = parseMOTD(server.CustomMOTD)
+		}
+		return info
+	}
+
+	// Prefer proxy cached latency/MOTD if available.
+	if provider, ok := a.proxyController.(LatencyInfoProvider); ok {
+		latency, online, motd, found := provider.GetServerLatencyInfoRaw(serverID)
+		if found && (latency >= 0 || motd != "") {
+			info := map[string]interface{}{
+				"server_id": serverID,
+				"latency":   latency,
+				"online":    online,
+				"motd":      motd,
+				"source":    "proxy",
+			}
+			if motd != "" {
+				info["parsed_motd"] = parseMOTD(motd)
+			}
+			return info
+		}
+	}
+
+	// Fallback: direct ping using the provided config.
+	host := strings.TrimSpace(server.Target)
+	if host != "" {
+		address := host
+		if !strings.Contains(host, ":") {
+			port := server.Port
+			if port <= 0 {
+				port = 19132
+			}
+			address = net.JoinHostPort(host, strconv.Itoa(port))
+		}
+		ping := a.doPingWithTimeout(address, publicPingTimeout)
+		info := map[string]interface{}{
+			"server_id": serverID,
+			"latency":   ping.Latency,
+			"online":    ping.Online,
+			"motd":      ping.MOTD,
+			"source":    "direct",
+		}
+		if ping.ParsedMOTD != nil {
+			info["parsed_motd"] = ping.ParsedMOTD
+		}
+		if ping.Error != "" {
+			info["error"] = ping.Error
+		}
+		return info
+	}
+
+	return map[string]interface{}{
+		"server_id": serverID,
+		"latency":   -1,
+		"online":    false,
+		"not_found": true,
+	}
+}
+
 // getConfig returns the global configuration (read-only).
 // GET /api/config
 func (a *APIServer) getConfig(c *gin.Context) {
@@ -929,6 +1092,7 @@ func (a *APIServer) getConfig(c *gin.Context) {
 		"auth_verify_url":        a.globalConfig.AuthVerifyURL,
 		"auth_cache_minutes":     a.globalConfig.AuthCacheMinutes,
 		"passthrough_idle_timeout": a.globalConfig.PassthroughIdleTimeout,
+		"public_ping_timeout_seconds": a.globalConfig.PublicPingTimeoutSeconds,
 	}
 	respondSuccess(c, configDTO)
 }
@@ -954,6 +1118,7 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 		AuthVerifyURL       string `json:"auth_verify_url"`
 		AuthCacheMinutes    int    `json:"auth_cache_minutes"`
 		PassthroughIdleTimeout *int `json:"passthrough_idle_timeout"`
+		PublicPingTimeoutSeconds *int `json:"public_ping_timeout_seconds"`
 		Restart             bool   `json:"restart"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -997,6 +1162,13 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 			return
 		}
 		a.globalConfig.PassthroughIdleTimeout = *req.PassthroughIdleTimeout
+	}
+	if req.PublicPingTimeoutSeconds != nil {
+		if *req.PublicPingTimeoutSeconds < 0 {
+			respondError(c, http.StatusBadRequest, "Invalid public_ping_timeout_seconds", "public_ping_timeout_seconds cannot be negative")
+			return
+		}
+		a.globalConfig.PublicPingTimeoutSeconds = *req.PublicPingTimeoutSeconds
 	}
 
 	// Note: Actual restart would require additional implementation
@@ -1701,6 +1873,28 @@ func (a *APIServer) doPing(address string) *PingResponse {
 	response.ParsedMOTD = parseMOTD(string(pong))
 
 	return response
+}
+
+// doPingWithTimeout performs ping with an upper time limit to avoid blocking long.
+func (a *APIServer) doPingWithTimeout(address string, timeout time.Duration) *PingResponse {
+	if timeout <= 0 {
+		return a.doPing(address)
+	}
+	resultCh := make(chan *PingResponse, 1)
+	go func() {
+		resultCh <- a.doPing(address)
+	}()
+	select {
+	case res := <-resultCh:
+		return res
+	case <-time.After(timeout):
+		return &PingResponse{
+			Address: address,
+			Online:  false,
+			Latency: -1,
+			Error:   "timeout",
+		}
+	}
 }
 
 // Goroutine Management Handlers

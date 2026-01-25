@@ -88,8 +88,13 @@
             </n-form-item>
           </n-gi>
           <n-gi>
-            <n-form-item label="Pass 离线超时(秒)">
+            <n-form-item label="Pass offline timeout (s)">
               <n-input-number v-model:value="config.passthrough_idle_timeout" :min="0" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="Public ping timeout (s)">
+              <n-input-number v-model:value="config.public_ping_timeout_seconds" :min="0" style="width: 100%" />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -223,6 +228,7 @@ const config = reactive({
   max_session_records: 100,
   max_access_log_records: 100,
   passthrough_idle_timeout: 30,
+  public_ping_timeout_seconds: 5,
   log_dir: 'logs',
   log_retention_days: 7,
   log_max_size_mb: 100,

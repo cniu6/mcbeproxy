@@ -41,6 +41,7 @@
             
             <n-layout-content :style="{ padding: isMobile ? '12px' : '16px', overflowX: 'auto' }">
               <Dashboard v-if="currentPage === 'dashboard'" />
+              <ServiceStatus v-else-if="currentPage === 'service-status'" />
               <Servers v-else-if="currentPage === 'servers'" />
               <ProxyOutbounds v-else-if="currentPage === 'proxy-outbounds'" :initial-search="searchParam" :initial-highlight="highlightParam" :key="'proxy-outbounds-' + searchKey" />
               <Players v-else-if="currentPage === 'players'" :initial-search="searchParam" :key="'players-' + searchKey" />
@@ -64,6 +65,7 @@ import { darkTheme } from 'naive-ui'
 import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import Dashboard from './views/Dashboard.vue'
+import ServiceStatus from './views/ServiceStatus.vue'
 import Servers from './views/Servers.vue'
 import Players from './views/Players.vue'
 import Blacklist from './views/Blacklist.vue'
@@ -87,6 +89,7 @@ const renderIcon = (icon) => () => h(NIcon, null, { default: () => h(icon) })
 
 const menuOptions = [
   { label: '仪表盘', key: 'dashboard', icon: renderIcon(HomeOutline) },
+  { label: '服务状态展示', key: 'service-status', icon: renderIcon(ServerOutline) },
   { label: '服务器', key: 'servers', icon: renderIcon(ServerOutline) },
   { label: '代理出站', key: 'proxy-outbounds', icon: renderIcon(GitNetworkOutline) },
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
@@ -100,11 +103,43 @@ const menuOptions = [
 
 const highlightParam = ref('')
 
-const navigateTo = (page, search, highlight) => {
+const normalizePage = (page) => {
+  const validPages = new Set(menuOptions.map(opt => opt.key))
+  return validPages.has(page) ? page : 'dashboard'
+}
+
+const buildHash = (page, search, highlight) => {
+  const params = new URLSearchParams()
+  if (search) params.set('search', search)
+  if (highlight) params.set('highlight', highlight)
+  const qs = params.toString()
+  return `#/${page}${qs ? `?${qs}` : ''}`
+}
+
+const parseHash = () => {
+  const raw = window.location.hash || ''
+  if (!raw) return { page: 'dashboard', search: '', highlight: '' }
+  let hash = raw.startsWith('#') ? raw.slice(1) : raw
+  if (hash.startsWith('/')) hash = hash.slice(1)
+  const [path, query] = hash.split('?')
+  const params = new URLSearchParams(query || '')
+  return {
+    page: normalizePage(path || 'dashboard'),
+    search: params.get('search') || '',
+    highlight: params.get('highlight') || ''
+  }
+}
+
+const navigateTo = (page, search, highlight, skipHash = false) => {
+  const normalized = normalizePage(page)
   searchParam.value = typeof search === 'string' ? search : ''
   highlightParam.value = typeof highlight === 'string' ? highlight : ''
   searchKey.value++
-  currentPage.value = page
+  currentPage.value = normalized
+  if (!skipHash) {
+    const nextHash = buildHash(normalized, searchParam.value, highlightParam.value)
+    if (window.location.hash !== nextHash) window.location.hash = nextHash
+  }
 }
 
 const handleMobileNav = (page) => {
@@ -121,14 +156,26 @@ const handleResize = () => {
   windowWidth.value = window.innerWidth
 }
 
+const handleHashChange = () => {
+  const parsed = parseHash()
+  navigateTo(parsed.page, parsed.search, parsed.highlight, true)
+}
+
 onMounted(() => {
   window.addEventListener('navigate', handleNavigate)
   window.addEventListener('resize', handleResize)
+  window.addEventListener('hashchange', handleHashChange)
+  const parsed = parseHash()
+  navigateTo(parsed.page, parsed.search, parsed.highlight, true)
+  if (!window.location.hash) {
+    window.location.hash = buildHash(currentPage.value, searchParam.value, highlightParam.value)
+  }
 })
 
 onUnmounted(() => {
   window.removeEventListener('navigate', handleNavigate)
   window.removeEventListener('resize', handleResize)
+  window.removeEventListener('hashchange', handleHashChange)
 })
 </script>
 

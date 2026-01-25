@@ -421,9 +421,13 @@ func (p *PassthroughProxy) pingThroughProxy(targetAddr, proxyName string) ([]byt
 	latency := time.Since(start)
 
 	if err != nil {
+		logger.Debug("PingThroughProxy failed: server=%s target=%s node=%s latency=%v err=%v",
+			p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, err)
 		return nil, latency, err
 	}
 
+	logger.Debug("PingThroughProxy ok: server=%s target=%s node=%s latency=%v",
+		p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency)
 	return pong, latency, nil
 }
 

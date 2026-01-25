@@ -2107,14 +2107,17 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// Create connection for ping
 	var conn net.PacketConn
 	var err error
+	var selectedNode string
 
 	if p.shouldUseProxy() {
-		conn, _, err = p.dialThroughProxyWithTimeout(8 * time.Second)
+		conn, selectedNode, err = p.dialThroughProxyWithTimeout(8 * time.Second)
 	} else {
 		conn, err = net.DialUDP("udp", nil, p.targetAddr)
 	}
 
 	if err != nil {
+		logger.Debug("RawUDP pingTargetServer dial failed: server=%s target=%s node=%s err=%v",
+			p.serverID, p.targetAddr.String(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2127,6 +2130,8 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.WriteTo(pingPacket.Bytes(), p.targetAddr)
 	if err != nil {
+		logger.Debug("RawUDP pingTargetServer write failed: server=%s target=%s node=%s err=%v",
+			p.serverID, p.targetAddr.String(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2138,6 +2143,8 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err := conn.ReadFrom(buffer)
 	if err != nil {
+		logger.Debug("RawUDP pingTargetServer read failed: server=%s target=%s node=%s err=%v",
+			p.serverID, p.targetAddr.String(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2161,12 +2168,16 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 			p.cachedPong = nil
 		}
 		p.latencyMu.Unlock()
+		logger.Debug("RawUDP pingTargetServer ok: server=%s target=%s node=%s latency=%dms",
+			p.serverID, p.targetAddr.String(), selectedNode, latency)
 		return latency
 	}
 
 	p.latencyMu.Lock()
 	p.cachedLatency = -1
 	p.latencyMu.Unlock()
+	logger.Debug("RawUDP pingTargetServer invalid pong: server=%s target=%s node=%s latency=%dms",
+		p.serverID, p.targetAddr.String(), selectedNode, latency)
 	return -1
 }
 

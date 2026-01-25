@@ -591,6 +591,9 @@ type GlobalConfig struct {
 	// PassthroughIdleTimeout is the global idle timeout (seconds) for passthrough online sessions.
 	// 0 disables the override and falls back to per-server idle_timeout.
 	PassthroughIdleTimeout int `json:"passthrough_idle_timeout"`
+	// PublicPingTimeoutSeconds controls per-server ping timeout for /api/public/status.
+	// 0 disables the timeout (wait indefinitely).
+	PublicPingTimeoutSeconds int `json:"public_ping_timeout_seconds"`
 }
 
 // DefaultGlobalConfig returns a GlobalConfig with default values.
@@ -609,6 +612,7 @@ func DefaultGlobalConfig() *GlobalConfig {
 		AuthVerifyURL:       "",
 		AuthCacheMinutes:    15,
 		PassthroughIdleTimeout: 30,
+		PublicPingTimeoutSeconds: 5,
 	}
 }
 
@@ -679,6 +683,9 @@ func (gc *GlobalConfig) Validate() error {
 	}
 	if gc.PassthroughIdleTimeout < 0 {
 		return errors.New("passthrough_idle_timeout cannot be negative")
+	}
+	if gc.PublicPingTimeoutSeconds < 0 {
+		return errors.New("public_ping_timeout_seconds cannot be negative")
 	}
 	return nil
 }

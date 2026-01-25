@@ -296,9 +296,18 @@ func (p *RakNetProxy) pingThroughProxy(targetAddr, proxyName string) ([]byte, ti
 	select {
 	case <-ctx.Done():
 		latency := time.Since(start)
+		logger.Debug("RakNet pingThroughProxy timeout: server=%s target=%s node=%s latency=%s err=%v",
+			p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, ctx.Err())
 		return nil, latency, ctx.Err()
 	case result := <-resultCh:
 		latency := time.Since(start)
+		if result.err != nil {
+			logger.Debug("RakNet pingThroughProxy failed: server=%s target=%s node=%s latency=%s err=%v",
+				p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, result.err)
+		} else {
+			logger.Debug("RakNet pingThroughProxy ok: server=%s target=%s node=%s latency=%s",
+				p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency)
+		}
 		return result.pong, latency, result.err
 	}
 }
