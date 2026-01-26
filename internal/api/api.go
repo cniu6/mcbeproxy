@@ -53,6 +53,8 @@ type APIServer struct {
 	aclManager *acl.ACLManager
 	// Proxy outbound handler for managing proxy outbound nodes
 	proxyOutboundHandler *ProxyOutboundHandler
+	// Proxy port config manager
+	proxyPortConfigMgr *config.ProxyPortConfigManager
 }
 
 // ProxyController defines the interface for controlling proxy servers.
@@ -66,6 +68,7 @@ type ProxyController interface {
 	GetAllServerStatuses() []config.ServerConfigDTO
 	KickPlayer(playerName string, reason string) int // Kick player by name with reason, returns count of kicked sessions
 	GetServerLatency(serverID string) (int64, bool)  // Get cached latency for a server, returns (latency_ms, ok)
+	ReloadProxyPorts() error
 }
 
 // LatencyInfoProvider is an optional interface for getting detailed latency info with MOTD
@@ -86,6 +89,7 @@ func NewAPIServer(
 	proxyController ProxyController,
 	aclManager *acl.ACLManager,
 	proxyOutboundHandler *ProxyOutboundHandler,
+	proxyPortConfigMgr *config.ProxyPortConfigManager,
 ) *APIServer {
 	// Set Gin to release mode for production
 	gin.SetMode(gin.ReleaseMode)
@@ -110,6 +114,7 @@ func NewAPIServer(
 		proxyController:      proxyController,
 		aclManager:           aclManager,
 		proxyOutboundHandler: proxyOutboundHandler,
+		proxyPortConfigMgr:   proxyPortConfigMgr,
 	}
 
 	api.setupRoutes()
@@ -242,6 +247,17 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.DELETE("/:name", a.proxyOutboundHandler.DeleteProxyOutbound)
 				proxyOutboundGroup.POST("/:name/test", a.proxyOutboundHandler.TestProxyOutbound)
 				proxyOutboundGroup.GET("/:name/health", a.proxyOutboundHandler.GetProxyOutboundHealth)
+			}
+		}
+
+		// Proxy port endpoints
+		if a.proxyPortConfigMgr != nil {
+			proxyPortGroup := api.Group("/proxy-ports")
+			{
+				proxyPortGroup.GET("", a.getProxyPorts)
+				proxyPortGroup.POST("", a.createProxyPort)
+				proxyPortGroup.PUT("/:id", a.updateProxyPort)
+				proxyPortGroup.DELETE("/:id", a.deleteProxyPort)
 			}
 		}
 	}
@@ -1079,19 +1095,20 @@ func (a *APIServer) getConfig(c *gin.Context) {
 
 	// Return a safe subset of config (no sensitive data)
 	configDTO := map[string]interface{}{
-		"api_port":               a.globalConfig.APIPort,
-		"api_entry_path":         a.globalConfig.APIEntryPath,
-		"database_path":          a.globalConfig.DatabasePath,
-		"log_dir":                a.globalConfig.LogDir,
-		"log_retention_days":     a.globalConfig.LogRetentionDays,
-		"log_max_size_mb":        a.globalConfig.LogMaxSizeMB,
-		"debug_mode":             a.globalConfig.DebugMode,
-		"max_session_records":    a.globalConfig.MaxSessionRecords,
-		"max_access_log_records": a.globalConfig.MaxAccessLogRecords,
-		"auth_verify_enabled":    a.globalConfig.AuthVerifyEnabled,
-		"auth_verify_url":        a.globalConfig.AuthVerifyURL,
-		"auth_cache_minutes":     a.globalConfig.AuthCacheMinutes,
-		"passthrough_idle_timeout": a.globalConfig.PassthroughIdleTimeout,
+		"api_port":                    a.globalConfig.APIPort,
+		"api_entry_path":              a.globalConfig.APIEntryPath,
+		"database_path":               a.globalConfig.DatabasePath,
+		"log_dir":                     a.globalConfig.LogDir,
+		"log_retention_days":          a.globalConfig.LogRetentionDays,
+		"log_max_size_mb":             a.globalConfig.LogMaxSizeMB,
+		"debug_mode":                  a.globalConfig.DebugMode,
+		"max_session_records":         a.globalConfig.MaxSessionRecords,
+		"max_access_log_records":      a.globalConfig.MaxAccessLogRecords,
+		"auth_verify_enabled":         a.globalConfig.AuthVerifyEnabled,
+		"auth_verify_url":             a.globalConfig.AuthVerifyURL,
+		"auth_cache_minutes":          a.globalConfig.AuthCacheMinutes,
+		"proxy_ports_enabled":         a.globalConfig.ProxyPortsEnabled,
+		"passthrough_idle_timeout":    a.globalConfig.PassthroughIdleTimeout,
 		"public_ping_timeout_seconds": a.globalConfig.PublicPingTimeoutSeconds,
 	}
 	respondSuccess(c, configDTO)
@@ -1106,20 +1123,21 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	}
 
 	var req struct {
-		APIPort             int    `json:"api_port"`
-		APIEntryPath        string `json:"api_entry_path"`
-		LogDir              string `json:"log_dir"`
-		LogRetentionDays    int    `json:"log_retention_days"`
-		LogMaxSizeMB        int    `json:"log_max_size_mb"`
-		DebugMode           bool   `json:"debug_mode"`
-		MaxSessionRecords   int    `json:"max_session_records"`
-		MaxAccessLogRecords int    `json:"max_access_log_records"`
-		AuthVerifyEnabled   bool   `json:"auth_verify_enabled"`
-		AuthVerifyURL       string `json:"auth_verify_url"`
-		AuthCacheMinutes    int    `json:"auth_cache_minutes"`
-		PassthroughIdleTimeout *int `json:"passthrough_idle_timeout"`
-		PublicPingTimeoutSeconds *int `json:"public_ping_timeout_seconds"`
-		Restart             bool   `json:"restart"`
+		APIPort                  int    `json:"api_port"`
+		APIEntryPath             string `json:"api_entry_path"`
+		LogDir                   string `json:"log_dir"`
+		LogRetentionDays         int    `json:"log_retention_days"`
+		LogMaxSizeMB             int    `json:"log_max_size_mb"`
+		DebugMode                bool   `json:"debug_mode"`
+		MaxSessionRecords        int    `json:"max_session_records"`
+		MaxAccessLogRecords      int    `json:"max_access_log_records"`
+		AuthVerifyEnabled        bool   `json:"auth_verify_enabled"`
+		AuthVerifyURL            string `json:"auth_verify_url"`
+		AuthCacheMinutes         int    `json:"auth_cache_minutes"`
+		ProxyPortsEnabled        *bool  `json:"proxy_ports_enabled"`
+		PassthroughIdleTimeout   *int   `json:"passthrough_idle_timeout"`
+		PublicPingTimeoutSeconds *int   `json:"public_ping_timeout_seconds"`
+		Restart                  bool   `json:"restart"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
@@ -1155,6 +1173,14 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	}
 	if req.AuthCacheMinutes > 0 {
 		a.globalConfig.AuthCacheMinutes = req.AuthCacheMinutes
+	}
+	if req.ProxyPortsEnabled != nil {
+		a.globalConfig.ProxyPortsEnabled = *req.ProxyPortsEnabled
+		if a.proxyController != nil {
+			if err := a.proxyController.ReloadProxyPorts(); err != nil {
+				fmt.Printf("Warning: failed to reload proxy ports after config update: %v\n", err)
+			}
+		}
 	}
 	if req.PassthroughIdleTimeout != nil {
 		if *req.PassthroughIdleTimeout < 0 {

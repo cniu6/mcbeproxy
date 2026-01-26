@@ -150,6 +150,7 @@ func main() {
 		proxyServer,
 		aclManager,
 		proxyOutboundHandler,
+		proxyServer.GetProxyPortConfigManager(),
 	)
 
 	// Start proxy server

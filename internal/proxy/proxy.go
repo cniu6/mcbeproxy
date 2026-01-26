@@ -43,6 +43,8 @@ type ProxyServer struct {
 	externalVerifier       *auth.ExternalVerifier             // External auth verifier
 	outboundMgr            OutboundManager                    // Outbound manager for proxy routing
 	proxyOutboundConfigMgr *config.ProxyOutboundConfigManager // Proxy outbound config manager
+	proxyPortConfigMgr     *config.ProxyPortConfigManager     // Proxy port config manager
+	proxyPortManager       *ProxyPortManager                  // Proxy port runtime manager
 	listeners              map[string]Listener                // serverID -> listener (can be UDPListener or RakNetProxy)
 	listenersMu            sync.RWMutex
 	ctx                    context.Context
@@ -118,6 +120,13 @@ func NewProxyServer(
 		}
 	}
 
+	// Create proxy port config manager
+	proxyPortConfigMgr := config.NewProxyPortConfigManager("proxy_ports.json")
+	if err := proxyPortConfigMgr.Load(); err != nil {
+		logger.Warn("Failed to load proxy port config: %v", err)
+	}
+	proxyPortManager := NewProxyPortManager(proxyPortConfigMgr, outboundMgr)
+
 	// Set up session end callback for persistence
 	sessionMgr.OnSessionEnd = func(sess *session.Session) {
 		persistSession(sess, sessionRepo, playerRepo, errorHandler)
@@ -136,6 +145,8 @@ func NewProxyServer(
 		externalVerifier:       externalVerifier,
 		outboundMgr:            outboundMgr,
 		proxyOutboundConfigMgr: proxyOutboundConfigMgr,
+		proxyPortConfigMgr:     proxyPortConfigMgr,
+		proxyPortManager:       proxyPortManager,
 		listeners:              make(map[string]Listener),
 	}, nil
 }
@@ -172,6 +183,11 @@ func (p *ProxyServer) GetOutboundManager() OutboundManager {
 // GetProxyOutboundConfigManager returns the proxy outbound config manager.
 func (p *ProxyServer) GetProxyOutboundConfigManager() *config.ProxyOutboundConfigManager {
 	return p.proxyOutboundConfigMgr
+}
+
+// GetProxyPortConfigManager returns the proxy port config manager.
+func (p *ProxyServer) GetProxyPortConfigManager() *config.ProxyPortConfigManager {
+	return p.proxyPortConfigMgr
 }
 
 // persistSession saves session data to the database when a session ends.
@@ -309,6 +325,18 @@ func (p *ProxyServer) Start() error {
 		})
 	}
 
+	// Start proxy port config file watcher
+	if p.proxyPortConfigMgr != nil {
+		if err := p.proxyPortConfigMgr.Watch(p.ctx); err != nil {
+			log.Printf("Warning: failed to start proxy port config watcher: %v", err)
+		}
+		p.proxyPortConfigMgr.SetOnChange(func() {
+			if err := p.ReloadProxyPorts(); err != nil {
+				logger.Error("Failed to reload proxy ports after config change: %v", err)
+			}
+		})
+	}
+
 	// Set up config change callback
 	p.configMgr.SetOnChange(func() {
 		if err := p.Reload(); err != nil {
@@ -323,6 +351,13 @@ func (p *ProxyServer) Start() error {
 			if err := p.startListener(serverCfg); err != nil {
 				logger.Error("Failed to start listener for server %s: %v", serverCfg.ID, err)
 			}
+		}
+	}
+
+	// Start proxy ports (local HTTP/SOCKS) if enabled
+	if p.proxyPortManager != nil {
+		if err := p.proxyPortManager.Start(p.config != nil && p.config.ProxyPortsEnabled); err != nil {
+			logger.Error("Failed to start proxy ports: %v", err)
 		}
 	}
 
@@ -503,6 +538,10 @@ func (p *ProxyServer) Stop() error {
 	if p.proxyOutboundConfigMgr != nil {
 		p.proxyOutboundConfigMgr.StopWatch()
 	}
+	// Stop proxy port config watcher
+	if p.proxyPortConfigMgr != nil {
+		p.proxyPortConfigMgr.StopWatch()
+	}
 
 	// Stop all listeners
 	p.listenersMu.Lock()
@@ -513,6 +552,11 @@ func (p *ProxyServer) Stop() error {
 	}
 	p.listeners = make(map[string]Listener)
 	p.listenersMu.Unlock()
+
+	// Stop proxy ports
+	if p.proxyPortManager != nil {
+		p.proxyPortManager.Stop()
+	}
 
 	// Clean up all sessions (persist to database)
 	sessions := p.sessionMgr.GetAllSessions()
@@ -592,6 +636,15 @@ func (p *ProxyServer) Reload() error {
 
 	logger.LogConfigReloaded(p.listenerCount())
 	return nil
+}
+
+// ReloadProxyPorts reloads proxy port listeners based on current config.
+func (p *ProxyServer) ReloadProxyPorts() error {
+	if p.proxyPortManager == nil {
+		return nil
+	}
+	enabled := p.config != nil && p.config.ProxyPortsEnabled
+	return p.proxyPortManager.Reload(enabled)
 }
 
 // reloadProxyOutbounds reloads proxy outbound configurations and recreates sing-box outbounds.

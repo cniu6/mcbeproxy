@@ -588,6 +588,7 @@ type GlobalConfig struct {
 	AuthVerifyEnabled   bool   `json:"auth_verify_enabled"` // Enable external auth verification
 	AuthVerifyURL       string `json:"auth_verify_url"`     // External auth verification URL
 	AuthCacheMinutes    int    `json:"auth_cache_minutes"`  // Cache duration for auth results
+	ProxyPortsEnabled   bool   `json:"proxy_ports_enabled"` // Enable local proxy ports feature
 	// PassthroughIdleTimeout is the global idle timeout (seconds) for passthrough online sessions.
 	// 0 disables the override and falls back to per-server idle_timeout.
 	PassthroughIdleTimeout int `json:"passthrough_idle_timeout"`
@@ -599,19 +600,20 @@ type GlobalConfig struct {
 // DefaultGlobalConfig returns a GlobalConfig with default values.
 func DefaultGlobalConfig() *GlobalConfig {
 	return &GlobalConfig{
-		MaxSessionRecords:   100,
-		MaxAccessLogRecords: 100,
-		APIPort:             8080,
-		APIKey:              "",
-		APIEntryPath:        "/mcpe-admin",
-		DatabasePath:        "data.db",
-		LogDir:              "logs",
-		LogRetentionDays:    7,
-		LogMaxSizeMB:        100,
-		AuthVerifyEnabled:   false,
-		AuthVerifyURL:       "",
-		AuthCacheMinutes:    15,
-		PassthroughIdleTimeout: 30,
+		MaxSessionRecords:        100,
+		MaxAccessLogRecords:      100,
+		APIPort:                  8080,
+		APIKey:                   "",
+		APIEntryPath:             "/mcpe-admin",
+		DatabasePath:             "data.db",
+		LogDir:                   "logs",
+		LogRetentionDays:         7,
+		LogMaxSizeMB:             100,
+		AuthVerifyEnabled:        false,
+		AuthVerifyURL:            "",
+		AuthCacheMinutes:         15,
+		ProxyPortsEnabled:        true,
+		PassthroughIdleTimeout:   30,
 		PublicPingTimeoutSeconds: 5,
 	}
 }

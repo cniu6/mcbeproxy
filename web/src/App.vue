@@ -44,6 +44,7 @@
               <ServiceStatus v-else-if="currentPage === 'service-status'" />
               <Servers v-else-if="currentPage === 'servers'" />
               <ProxyOutbounds v-else-if="currentPage === 'proxy-outbounds'" :initial-search="searchParam" :initial-highlight="highlightParam" :key="'proxy-outbounds-' + searchKey" />
+              <ProxyPorts v-else-if="currentPage === 'proxy-ports'" />
               <Players v-else-if="currentPage === 'players'" :initial-search="searchParam" :key="'players-' + searchKey" />
               <Blacklist v-else-if="currentPage === 'blacklist'" />
               <Whitelist v-else-if="currentPage === 'whitelist'" />
@@ -62,7 +63,7 @@
 <script setup>
 import { ref, h, onMounted, onUnmounted, computed } from 'vue'
 import { darkTheme } from 'naive-ui'
-import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline } from '@vicons/ionicons5'
+import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import Dashboard from './views/Dashboard.vue'
 import ServiceStatus from './views/ServiceStatus.vue'
@@ -74,6 +75,7 @@ import Sessions from './views/Sessions.vue'
 import Logs from './views/Logs.vue'
 import Settings from './views/Settings.vue'
 import ProxyOutbounds from './views/ProxyOutbounds.vue'
+import ProxyPorts from './views/ProxyPorts.vue'
 import Debug from './views/Debug.vue'
 
 const currentPage = ref('dashboard')
@@ -92,6 +94,7 @@ const menuOptions = [
   { label: '服务状态展示', key: 'service-status', icon: renderIcon(ServerOutline) },
   { label: '服务器', key: 'servers', icon: renderIcon(ServerOutline) },
   { label: '代理出站', key: 'proxy-outbounds', icon: renderIcon(GitNetworkOutline) },
+  { label: 'Proxy Ports', key: 'proxy-ports', icon: renderIcon(SwapHorizontalOutline) },
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
   { label: '黑名单', key: 'blacklist', icon: renderIcon(BanOutline) },
   { label: '白名单', key: 'whitelist', icon: renderIcon(CheckmarkCircleOutline) },

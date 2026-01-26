@@ -12,6 +12,7 @@
     "auth_verify_enabled":  false,
     "auth_verify_url":  "http://127.0.0.1:818/jiasuip/index.php",
     "auth_cache_minutes":  15,
+    "proxy_ports_enabled":  true,
     "passthrough_idle_timeout":  30,
     "public_ping_timeout_seconds":  5
 }
