@@ -92,7 +92,7 @@ const renderIcon = (icon) => () => h(NIcon, null, { default: () => h(icon) })
 const menuOptions = [
   { label: '仪表盘', key: 'dashboard', icon: renderIcon(HomeOutline) },
   { label: '服务状态展示', key: 'service-status', icon: renderIcon(ServerOutline) },
-  { label: '服务器', key: 'servers', icon: renderIcon(ServerOutline) },
+  { label: '代理服务器', key: 'servers', icon: renderIcon(ServerOutline) },
   { label: '代理出站', key: 'proxy-outbounds', icon: renderIcon(GitNetworkOutline) },
   { label: 'Proxy Ports', key: 'proxy-ports', icon: renderIcon(SwapHorizontalOutline) },
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },

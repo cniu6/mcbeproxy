@@ -377,101 +377,134 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 	}
 
 	var listener Listener
+	protocol := strings.ToLower(serverCfg.Protocol)
 	proxyMode := serverCfg.GetProxyMode()
 
-	switch proxyMode {
-	case "mitm":
-		// Use MITM proxy with gophertunnel (full protocol access, requires proxy Xbox auth for auth servers)
-		mitmProxy := NewMITMProxy(
-			serverCfg.ID,
-			serverCfg,
-			p.configMgr,
-			p.sessionMgr,
-		)
-		// Inject ACL manager for access control (Requirement 5.1)
-		if p.aclManager != nil {
-			mitmProxy.SetACLManager(p.aclManager)
+	if protocol != "" && protocol != "raknet" {
+		switch protocol {
+		case "udp":
+			udpProxy := NewPlainUDPProxy(serverCfg.ID, serverCfg)
+			if p.outboundMgr != nil {
+				udpProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = udpProxy
+			logger.Info("Using plain UDP forwarding for server %s", serverCfg.ID)
+		case "tcp":
+			tcpProxy := NewPlainTCPProxy(serverCfg.ID, serverCfg)
+			if p.outboundMgr != nil {
+				tcpProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = tcpProxy
+			logger.Info("Using plain TCP forwarding for server %s", serverCfg.ID)
+		case "tcp_udp":
+			udpProxy := NewPlainUDPProxy(serverCfg.ID, serverCfg)
+			tcpProxy := NewPlainTCPProxy(serverCfg.ID, serverCfg)
+			if p.outboundMgr != nil {
+				udpProxy.SetOutboundManager(p.outboundMgr)
+				tcpProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = newCombinedListener(tcpProxy, udpProxy)
+			logger.Info("Using plain TCP+UDP forwarding for server %s", serverCfg.ID)
+		default:
+			logger.Warn("Unknown protocol %s for server %s, falling back to raknet proxy mode", protocol, serverCfg.ID)
 		}
-		listener = mitmProxy
-		logger.Info("Using MITM proxy mode for server %s", serverCfg.ID)
-	case "raknet":
-		// Use full RakNet proxy (can extract player info)
-		raknetProxy := NewRakNetProxy(
-			serverCfg.ID,
-			serverCfg,
-			p.configMgr,
-			p.sessionMgr,
-		)
-		// Inject ACL manager for access control (Requirement 5.1)
-		if p.aclManager != nil {
-			raknetProxy.SetACLManager(p.aclManager)
+	}
+
+	if listener == nil {
+		switch proxyMode {
+		case "mitm":
+			// Use MITM proxy with gophertunnel (full protocol access, requires proxy Xbox auth for auth servers)
+			mitmProxy := NewMITMProxy(
+				serverCfg.ID,
+				serverCfg,
+				p.configMgr,
+				p.sessionMgr,
+			)
+			// Inject ACL manager for access control (Requirement 5.1)
+			if p.aclManager != nil {
+				mitmProxy.SetACLManager(p.aclManager)
+			}
+			listener = mitmProxy
+			logger.Info("Using MITM proxy mode for server %s", serverCfg.ID)
+		case "raknet":
+			// Use full RakNet proxy (can extract player info)
+			raknetProxy := NewRakNetProxy(
+				serverCfg.ID,
+				serverCfg,
+				p.configMgr,
+				p.sessionMgr,
+			)
+			// Inject ACL manager for access control (Requirement 5.1)
+			if p.aclManager != nil {
+				raknetProxy.SetACLManager(p.aclManager)
+			}
+			// Inject outbound manager for proxy routing (Requirement 2.1)
+			if p.outboundMgr != nil {
+				raknetProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = raknetProxy
+			logger.Info("Using RakNet proxy mode for server %s", serverCfg.ID)
+		case "passthrough":
+			// Use passthrough proxy (like gamma - forwards auth, extracts player info)
+			passthroughProxy := NewPassthroughProxy(
+				serverCfg.ID,
+				serverCfg,
+				p.configMgr,
+				p.sessionMgr,
+			)
+			// Global override for passthrough idle timeout
+			if p.config != nil && p.config.PassthroughIdleTimeout > 0 {
+				passthroughProxy.SetPassthroughIdleTimeoutOverride(time.Duration(p.config.PassthroughIdleTimeout) * time.Second)
+			}
+			// Inject ACL manager for access control (Requirement 5.1)
+			if p.aclManager != nil {
+				passthroughProxy.SetACLManager(p.aclManager)
+			}
+			// Inject external verifier for auth verification
+			if p.externalVerifier != nil {
+				passthroughProxy.SetExternalVerifier(p.externalVerifier)
+			}
+			// Inject outbound manager for proxy routing (Requirement 2.1)
+			if p.outboundMgr != nil {
+				passthroughProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = passthroughProxy
+			logger.Info("Using passthrough proxy mode for server %s (auth forwarded)", serverCfg.ID)
+		case "raw_udp":
+			// Use raw UDP forwarding proxy (no RakNet processing, pure UDP forwarding)
+			rawUDPProxy := NewRawUDPProxy(
+				serverCfg.ID,
+				serverCfg,
+				p.configMgr,
+				p.sessionMgr,
+			)
+			// Inject ACL manager for access control
+			if p.aclManager != nil {
+				rawUDPProxy.SetACLManager(p.aclManager)
+			}
+			// Inject external verifier for auth verification
+			if p.externalVerifier != nil {
+				rawUDPProxy.SetExternalVerifier(p.externalVerifier)
+			}
+			// Inject outbound manager for proxy routing
+			if p.outboundMgr != nil {
+				rawUDPProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = rawUDPProxy
+			logger.Info("Using raw UDP forwarding mode for server %s (no RakNet processing)", serverCfg.ID)
+		default:
+			// Use transparent UDP proxy (default)
+			udpListener := NewUDPListener(
+				serverCfg.ID,
+				serverCfg,
+				p.bufferPool,
+				p.sessionMgr,
+				p.forwarder,
+				p.configMgr,
+			)
+			listener = udpListener
+			logger.Debug("Using transparent proxy mode for server %s", serverCfg.ID)
 		}
-		// Inject outbound manager for proxy routing (Requirement 2.1)
-		if p.outboundMgr != nil {
-			raknetProxy.SetOutboundManager(p.outboundMgr)
-		}
-		listener = raknetProxy
-		logger.Info("Using RakNet proxy mode for server %s", serverCfg.ID)
-	case "passthrough":
-		// Use passthrough proxy (like gamma - forwards auth, extracts player info)
-		passthroughProxy := NewPassthroughProxy(
-			serverCfg.ID,
-			serverCfg,
-			p.configMgr,
-			p.sessionMgr,
-		)
-		// Global override for passthrough idle timeout
-		if p.config != nil && p.config.PassthroughIdleTimeout > 0 {
-			passthroughProxy.SetPassthroughIdleTimeoutOverride(time.Duration(p.config.PassthroughIdleTimeout) * time.Second)
-		}
-		// Inject ACL manager for access control (Requirement 5.1)
-		if p.aclManager != nil {
-			passthroughProxy.SetACLManager(p.aclManager)
-		}
-		// Inject external verifier for auth verification
-		if p.externalVerifier != nil {
-			passthroughProxy.SetExternalVerifier(p.externalVerifier)
-		}
-		// Inject outbound manager for proxy routing (Requirement 2.1)
-		if p.outboundMgr != nil {
-			passthroughProxy.SetOutboundManager(p.outboundMgr)
-		}
-		listener = passthroughProxy
-		logger.Info("Using passthrough proxy mode for server %s (auth forwarded)", serverCfg.ID)
-	case "raw_udp":
-		// Use raw UDP forwarding proxy (no RakNet processing, pure UDP forwarding)
-		rawUDPProxy := NewRawUDPProxy(
-			serverCfg.ID,
-			serverCfg,
-			p.configMgr,
-			p.sessionMgr,
-		)
-		// Inject ACL manager for access control
-		if p.aclManager != nil {
-			rawUDPProxy.SetACLManager(p.aclManager)
-		}
-		// Inject external verifier for auth verification
-		if p.externalVerifier != nil {
-			rawUDPProxy.SetExternalVerifier(p.externalVerifier)
-		}
-		// Inject outbound manager for proxy routing
-		if p.outboundMgr != nil {
-			rawUDPProxy.SetOutboundManager(p.outboundMgr)
-		}
-		listener = rawUDPProxy
-		logger.Info("Using raw UDP forwarding mode for server %s (no RakNet processing)", serverCfg.ID)
-	default:
-		// Use transparent UDP proxy (default)
-		udpListener := NewUDPListener(
-			serverCfg.ID,
-			serverCfg,
-			p.bufferPool,
-			p.sessionMgr,
-			p.forwarder,
-			p.configMgr,
-		)
-		listener = udpListener
-		logger.Debug("Using transparent proxy mode for server %s", serverCfg.ID)
 	}
 
 	// Start the listener

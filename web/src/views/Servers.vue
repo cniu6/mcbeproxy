@@ -1,7 +1,7 @@
 <template>
   <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">服务器管理</n-h2>
+      <n-h2 style="margin: 0">代理服务器管理</n-h2>
       <n-space>
         <n-button @click="openExportModal">批量导出</n-button>
         <n-button @click="openImportModal">批量导入</n-button>
@@ -35,7 +35,7 @@
           <n-gi><n-form-item label="协议"><n-select v-model:value="form.protocol" :options="protocolOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
           <n-gi><n-form-item label="Xbox 验证"><n-switch v-model:value="form.xbox_auth_enabled" /></n-form-item></n-gi>
-          <n-gi :span="2"><n-form-item label="代理模式"><n-select v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
+          <n-gi :span="2" v-if="isRaknetProtocol"><n-form-item label="代理模式"><n-select v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="空闲超时"><n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="DNS刷新"><n-input-number v-model:value="form.resolve_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi :span="2">
@@ -708,7 +708,12 @@ const sortedServers = computed(() => {
   return [...servers.value].sort((a, b) => (a.id || '').localeCompare(b.id || ''))
 })
 
-const protocolOptions = [{ label: 'RakNet', value: 'raknet' }, { label: 'UDP', value: 'udp' }]
+const protocolOptions = [
+  { label: 'RakNet', value: 'raknet' },
+  { label: 'UDP', value: 'udp' },
+  { label: 'TCP', value: 'tcp' },
+  { label: 'TCP+UDP', value: 'tcp_udp' }
+]
 const proxyModeOptions = [
   { label: 'Raw UDP (反检测推荐)', value: 'raw_udp' },
   { label: 'Passthrough', value: 'passthrough' },
@@ -755,6 +760,7 @@ const generateDefaultMOTD = (name, port) => {
   return `MCPE;§a${name || '代理服务器'};712;1.21.50;0;100;${serverUID};${name || '代理服务器'};Survival;1;${port || 19132};${port || 19132};0;`
 }
 const form = ref({ ...defaultForm })
+const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
 
 // 存储代理出站详情用于显示类型标签
 const proxyOutboundDetails = ref({})
