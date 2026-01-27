@@ -21,7 +21,8 @@
     "show_real_latency": true,
     "load_balance": "",
     "load_balance_sort": "",
-    "protocol_version": 0
+    "protocol_version": 0,
+    "auto_ping_interval_minutes": 0
   },
   {
     "id": "cubecraft",
@@ -41,11 +42,12 @@
     "proxy_mode": "passthrough",
     "xbox_auth_enabled": false,
     "xbox_token_path": "xbox_token.json",
-    "proxy_outbound": "🇭🇰 香港 04丨1x [HK],🇭🇰 香港 05丨1x [HK]",
+    "proxy_outbound": "HK-1,剩余流量：199.82 GB,HK-2",
     "show_real_latency": true,
-    "load_balance": "",
-    "load_balance_sort": "",
-    "protocol_version": 0
+    "load_balance": "least-latency",
+    "load_balance_sort": "udp",
+    "protocol_version": 0,
+    "auto_ping_interval_minutes": 11
   },
   {
     "id": "play.venitymc.com",
@@ -69,6 +71,7 @@
     "show_real_latency": true,
     "load_balance": "",
     "load_balance_sort": "",
-    "protocol_version": 0
+    "protocol_version": 0,
+    "auto_ping_interval_minutes": 0
   }
 ]

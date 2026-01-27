@@ -54,8 +54,10 @@ type ServerConfig struct {
 	LoadBalance     string `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
 	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
 	ProtocolVersion int    `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
-	resolvedIP      string
-	lastResolved    time.Time
+	// Load balancing ping interval
+	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval in minutes
+	resolvedIP             string
+	lastResolved           time.Time
 }
 
 // GetProxyMode returns the proxy mode, defaulting to "transparent".
@@ -154,6 +156,8 @@ type ServerConfigDTO struct {
 	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type
 	Status          string `json:"status"`            // running, stopped
 	ActiveSessions  int    `json:"active_sessions"`
+	// Load balancing ping interval
+	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval
 }
 
 // ToDTO converts the server config to a DTO for API responses.
@@ -182,6 +186,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		LoadBalanceSort: sc.LoadBalanceSort,
 		Status:          status,
 		ActiveSessions:  activeSessions,
+		AutoPingIntervalMinutes: sc.AutoPingIntervalMinutes,
 	}
 }
 

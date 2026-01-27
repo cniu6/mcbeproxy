@@ -128,6 +128,32 @@ func (m *ProxyOutboundConfigManager) GetAllOutbounds() []*ProxyOutbound {
 	return outbounds
 }
 
+// GetAll returns all proxy outbound configurations.
+// It is an alias for GetAllOutbounds (kept for scheduler compatibility).
+func (m *ProxyOutboundConfigManager) GetAll() []*ProxyOutbound {
+	return m.GetAllOutbounds()
+}
+
+// GetByName returns a proxy outbound configuration by name.
+// It is an alias for GetOutbound (kept for scheduler compatibility).
+func (m *ProxyOutboundConfigManager) GetByName(name string) (*ProxyOutbound, bool) {
+	return m.GetOutbound(name)
+}
+
+// GetByGroup returns all proxy outbound configurations in the given group.
+func (m *ProxyOutboundConfigManager) GetByGroup(group string) []*ProxyOutbound {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	outbounds := make([]*ProxyOutbound, 0)
+	for _, outbound := range m.outbounds {
+		if outbound.Group == group {
+			outbounds = append(outbounds, outbound.Clone())
+		}
+	}
+	return outbounds
+}
+
 // AddOutbound adds a new proxy outbound configuration.
 func (m *ProxyOutboundConfigManager) AddOutbound(config *ProxyOutbound) error {
 	if err := config.Validate(); err != nil {

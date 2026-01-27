@@ -52,6 +52,50 @@
           <n-gi><n-form-item label="真实延迟"><n-switch v-model:value="form.show_real_latency" /><template #feedback>在服务器列表显示通过代理的真实延迟</template></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="禁用消息"><n-input v-model:value="form.disabled_message" type="textarea" :rows="2" /></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="自定义MOTD"><n-input v-model:value="form.custom_motd" type="textarea" :rows="2" /></n-form-item></n-gi>
+
+          <!-- 负载均衡配置 -->
+          <n-gi :span="2" v-if="isGroupOrMultiNode">
+            <n-divider style="margin: 8px 0">负载均衡配置</n-divider>
+          </n-gi>
+          <n-gi :span="2" v-if="isGroupOrMultiNode">
+            <n-alert type="info" style="margin-bottom: 12px">
+              多节点或分组模式需要配置负载均衡策略。系统将按照设定的策略和间隔定时测试节点延迟，自动选择最优节点。
+            </n-alert>
+            <n-form-item label="负载策略" label-placement="left" label-width="100">
+              <n-select v-model:value="form.load_balance" :options="loadBalanceOptions" placeholder="选择负载策略" />
+            </n-form-item>
+            <n-grid :cols="2" :x-gap="16" style="margin-top: 12px">
+              <n-gi>
+                <n-form-item label="延迟类型" label-placement="left" label-width="100">
+                  <n-select v-model:value="form.load_balance_sort" :options="loadBalanceSortOptions" placeholder="选择延迟类型" />
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="Ping间隔" label-placement="left" label-width="100">
+                  <n-input-number
+                    v-model:value="form.auto_ping_interval_minutes"
+                    :min="1"
+                    placeholder="建议10分钟以上"
+                    style="width: 100%"
+                  >
+                    <template #suffix>分钟</template>
+                  </n-input-number>
+                </n-form-item>
+              </n-gi>
+            </n-grid>
+            <n-space style="margin-top: 8px" align="center">
+              <n-button secondary size="small" @click="showBestNodePreview">
+                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg></n-icon></template>
+                查看当前最优节点
+              </n-button>
+              <n-text v-if="getCurrentNodeInfo" depth="3" style="font-size: 13px">
+                当前: <n-text strong>{{ getCurrentNodeInfo.display }}</n-text>
+                <n-tag v-if="getCurrentNodeInfo.latency !== '-'" type="info" size="small" style="margin-left: 4px">
+                  {{ getCurrentNodeInfo.latency }}
+                </n-tag>
+              </n-text>
+            </n-space>
+          </n-gi>
         </n-grid>
       </n-form>
       <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveServer">保存</n-button></n-space></template>
@@ -682,8 +726,103 @@
         </n-space>
       </template>
     </n-modal>
+
+    <!-- 最优节点列表弹窗 -->
+    <n-modal v-model:show="showBestNodeModal" preset="card" title="节点延迟排序与测试" style="width: 1200px; max-width: 95vw">
+      <n-spin :show="bestNodeTesting">
+        <n-space vertical>
+          <n-alert type="info">
+            根据当前配置的延迟类型（{{ bestNodeSortType }}），显示所有候选节点。延迟最低的节点将高亮显示为"最优"。
+          </n-alert>
+
+          <!-- 批量操作按钮（选中节点时显示） -->
+          <n-space style="margin-bottom: 8px" align="center" v-if="bestNodeCheckedKeys.length > 0">
+            <n-tag type="success" size="small">已选 {{ bestNodeCheckedKeys.length }} 个节点</n-tag>
+            <n-dropdown trigger="click" :options="batchTestOptions" @select="handleBestNodeBatchTest">
+              <n-button type="info" size="small" :loading="bestNodeBatchTesting">
+                {{ bestNodeBatchTesting ? `测试中 ${bestNodeBatchProgress.current}/${bestNodeBatchProgress.total}` : `批量测试` }}
+              </n-button>
+            </n-dropdown>
+            <n-button size="small" @click="bestNodeCheckedKeys = []">取消选择</n-button>
+          </n-space>
+
+          <!-- 操作工具栏 -->
+          <n-space justify="space-between" align="center" wrap>
+            <n-space>
+              <n-button type="primary" size="small" @click="batchTestBestNodes('tcp')" :loading="bestNodeTesting">
+                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg></n-icon></template>
+                测试全部TCP
+              </n-button>
+              <n-button size="small" @click="batchTestBestNodes('http')" :loading="bestNodeTesting">测试全部HTTP</n-button>
+              <n-button size="small" @click="batchTestBestNodes('udp')" :loading="bestNodeTesting">测试全部UDP</n-button>
+              <n-button size="small" @click="batchTestBestNodes('all')" :loading="bestNodeTesting">一键测试全部</n-button>
+              <n-divider vertical />
+              <n-button type="success" size="small" @click="recalculateBestNode">
+                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></n-icon></template>
+                重新计算最优节点
+              </n-button>
+            </n-space>
+            <n-space align="center" wrap>
+              <span style="font-size: 12px; color: var(--n-text-color-3)">HTTP 测试地址:</span>
+              <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" style="width: 220px" size="small" clearable />
+              <span style="font-size: 12px; color: var(--n-text-color-3)">UDP(MCBE) 地址:</span>
+              <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" style="width: 200px" size="small" />
+            </n-space>
+          </n-space>
+
+          <!-- 筛选工具栏 -->
+          <n-space align="center" wrap>
+            <n-select v-model:value="bestNodeFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable size="small" />
+            <n-select v-model:value="bestNodeFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable size="small" />
+            <n-checkbox v-model:checked="bestNodeFilter.udpOnly" size="small">仅UDP可用</n-checkbox>
+            <n-input v-model:value="bestNodeFilter.search" placeholder="搜索" style="width: 150px" clearable size="small" />
+            <n-tag v-if="filteredBestNodeList.length !== bestNodeRawData.length" type="info" size="small">
+              {{ filteredBestNodeList.length }} / {{ bestNodeRawData.length }}
+            </n-tag>
+          </n-space>
+
+          <!-- 测试进度 -->
+          <n-progress v-if="bestNodeTesting" type="line" :percentage="bestNodeProgress.percentage" :status="bestNodeProgress.status">
+            {{ bestNodeProgress.current }}/{{ bestNodeProgress.total }} (成功: {{ bestNodeProgress.success }}, 失败: {{ bestNodeProgress.failed }})
+          </n-progress>
+
+          <!-- 数据表格（支持多选和拖拽） -->
+          <n-data-table
+            :columns="bestNodeColumnsWithActions"
+            :data="filteredBestNodeList"
+            :max-height="450"
+            :scroll-x="1100"
+            :row-class-name="bestNodeRowClassName"
+            :row-key="row => row.name"
+            :row-props="bestNodeSelectRowProps"
+            v-model:checked-row-keys="bestNodeCheckedKeys"
+            :pagination="bestNodePagination"
+            @update:page="p => bestNodePagination.page = p"
+            @update:page-size="s => { bestNodePagination.pageSize = s; bestNodePagination.page = 1 }"
+          />
+        </n-space>
+      </n-spin>
+
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showBestNodeModal = false">关闭</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </div>
 </template>
+
+<style scoped>
+/* 高亮最优节点 */
+:deep(.best-node-row) {
+  background-color: rgba(24, 160, 88, 0.1) !important;
+  font-weight: 600;
+}
+
+:deep(.best-node-row:hover) {
+  background-color: rgba(24, 160, 88, 0.15) !important;
+}
+</style>
 
 <script setup>
 import { ref, computed, onMounted, h, nextTick } from 'vue'
@@ -725,12 +864,13 @@ const proxyModeOptions = [
   { label: 'RakNet', value: 'raknet' }
 ]
 const proxyOutboundOptions = ref([{ label: '直连 (不使用代理)', value: '' }])
-const defaultForm = { 
-  id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true, 
-  disabled_message: '§c服务器维护中§r\n§7请稍后再试', 
+const defaultForm = {
+  id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true,
+  disabled_message: '§c服务器维护中§r\n§7请稍后再试',
   custom_motd: '', // 留空则从远程服务器获取
   xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
-  load_balance: '', load_balance_sort: ''
+  load_balance: 'least-latency', load_balance_sort: 'udp',
+  auto_ping_interval_minutes: 10 // 负载均衡Ping间隔（分钟）
 }
 
 // Load balance strategy options
@@ -744,8 +884,7 @@ const loadBalanceOptions = [
 
 // Load balance sort options
 const loadBalanceSortOptions = [
-  { label: 'UDP延迟 (默认)', value: '' },
-  { label: 'UDP延迟', value: 'udp' },
+  { label: 'UDP延迟 (MCBE默认)', value: 'udp' },
   { label: 'TCP延迟', value: 'tcp' },
   { label: 'HTTP延迟', value: 'http' }
 ]
@@ -755,6 +894,13 @@ const isGroupSelection = computed(() => {
   const value = form.value.proxy_outbound
   if (!value) return false
   // 分组选择（以@开头）或多节点选择（包含逗号）都需要显示负载均衡选项
+  return value.startsWith('@') || value.includes(',')
+})
+
+// 判断是否为分组或多节点模式（需要负载均衡配置）
+const isGroupOrMultiNode = computed(() => {
+  const value = form.value.proxy_outbound
+  if (!value || value === 'direct') return false
   return value.startsWith('@') || value.includes(',')
 })
 
@@ -964,6 +1110,129 @@ const formBatchProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
 
 // 代理节点详情弹窗相关
 const showProxyDetailModal = ref(false)
+
+// 最优节点列表弹窗相关
+const showBestNodeModal = ref(false)
+const bestNodeList = ref([])
+const bestNodeRawData = ref([]) // 保存原始节点数据
+const bestNodeSortType = ref('UDP')
+const bestNodeTesting = ref(false)
+const bestNodeProgress = ref({ current: 0, total: 0, success: 0, failed: 0, percentage: 0, status: 'default' })
+const bestNodeFilter = ref({ group: '', protocol: '', udpOnly: false, search: '' })
+const bestNodeCheckedKeys = ref([]) // 多选的节点
+const bestNodeBatchTesting = ref(false) // 批量测试状态
+const bestNodeBatchProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
+const bestNodePagination = ref({
+  page: 1,
+  pageSize: 50,
+  pageSizes: [20, 50, 100, 200],
+  showSizePicker: true,
+  prefix: ({ itemCount }) => `共 ${itemCount} 条`
+})
+
+// 筛选后的最优节点列表
+const filteredBestNodeList = computed(() => {
+  let list = [...bestNodeRawData.value]
+
+  // 分组筛选
+  if (bestNodeFilter.value.group) {
+    if (bestNodeFilter.value.group === '_ungrouped') {
+      list = list.filter(o => !o.group)
+    } else {
+      list = list.filter(o => o.group === bestNodeFilter.value.group)
+    }
+  }
+
+  // 协议筛选
+  if (bestNodeFilter.value.protocol) {
+    list = list.filter(o => o.type === bestNodeFilter.value.protocol)
+  }
+
+  // UDP可用性筛选
+  if (bestNodeFilter.value.udpOnly) {
+    list = list.filter(o => o.udp_available !== false)
+  }
+
+  // 搜索筛选
+  if (bestNodeFilter.value.search) {
+    const kw = bestNodeFilter.value.search.toLowerCase()
+    list = list.filter(o =>
+      o.name.toLowerCase().includes(kw) ||
+      o.server.toLowerCase().includes(kw) ||
+      (o.group && o.group.toLowerCase().includes(kw))
+    )
+  }
+
+  return list
+})
+
+// 节点列表表格列定义（完全参考代理出站选择弹窗）
+const bestNodeColumns = [
+  { title: '名称', key: 'name', width: 160, ellipsis: { tooltip: true }, sorter: (a, b) => a.name.localeCompare(b.name) },
+  { title: '分组', key: 'group', width: 100, ellipsis: { tooltip: true }, sorter: (a, b) => {
+    if (!a.group && !b.group) return 0
+    if (!a.group) return -1
+    if (!b.group) return 1
+    return a.group.localeCompare(b.group)
+  }, render: r => r.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => r.group) : '-' },
+  { title: '协议', key: 'type', width: 140, sorter: (a, b) => (a.type || '').localeCompare(b.type || ''), render: r => {
+    const tags = [h(NTag, { type: 'info', size: 'small' }, () => r.type?.toUpperCase())]
+    if (r.network === 'ws') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'WS'))
+    if (r.network === 'grpc') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'gRPC'))
+    if (r.reality) tags.push(h(NTag, { type: 'success', size: 'small', style: 'margin-left: 4px' }, () => 'Reality'))
+    if (r.flow === 'xtls-rprx-vision') tags.push(h(NTag, { type: 'primary', size: 'small', style: 'margin-left: 4px' }, () => 'Vision'))
+    return h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, tags)
+  }},
+  { title: '服务器', key: 'server', width: 160, ellipsis: { tooltip: true }, render: r => `${r.server}:${r.port}` },
+  { title: 'TCP', key: 'latency_ms', width: 70, sorter: (a, b) => (a.latency_ms || 9999) - (b.latency_ms || 9999), render: r => {
+    if (r.latency_ms > 0) {
+      const type = r.latency_ms < 200 ? 'success' : r.latency_ms < 500 ? 'warning' : 'error'
+      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.latency_ms}ms`)
+    }
+    return '-'
+  }},
+  { title: 'HTTP', key: 'http_latency_ms', width: 70, sorter: (a, b) => (a.http_latency_ms || 9999) - (b.http_latency_ms || 9999), render: r => {
+    if (r.http_latency_ms > 0) {
+      const type = r.http_latency_ms < 500 ? 'success' : r.http_latency_ms < 1500 ? 'warning' : 'error'
+      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.http_latency_ms}ms`)
+    }
+    return '-'
+  }},
+  { title: 'UDP', key: 'udp_available', width: 80, sorter: (a, b) => {
+    const getScore = (o) => {
+      if (o.udp_available === true && o.udp_latency_ms > 0) return o.udp_latency_ms
+      if (o.udp_available === true) return 10000
+      if (o.udp_available === false) return 99999
+      return 50000
+    }
+    return getScore(a) - getScore(b)
+  }, render: r => {
+    if (r.udp_available === true) {
+      const latencyText = r.udp_latency_ms > 0 ? `${r.udp_latency_ms}ms` : '✓'
+      const type = r.udp_latency_ms > 0 ? (r.udp_latency_ms < 200 ? 'success' : r.udp_latency_ms < 500 ? 'warning' : 'error') : 'success'
+      return h(NTag, { type, size: 'small', bordered: false }, () => latencyText)
+    }
+    if (r.udp_available === false) return h(NTag, { type: 'error', size: 'small' }, () => '✗')
+    return '-'
+  }},
+  { title: '是否最优', key: 'is_best', width: 80, render: r => h(NTag, { type: r._isBest ? 'success' : 'default', size: 'small' }, () => r._isBest ? '✓ 最优' : '-') }
+]
+
+// 带操作列和多选的表格列
+const bestNodeColumnsWithActions = computed(() => [
+  { type: 'selection' },
+  ...bestNodeColumns,
+  { title: '操作', key: 'actions', width: 160, fixed: 'right', render: r => h(NSpace, { size: 'small' }, () => [
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testBestNode(r.name, 'tcp') } }, () => 'TCP'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testBestNode(r.name, 'http') } }, () => 'HTTP'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testBestNode(r.name, 'udp') } }, () => 'UDP')
+  ])}
+])
+
+// 节点行样式（高亮当前使用的节点）
+const bestNodeRowClassName = (row) => {
+  return row._isSelected ? 'best-node-row' : ''
+}
 const proxyDetailType = ref('single') // 'single', 'multi', 'group'
 const proxyDetailData = ref(null) // 单节点详情
 const proxyDetailNodes = ref([]) // 多节点名称列表
@@ -1011,6 +1280,7 @@ const batchMcbeAddress = ref('mco.cubecraft.net:19132')
 const { rowProps: quickSelectRowProps } = useDragSelect(quickCheckedKeys, 'name')
 const { rowProps: formSelectRowProps } = useDragSelect(formSelectedNodes, 'name')
 const { rowProps: multiDetailRowProps } = useDragSelect(multiDetailCheckedKeys, 'name')
+const { rowProps: bestNodeSelectRowProps } = useDragSelect(bestNodeCheckedKeys, 'name')
 
 const buildHttpTestRequest = (name) => {
   if (customHttpUrl.value) {
@@ -1051,34 +1321,35 @@ const runBatchTestType = async (names, type, progressRef) => {
 // 处理批量测试结果
 const handleBatchTestResult = (name, res, type, progressRef) => {
   progressRef.value.current++
-  
+
   if (type === 'tcp') {
     if (res?.success && res.data?.success) {
       progressRef.value.success++
-      updateProxyOutboundData(name, { latency_ms: res.data.latency_ms, healthy: true })
+      // 同时更新 bestNodeRawData 和 proxyOutboundDetails
+      updateBestNodeData(name, { latency_ms: res.data.latency_ms, healthy: true })
     } else {
       progressRef.value.failed++
-      updateProxyOutboundData(name, { latency_ms: 0, healthy: false })
+      updateBestNodeData(name, { latency_ms: 0, healthy: false })
     }
   } else if (type === 'http') {
     if (res?.success && res.data?.success) {
       progressRef.value.success++
       const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
-      updateProxyOutboundData(name, { 
+      updateBestNodeData(name, {
         http_latency_ms: httpTest?.latency_ms || 0,
         latency_ms: res.data.ping_test?.latency_ms || 0
       })
     } else {
       progressRef.value.failed++
-      updateProxyOutboundData(name, { http_latency_ms: 0 })
+      updateBestNodeData(name, { http_latency_ms: 0 })
     }
   } else {
     if (res?.success && res.data?.success) {
       progressRef.value.success++
-      updateProxyOutboundData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
+      updateBestNodeData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
     } else {
       progressRef.value.failed++
-      updateProxyOutboundData(name, { udp_available: false })
+      updateBestNodeData(name, { udp_available: false })
     }
   }
 }
@@ -2217,10 +2488,327 @@ const onNameChange = () => {
 
 const saveServer = async () => {
   if (!form.value.id || !form.value.name || !form.value.target) { message.warning('请填写必填项'); return }
+
+  // 如果是多节点/分组模式，确保负载均衡配置完整
+  if (isGroupOrMultiNode.value) {
+    if (!form.value.load_balance) {
+      form.value.load_balance = 'least-latency'
+    }
+    if (!form.value.load_balance_sort) {
+      form.value.load_balance_sort = 'udp'
+    }
+    if (!form.value.auto_ping_interval_minutes || form.value.auto_ping_interval_minutes < 1) {
+      form.value.auto_ping_interval_minutes = 10
+    }
+  }
+
   const res = await api(editingId.value ? `/api/servers/${editingId.value}` : '/api/servers', editingId.value ? 'PUT' : 'POST', form.value)
   if (res.success) { message.success(editingId.value ? '已更新' : '已创建'); showEditModal.value = false; load() }
   else message.error(res.error || '操作失败')
 }
+
+// 查看当前最优节点（显示弹窗列表）
+const showBestNodePreview = async () => {
+  const proxyOutbound = form.value.proxy_outbound
+  if (!proxyOutbound || proxyOutbound === 'direct') {
+    message.warning('当前未配置代理节点')
+    return
+  }
+
+  const sortType = form.value.load_balance_sort || 'udp'
+  bestNodeSortType.value = sortType.toUpperCase()
+
+  try {
+    // 获取代理节点列表
+    const res = await api('/api/proxy-outbounds')
+    if (!res.success || !res.data) {
+      message.error('获取节点列表失败')
+      return
+    }
+
+    let targetNodes = []
+    let selectedNodeNames = []
+
+    // 根据proxy_outbound类型筛选节点
+    if (proxyOutbound.startsWith('@')) {
+      // 分组模式
+      const groupName = proxyOutbound.substring(1)
+      targetNodes = res.data.filter(node => node.group === groupName && node.enabled)
+      selectedNodeNames = targetNodes.map(n => n.name)
+    } else if (proxyOutbound.includes(',')) {
+      // 多节点模式
+      const nodeNames = proxyOutbound.split(',').map(n => n.trim())
+      targetNodes = res.data.filter(node => nodeNames.includes(node.name) && node.enabled)
+      selectedNodeNames = nodeNames
+    } else {
+      // 单节点模式
+      targetNodes = res.data.filter(node => node.name === proxyOutbound && node.enabled)
+      selectedNodeNames = [proxyOutbound]
+    }
+
+    if (targetNodes.length === 0) {
+      message.warning('没有找到可用的节点')
+      return
+    }
+
+    // 保存原始数据（不自动标记最优节点）
+    bestNodeRawData.value = targetNodes.map(node => ({
+      ...node,
+      _isBest: false
+    }))
+
+    // 重置筛选和分页
+    bestNodeFilter.value = { group: '', protocol: '', udpOnly: false, search: '' }
+    bestNodePagination.value.page = 1
+
+    // 显示弹窗
+    showBestNodeModal.value = true
+
+    // 显示后自动计算一次最优节点
+    nextTick(() => {
+      recalculateBestNode()
+    })
+
+  } catch (error) {
+    message.error('查询失败: ' + error.message)
+  }
+}
+
+// 测试单个节点
+const testBestNode = async (name, type) => {
+  try {
+    let res
+    if (type === 'tcp') {
+      res = await api('/api/proxy-outbounds/test', 'POST', { name })
+      if (res?.success && res.data?.success) {
+        updateBestNodeData(name, { latency_ms: res.data.latency_ms, healthy: true })
+        message.success(`${name} TCP测试成功: ${res.data.latency_ms}ms`)
+      } else {
+        updateBestNodeData(name, { latency_ms: 0, healthy: false })
+        message.error(`${name} TCP测试失败`)
+      }
+    } else if (type === 'http') {
+      res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildHttpTestRequest(name))
+      if (res?.success && res.data?.success) {
+        const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
+        updateBestNodeData(name, { http_latency_ms: httpTest?.latency_ms || 0 })
+        message.success(`${name} HTTP测试成功: ${httpTest?.latency_ms || 0}ms`)
+      } else {
+        updateBestNodeData(name, { http_latency_ms: 0 })
+        message.error(`${name} HTTP测试失败`)
+      }
+    } else if (type === 'udp') {
+      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
+      if (res?.success && res.data?.success) {
+        updateBestNodeData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
+        message.success(`${name} UDP测试成功: ${res.data.latency_ms}ms`)
+      } else {
+        updateBestNodeData(name, { udp_available: false })
+        message.error(`${name} UDP测试失败`)
+      }
+    }
+  } catch (e) {
+    message.error(`测试失败: ${e.message}`)
+  }
+}
+
+// 更新节点测试数据（强制触发响应式更新）
+const updateBestNodeData = (name, updates) => {
+  const index = bestNodeRawData.value.findIndex(n => n.name === name)
+  if (index >= 0) {
+    // 使用替换方式触发响应式更新
+    bestNodeRawData.value[index] = {
+      ...bestNodeRawData.value[index],
+      ...updates
+    }
+  }
+  // 同时更新 proxyOutboundDetails 以保持数据同步
+  updateProxyOutboundData(name, updates)
+}
+
+// 重新计算最优节点（手动触发）
+const recalculateBestNode = () => {
+  const sortType = form.value.load_balance_sort || 'udp'
+  const latencyKey = sortType === 'tcp' ? 'latency_ms' : sortType === 'http' ? 'http_latency_ms' : 'udp_latency_ms'
+
+  // 先清除所有节点的最优标记
+  bestNodeRawData.value.forEach(node => {
+    node._isBest = false
+  })
+
+  // 找出延迟最低的节点
+  let bestNode = null
+  let bestLatency = 999999
+
+  for (const node of bestNodeRawData.value) {
+    const latency = node[latencyKey] || 999999
+    if (latency > 0 && latency < bestLatency) {
+      bestLatency = latency
+      bestNode = node
+    }
+  }
+
+  // 标记最优节点
+  if (bestNode) {
+    bestNode._isBest = true
+  }
+
+  // 强制更新数组以触发响应式
+  bestNodeRawData.value = [...bestNodeRawData.value]
+
+  message.success(bestNode ? `最优节点: ${bestNode.name} (${bestLatency}ms)` : '没有找到可用节点')
+}
+
+// 批量测试所有节点
+const batchTestBestNodes = async (testType) => {
+  if (bestNodeRawData.value.length === 0) {
+    message.warning('没有可测试的节点')
+    return
+  }
+
+  bestNodeTesting.value = true
+  const nodes = bestNodeRawData.value.map(n => n.name)
+
+  let totalTests = nodes.length
+  if (testType === 'all') {
+    totalTests = nodes.length * 3
+  }
+
+  bestNodeProgress.value = {
+    current: 0,
+    total: totalTests,
+    success: 0,
+    failed: 0,
+    percentage: 0,
+    status: 'default'
+  }
+
+  try {
+    if (testType === 'all') {
+      message.info(`开始一键测试 ${nodes.length} 个节点（TCP+HTTP+UDP）...`)
+      await runBatchTestType(nodes, 'tcp', bestNodeProgress)
+      await runBatchTestType(nodes, 'http', bestNodeProgress)
+      await runBatchTestType(nodes, 'udp', bestNodeProgress)
+    } else {
+      message.info(`开始 ${testType.toUpperCase()} 测试 ${nodes.length} 个节点...`)
+      await runBatchTestType(nodes, testType, bestNodeProgress)
+    }
+
+    bestNodeProgress.value.status = 'success'
+    message.success(`测试完成: ${bestNodeProgress.value.success} 成功, ${bestNodeProgress.value.failed} 失败`)
+
+    // 测试完成后强制刷新表格并重新计算最优节点
+    bestNodeRawData.value = [...bestNodeRawData.value]
+    recalculateBestNode()
+  } catch (error) {
+    bestNodeProgress.value.status = 'error'
+    message.error(`测试失败: ${error.message}`)
+  } finally {
+    bestNodeTesting.value = false
+  }
+}
+
+// 处理选中节点的批量测试
+const handleBestNodeBatchTest = async (key) => {
+  const names = bestNodeCheckedKeys.value.filter(name => proxyOutboundDetails.value[name])
+  if (names.length === 0) {
+    message.warning('没有可测试的节点')
+    return
+  }
+
+  bestNodeBatchTesting.value = true
+
+  if (key === 'all') {
+    const totalTests = names.length * 3
+    bestNodeBatchProgress.value = { current: 0, total: totalTests, success: 0, failed: 0 }
+    message.info(`开始一键测试 ${names.length} 个节点...`)
+    await runBatchTestType(names, 'tcp', bestNodeBatchProgress)
+    await runBatchTestType(names, 'http', bestNodeBatchProgress)
+    await runBatchTestType(names, 'udp', bestNodeBatchProgress)
+  } else {
+    bestNodeBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
+    message.info(`开始 ${key.toUpperCase()} 测试 ${names.length} 个节点...`)
+    await runBatchTestType(names, key, bestNodeBatchProgress)
+  }
+
+  bestNodeBatchTesting.value = false
+  message.success(`测试完成: ${bestNodeBatchProgress.value.success} 成功, ${bestNodeBatchProgress.value.failed} 失败`)
+
+  // 测试完成后强制刷新表格并重新计算最优节点
+  bestNodeRawData.value = [...bestNodeRawData.value]
+  recalculateBestNode()
+}
+
+// 获取当前选择的节点和延迟信息（用于表单显示）
+const getCurrentNodeInfo = computed(() => {
+  const proxyOutbound = form.value.proxy_outbound
+  if (!proxyOutbound || proxyOutbound === 'direct') {
+    return null
+  }
+
+  const sortType = form.value.load_balance_sort || 'udp'
+  const latencyKey = sortType === 'tcp' ? 'latency_ms' : sortType === 'http' ? 'http_latency_ms' : 'udp_latency_ms'
+
+  // 分组模式：显示分组名 + 最优节点延迟
+  if (proxyOutbound.startsWith('@')) {
+    const groupName = proxyOutbound.substring(1)
+    const displayName = groupName ? `@${groupName}` : '@(未分组)'
+
+    // 找出该分组中延迟最低的节点
+    const groupNodes = Object.values(proxyOutboundDetails.value).filter(o =>
+      o.enabled && (o.group || '') === groupName
+    )
+    if (groupNodes.length === 0) {
+      return { display: displayName, latency: '未测试' }
+    }
+
+    const bestNode = groupNodes.reduce((best, node) => {
+      const bestLatency = best[latencyKey] || 999999
+      const nodeLatency = node[latencyKey] || 999999
+      return nodeLatency < bestLatency ? node : best
+    })
+
+    const latency = bestNode[latencyKey] || 0
+    return {
+      display: `${displayName} (${bestNode.name})`,
+      latency: latency > 0 ? `${latency}ms` : '未测试'
+    }
+  }
+
+  // 多节点模式：显示节点数 + 最优节点延迟
+  if (proxyOutbound.includes(',')) {
+    const nodeNames = proxyOutbound.split(',').map(n => n.trim())
+    const nodes = nodeNames.map(name => proxyOutboundDetails.value[name]).filter(Boolean)
+
+    if (nodes.length === 0) {
+      return { display: `多节点(${nodeNames.length}个)`, latency: '未测试' }
+    }
+
+    const bestNode = nodes.reduce((best, node) => {
+      const bestLatency = best[latencyKey] || 999999
+      const nodeLatency = node[latencyKey] || 999999
+      return nodeLatency < bestLatency ? node : best
+    })
+
+    const latency = bestNode[latencyKey] || 0
+    return {
+      display: `多节点 (${bestNode.name})`,
+      latency: latency > 0 ? `${latency}ms` : '未测试'
+    }
+  }
+
+  // 单节点：显示节点名 + 延迟
+  const detail = proxyOutboundDetails.value[proxyOutbound]
+  if (!detail) {
+    return { display: proxyOutbound, latency: '未测试' }
+  }
+
+  const latency = detail[latencyKey] || 0
+  return {
+    display: proxyOutbound,
+    latency: latency > 0 ? `${latency}ms` : '未测试'
+  }
+})
 
 const deleteServer = async (id) => {
   const res = await api(`/api/servers/${id}`, 'DELETE')
