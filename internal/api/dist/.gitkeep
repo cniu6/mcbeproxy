@@ -1,2 +1,1 @@
-# Placeholder to ensure dist directory exists for go:embed
-# This file will be replaced when running: npm run build (in web/)
+

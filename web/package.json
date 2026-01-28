@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node -e \"const fs = require('fs'); const path = '../internal/api/dist'; if (fs.existsSync(path)) { fs.rmSync(path, { recursive: true, force: true }); console.log('Cleaned:', path); }\"",
     "build": "vite build",
     "preview": "vite preview"
   },

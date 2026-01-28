@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -364,6 +365,11 @@ func (cm *ConfigManager) Load() error {
 
 	data, err := os.ReadFile(cm.configPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// If config file doesn't exist, start with empty config.
+			cm.servers = make(map[string]*ServerConfig)
+			return nil
+		}
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
@@ -708,6 +714,18 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 	cm.watcherMu.Lock()
 	cm.watcher = watcher
 	cm.watcherMu.Unlock()
+
+	// Ensure the config file exists before watching (same behavior as other config managers).
+	if _, err := os.Stat(cm.configPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(cm.configPath), 0755); err != nil {
+			cm.closeWatcher()
+			return fmt.Errorf("failed to create config dir: %w", err)
+		}
+		if err := os.WriteFile(cm.configPath, []byte("[]"), 0644); err != nil {
+			cm.closeWatcher()
+			return fmt.Errorf("failed to create config file: %w", err)
+		}
+	}
 
 	// Add the config file to the watcher
 	if err := watcher.Add(cm.configPath); err != nil {

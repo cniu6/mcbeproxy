@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"mcpeserverproxy/internal/acl"
@@ -42,6 +43,19 @@ func main() {
 		fmt.Printf("Build Time: %s\n", logger.BuildTime)
 		fmt.Printf("Git Commit: %s\n", logger.GitCommit)
 		os.Exit(0)
+	}
+
+	// Initialize JSON files on first run (create when missing, keep when present).
+	ensureJSONFile(*serverListPath, []byte("[]"), "server list config")
+	ensureJSONFile("proxy_outbounds.json", []byte("[]"), "proxy outbounds config")
+	ensureJSONFile("proxy_ports.json", []byte("[]"), "proxy ports config")
+	if _, err := os.Stat(*configPath); os.IsNotExist(err) {
+		defaultCfg := config.DefaultGlobalConfig()
+		if err := defaultCfg.Save(*configPath); err != nil {
+			logger.Warn("Failed to initialize global config file %s: %v", *configPath, err)
+		} else {
+			logger.Info("Initialized global config file: %s", *configPath)
+		}
 	}
 
 	// Load global configuration
@@ -189,4 +203,26 @@ func main() {
 	logger.Close()
 
 	logger.Info("Shutdown complete")
+}
+
+func ensureJSONFile(path string, defaultContent []byte, desc string) {
+	if path == "" {
+		return
+	}
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			logger.Warn("Failed to create directory for %s (%s): %v", desc, path, err)
+			return
+		}
+	}
+
+	if err := os.WriteFile(path, defaultContent, 0644); err != nil {
+		logger.Warn("Failed to initialize %s (%s): %v", desc, path, err)
+		return
+	}
+	logger.Info("Initialized %s: %s", desc, path)
 }
