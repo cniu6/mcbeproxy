@@ -1,8 +1,8 @@
 <template>
   <div class="page-container">
-    <n-space justify="space-between" align="center" style="margin-bottom: 16px; flex-wrap: wrap">
-      <n-h2 style="margin: 0; font-size: 1.5rem">代理出站管理</n-h2>
-      <n-space wrap>
+    <n-space justify="space-between" align="center" style="margin-bottom: 16px">
+      <n-h2 style="margin: 0">代理出站管理</n-h2>
+      <n-space>
         <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
           <n-button type="info">批量测试 ({{ checkedRowKeys.length }})</n-button>
         </n-dropdown>
@@ -91,13 +91,13 @@
     </div>
 
     <!-- 分组筛选 -->
-    <n-card size="small" style="margin-bottom: 16px; overflow: hidden">
+    <n-card size="small" style="margin-bottom: 16px">
       <n-space align="center" wrap>
         <span>协议:</span>
         <n-select 
           v-model:value="selectedProtocol" 
           :options="protocolFilterOptions" 
-          style="min-width: 100px; max-width: 150px" 
+          style="width: 150px" 
           placeholder="全部协议"
           clearable
         />
@@ -105,14 +105,14 @@
         <n-select 
           v-model:value="selectedStatus" 
           :options="statusFilterOptions" 
-          style="min-width: 80px; max-width: 120px" 
+          style="width: 120px" 
           placeholder="全部"
           clearable
         />
         <n-input 
           v-model:value="searchKeyword" 
           placeholder="搜索节点名称/服务器" 
-          style="min-width: 120px; max-width: 200px; margin-left: 16px"
+          style="width: 200px; margin-left: 16px"
           clearable
         />
         <n-tag v-if="filteredOutbounds.length !== outbounds.length" type="info">
@@ -139,9 +139,9 @@
     </n-card>
 
     <!-- 编辑 Modal -->
-    <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" style="width: 700px; max-width: 95vw;">
-      <n-form :model="form" label-placement="left" label-width="100" class="responsive-form">
-        <n-grid :cols="2" :x-gap="16" responsive="screen">
+    <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" style="width: 700px">
+      <n-form :model="form" label-placement="left" label-width="100">
+        <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="节点名称" required><n-input v-model:value="form.name" :disabled="!!editingName" placeholder="唯一标识（建议英文）" /></n-form-item></n-gi>
           <n-gi><n-form-item label="协议类型" required><n-select v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
           <n-gi><n-form-item label="服务器地址" required><n-input v-model:value="form.server" placeholder="example.com" /></n-form-item></n-gi>
@@ -1682,44 +1682,13 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 </script>
 
 <style scoped>
-/* 响应式表单样式 */
-.responsive-form :deep(.n-form-item-label) {
-  min-width: 80px;
-}
-
-@media (max-width: 768px) {
-  .responsive-form :deep(.n-form-item-label) {
-    min-width: 70px;
-  }
-}
-
 .page-container {
   width: 100%;
-  max-width: 100%;
-  overflow-x: hidden;
-  box-sizing: border-box;
-}
-
-/* 移动端特殊处理 */
-@media (max-width: 768px) {
-  .page-container {
-    padding: 0 4px;
-  }
+  overflow-x: auto;
 }
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  box-sizing: border-box;
-}
-
-/* 移动端表格特殊处理 */
-@media (max-width: 768px) {
-  .table-wrapper {
-    overflow-x: auto;
-    margin: 0 -4px;
-    padding: 0 4px;
-  }
 }
 .http-body-container {
   border: 1px solid #e0e0e6;
@@ -1744,16 +1713,6 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
   gap: 12px;
   margin-bottom: 16px;
   padding: 4px;
-  width: 100%;
-  box-sizing: border-box;
-}
-
-/* 移动端分组卡片特殊处理 */
-@media (max-width: 768px) {
-  .group-cards-container {
-    gap: 8px;
-    padding: 2px;
-  }
 }
 
 /* 分组卡片包装器 (n-card) */
@@ -1762,15 +1721,6 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
   border-radius: 8px !important;
   transition: all 0.2s ease;
   cursor: pointer;
-  flex-shrink: 0;
-}
-
-/* 移动端分组卡片特殊处理 */
-@media (max-width: 768px) {
-  .group-card-wrapper {
-    width: calc(50% - 4px);
-    min-width: 140px;
-  }
 }
 
 /* 选中状态 - 使用主题色 */
