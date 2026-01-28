@@ -1,0 +1,196 @@
+2026-01-29 00:19:37 [INFO] =================================================
+2026-01-29 00:19:37 [INFO] mcpeserverproxy starting
+2026-01-29 00:19:37 [INFO] Version: dev
+2026-01-29 00:19:37 [INFO] Build Time: unknown
+2026-01-29 00:19:37 [INFO] Git Commit: unknown
+2026-01-29 00:19:37 [INFO] -------------------------------------------------
+2026-01-29 00:19:37 [INFO] Configuration Summary:
+2026-01-29 00:19:37 [INFO]   API Port: 8080
+2026-01-29 00:19:37 [INFO]   Database: data.db
+2026-01-29 00:19:37 [INFO]   Server Count: 0
+2026-01-29 00:19:37 [INFO]   Max Session Records: 100
+2026-01-29 00:19:37 [INFO]   Max Access Log Records: 100
+2026-01-29 00:19:37 [INFO]   Log Directory: logs
+2026-01-29 00:19:37 [INFO]   Log Retention: 7 days
+2026-01-29 00:19:37 [INFO] =================================================
+2026-01-29 00:19:37 [INFO] Outbound manager started
+2026-01-29 00:19:37 [INFO] Proxy server started with 0 listeners
+2026-01-29 00:19:37 [INFO] Starting API server on :8080
+2026-01-29 00:22:03 [INFO] Shutdown signal received, stopping services...
+2026-01-29 00:22:03 [INFO] Outbound manager stopped
+2026-01-29 00:22:03 [INFO] Proxy server stopped
+2026-01-29 00:24:42 [INFO] =================================================
+2026-01-29 00:24:42 [INFO] mcpeserverproxy starting
+2026-01-29 00:24:42 [INFO] Version: dev
+2026-01-29 00:24:42 [INFO] Build Time: unknown
+2026-01-29 00:24:42 [INFO] Git Commit: unknown
+2026-01-29 00:24:42 [INFO] -------------------------------------------------
+2026-01-29 00:24:42 [INFO] Configuration Summary:
+2026-01-29 00:24:42 [INFO]   API Port: 8080
+2026-01-29 00:24:42 [INFO]   Database: data.db
+2026-01-29 00:24:42 [INFO]   Server Count: 0
+2026-01-29 00:24:42 [INFO]   Max Session Records: 100
+2026-01-29 00:24:42 [INFO]   Max Access Log Records: 100
+2026-01-29 00:24:42 [INFO]   Log Directory: logs
+2026-01-29 00:24:42 [INFO]   Log Retention: 7 days
+2026-01-29 00:24:42 [INFO] =================================================
+2026-01-29 00:24:42 [INFO] Outbound manager started
+2026-01-29 00:24:42 [INFO] Proxy server started with 0 listeners
+2026-01-29 00:24:42 [INFO] Starting API server on :8080
+2026-01-29 00:25:48 [INFO] Shutdown signal received, stopping services...
+2026-01-29 00:25:48 [INFO] Outbound manager stopped
+2026-01-29 00:25:48 [INFO] Proxy server stopped
+2026-01-29 00:39:32 [INFO] =================================================
+2026-01-29 00:39:32 [INFO] mcpeserverproxy starting
+2026-01-29 00:39:32 [INFO] Version: dev
+2026-01-29 00:39:32 [INFO] Build Time: unknown
+2026-01-29 00:39:32 [INFO] Git Commit: unknown
+2026-01-29 00:39:32 [INFO] -------------------------------------------------
+2026-01-29 00:39:32 [INFO] Configuration Summary:
+2026-01-29 00:39:32 [INFO]   API Port: 8080
+2026-01-29 00:39:32 [INFO]   Database: data.db
+2026-01-29 00:39:32 [INFO]   Server Count: 0
+2026-01-29 00:39:32 [INFO]   Max Session Records: 100
+2026-01-29 00:39:32 [INFO]   Max Access Log Records: 100
+2026-01-29 00:39:32 [INFO]   Log Directory: logs
+2026-01-29 00:39:32 [INFO]   Log Retention: 7 days
+2026-01-29 00:39:32 [INFO] =================================================
+2026-01-29 00:39:32 [INFO] Outbound manager started
+2026-01-29 00:39:32 [INFO] Proxy server started with 0 listeners
+2026-01-29 00:39:32 [INFO] Starting API server on :8080
+2026-01-29 00:48:42 [INFO] Shutdown signal received, stopping services...
+2026-01-29 00:48:42 [INFO] Outbound manager stopped
+2026-01-29 00:48:42 [INFO] Proxy server stopped
+2026-01-29 00:48:57 [INFO] =================================================
+2026-01-29 00:48:57 [INFO] mcpeserverproxy starting
+2026-01-29 00:48:57 [INFO] Version: dev
+2026-01-29 00:48:57 [INFO] Build Time: unknown
+2026-01-29 00:48:57 [INFO] Git Commit: unknown
+2026-01-29 00:48:57 [INFO] -------------------------------------------------
+2026-01-29 00:48:57 [INFO] Configuration Summary:
+2026-01-29 00:48:57 [INFO]   API Port: 8080
+2026-01-29 00:48:57 [INFO]   Database: data.db
+2026-01-29 00:48:57 [INFO]   Server Count: 0
+2026-01-29 00:48:57 [INFO]   Max Session Records: 100
+2026-01-29 00:48:57 [INFO]   Max Access Log Records: 100
+2026-01-29 00:48:57 [INFO]   Log Directory: logs
+2026-01-29 00:48:57 [INFO]   Log Retention: 7 days
+2026-01-29 00:48:57 [INFO] =================================================
+2026-01-29 00:48:57 [INFO] Outbound manager started
+2026-01-29 00:48:57 [INFO] Proxy server started with 0 listeners
+2026-01-29 00:48:57 [INFO] Starting API server on :8080
+2026-01-29 00:49:30 [INFO] Using raw UDP forwarding mode for server beta1-20007-lbsg (no RakNet processing)
+2026-01-29 00:49:30 [INFO] Raw UDP proxy started: id=beta1-20007-lbsg, listen=0.0.0.0:20007, target=51.79.173.69:19132 (direct)
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20007-lbsg, listen=0.0.0.0:20007
+2026-01-29 00:49:30 [INFO] Using passthrough proxy mode for server beta1-20001-hive (auth forwarded)
+2026-01-29 00:49:30 [INFO] Passthrough proxy started: id=beta1-20001-hive, listen=0.0.0.0:20001
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20001-hive, listen=0.0.0.0:20001
+2026-01-29 00:49:30 [INFO] Using passthrough proxy mode for server beta1-20002-ven (auth forwarded)
+2026-01-29 00:49:30 [INFO] Passthrough proxy started: id=beta1-20002-ven, listen=0.0.0.0:20002
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20002-ven, listen=0.0.0.0:20002
+2026-01-29 00:49:30 [INFO] Using raw UDP forwarding mode for server beta1-20005-zeqa (no RakNet processing)
+2026-01-29 00:49:30 [INFO] Raw UDP proxy started: id=beta1-20005-zeqa, listen=0.0.0.0:20005, target=40.160.1.214:19132 (direct)
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20005-zeqa, listen=0.0.0.0:20005
+2026-01-29 00:49:30 [INFO] Using passthrough proxy mode for server beta1-20006-sega (auth forwarded)
+2026-01-29 00:49:30 [INFO] Passthrough proxy started: id=beta1-20006-sega, listen=0.0.0.0:20006
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20006-sega, listen=0.0.0.0:20006
+2026-01-29 00:49:30 [INFO] Using raw UDP forwarding mode for server beta1-20004-ng (no RakNet processing)
+2026-01-29 00:49:30 [INFO] Raw UDP proxy started: id=beta1-20004-ng, listen=0.0.0.0:20004, target=15.235.160.135:19132 (direct)
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20004-ng, listen=0.0.0.0:20004
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 6 servers configured
+2026-01-29 00:49:30 [INFO] Using passthrough proxy mode for server beta1-20003-cb (auth forwarded)
+2026-01-29 00:49:30 [INFO] Passthrough proxy started: id=beta1-20003-cb, listen=0.0.0.0:20003
+2026-01-29 00:49:30 [INFO] Server started: id=beta1-20003-cb, listen=0.0.0.0:20003
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:30 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 00:49:31 [INFO] Configuration reloaded: 7 servers configured
+2026-01-29 01:00:15 [INFO] =================================================
+2026-01-29 01:00:15 [INFO] mcpeserverproxy starting
+2026-01-29 01:00:15 [INFO] Version: dev
+2026-01-29 01:00:15 [INFO] Build Time: unknown
+2026-01-29 01:00:15 [INFO] Git Commit: unknown
+2026-01-29 01:00:15 [INFO] -------------------------------------------------
+2026-01-29 01:00:15 [INFO] Configuration Summary:
+2026-01-29 01:00:15 [INFO]   API Port: 8080
+2026-01-29 01:00:15 [INFO]   Database: data.db
+2026-01-29 01:00:15 [INFO]   Server Count: 7
+2026-01-29 01:00:15 [INFO]   Max Session Records: 100
+2026-01-29 01:00:15 [INFO]   Max Access Log Records: 100
+2026-01-29 01:00:15 [INFO]   Log Directory: logs
+2026-01-29 01:00:15 [INFO]   Log Retention: 7 days
+2026-01-29 01:00:15 [INFO] =================================================
+2026-01-29 01:00:15 [INFO] Outbound manager started
+2026-01-29 01:00:15 [INFO] Using raw UDP forwarding mode for server beta1-20007-lbsg (no RakNet processing)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20007-lbsg: failed to start listener: failed to start UDP listener: listen udp 0.0.0.0:20007: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using passthrough proxy mode for server beta1-20001-hive (auth forwarded)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20001-hive: failed to start listener: failed to start RakNet listener: listen raknet: listen udp 0.0.0.0:20001: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using passthrough proxy mode for server beta1-20002-ven (auth forwarded)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20002-ven: failed to start listener: failed to start RakNet listener: listen raknet: listen udp 0.0.0.0:20002: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using raw UDP forwarding mode for server beta1-20005-zeqa (no RakNet processing)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20005-zeqa: failed to start listener: failed to start UDP listener: listen udp 0.0.0.0:20005: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using passthrough proxy mode for server beta1-20006-sega (auth forwarded)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20006-sega: failed to start listener: failed to start RakNet listener: listen raknet: listen udp 0.0.0.0:20006: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using raw UDP forwarding mode for server beta1-20004-ng (no RakNet processing)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20004-ng: failed to start listener: failed to start UDP listener: listen udp 0.0.0.0:20004: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Using passthrough proxy mode for server beta1-20003-cb (auth forwarded)
+2026-01-29 01:00:15 [ERROR] Failed to start listener for server beta1-20003-cb: failed to start listener: failed to start RakNet listener: listen raknet: listen udp 0.0.0.0:20003: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.
+2026-01-29 01:00:15 [INFO] Proxy server started with 0 listeners
+2026-01-29 01:00:15 [INFO] Starting API server on :8080
+2026-01-29 01:00:17 [INFO] Shutdown signal received, stopping services...
+2026-01-29 01:00:17 [INFO] Outbound manager stopped
+2026-01-29 01:00:17 [INFO] Proxy server stopped
+2026-01-29 01:00:18 [INFO] Shutdown signal received, stopping services...
+2026-01-29 01:00:18 [INFO] Raw UDP proxy stopped: id=beta1-20007-lbsg
+2026-01-29 01:00:18 [INFO] Raw UDP proxy stopped: id=beta1-20005-zeqa
+2026-01-29 01:00:18 [INFO] Raw UDP proxy stopped: id=beta1-20004-ng
+2026-01-29 01:00:18 [INFO] Outbound manager stopped
+2026-01-29 01:00:18 [INFO] Proxy server stopped
+2026-01-29 01:00:19 [INFO] =================================================
+2026-01-29 01:00:19 [INFO] mcpeserverproxy starting
+2026-01-29 01:00:19 [INFO] Version: dev
+2026-01-29 01:00:19 [INFO] Build Time: unknown
+2026-01-29 01:00:19 [INFO] Git Commit: unknown
+2026-01-29 01:00:19 [INFO] -------------------------------------------------
+2026-01-29 01:00:19 [INFO] Configuration Summary:
+2026-01-29 01:00:19 [INFO]   API Port: 8080
+2026-01-29 01:00:19 [INFO]   Database: data.db
+2026-01-29 01:00:19 [INFO]   Server Count: 7
+2026-01-29 01:00:19 [INFO]   Max Session Records: 100
+2026-01-29 01:00:19 [INFO]   Max Access Log Records: 100
+2026-01-29 01:00:19 [INFO]   Log Directory: logs
+2026-01-29 01:00:19 [INFO]   Log Retention: 7 days
+2026-01-29 01:00:19 [INFO] =================================================
+2026-01-29 01:00:19 [INFO] Outbound manager started
+2026-01-29 01:00:19 [INFO] Using passthrough proxy mode for server beta1-20001-hive (auth forwarded)
+2026-01-29 01:00:19 [INFO] Passthrough proxy started: id=beta1-20001-hive, listen=0.0.0.0:20001
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20001-hive, listen=0.0.0.0:20001
+2026-01-29 01:00:19 [INFO] Using passthrough proxy mode for server beta1-20002-ven (auth forwarded)
+2026-01-29 01:00:19 [INFO] Passthrough proxy started: id=beta1-20002-ven, listen=0.0.0.0:20002
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20002-ven, listen=0.0.0.0:20002
+2026-01-29 01:00:19 [INFO] Using raw UDP forwarding mode for server beta1-20005-zeqa (no RakNet processing)
+2026-01-29 01:00:19 [INFO] Raw UDP proxy started: id=beta1-20005-zeqa, listen=0.0.0.0:20005, target=40.160.1.214:19132 (direct)
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20005-zeqa, listen=0.0.0.0:20005
+2026-01-29 01:00:19 [INFO] Using passthrough proxy mode for server beta1-20006-sega (auth forwarded)
+2026-01-29 01:00:19 [INFO] Passthrough proxy started: id=beta1-20006-sega, listen=0.0.0.0:20006
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20006-sega, listen=0.0.0.0:20006
+2026-01-29 01:00:19 [INFO] Using raw UDP forwarding mode for server beta1-20004-ng (no RakNet processing)
+2026-01-29 01:00:19 [INFO] Raw UDP proxy started: id=beta1-20004-ng, listen=0.0.0.0:20004, target=15.235.160.135:19132 (direct)
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20004-ng, listen=0.0.0.0:20004
+2026-01-29 01:00:19 [INFO] Using passthrough proxy mode for server beta1-20003-cb (auth forwarded)
+2026-01-29 01:00:19 [INFO] Passthrough proxy started: id=beta1-20003-cb, listen=0.0.0.0:20003
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20003-cb, listen=0.0.0.0:20003
+2026-01-29 01:00:19 [INFO] Using raw UDP forwarding mode for server beta1-20007-lbsg (no RakNet processing)
+2026-01-29 01:00:19 [INFO] Raw UDP proxy started: id=beta1-20007-lbsg, listen=0.0.0.0:20007, target=51.79.173.61:19132 (direct)
+2026-01-29 01:00:19 [INFO] Server started: id=beta1-20007-lbsg, listen=0.0.0.0:20007
+2026-01-29 01:00:19 [INFO] Proxy server started with 7 listeners
+2026-01-29 01:00:19 [INFO] Starting API server on :8080

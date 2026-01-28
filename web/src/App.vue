@@ -39,7 +39,7 @@
               </n-drawer-content>
             </n-drawer>
             
-            <n-layout-content :style="{ padding: isMobile ? '12px' : '16px', overflowX: 'auto' }">
+            <n-layout-content :style="{ padding: isMobile ? '12px' : '16px', overflowX: 'hidden', maxWidth: '100vw', width: '100%' }" class="content-container">
               <Dashboard v-if="currentPage === 'dashboard'" />
               <ServiceStatus v-else-if="currentPage === 'service-status'" />
               <Servers v-else-if="currentPage === 'servers'" />
@@ -183,5 +183,90 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.logo { padding: 16px; font-size: 16px; font-weight: bold; color: #63e2b7; border-bottom: 1px solid #333; }
+.logo { padding: 16px; font-size: 16px; font-weight: bold; color: #63e2b7; border-bottom: 1px solid #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 全局样式，确保所有元素都能正确适应屏幕宽度 */
+* {
+  box-sizing: border-box;
+}
+
+/* 确保按钮和输入框不会超出屏幕宽度 */
+:deep(.n-button),
+:deep(.n-input),
+:deep(.n-select) {
+  max-width: 100%;
+}
+
+/* 确保文字能够正确换行 */
+:deep(.n-text) {
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* 移动端特殊处理 */
+@media (max-width: 767px) {
+  :deep(.n-button),
+  :deep(.n-input),
+  :deep(.n-select) {
+    width: 100%;
+    max-width: 100%;
+  }
+  
+  :deep(.n-space) {
+    width: 100%;
+  }
+  
+  :deep(.n-space > *) {
+    width: 100%;
+  }
+}
+
+/* 桌面端动画效果 */
+@media (min-width: 768px) {
+  .logo {
+    animation: fadeIn 0.5s ease-in-out;
+  }
+  
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateX(-10px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  
+  /* 菜单项动画 */
+  :deep(.n-menu-item) {
+    transition: all 0.3s ease;
+  }
+  
+  :deep(.n-menu-item:hover) {
+    transform: translateX(5px);
+  }
+}
+
+/* 内容容器样式 */
+.content-container {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  box-sizing: border-box;
+}
+
+/* 确保内容区域文字在窗口调整时能够换行 */
+:deep(.n-layout-content) {
+  overflow-x: hidden;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* 确保表格在窗口调整时不会变形 */
+:deep(.n-data-table) {
+  min-width: 100%;
+}
+
+/* 确保卡片内容不会超出屏幕宽度 */
+:deep(.n-card) {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow-wrap: break-word;
+}
 </style>
