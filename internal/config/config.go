@@ -32,7 +32,7 @@ const (
 )
 
 // ServerConfig represents a proxy target server configuration.
-type ServerConfig struct {
+ type ServerConfig struct {
 	ID              string `json:"id"`
 	Name            string `json:"name"`
 	Target          string `json:"target"`
@@ -56,6 +56,7 @@ type ServerConfig struct {
 	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
 	ProtocolVersion int    `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
 	// Load balancing ping interval
+	AutoPingEnabled         bool `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval in minutes
 	resolvedIP             string
 	lastResolved           time.Time
@@ -133,7 +134,7 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 }
 
 // ServerConfigDTO is the data transfer object for server config API responses.
-type ServerConfigDTO struct {
+ type ServerConfigDTO struct {
 	ID              string `json:"id"`
 	Name            string `json:"name"`
 	Target          string `json:"target"`
@@ -158,6 +159,7 @@ type ServerConfigDTO struct {
 	Status          string `json:"status"`            // running, stopped
 	ActiveSessions  int    `json:"active_sessions"`
 	// Load balancing ping interval
+	AutoPingEnabled         bool `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval
 }
 
@@ -187,6 +189,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		LoadBalanceSort: sc.LoadBalanceSort,
 		Status:          status,
 		ActiveSessions:  activeSessions,
+		AutoPingEnabled:         sc.AutoPingEnabled,
 		AutoPingIntervalMinutes: sc.AutoPingIntervalMinutes,
 	}
 }

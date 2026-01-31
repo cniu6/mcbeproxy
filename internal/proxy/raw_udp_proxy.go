@@ -619,7 +619,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 		sortBy := p.config.GetLoadBalanceSort()
 
 		// Select a node using load balancing
-		selectedOutbound, err := p.outboundMgr.SelectOutboundWithFailover(proxyOutbound, strategy, sortBy, nil)
+		selectedOutbound, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil)
 		if err != nil {
 			return nil, "", fmt.Errorf("no healthy nodes available: %w", err)
 		}
@@ -915,7 +915,23 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 					// Clean up stale split packets for active clients
 					clientInfo.mu.Lock()
 					clientInfo.cleanupStaleSplitPackets()
+					playerName := clientInfo.playerName
+					playerUUID := clientInfo.playerUUID
+					playerXUID := clientInfo.playerXUID
 					clientInfo.mu.Unlock()
+
+					if clientInfo.loginParsed.Load() && playerName != "" {
+						sess, exists := p.sessionMgr.Get(clientInfo.sessionID)
+						if !exists {
+							sess, _ = p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
+							if sess != nil {
+								sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
+							}
+						}
+						if sess != nil {
+							sess.UpdateLastSeen()
+						}
+					}
 				}
 				return true
 			})

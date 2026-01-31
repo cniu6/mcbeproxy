@@ -2,9 +2,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +30,8 @@ type Listener interface {
 	Listen(ctx context.Context) error
 	Stop() error
 }
+
+const defaultAutoPingIntervalMinutes = 10
 
 // ProxyServer is the main entry point that integrates all proxy components.
 // It manages UDP listeners, session management, configuration, and database persistence.
@@ -354,6 +360,9 @@ func (p *ProxyServer) Start() error {
 		}
 	}
 
+	// Start auto ping scheduler (per-server, per-node latency cache)
+	p.startAutoPingScheduler()
+
 	// Start proxy ports (local HTTP/SOCKS) if enabled
 	if p.proxyPortManager != nil {
 		if err := p.proxyPortManager.Start(p.config != nil && p.config.ProxyPortsEnabled); err != nil {
@@ -363,6 +372,222 @@ func (p *ProxyServer) Start() error {
 
 	logger.Info("Proxy server started with %d listeners", p.listenerCount())
 	return nil
+}
+
+func (p *ProxyServer) startAutoPingScheduler() {
+	if p.configMgr == nil || p.outboundMgr == nil {
+		return
+	}
+	if p.ctx == nil {
+		return
+	}
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		gm := monitor.GetGoroutineManager()
+		gid := gm.TrackBackground("auto-ping", "proxy-server", "Auto ping scheduler", p.cancel)
+		defer gm.Untrack(gid)
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		lastRun := make(map[string]time.Time)
+
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			servers := p.configMgr.GetAllServers()
+			now := time.Now()
+
+			for _, serverCfg := range servers {
+				if serverCfg == nil {
+					continue
+				}
+				if !serverCfg.AutoPingEnabled {
+					continue
+				}
+				intervalMin := serverCfg.AutoPingIntervalMinutes
+				if intervalMin <= 0 {
+					intervalMin = defaultAutoPingIntervalMinutes
+				}
+
+				if t, ok := lastRun[serverCfg.ID]; ok {
+					if now.Sub(t) < time.Duration(intervalMin)*time.Minute {
+						continue
+					}
+				}
+
+				p.pingAllNodesForServer(serverCfg)
+				lastRun[serverCfg.ID] = now
+			}
+		}
+	}()
+}
+
+func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig) {
+	if serverCfg == nil || p.outboundMgr == nil {
+		return
+	}
+
+	proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		return
+	}
+
+	targetAddr := serverCfg.GetTargetAddr()
+	destAddr, err := resolveUDPAddr(targetAddr)
+	if err != nil {
+		logger.Debug("auto ping resolve target failed: server=%s target=%s err=%v", serverCfg.ID, targetAddr, err)
+		return
+	}
+
+	sortBy := serverCfg.GetLoadBalanceSort()
+	if sortBy == "" {
+		sortBy = config.LoadBalanceSortUDP
+	}
+
+	nodeNames := p.getServerNodeNames(serverCfg)
+	if len(nodeNames) == 0 {
+		return
+	}
+
+	for _, nodeName := range nodeNames {
+		select {
+		case <-p.ctx.Done():
+			return
+		default:
+		}
+
+		latencyMs := p.pingServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr)
+		if latencyMs > 0 {
+			p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, latencyMs)
+		} else {
+			p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, 0)
+		}
+	}
+}
+
+func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []string {
+	if serverCfg == nil || p.outboundMgr == nil {
+		return nil
+	}
+	proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		return nil
+	}
+
+	// Group selection
+	if serverCfg.IsGroupSelection() {
+		groupName := serverCfg.GetGroupName()
+		nodes := p.outboundMgr.GetOutboundsByGroup(groupName)
+		out := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			out = append(out, n.Name)
+		}
+		return out
+	}
+
+	// Multi node selection
+	if serverCfg.IsMultiNodeSelection() {
+		ns := serverCfg.GetNodeList()
+		out := make([]string, 0, len(ns))
+		for _, n := range ns {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+
+	// Single node
+	return []string{proxyOutbound}
+}
+
+func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr string, destAddr *net.UDPAddr) int64 {
+	if p.outboundMgr == nil {
+		return -1
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
+	defer cancel()
+
+	conn, err := p.outboundMgr.DialPacketConn(ctx, nodeName, targetAddr)
+	if err != nil {
+		logger.Debug("auto ping dial failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
+		return -1
+	}
+	defer conn.Close()
+
+	pingPacket := buildRakNetPingPacket()
+
+	startTime := time.Now()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.WriteTo(pingPacket, destAddr)
+	if err != nil {
+		logger.Debug("auto ping write failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
+		return -1
+	}
+
+	buf := make([]byte, 1500)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := conn.ReadFrom(buf)
+	latencyMs := time.Since(startTime).Milliseconds()
+	if err != nil {
+		logger.Debug("auto ping read failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
+		return -1
+	}
+	if n <= 0 || buf[0] != 0x1c {
+		logger.Debug("auto ping invalid pong: server=%s node=%s target=%s", serverID, nodeName, targetAddr)
+		return -1
+	}
+
+	return latencyMs
+}
+
+func buildRakNetPingPacket() []byte {
+	// 0x01 + timestamp(8 bytes BE) + MAGIC(16 bytes) + clientGUID(8 bytes)
+	var pingPacket bytes.Buffer
+	pingPacket.WriteByte(0x01)
+	_ = binary.Write(&pingPacket, binary.BigEndian, time.Now().UnixMilli())
+	pingPacket.Write(raknetMagic)
+	_ = binary.Write(&pingPacket, binary.BigEndian, uint64(12345678901234567))
+	return pingPacket.Bytes()
+}
+
+func resolveUDPAddr(address string) (*net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, err
+	}
+
+	udpAddr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
+	if udpAddr.IP != nil {
+		return udpAddr, nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		if err == nil {
+			err = fmt.Errorf("no A/AAAA records")
+		}
+		return nil, err
+	}
+	udpAddr.IP = ips[0]
+	return udpAddr, nil
 }
 
 // startListener creates and starts a listener for a server configuration.

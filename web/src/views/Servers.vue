@@ -47,8 +47,6 @@
               </n-space>
             </n-form-item>
           </n-gi>
-          <n-gi v-if="isGroupSelection"><n-form-item label="负载均衡"><n-select v-model:value="form.load_balance" :options="loadBalanceOptions" /></n-form-item></n-gi>
-          <n-gi v-if="isGroupSelection"><n-form-item label="延迟排序"><n-select v-model:value="form.load_balance_sort" :options="loadBalanceSortOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="真实延迟"><n-switch v-model:value="form.show_real_latency" /><template #feedback>在服务器列表显示通过代理的真实延迟</template></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="禁用消息"><n-input v-model:value="form.disabled_message" type="textarea" :rows="2" /></n-form-item></n-gi>
           <n-gi :span="2"><n-form-item label="自定义MOTD"><n-input v-model:value="form.custom_motd" type="textarea" :rows="2" /></n-form-item></n-gi>
@@ -63,6 +61,10 @@
             </n-alert>
             <n-form-item label="负载策略" label-placement="left" label-width="100">
               <n-select v-model:value="form.load_balance" :options="loadBalanceOptions" placeholder="选择负载策略" />
+            </n-form-item>
+            <n-form-item label="自动Ping" label-placement="left" label-width="100">
+              <n-switch v-model:value="form.auto_ping_enabled" />
+              <template #feedback>关闭后不会自动测试节点延迟</template>
             </n-form-item>
             <n-grid :cols="2" :x-gap="16" style="margin-top: 12px">
               <n-gi>
@@ -825,7 +827,7 @@
 </style>
 
 <script setup>
-import { ref, computed, onMounted, h, nextTick } from 'vue'
+import { ref, computed, onMounted, h, nextTick, watch } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
 import { api } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
@@ -870,6 +872,7 @@ const defaultForm = {
   custom_motd: '', // 留空则从远程服务器获取
   xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
   load_balance: 'least-latency', load_balance_sort: 'udp',
+  auto_ping_enabled: true,
   auto_ping_interval_minutes: 10 // 负载均衡Ping间隔（分钟）
 }
 
@@ -1122,6 +1125,8 @@ const bestNodeFilter = ref({ group: '', protocol: '', udpOnly: false, search: ''
 const bestNodeCheckedKeys = ref([]) // 多选的节点
 const bestNodeBatchTesting = ref(false) // 批量测试状态
 const bestNodeBatchProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
+const serverNodeLatencySortBy = ref('')
+const serverNodeLatencyMap = ref({})
 const bestNodePagination = ref({
   page: 1,
   pageSize: 50,
@@ -1229,6 +1234,50 @@ const bestNodeColumnsWithActions = computed(() => [
   ])}
 ])
 
+const refreshServerNodeLatency = async () => {
+  const serverId = form.value?.id
+  if (!serverId) {
+    serverNodeLatencySortBy.value = ''
+    serverNodeLatencyMap.value = {}
+    return
+  }
+
+  const sortBy = form.value?.load_balance_sort || 'udp'
+  try {
+    const res = await api(`/api/servers/${serverId}/node-latency?sort_by=${sortBy}`)
+    if (!res?.success || !res.data) {
+      serverNodeLatencySortBy.value = ''
+      serverNodeLatencyMap.value = {}
+      return
+    }
+
+    const m = {}
+    ;(res.data.nodes || []).forEach(n => {
+      if (n?.name) m[n.name] = n.ok ? (n.latency_ms || 0) : 0
+    })
+    serverNodeLatencySortBy.value = sortBy
+    serverNodeLatencyMap.value = m
+  } catch {
+    serverNodeLatencySortBy.value = ''
+    serverNodeLatencyMap.value = {}
+  }
+}
+
+const applyServerNodeLatencyToBestNodeData = (sortBy) => {
+  if (!sortBy || serverNodeLatencySortBy.value !== sortBy) return
+  const key = sortBy === 'tcp' ? 'latency_ms' : sortBy === 'http' ? 'http_latency_ms' : 'udp_latency_ms'
+
+  bestNodeRawData.value = bestNodeRawData.value.map(node => {
+    const v = serverNodeLatencyMap.value?.[node.name]
+    if (v > 0) {
+      const updates = { [key]: v }
+      if (sortBy === 'udp') updates.udp_available = true
+      return { ...node, ...updates }
+    }
+    return node
+  })
+}
+
 // 节点行样式（高亮当前使用的节点）
 const bestNodeRowClassName = (row) => {
   return row._isSelected ? 'best-node-row' : ''
@@ -1274,7 +1323,7 @@ const batchTestOptions = [
 // 批量测试配置
 const batchHttpTarget = ref('cloudflare')
 const customHttpUrl = ref('')
-const batchMcbeAddress = ref('mco.cubecraft.net:19132')
+const batchMcbeAddress = ref('')
 
 // 拖选功能实例
 const { rowProps: quickSelectRowProps } = useDragSelect(quickCheckedKeys, 'name')
@@ -1308,7 +1357,7 @@ const runBatchTestType = async (names, type, progressRef) => {
         res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildHttpTestRequest(name))
         handleBatchTestResult(name, res, 'http', progressRef)
       } else {
-        res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
+        res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, server_id: form.value?.id || '', address: batchMcbeAddress.value })
         handleBatchTestResult(name, res, 'udp', progressRef)
       }
     } catch (e) {
@@ -1433,7 +1482,7 @@ const testSingleProxy = async (name, type) => {
         message.error(`HTTP 测试失败`)
       }
     } else {
-      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
+      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, server_id: form.value?.id || '', address: batchMcbeAddress.value })
       if (res?.success && res.data?.success) {
         updateProxyOutboundData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
         message.success(`UDP 测试成功: ${res.data.latency_ms}ms`)
@@ -2475,8 +2524,32 @@ const columns = [
 ]
 
 const load = async () => { const res = await api('/api/servers'); if (res.success) servers.value = res.data || [] }
-const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true }
-const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true }
+const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true; refreshBatchMcbeAddress() }
+const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; refreshBatchMcbeAddress(); refreshServerNodeLatency() }
+
+const refreshBatchMcbeAddress = () => {
+  const target = form.value?.target
+  const port = form.value?.port
+  if (target && port) {
+    batchMcbeAddress.value = `${target}:${port}`
+    return
+  }
+  batchMcbeAddress.value = ''
+}
+
+watch(
+  () => [showEditModal.value, form.value?.target, form.value?.port],
+  () => {
+    if (showEditModal.value) refreshBatchMcbeAddress()
+  }
+)
+
+watch(
+  () => [showEditModal.value, form.value?.id, form.value?.proxy_outbound, form.value?.load_balance_sort],
+  () => {
+    if (showEditModal.value) refreshServerNodeLatency()
+  }
+)
 
 // 监听名称变化，自动生成MOTD（仅新建时且MOTD为空）
 const onNameChange = () => {
@@ -2564,6 +2637,9 @@ const showBestNodePreview = async () => {
     // 显示弹窗
     showBestNodeModal.value = true
 
+    await refreshServerNodeLatency()
+    applyServerNodeLatencyToBestNodeData(sortType)
+
     // 显示后自动计算一次最优节点
     nextTick(() => {
       recalculateBestNode()
@@ -2582,6 +2658,10 @@ const testBestNode = async (name, type) => {
       res = await api('/api/proxy-outbounds/test', 'POST', { name })
       if (res?.success && res.data?.success) {
         updateBestNodeData(name, { latency_ms: res.data.latency_ms, healthy: true })
+        if (form.value?.id) {
+          serverNodeLatencySortBy.value = 'tcp'
+          serverNodeLatencyMap.value = { ...serverNodeLatencyMap.value, [name]: res.data.latency_ms }
+        }
         message.success(`${name} TCP测试成功: ${res.data.latency_ms}ms`)
       } else {
         updateBestNodeData(name, { latency_ms: 0, healthy: false })
@@ -2592,15 +2672,23 @@ const testBestNode = async (name, type) => {
       if (res?.success && res.data?.success) {
         const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
         updateBestNodeData(name, { http_latency_ms: httpTest?.latency_ms || 0 })
+        if (form.value?.id) {
+          serverNodeLatencySortBy.value = 'http'
+          serverNodeLatencyMap.value = { ...serverNodeLatencyMap.value, [name]: httpTest?.latency_ms || 0 }
+        }
         message.success(`${name} HTTP测试成功: ${httpTest?.latency_ms || 0}ms`)
       } else {
         updateBestNodeData(name, { http_latency_ms: 0 })
         message.error(`${name} HTTP测试失败`)
       }
     } else if (type === 'udp') {
-      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
+      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, server_id: form.value?.id || '', address: batchMcbeAddress.value })
       if (res?.success && res.data?.success) {
         updateBestNodeData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
+        if (form.value?.id) {
+          serverNodeLatencySortBy.value = 'udp'
+          serverNodeLatencyMap.value = { ...serverNodeLatencyMap.value, [name]: res.data.latency_ms }
+        }
         message.success(`${name} UDP测试成功: ${res.data.latency_ms}ms`)
       } else {
         updateBestNodeData(name, { udp_available: false })
@@ -2749,6 +2837,15 @@ const getCurrentNodeInfo = computed(() => {
   const sortType = form.value.load_balance_sort || 'udp'
   const latencyKey = sortType === 'tcp' ? 'latency_ms' : sortType === 'http' ? 'http_latency_ms' : 'udp_latency_ms'
 
+  const getLatencyByName = (name) => {
+    if (serverNodeLatencySortBy.value === sortType) {
+      const v = serverNodeLatencyMap.value?.[name]
+      if (v > 0) return v
+    }
+    const detail = proxyOutboundDetails.value[name]
+    return detail?.[latencyKey] || 0
+  }
+
   // 分组模式：显示分组名 + 最优节点延迟
   if (proxyOutbound.startsWith('@')) {
     const groupName = proxyOutbound.substring(1)
@@ -2763,12 +2860,12 @@ const getCurrentNodeInfo = computed(() => {
     }
 
     const bestNode = groupNodes.reduce((best, node) => {
-      const bestLatency = best[latencyKey] || 999999
-      const nodeLatency = node[latencyKey] || 999999
+      const bestLatency = getLatencyByName(best.name) || 999999
+      const nodeLatency = getLatencyByName(node.name) || 999999
       return nodeLatency < bestLatency ? node : best
     })
 
-    const latency = bestNode[latencyKey] || 0
+    const latency = getLatencyByName(bestNode.name) || 0
     return {
       display: `${displayName} (${bestNode.name})`,
       latency: latency > 0 ? `${latency}ms` : '未测试'
@@ -2785,12 +2882,12 @@ const getCurrentNodeInfo = computed(() => {
     }
 
     const bestNode = nodes.reduce((best, node) => {
-      const bestLatency = best[latencyKey] || 999999
-      const nodeLatency = node[latencyKey] || 999999
+      const bestLatency = getLatencyByName(best.name) || 999999
+      const nodeLatency = getLatencyByName(node.name) || 999999
       return nodeLatency < bestLatency ? node : best
     })
 
-    const latency = bestNode[latencyKey] || 0
+    const latency = getLatencyByName(bestNode.name) || 0
     return {
       display: `多节点 (${bestNode.name})`,
       latency: latency > 0 ? `${latency}ms` : '未测试'
@@ -2803,7 +2900,7 @@ const getCurrentNodeInfo = computed(() => {
     return { display: proxyOutbound, latency: '未测试' }
   }
 
-  const latency = detail[latencyKey] || 0
+  const latency = getLatencyByName(proxyOutbound) || 0
   return {
     display: proxyOutbound,
     latency: latency > 0 ? `${latency}ms` : '未测试'

@@ -596,7 +596,7 @@ func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (n
 	}
 
 	for i := 0; i < attempts; i++ {
-		selected, err := l.outboundMgr.SelectOutboundWithFailover(l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
+		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer("", l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
 		if err != nil {
 			return nil, "", err
 		}

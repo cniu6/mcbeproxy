@@ -36,6 +36,8 @@ const (
 	// OutboundIdleTimeout is the time after which an unused singbox outbound is closed
 	// to release TLS connections and other resources
 	OutboundIdleTimeout = 5 * time.Minute
+
+	serverNodeLatencyCacheTTL = 30 * time.Minute
 )
 
 // HealthStatus represents the health status of a proxy outbound.
@@ -146,6 +148,18 @@ type OutboundManager interface {
 	// Returns the selected outbound or error if all nodes exhausted.
 	// Requirements: 3.1, 3.4
 	SelectOutboundWithFailover(groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error)
+
+	// SetServerNodeLatency caches latency for a specific server and node.
+	// sortBy: udp/tcp/http (same values as ServerConfig.LoadBalanceSort)
+	SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64)
+
+	// GetServerNodeLatency returns cached latency for a specific server and node.
+	// Returns (0,false) if missing or expired.
+	GetServerNodeLatency(serverID, nodeName, sortBy string) (int64, bool)
+
+	// SelectOutboundWithFailoverForServer selects a healthy proxy outbound with per-server latency preference.
+	// If serverID is empty, it behaves like SelectOutboundWithFailover.
+	SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error)
 }
 
 // ServerConfigUpdater is an interface for updating server configurations.
@@ -166,6 +180,20 @@ type outboundManagerImpl struct {
 	serverConfigUpdater ServerConfigUpdater
 	cleanupCtx          context.Context
 	cleanupCancel       context.CancelFunc
+	serverNodeLatencyMu sync.RWMutex
+	serverNodeLatency   map[serverNodeLatencyKey]serverNodeLatencyValue
+}
+
+type serverNodeLatencyKey struct {
+	serverID string
+	nodeName string
+	sortBy   string
+}
+
+type serverNodeLatencyValue struct {
+	latencyMs  int64
+	updatedAt  time.Time
+	updatedAtN int64
 }
 
 // NewOutboundManager creates a new OutboundManager instance.
@@ -176,7 +204,260 @@ func NewOutboundManager(serverConfigUpdater ServerConfigUpdater) OutboundManager
 		singboxOutbounds:    make(map[string]*SingboxOutbound),
 		singboxLastUsed:     make(map[string]time.Time),
 		serverConfigUpdater: serverConfigUpdater,
+		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
 	}
+}
+
+func normalizeSortBy(sortBy string) string {
+	sortBy = strings.ToLower(strings.TrimSpace(sortBy))
+	switch sortBy {
+	case config.LoadBalanceSortTCP:
+		return config.LoadBalanceSortTCP
+	case config.LoadBalanceSortHTTP:
+		return config.LoadBalanceSortHTTP
+	case config.LoadBalanceSortUDP:
+		fallthrough
+	default:
+		return config.LoadBalanceSortUDP
+	}
+}
+
+func (m *outboundManagerImpl) SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64) {
+	serverID = strings.TrimSpace(serverID)
+	nodeName = strings.TrimSpace(nodeName)
+	if serverID == "" || nodeName == "" {
+		return
+	}
+	sortBy = normalizeSortBy(sortBy)
+
+	key := serverNodeLatencyKey{serverID: serverID, nodeName: nodeName, sortBy: sortBy}
+	now := time.Now()
+
+	m.serverNodeLatencyMu.Lock()
+	m.serverNodeLatency[key] = serverNodeLatencyValue{latencyMs: latencyMs, updatedAt: now, updatedAtN: now.UnixNano()}
+	m.serverNodeLatencyMu.Unlock()
+}
+
+func (m *outboundManagerImpl) GetServerNodeLatency(serverID, nodeName, sortBy string) (int64, bool) {
+	serverID = strings.TrimSpace(serverID)
+	nodeName = strings.TrimSpace(nodeName)
+	if serverID == "" || nodeName == "" {
+		return 0, false
+	}
+	sortBy = normalizeSortBy(sortBy)
+
+	key := serverNodeLatencyKey{serverID: serverID, nodeName: nodeName, sortBy: sortBy}
+
+	m.serverNodeLatencyMu.RLock()
+	v, ok := m.serverNodeLatency[key]
+	m.serverNodeLatencyMu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	if !v.updatedAt.IsZero() && time.Since(v.updatedAt) > serverNodeLatencyCacheTTL {
+		return 0, false
+	}
+	if v.latencyMs <= 0 {
+		return 0, false
+	}
+	return v.latencyMs, true
+}
+
+func (m *outboundManagerImpl) selectLeastLatencyForServer(serverID string, nodes []*config.ProxyOutbound, sortBy string) *config.ProxyOutbound {
+	// Prefer per-server cache. If none are available, fall back to the old global latency selection.
+	var selected *config.ProxyOutbound
+	var minLatency int64 = -1
+	var hasCached bool
+
+	for _, node := range nodes {
+		latency, ok := m.GetServerNodeLatency(serverID, node.Name, sortBy)
+		if !ok {
+			continue
+		}
+		hasCached = true
+		if minLatency < 0 || latency < minLatency {
+			minLatency = latency
+			selected = node
+		}
+	}
+
+	if hasCached {
+		if selected == nil && len(nodes) > 0 {
+			return nodes[0]
+		}
+		return selected
+	}
+
+	return loadBalancer.Select(nodes, config.LoadBalanceLeastLatency, sortBy, "")
+}
+
+func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	serverID = strings.TrimSpace(serverID)
+	strategy = strings.TrimSpace(strategy)
+	sortBy = normalizeSortBy(sortBy)
+
+	// Empty serverID => preserve old behavior.
+	if serverID == "" {
+		return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, excludeNodes)
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Check if it's a group selection (starts with "@")
+	if strings.HasPrefix(groupOrName, "@") {
+		groupName := strings.TrimPrefix(groupOrName, "@")
+		return m.selectFromGroupForServer(serverID, groupName, strategy, sortBy, excludeNodes)
+	}
+
+	// Check if it's a multi-node selection (comma-separated)
+	if strings.Contains(groupOrName, ",") {
+		return m.selectFromNodeListForServer(serverID, groupOrName, strategy, sortBy, excludeNodes)
+	}
+
+	// Single node selection
+	return m.selectSingleNode(groupOrName, excludeNodes)
+}
+
+// selectFromNodeListForServer selects a healthy node from a comma-separated list with per-server latency preference.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) selectFromNodeListForServer(serverID, nodeListStr, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	// Parse the comma-separated node list
+	nodeNames := strings.Split(nodeListStr, ",")
+
+	// Build exclusion set for O(1) lookup
+	excludeSet := make(map[string]bool)
+	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+
+	// Collect healthy nodes from the specified list
+	var healthyNodes []*config.ProxyOutbound
+	var notFoundNodes []string
+
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+
+		// Skip excluded nodes (for failover)
+		if excludeSet[nodeName] {
+			continue
+		}
+
+		outbound, exists := m.outbounds[nodeName]
+		if !exists {
+			notFoundNodes = append(notFoundNodes, nodeName)
+			continue
+		}
+
+		// Skip disabled nodes
+		if !outbound.Enabled {
+			continue
+		}
+
+		// Skip unhealthy nodes only if they have been tested and failed recently
+		// Allow retry after 30 seconds to recover from transient issues
+		lastCheck := outbound.GetLastCheck()
+		isNeverTested := lastCheck.IsZero()
+		hasError := outbound.GetLastError() != ""
+		isHealthy := outbound.GetHealthy()
+		timeSinceLastCheck := time.Since(lastCheck)
+
+		if !isHealthy && !isNeverTested && hasError && timeSinceLastCheck < 30*time.Second {
+			continue
+		}
+
+		healthyNodes = append(healthyNodes, outbound)
+	}
+
+	if len(healthyNodes) == 0 {
+		if len(notFoundNodes) > 0 {
+			return nil, fmt.Errorf("%w: nodes not found: %v", ErrOutboundNotFound, notFoundNodes)
+		}
+		if len(excludeNodes) > 0 {
+			return nil, fmt.Errorf("%w: all specified nodes have been tried", ErrAllFailoversFailed)
+		}
+		return nil, fmt.Errorf("%w: in specified node list", ErrNoHealthyNodes)
+	}
+
+	if strategy == config.LoadBalanceLeastLatency {
+		selected := m.selectLeastLatencyForServer(serverID, healthyNodes, sortBy)
+		if selected == nil {
+			return nil, fmt.Errorf("%w: in specified node list", ErrNoHealthyNodes)
+		}
+		return selected.Clone(), nil
+	}
+
+	virtualGroupName := "nodelist:" + nodeListStr
+	selected := loadBalancer.Select(healthyNodes, strategy, sortBy, virtualGroupName)
+	if selected == nil {
+		return nil, fmt.Errorf("%w: in specified node list", ErrNoHealthyNodes)
+	}
+	return selected.Clone(), nil
+}
+
+// selectFromGroupForServer selects a healthy node from a group with per-server latency preference.
+// Must be called with read lock held.
+func (m *outboundManagerImpl) selectFromGroupForServer(serverID, groupName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	// Build exclusion set for O(1) lookup
+	excludeSet := make(map[string]bool)
+	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+
+	// Collect healthy nodes from the group, excluding specified nodes
+	var healthyNodes []*config.ProxyOutbound
+	var groupExists bool
+
+	for _, outbound := range m.outbounds {
+		if outbound.Group == groupName {
+			groupExists = true
+
+			if excludeSet[outbound.Name] {
+				continue
+			}
+			if !outbound.Enabled {
+				continue
+			}
+
+			lastCheck := outbound.GetLastCheck()
+			hasError := outbound.GetLastError() != ""
+			isHealthy := outbound.GetHealthy()
+			timeSinceLastCheck := time.Since(lastCheck)
+
+			if !isHealthy && hasError && !lastCheck.IsZero() && timeSinceLastCheck < 30*time.Second {
+				continue
+			}
+
+			healthyNodes = append(healthyNodes, outbound)
+		}
+	}
+
+	if !groupExists {
+		return nil, fmt.Errorf("%w: '@%s'", ErrGroupNotFound, groupName)
+	}
+	if len(healthyNodes) == 0 {
+		if len(excludeNodes) > 0 {
+			return nil, fmt.Errorf("%w: all nodes in group '@%s' have been tried", ErrAllFailoversFailed, groupName)
+		}
+		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
+	}
+
+	if strategy == config.LoadBalanceLeastLatency {
+		selected := m.selectLeastLatencyForServer(serverID, healthyNodes, sortBy)
+		if selected == nil {
+			return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
+		}
+		return selected.Clone(), nil
+	}
+
+	selected := loadBalancer.Select(healthyNodes, strategy, sortBy, groupName)
+	if selected == nil {
+		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
+	}
+	return selected.Clone(), nil
 }
 
 // AddOutbound adds a new proxy outbound configuration.
@@ -224,10 +505,12 @@ func (m *outboundManagerImpl) GetOutbound(name string) (*config.ProxyOutbound, b
 // Requirements: 1.4
 func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 	m.mu.Lock()
-	if _, exists := m.outbounds[name]; !exists {
+	deletedCfg, exists := m.outbounds[name]
+	if !exists {
 		m.mu.Unlock()
 		return ErrOutboundNotFound
 	}
+	deletedGroup := deletedCfg.Group
 
 	// Close and remove the sing-box outbound if it exists
 	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
@@ -242,7 +525,7 @@ func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 
 	// Cascade update server configs after releasing the lock to avoid deadlocks
 	if m.serverConfigUpdater != nil {
-		m.cascadeUpdateServerConfigs(name)
+		m.cascadeUpdateServerConfigs(name, deletedGroup)
 	}
 	return nil
 }
@@ -250,7 +533,7 @@ func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 // cascadeUpdateServerConfigs updates all server configs that reference the deleted outbound.
 // Must be called after releasing the lock to avoid deadlocks.
 // Requirements: 1.4
-func (m *outboundManagerImpl) cascadeUpdateServerConfigs(deletedOutboundName string) {
+func (m *outboundManagerImpl) cascadeUpdateServerConfigs(deletedOutboundName string, deletedOutboundGroup string) {
 	if m.serverConfigUpdater == nil {
 		return
 	}
@@ -272,33 +555,36 @@ func (m *outboundManagerImpl) cascadeUpdateServerConfigs(deletedOutboundName str
 		}
 
 		next := current
-		if strings.HasPrefix(current, "@") {
+		if current == deletedOutboundName {
+			next = "direct"
+		} else if strings.HasPrefix(current, "@") {
 			group := strings.TrimPrefix(current, "@")
-			if groupCounts[group] == 0 {
+			if group == deletedOutboundGroup && groupCounts[group] == 0 {
 				next = "direct"
 			}
 		} else if strings.Contains(current, ",") {
 			nodes := strings.Split(current, ",")
 			kept := make([]string, 0, len(nodes))
+			removed := false
 			for _, n := range nodes {
 				n = strings.TrimSpace(n)
 				if n == "" {
 					continue
 				}
-				if _, ok := remainingNames[n]; ok {
-					kept = append(kept, n)
+				if n == deletedOutboundName {
+					removed = true
+					continue
 				}
+				kept = append(kept, n)
 			}
-			if len(kept) == 0 {
-				next = "direct"
-			} else if len(kept) == 1 {
-				next = kept[0]
-			} else {
-				next = strings.Join(kept, ",")
-			}
-		} else {
-			if _, ok := remainingNames[current]; !ok {
-				next = "direct"
+			if removed {
+				if len(kept) == 0 {
+					next = "direct"
+				} else if len(kept) == 1 {
+					next = kept[0]
+				} else {
+					next = strings.Join(kept, ",")
+				}
 			}
 		}
 

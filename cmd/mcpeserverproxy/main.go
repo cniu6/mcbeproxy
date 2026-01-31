@@ -148,6 +148,7 @@ func main() {
 	// OutboundManager and ProxyOutboundConfigManager are now created inside NewProxyServer
 	proxyOutboundHandler := api.NewProxyOutboundHandler(
 		proxyServer.GetProxyOutboundConfigManager(),
+		configMgr,
 		proxyServer.GetOutboundManager(),
 	)
 

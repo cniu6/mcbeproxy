@@ -147,7 +147,7 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 	}
 
 	for i := 0; i < attempts; i++ {
-		selected, err := p.outboundMgr.SelectOutboundWithFailover(p.config.ProxyOutbound, p.config.GetLoadBalance(), p.config.GetLoadBalanceSort(), exclude)
+		selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, p.config.ProxyOutbound, p.config.GetLoadBalance(), p.config.GetLoadBalanceSort(), exclude)
 		if err != nil {
 			return nil, "", err
 		}

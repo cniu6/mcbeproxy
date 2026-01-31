@@ -21,15 +21,17 @@ import (
 // ProxyOutboundHandler handles REST API requests for proxy outbound management.
 // Requirements: 5.3
 type ProxyOutboundHandler struct {
-	configMgr   *config.ProxyOutboundConfigManager
-	outboundMgr proxy.OutboundManager
+	configMgr       *config.ProxyOutboundConfigManager
+	serverConfigMgr *config.ConfigManager
+	outboundMgr     proxy.OutboundManager
 }
 
 // NewProxyOutboundHandler creates a new ProxyOutboundHandler instance.
-func NewProxyOutboundHandler(configMgr *config.ProxyOutboundConfigManager, outboundMgr proxy.OutboundManager) *ProxyOutboundHandler {
+func NewProxyOutboundHandler(configMgr *config.ProxyOutboundConfigManager, serverConfigMgr *config.ConfigManager, outboundMgr proxy.OutboundManager) *ProxyOutboundHandler {
 	return &ProxyOutboundHandler{
-		configMgr:   configMgr,
-		outboundMgr: outboundMgr,
+		configMgr:       configMgr,
+		serverConfigMgr: serverConfigMgr,
+		outboundMgr:     outboundMgr,
 	}
 }
 
@@ -593,8 +595,9 @@ type UDPTestResult struct {
 
 // MCBETestRequest represents a request for MCBE server UDP test.
 type MCBETestRequest struct {
-	Name    string `json:"name" binding:"required"`
-	Address string `json:"address,omitempty"` // Default: mco.cubecraft.net:19132
+	Name     string `json:"name" binding:"required"`
+	ServerID string `json:"server_id,omitempty"`
+	Address  string `json:"address,omitempty"` // Default: mco.cubecraft.net:19132
 }
 
 // PingTestResult represents ICMP ping result to proxy server.
@@ -1211,10 +1214,24 @@ func (h *ProxyOutboundHandler) TestMCBEUDP(c *gin.Context) {
 	// Default MCBE server
 	address := req.Address
 	if address == "" {
-		address = "mco.cubecraft.net:19132"
+		if req.ServerID != "" && h.serverConfigMgr != nil {
+			if serverCfg, ok := h.serverConfigMgr.GetServer(req.ServerID); ok {
+				address = serverCfg.GetTargetAddr()
+			}
+		}
+		if address == "" {
+			address = "mco.cubecraft.net:19132"
+		}
 	}
 
 	result := h.testMCBEServer(cfg, address)
+	if req.ServerID != "" && h.outboundMgr != nil {
+		if result.Success {
+			h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortUDP, result.LatencyMs)
+		} else {
+			h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortUDP, 0)
+		}
+	}
 
 	// Update UDP availability and latency, persist to config file
 	if outbound, ok := h.configMgr.GetOutbound(req.Name); ok {
@@ -1403,4 +1420,90 @@ func (h *ProxyOutboundHandler) GetGroup(c *gin.Context) {
 	}
 
 	respondSuccess(c, stats)
+}
+
+type ServerNodeLatencyItem struct {
+	Name      string `json:"name"`
+	LatencyMs int64  `json:"latency_ms"`
+	OK        bool   `json:"ok"`
+}
+
+// GetServerNodeLatency returns per-server per-node cached latency for the server's selected nodes.
+// GET /api/servers/:id/node-latency?sort_by=udp
+func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	if h.serverConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Server config manager not initialized", "")
+		return
+	}
+
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+
+	sortBy := strings.TrimSpace(c.Query("sort_by"))
+	if sortBy == "" {
+		sortBy = serverCfg.GetLoadBalanceSort()
+	}
+
+	proxyOutbound := strings.TrimSpace(serverCfg.ProxyOutbound)
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		respondSuccess(c, map[string]interface{}{
+			"server_id": serverID,
+			"sort_by":   sortBy,
+			"nodes":     []ServerNodeLatencyItem{},
+		})
+		return
+	}
+
+	candidateNodes := make([]string, 0)
+	if serverCfg.IsGroupSelection() {
+		groupName := serverCfg.GetGroupName()
+		outbounds := h.configMgr.GetByGroup(groupName)
+		for _, o := range outbounds {
+			if o == nil || !o.Enabled {
+				continue
+			}
+			candidateNodes = append(candidateNodes, o.Name)
+		}
+	} else if serverCfg.IsMultiNodeSelection() {
+		for _, name := range serverCfg.GetNodeList() {
+			if name == "" {
+				continue
+			}
+			o, exists := h.configMgr.GetOutbound(name)
+			if !exists || o == nil || !o.Enabled {
+				continue
+			}
+			candidateNodes = append(candidateNodes, name)
+		}
+	} else {
+		o, exists := h.configMgr.GetOutbound(proxyOutbound)
+		if exists && o != nil && o.Enabled {
+			candidateNodes = append(candidateNodes, proxyOutbound)
+		}
+	}
+
+	items := make([]ServerNodeLatencyItem, 0, len(candidateNodes))
+	for _, nodeName := range candidateNodes {
+		latency, ok := h.outboundMgr.GetServerNodeLatency(serverID, nodeName, sortBy)
+		items = append(items, ServerNodeLatencyItem{Name: nodeName, LatencyMs: latency, OK: ok})
+	}
+
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"sort_by":   sortBy,
+		"nodes":     items,
+	})
 }

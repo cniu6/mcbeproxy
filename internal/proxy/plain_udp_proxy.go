@@ -187,7 +187,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
 		strategy := p.config.GetLoadBalance()
 		sortBy := p.config.GetLoadBalanceSort()
-		selected, err := p.outboundMgr.SelectOutboundWithFailover(proxyOutbound, strategy, sortBy, nil)
+		selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil)
 		if err != nil {
 			return nil, nil, err
 		}

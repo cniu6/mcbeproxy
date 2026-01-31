@@ -151,7 +151,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 	// Try to select and connect to a node, with failover on failure
 	for {
 		// Select a healthy node from the group
-		selectedOutbound, err := d.outboundMgr.SelectOutboundWithFailover(groupSelector, strategy, sortBy, excludedNodes)
+		selectedOutbound, err := d.outboundMgr.SelectOutboundWithFailoverForServer(d.serverConfig.ID, groupSelector, strategy, sortBy, excludedNodes)
 		if err != nil {
 			// No more healthy nodes available
 			// Requirements: 3.2 - Log failover event

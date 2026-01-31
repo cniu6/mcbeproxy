@@ -17,11 +17,13 @@ import (
 // mockOutboundManager implements proxy.OutboundManager for testing.
 type mockOutboundManager struct {
 	outbounds map[string]*config.ProxyOutbound
+	latency  map[string]int64
 }
 
 func newMockOutboundManager() *mockOutboundManager {
 	return &mockOutboundManager{
 		outbounds: make(map[string]*config.ProxyOutbound),
+		latency:   make(map[string]int64),
 	}
 }
 
@@ -138,15 +140,38 @@ func (m *mockOutboundManager) SelectOutboundWithFailover(groupOrName, strategy, 
 	return nil, nil
 }
 
-// setupTestHandler creates a test handler with mock dependencies.
+func (m *mockOutboundManager) SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64) {
+	key := serverID + "|" + nodeName + "|" + sortBy
+	m.latency[key] = latencyMs
+}
+
+func (m *mockOutboundManager) GetServerNodeLatency(serverID, nodeName, sortBy string) (int64, bool) {
+	key := serverID + "|" + nodeName + "|" + sortBy
+	v, ok := m.latency[key]
+	return v, ok
+}
+
+func (m *mockOutboundManager) SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
+	return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, excludeNodes)
+}
+
+// setupTestProxyOutboundHandler creates a test handler with mock dependencies.
+func setupTestProxyOutboundHandler() (*ProxyOutboundHandler, *config.ProxyOutboundConfigManager, *mockOutboundManager) {
+	// Create config manager
+	configMgr := config.NewProxyOutboundConfigManager("test_proxy_outbounds.json")
+
+	// Create mock outbound manager
+	outboundMgr := newMockOutboundManager()
+
+	// Create handler
+	handler := NewProxyOutboundHandler(configMgr, nil, outboundMgr)
+
+	return handler, configMgr, outboundMgr
+}
+
 func setupTestHandler() (*ProxyOutboundHandler, *mockOutboundManager) {
-	gin.SetMode(gin.TestMode)
-	mockMgr := newMockOutboundManager()
-	handler := &ProxyOutboundHandler{
-		configMgr:   nil, // Not needed for group tests
-		outboundMgr: mockMgr,
-	}
-	return handler, mockMgr
+	h, _, m := setupTestProxyOutboundHandler()
+	return h, m
 }
 
 // setupTestRouter creates a test router with the handler registered.

@@ -829,21 +829,20 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					}
 					// Log detailed connection close info
 					logger.Info("Connection closed (remote->client) for %s: %v", clientAddr, err)
-					parsedMsg := ""
-					if !logger.IsLevelEnabled(logger.LevelDebug) {
-						parsedMsg = p.tryParseDisconnectPacket(lastParseableRemotePacket)
-						if parsedMsg != "" {
-							logger.Info("[S->C] %s: Disconnect message=%s", clientAddr, parsedMsg)
-						}
-					}
-					if parsedMsg == "" && len(lastParseableRemotePacket) > 0 {
-						p.tryParseAndLogPacket(lastParseableRemotePacket, clientAddr, "S->C(last)")
-					}
+					parsedMsg := p.tryParseDisconnectPacket(lastParseableRemotePacket)
+					connInf.kickMu.Lock()
 					if parsedMsg == "" {
-						connInf.kickMu.Lock()
-						compression := connInf.compression
-						connInf.kickMu.Unlock()
-						p.sendDisconnect(clientConn, "§c连接已断开", compression)
+						parsedMsg = connInf.kickReason
+					}
+					compression := connInf.compression
+					connInf.kickMu.Unlock()
+					if parsedMsg != "" {
+						logger.Info("Remote server disconnected: server=%s player=%s client=%s reason=%s", p.serverID, playerName, clientAddr, parsedMsg)
+						p.sendDisconnect(clientConn, parsedMsg, compression)
+						// Give RakNet a brief moment to flush the packet so the client has a chance to display the reason.
+						time.Sleep(200 * time.Millisecond)
+					} else if len(lastParseableRemotePacket) > 0 {
+						p.tryParseAndLogPacket(lastParseableRemotePacket, clientAddr, "S->C(last)")
 					}
 					// Check if it's a RakNet-level disconnect
 					errStr := err.Error()
@@ -852,6 +851,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					}
 					return
 				}
+
 				// Reset timeout counter on successful read
 				consecutiveTimeouts = 0
 				activityUpdateCounter = 0
@@ -860,6 +860,12 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 				if len(pk) >= 3 && pk[0] == packetHeader && (pk[1] == 0x00 || pk[1] == 0x01 || pk[1] == 0xff) {
 					lastParseableRemotePacket = append(lastParseableRemotePacket[:0], pk...)
+					if msg := p.tryParseDisconnectPacket(pk); msg != "" {
+						logger.Info("Remote server sent disconnect: server=%s player=%s client=%s reason=%s", p.serverID, playerName, clientAddr, msg)
+						connInf.kickMu.Lock()
+						connInf.kickReason = msg
+						connInf.kickMu.Unlock()
+					}
 				} else {
 					lastParseableRemotePacket = nil
 				}
@@ -941,25 +947,6 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 			}
 		}
 	}()
-
-	// 在线状态保活：每 10 秒检查一次连接是否仍然存活，存活则刷新 LastSeen。
-	// 这样即使玩家空闲不发“游戏包”，在线列表也不会在 5 分钟后被 GC 清理。
-	if sess != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-connCtx.Done():
-					return
-				case <-ticker.C:
-					sess.UpdateLastSeen()
-				}
-			}
-		}()
-	}
 
 	wg.Wait()
 

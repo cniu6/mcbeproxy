@@ -155,6 +155,9 @@ func (a *APIServer) setupRoutes() {
 		api.POST("/servers/:id/disable", a.disableServer)
 		api.POST("/servers/:id/enable", a.enableServer)
 		api.GET("/servers/:id/latency", a.getServerLatency)
+		if a.proxyOutboundHandler != nil {
+			api.GET("/servers/:id/node-latency", a.proxyOutboundHandler.GetServerNodeLatency)
+		}
 
 		// Session endpoints
 		api.GET("/sessions", a.getSessions)
@@ -365,11 +368,6 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 		anyKeyConfigured := configKeySet || dbHasKeys
 		c.Set(ctxAuthAnyKeyConfigured, anyKeyConfigured)
 		if !anyKeyConfigured {
-			if !isLocal {
-				respondError(c, http.StatusUnauthorized, "未配置 API Key，禁止远程访问", "")
-				c.Abort()
-				return
-			}
 			c.Next()
 			return
 		}
