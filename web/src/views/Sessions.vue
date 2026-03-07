@@ -43,7 +43,7 @@
           :data="sessions" 
           :bordered="false" 
           :pagination="pagination"
-          :scroll-x="1250"
+          :scroll-x="1410"
           @update:page="p => pagination.page = p"
           @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
         />
@@ -108,6 +108,7 @@ const columns = [
     filterOptions: Object.entries(statusMap).map(([k, v]) => ({ label: v.label, value: k })),
     filter: (value, row) => (row.status || 'disconnected') === value
   },
+  { title: '原因', key: 'status_reason', width: 160, ellipsis: { tooltip: true }, render: r => r.status_reason || '-' },
   { title: '客户端', key: 'client_addr', width: 140 },
   { title: '开始时间', key: 'start_time', render: r => formatTime(r.start_time), width: 150 },
   { title: '结束时间', key: 'end_time', render: r => formatTime(r.end_time), width: 150 },

@@ -160,6 +160,18 @@ type OutboundManager interface {
 	// SelectOutboundWithFailoverForServer selects a healthy proxy outbound with per-server latency preference.
 	// If serverID is empty, it behaves like SelectOutboundWithFailover.
 	SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error)
+
+	// GetServerSelectedNode returns the currently pinned/selected node for a server.
+	// Returns ("", false) if no node is pinned.
+	GetServerSelectedNode(serverID string) (string, bool)
+
+	// SetServerSelectedNode pins a specific node as the active node for a server.
+	// Set nodeName="" to clear.
+	SetServerSelectedNode(serverID, nodeName string)
+
+	// GetBestNodeForServer determines the best node for a server based on cached latency.
+	// Returns the best node name and its latency, or ("", 0) if no data.
+	GetBestNodeForServer(serverID, groupOrName, sortBy string) (string, int64)
 }
 
 // ServerConfigUpdater is an interface for updating server configurations.
@@ -182,6 +194,8 @@ type outboundManagerImpl struct {
 	cleanupCancel       context.CancelFunc
 	serverNodeLatencyMu sync.RWMutex
 	serverNodeLatency   map[serverNodeLatencyKey]serverNodeLatencyValue
+	serverSelectedMu    sync.RWMutex
+	serverSelectedNode  map[string]string // serverID -> pinned node name
 }
 
 type serverNodeLatencyKey struct {
@@ -205,6 +219,7 @@ func NewOutboundManager(serverConfigUpdater ServerConfigUpdater) OutboundManager
 		singboxLastUsed:     make(map[string]time.Time),
 		serverConfigUpdater: serverConfigUpdater,
 		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
+		serverSelectedNode:  make(map[string]string),
 	}
 }
 
@@ -263,6 +278,81 @@ func (m *outboundManagerImpl) GetServerNodeLatency(serverID, nodeName, sortBy st
 	return v.latencyMs, true
 }
 
+func (m *outboundManagerImpl) GetServerSelectedNode(serverID string) (string, bool) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return "", false
+	}
+	m.serverSelectedMu.RLock()
+	node, ok := m.serverSelectedNode[serverID]
+	m.serverSelectedMu.RUnlock()
+	if !ok || node == "" {
+		return "", false
+	}
+	return node, true
+}
+
+func (m *outboundManagerImpl) SetServerSelectedNode(serverID, nodeName string) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return
+	}
+	m.serverSelectedMu.Lock()
+	if nodeName == "" {
+		delete(m.serverSelectedNode, serverID)
+	} else {
+		m.serverSelectedNode[serverID] = nodeName
+	}
+	m.serverSelectedMu.Unlock()
+}
+
+func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy string) (string, int64) {
+	serverID = strings.TrimSpace(serverID)
+	sortBy = normalizeSortBy(sortBy)
+	if serverID == "" || groupOrName == "" {
+		return "", 0
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var nodeNames []string
+	if strings.HasPrefix(groupOrName, "@") {
+		groupName := strings.TrimPrefix(groupOrName, "@")
+		for _, o := range m.outbounds {
+			if o != nil && o.Enabled && (o.Group == groupName) {
+				nodeNames = append(nodeNames, o.Name)
+			}
+		}
+	} else if strings.Contains(groupOrName, ",") {
+		for _, n := range strings.Split(groupOrName, ",") {
+			n = strings.TrimSpace(n)
+			if n != "" {
+				nodeNames = append(nodeNames, n)
+			}
+		}
+	} else {
+		return groupOrName, 0
+	}
+
+	var bestName string
+	var bestLatency int64 = -1
+	for _, name := range nodeNames {
+		lat, ok := m.GetServerNodeLatency(serverID, name, sortBy)
+		if !ok || lat <= 0 {
+			continue
+		}
+		if bestLatency < 0 || lat < bestLatency {
+			bestLatency = lat
+			bestName = name
+		}
+	}
+	if bestName == "" {
+		return "", 0
+	}
+	return bestName, bestLatency
+}
+
 func (m *outboundManagerImpl) selectLeastLatencyForServer(serverID string, nodes []*config.ProxyOutbound, sortBy string) *config.ProxyOutbound {
 	// Prefer per-server cache. If none are available, fall back to the old global latency selection.
 	var selected *config.ProxyOutbound
@@ -299,6 +389,25 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 	// Empty serverID => preserve old behavior.
 	if serverID == "" {
 		return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, excludeNodes)
+	}
+
+	// If a pinned node is set and not excluded, prefer it.
+	if pinnedName, ok := m.GetServerSelectedNode(serverID); ok {
+		excluded := false
+		for _, ex := range excludeNodes {
+			if ex == pinnedName {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			m.mu.RLock()
+			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled {
+				m.mu.RUnlock()
+				return o, nil
+			}
+			m.mu.RUnlock()
+		}
 	}
 
 	m.mu.RLock()

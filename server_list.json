@@ -43,7 +43,7 @@
     "proxy_mode": "passthrough",
     "xbox_auth_enabled": false,
     "xbox_token_path": "xbox_token.json",
-    "proxy_outbound": "IPLC HK-2丨5x,IPLC SG-2丨5x",
+    "proxy_outbound": "",
     "show_real_latency": true,
     "load_balance": "least-latency",
     "load_balance_sort": "udp",

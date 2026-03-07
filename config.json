@@ -1,5 +1,5 @@
 {
-  "max_session_records": 101,
+  "max_session_records": 500,
   "max_access_log_records": 100,
   "api_port": 8081,
   "api_key": "",

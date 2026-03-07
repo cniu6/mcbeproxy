@@ -1,7 +1,7 @@
 <template>
   <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">代理出站管理</n-h2>
+      <n-h2 style="margin: 0">代理节点管理</n-h2>
       <n-space>
         <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
           <n-button type="info">批量测试 ({{ checkedRowKeys.length }})</n-button>

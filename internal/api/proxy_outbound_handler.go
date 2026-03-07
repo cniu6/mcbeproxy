@@ -1507,3 +1507,148 @@ func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
 		"nodes":     items,
 	})
 }
+
+// GetServerCurrentNode returns the currently pinned/selected node for a server.
+// GET /api/servers/:id/current-node
+func (h *ProxyOutboundHandler) GetServerCurrentNode(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+
+	sortBy := serverCfg.GetLoadBalanceSort()
+	nodeName, hasNode := h.outboundMgr.GetServerSelectedNode(serverID)
+
+	// Collect all three latency types for current node
+	var tcpMs, udpMs, httpMs int64
+	var hasTcp, hasUdp, hasHttp bool
+	if hasNode {
+		tcpMs, hasTcp = h.outboundMgr.GetServerNodeLatency(serverID, nodeName, "tcp")
+		udpMs, hasUdp = h.outboundMgr.GetServerNodeLatency(serverID, nodeName, "udp")
+		httpMs, hasHttp = h.outboundMgr.GetServerNodeLatency(serverID, nodeName, "http")
+
+		// Fallback to the outbound's own global latency when per-server cache is empty
+		if !hasTcp || !hasUdp || !hasHttp {
+			if ob, exists := h.outboundMgr.GetOutbound(nodeName); exists && ob != nil {
+				if !hasTcp && ob.TCPLatencyMs > 0 {
+					tcpMs = ob.TCPLatencyMs
+					hasTcp = true
+				}
+				if !hasUdp && ob.UDPLatencyMs > 0 {
+					udpMs = ob.UDPLatencyMs
+					hasUdp = true
+				}
+				if !hasHttp && ob.HTTPLatencyMs > 0 {
+					httpMs = ob.HTTPLatencyMs
+					hasHttp = true
+				}
+			}
+		}
+	}
+
+	// Also provide the best node for comparison
+	proxyOutbound := strings.TrimSpace(serverCfg.ProxyOutbound)
+	bestNode, bestLatency := h.outboundMgr.GetBestNodeForServer(serverID, proxyOutbound, sortBy)
+
+	// Collect latencies for best node too (with global fallback)
+	var bestTcp, bestUdp, bestHttp int64
+	if bestNode != "" {
+		bestTcp, _ = h.outboundMgr.GetServerNodeLatency(serverID, bestNode, "tcp")
+		bestUdp, _ = h.outboundMgr.GetServerNodeLatency(serverID, bestNode, "udp")
+		bestHttp, _ = h.outboundMgr.GetServerNodeLatency(serverID, bestNode, "http")
+		if bestTcp == 0 || bestUdp == 0 || bestHttp == 0 {
+			if ob, exists := h.outboundMgr.GetOutbound(bestNode); exists && ob != nil {
+				if bestTcp == 0 && ob.TCPLatencyMs > 0 {
+					bestTcp = ob.TCPLatencyMs
+				}
+				if bestUdp == 0 && ob.UDPLatencyMs > 0 {
+					bestUdp = ob.UDPLatencyMs
+				}
+				if bestHttp == 0 && ob.HTTPLatencyMs > 0 {
+					bestHttp = ob.HTTPLatencyMs
+				}
+			}
+		}
+	}
+
+	respondSuccess(c, map[string]interface{}{
+		"server_id":    serverID,
+		"current_node": nodeName,
+		"has_node":     hasNode,
+		"tcp_ms":       tcpMs,
+		"udp_ms":       udpMs,
+		"http_ms":      httpMs,
+		"has_tcp":      hasTcp,
+		"has_udp":      hasUdp,
+		"has_http":     hasHttp,
+		"best_node":    bestNode,
+		"best_latency": bestLatency,
+		"best_tcp":     bestTcp,
+		"best_udp":     bestUdp,
+		"best_http":    bestHttp,
+		"sort_by":      sortBy,
+	})
+}
+
+// SwitchServerNode manually forces the server to switch to the current best node.
+// POST /api/servers/:id/switch-node
+func (h *ProxyOutboundHandler) SwitchServerNode(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+
+	proxyOutbound := strings.TrimSpace(serverCfg.ProxyOutbound)
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		respondError(c, http.StatusBadRequest, "Server is in direct mode", "")
+		return
+	}
+
+	sortBy := serverCfg.GetLoadBalanceSort()
+	strategy := serverCfg.GetLoadBalance()
+	bestNode, bestLatency := h.outboundMgr.GetBestNodeForServer(serverID, proxyOutbound, sortBy)
+
+	// If no latency data, fall back to dynamic selection
+	if bestNode == "" {
+		selected, err := h.outboundMgr.SelectOutboundWithFailoverForServer(serverID, proxyOutbound, strategy, sortBy, nil)
+		if err != nil || selected == nil {
+			respondError(c, http.StatusBadRequest, "暂无可用节点，请确认代理节点配置正确且已启用", "")
+			return
+		}
+		bestNode = selected.Name
+		bestLatency = 0
+	}
+
+	oldNode, _ := h.outboundMgr.GetServerSelectedNode(serverID)
+	h.outboundMgr.SetServerSelectedNode(serverID, bestNode)
+
+	respondSuccess(c, map[string]interface{}{
+		"server_id":    serverID,
+		"old_node":     oldNode,
+		"new_node":     bestNode,
+		"latency_ms":   bestLatency,
+		"sort_by":      sortBy,
+	})
+}

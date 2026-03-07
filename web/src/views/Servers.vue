@@ -39,7 +39,7 @@
           <n-gi><n-form-item label="空闲超时"><n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="DNS刷新"><n-input-number v-model:value="form.resolve_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi :span="2">
-            <n-form-item label="代理出站">
+            <n-form-item label="代理节点">
               <n-space align="center" style="width: 100%">
                 <n-input :value="getProxyOutboundDisplay(form.proxy_outbound)" readonly placeholder="点击选择代理" style="flex: 1" />
                 <n-button @click="openFormProxySelector">选择</n-button>
@@ -57,14 +57,15 @@
           </n-gi>
           <n-gi :span="2" v-if="isGroupOrMultiNode">
             <n-alert type="info" style="margin-bottom: 12px">
-              多节点或分组模式需要配置负载均衡策略。系统将按照设定的策略和间隔定时测试节点延迟，自动选择最优节点。
+              开启自动Ping后，系统会定时测试「代理节点」中对应的节点延迟，并在当前服务器连接人数为 0 时自动切换到最优节点。
+              如有活跃连接则推迟切换（避免断线）。你也可以手动一键切换。
             </n-alert>
             <n-form-item label="负载策略" label-placement="left" label-width="100">
               <n-select v-model:value="form.load_balance" :options="loadBalanceOptions" placeholder="选择负载策略" />
             </n-form-item>
             <n-form-item label="自动Ping" label-placement="left" label-width="100">
               <n-switch v-model:value="form.auto_ping_enabled" />
-              <template #feedback>关闭后不会自动测试节点延迟</template>
+              <template #feedback>关闭后不会自动测试节点延迟，最终服务器将保持不变</template>
             </n-form-item>
             <n-grid :cols="2" :x-gap="16" style="margin-top: 12px">
               <n-gi>
@@ -85,18 +86,34 @@
                 </n-form-item>
               </n-gi>
             </n-grid>
-            <n-space style="margin-top: 8px" align="center">
-              <n-button secondary size="small" @click="showBestNodePreview">
-                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg></n-icon></template>
-                查看当前最优节点
-              </n-button>
-              <n-text v-if="getCurrentNodeInfo" depth="3" style="font-size: 13px">
-                当前: <n-text strong>{{ getCurrentNodeInfo.display }}</n-text>
-                <n-tag v-if="getCurrentNodeInfo.latency !== '-'" type="info" size="small" style="margin-left: 4px">
-                  {{ getCurrentNodeInfo.latency }}
-                </n-tag>
-              </n-text>
-            </n-space>
+            <!-- 选择的最终服务器 -->
+            <div style="margin-top: 10px; padding: 8px 12px; border: 1px solid var(--n-border-color); border-radius: 6px; background: var(--n-color-embedded);">
+              <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;">
+                <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                  <n-text style="font-size: 12px; white-space: nowrap;" depth="3">最终服务器</n-text>
+                  <template v-if="currentNodeData.has_node">
+                    <n-tag type="success" size="small" round :bordered="false">{{ currentNodeData.current_node }}</n-tag>
+                    <n-tag v-if="currentNodeData.has_tcp" :type="currentNodeData.tcp_ms < 200 ? 'success' : currentNodeData.tcp_ms < 500 ? 'warning' : 'error'" size="tiny" :bordered="false">TCP {{ currentNodeData.tcp_ms }}ms</n-tag>
+                    <n-tag v-if="currentNodeData.has_udp" :type="currentNodeData.udp_ms < 200 ? 'success' : currentNodeData.udp_ms < 500 ? 'warning' : 'error'" size="tiny" :bordered="false">UDP {{ currentNodeData.udp_ms }}ms</n-tag>
+                    <n-tag v-if="currentNodeData.has_http" :type="currentNodeData.http_ms < 300 ? 'success' : currentNodeData.http_ms < 800 ? 'warning' : 'error'" size="tiny" :bordered="false">HTTP {{ currentNodeData.http_ms }}ms</n-tag>
+                    <n-tag v-if="!currentNodeData.has_tcp && !currentNodeData.has_udp && !currentNodeData.has_http" size="tiny" :bordered="false">未测试</n-tag>
+                  </template>
+                  <n-text v-else depth="3" style="font-size: 12px">尚未选择</n-text>
+                  <template v-if="currentNodeData.best_node && currentNodeData.best_node !== currentNodeData.current_node">
+                    <n-text depth="3" style="font-size: 11px;">→</n-text>
+                    <n-tag type="warning" size="tiny" round :bordered="false">{{ currentNodeData.best_node }}
+                      <template v-if="currentNodeData.best_tcp"> T:{{ currentNodeData.best_tcp }}</template>
+                      <template v-if="currentNodeData.best_udp"> U:{{ currentNodeData.best_udp }}</template>
+                      <template v-if="currentNodeData.best_http"> H:{{ currentNodeData.best_http }}</template>
+                      ms</n-tag>
+                  </template>
+                </div>
+                <div style="display: flex; gap: 4px; flex-shrink: 0;">
+                  <n-button size="tiny" type="primary" @click="manualSwitchNode" :loading="switchingNode">一键切换</n-button>
+                  <n-button size="tiny" secondary @click="showBestNodePreview">所有节点</n-button>
+                </div>
+              </div>
+            </div>
           </n-gi>
         </n-grid>
       </n-form>
@@ -116,7 +133,7 @@
     </n-modal>
 
     <!-- 代理选择器 Modal -->
-    <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理出站" style="width: 1400px; max-width: 95vw">
+    <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理节点" style="width: 1400px; max-width: 95vw">
       <n-spin :show="proxySelectorLoading">
         <!-- 视图切换和负载均衡选项 -->
         <n-space style="margin-bottom: 12px;" align="center" justify="space-between" wrap>
@@ -297,7 +314,7 @@
     </n-modal>
 
     <!-- 表单代理选择器 Modal -->
-    <n-modal v-model:show="showFormProxySelector" preset="card" title="选择代理出站" style="width: 1200px; max-width: 95vw">
+    <n-modal v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
       <n-spin :show="formProxySelectorLoading">
         <!-- 选择模式 -->
         <n-space style="margin-bottom: 16px" align="center">
@@ -616,7 +633,7 @@
       </template>
       <template #footer>
         <n-space justify="space-between">
-          <n-button v-if="proxyDetailType === 'single' && proxyDetailData?.name !== '直连'" type="info" @click="goToProxyOutboundConfirmed">跳转到代理出站</n-button>
+          <n-button v-if="proxyDetailType === 'single' && proxyDetailData?.name !== '直连'" type="info" @click="goToProxyOutboundConfirmed">跳转到代理节点</n-button>
           <span v-else></span>
           <n-button @click="showProxyDetailModal = false">关闭</n-button>
         </n-space>
@@ -723,7 +740,7 @@
       </n-tabs>
       <template #footer>
         <n-space justify="space-between">
-          <n-button type="info" @click="goToProxyOutboundFromSingleNode">跳转到代理出站</n-button>
+          <n-button type="info" @click="goToProxyOutboundFromSingleNode">跳转到代理节点</n-button>
           <n-button @click="showSingleNodeModal = false">关闭</n-button>
         </n-space>
       </template>
@@ -1233,6 +1250,40 @@ const bestNodeColumnsWithActions = computed(() => [
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testBestNode(r.name, 'udp') } }, () => 'UDP')
   ])}
 ])
+
+// 选择的最终服务器
+const currentNodeData = ref({ has_node: false, current_node: '', latency_ms: 0, has_latency: false, best_node: '', best_latency: 0 })
+const switchingNode = ref(false)
+
+const fetchCurrentNode = async () => {
+  const serverId = form.value?.id
+  if (!serverId) { currentNodeData.value = { has_node: false }; return }
+  try {
+    const res = await api(`/api/servers/${serverId}/current-node`)
+    if (res?.success && res.data) {
+      currentNodeData.value = res.data
+    } else {
+      currentNodeData.value = { has_node: false }
+    }
+  } catch { currentNodeData.value = { has_node: false } }
+}
+
+const manualSwitchNode = async () => {
+  const serverId = form.value?.id
+  if (!serverId) return
+  switchingNode.value = true
+  try {
+    const res = await api(`/api/servers/${serverId}/switch-node`, 'POST')
+    if (res?.success && res.data) {
+      message.success(`已切换到节点: ${res.data.new_node} (${res.data.latency_ms}ms)`)
+      await fetchCurrentNode()
+    } else {
+      message.error(res?.error || res?.msg || '切换失败，可能没有延迟数据，请先等待自动Ping完成')
+    }
+  } catch (e) {
+    message.error('切换失败: ' + (e.message || e))
+  } finally { switchingNode.value = false }
+}
 
 const refreshServerNodeLatency = async () => {
   const serverId = form.value?.id
@@ -2500,7 +2551,7 @@ const columns = [
   { title: '监听', key: 'listen_addr', width: 130 },
   { title: '目标', key: 'target', render: r => `${r.target}:${r.port}` },
   { 
-    title: '代理出站', 
+    title: '代理节点', 
     key: 'proxy_outbound', 
     width: 250, 
     render: r => h(NSpace, { size: 'small', align: 'center' }, () => [
@@ -2525,7 +2576,7 @@ const columns = [
 
 const load = async () => { const res = await api('/api/servers'); if (res.success) servers.value = res.data || [] }
 const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true; refreshBatchMcbeAddress() }
-const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; refreshBatchMcbeAddress(); refreshServerNodeLatency() }
+const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; refreshBatchMcbeAddress(); refreshServerNodeLatency(); fetchCurrentNode() }
 
 const refreshBatchMcbeAddress = () => {
   const target = form.value?.target
@@ -2745,6 +2796,9 @@ const recalculateBestNode = () => {
   bestNodeRawData.value = [...bestNodeRawData.value]
 
   message.success(bestNode ? `最优节点: ${bestNode.name} (${bestLatency}ms)` : '没有找到可用节点')
+
+  // Refresh the "最终服务器" display
+  fetchCurrentNode()
 }
 
 // 批量测试所有节点

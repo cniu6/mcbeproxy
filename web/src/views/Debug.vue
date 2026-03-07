@@ -80,9 +80,9 @@
           </n-card>
         </n-gi>
 
-        <!-- 代理出站统计 -->
+        <!-- 代理节点统计 -->
         <n-gi>
-          <n-card size="small" title="代理出站">
+          <n-card size="small" title="代理节点">
             <n-space vertical>
               <n-space justify="space-between">
                 <span>健康节点</span>

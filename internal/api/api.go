@@ -164,6 +164,8 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/servers/:id/latency", a.getServerLatency)
 		if a.proxyOutboundHandler != nil {
 			api.GET("/servers/:id/node-latency", a.proxyOutboundHandler.GetServerNodeLatency)
+			api.GET("/servers/:id/current-node", a.proxyOutboundHandler.GetServerCurrentNode)
+			api.POST("/servers/:id/switch-node", a.proxyOutboundHandler.SwitchServerNode)
 		}
 
 		// Session endpoints

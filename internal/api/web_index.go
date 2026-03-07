@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -29,27 +30,53 @@ var wiCache = &webIndexCache{}
 // getWebIndexAPI returns a consolidated public status snapshot without authentication.
 // GET /api/web/index-api
 func (a *APIServer) getWebIndexAPI(c *gin.Context) {
+	// Parse history pagination params
+	historyLimit := 10
+	historyPage := 1
+	if v := c.Query("history_limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			allowed := map[int]bool{10: true, 20: true, 100: true, 200: true, 500: true, 1000: true}
+			if allowed[n] {
+				historyLimit = n
+			}
+		}
+	}
+	if v := c.Query("history_page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			historyPage = n
+		}
+	}
+
 	wiCache.mu.Lock()
 	now := time.Now()
 	wiCache.requestedAt = now
+	var baseData []byte
 	// Serve cached if fresh enough (< 2s)
 	if wiCache.data != nil && now.Sub(wiCache.updatedAt) < 2*time.Second {
-		cached := wiCache.data
+		baseData = wiCache.data
 		wiCache.mu.Unlock()
-		c.Data(http.StatusOK, "application/json; charset=utf-8", cached)
-		return
+	} else {
+		wiCache.mu.Unlock()
+		// Build fresh base response (without history)
+		baseData = a.buildWebIndexResponse()
+		wiCache.mu.Lock()
+		wiCache.data = baseData
+		wiCache.updatedAt = time.Now()
+		wiCache.mu.Unlock()
 	}
-	wiCache.mu.Unlock()
 
-	// Build fresh response
-	data := a.buildWebIndexResponse()
+	// Fetch history with pagination (always fresh per request)
+	var response map[string]interface{}
+	json.Unmarshal(baseData, &response)
 
-	wiCache.mu.Lock()
-	wiCache.data = data
-	wiCache.updatedAt = time.Now()
-	wiCache.mu.Unlock()
+	historyDTOs, historyTotal := a.fetchSessionHistory(historyLimit, historyPage)
+	response["session_history"] = historyDTOs
+	response["history_total"] = historyTotal
+	response["history_page"] = historyPage
+	response["history_limit"] = historyLimit
 
-	c.Data(http.StatusOK, "application/json; charset=utf-8", data)
+	final, _ := json.Marshal(response)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", final)
 }
 
 func (a *APIServer) buildWebIndexResponse() []byte {
@@ -93,38 +120,6 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 		})
 	}
 
-	// Session history (last 50 records, with status)
-	type publicHistoryDTO struct {
-		DisplayName  string    `json:"display_name"`
-		ServerID     string    `json:"server_id"`
-		ClientAddr   string    `json:"client_addr"`
-		StartTime    time.Time `json:"start_time"`
-		EndTime      time.Time `json:"end_time"`
-		BytesUp      int64     `json:"bytes_up"`
-		BytesDown    int64     `json:"bytes_down"`
-		Status       string    `json:"status"`
-		StatusReason string    `json:"status_reason"`
-	}
-	var historyDTOs []publicHistoryDTO
-	if a.sessionRepo != nil {
-		records, err := a.sessionRepo.List(50, 0)
-		if err == nil {
-			historyDTOs = make([]publicHistoryDTO, 0, len(records))
-			for _, r := range records {
-				historyDTOs = append(historyDTOs, publicHistoryDTO{
-					DisplayName:  r.DisplayName,
-					ServerID:     r.ServerID,
-					ClientAddr:   r.ClientAddr,
-					StartTime:    r.StartTime,
-					EndTime:      r.EndTime,
-					BytesUp:      r.BytesUp,
-					BytesDown:    r.BytesDown,
-					Status:       r.Status,
-					StatusReason: r.StatusReason,
-				})
-			}
-		}
-	}
 
 	// Fetch pings concurrently
 	type pingResult struct {
@@ -304,7 +299,6 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 		"total_servers":   totalCount,
 		"active_sessions": sessionDTOs,
 		"session_count":   len(sessionDTOs),
-		"session_history": historyDTOs,
 		"generated_at":    time.Now(),
 	}
 	if statsErr != nil {
@@ -313,6 +307,40 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 
 	data, _ := json.Marshal(response)
 	return data
+}
+
+// fetchSessionHistory returns paginated session history and total count.
+func (a *APIServer) fetchSessionHistory(limit, page int) ([]map[string]interface{}, int) {
+	if a.sessionRepo == nil {
+		return nil, 0
+	}
+	total, err := a.sessionRepo.Count()
+	if err != nil {
+		return nil, 0
+	}
+	offset := (page - 1) * limit
+	if offset >= total {
+		return []map[string]interface{}{}, total
+	}
+	records, err := a.sessionRepo.List(limit, offset)
+	if err != nil {
+		return nil, 0
+	}
+	dtos := make([]map[string]interface{}, 0, len(records))
+	for _, r := range records {
+		dtos = append(dtos, map[string]interface{}{
+			"display_name":  r.DisplayName,
+			"server_id":     r.ServerID,
+			"client_addr":   r.ClientAddr,
+			"start_time":    r.StartTime,
+			"end_time":      r.EndTime,
+			"bytes_up":      r.BytesUp,
+			"bytes_down":    r.BytesDown,
+			"status":        r.Status,
+			"status_reason": r.StatusReason,
+		})
+	}
+	return dtos, total
 }
 
 // Suppress unused import warnings
@@ -408,6 +436,19 @@ tbody tr:nth-child(even):hover td{background:rgba(79,140,255,0.06)}
 .st-tag-warn{background:rgba(255,169,77,0.12);color:#ffa94d;border:1px solid rgba(255,169,77,0.2)}
 .st-tag-def{background:rgba(138,150,168,0.1);color:var(--text2);border:1px solid rgba(138,150,168,0.15)}
 .runtime-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+
+/* Pagination */
+.pager{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;gap:10px;flex-wrap:wrap;border-top:1px solid var(--border);font-size:0.8em}
+.pager-info{color:var(--text2);font-variant-numeric:tabular-nums}
+.pager-controls{display:flex;align-items:center;gap:6px}
+.pager-btn{background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:8px;cursor:pointer;font-size:0.85em;transition:all 0.15s;min-width:32px;text-align:center}
+.pager-btn:hover:not(:disabled){background:var(--card-hover);border-color:var(--border2)}
+.pager-btn:disabled{opacity:0.35;cursor:not-allowed}
+.pager-btn.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+.pager-size{display:flex;align-items:center;gap:6px}
+.pager-size label{color:var(--text2);font-size:0.85em}
+.pager-size select{background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:8px;font-size:0.85em;cursor:pointer;outline:none}
+.pager-size select:focus{border-color:var(--accent)}
 
 /* Footer */
 .footer{text-align:center;color:var(--text3);font-size:0.75em;margin-top:28px;padding:18px 0;border-top:1px solid var(--border)}
@@ -545,6 +586,17 @@ body.light{--bg:#f5f7fa;--bg2:#edf0f5;--card:#ffffff;--card-hover:#f8f9fc;--bord
       <div class="table-wrap">
         <table><thead><tr><th>玩家</th><th>服务器</th><th>状态</th><th>原因</th><th>时间</th><th>上传</th><th>下载</th></tr></thead>
         <tbody id="historyTable"><tr class="empty-row"><td colspan="7">无历史记录</td></tr></tbody></table>
+        <div class="pager" id="historyPager">
+          <div class="pager-info" id="historyPagerInfo">-</div>
+          <div class="pager-controls">
+            <div class="pager-size"><label>每页</label><select id="historyPageSize" onchange="changePageSize(this.value)"><option value="10" selected>10</option><option value="20">20</option><option value="100">100</option><option value="200">200</option><option value="500">500</option><option value="1000">1000</option></select></div>
+            <button class="pager-btn" id="hpFirst" onclick="goPage(1)" title="首页">«</button>
+            <button class="pager-btn" id="hpPrev" onclick="goPage(hPage-1)" title="上一页">‹</button>
+            <span id="hpPages"></span>
+            <button class="pager-btn" id="hpNext" onclick="goPage(hPage+1)" title="下一页">›</button>
+            <button class="pager-btn" id="hpLast" onclick="goPage(hTotalPages)" title="末页">»</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -590,6 +642,9 @@ function esc(s){if(!s)return'';var d=document.createElement('div');d.textContent
 
 var statusMap={'disconnected':['正常断开','st-tag-ok'],'blacklist':['黑名单','st-tag-err'],'whitelist':['白名单拒绝','st-tag-warn'],'auth_failed':['验证失败','st-tag-err'],'kicked':['被踢出','st-tag-warn']};
 function stTag(st){var info=statusMap[st||'disconnected']||[st||'断开','st-tag-def'];return '<span class="st-tag '+info[1]+'">'+esc(info[0])+'</span>'}
+
+// Pagination state
+var hPage=1,hLimit=10,hTotal=0,hTotalPages=1;
 
 function update(data){
   $('loading').style.display='none';
@@ -660,6 +715,26 @@ function update(data){
   });
   $('historyTable').innerHTML=hh;
 
+  // Update pagination state
+  hTotal=data.history_total||0;
+  hPage=data.history_page||1;
+  hLimit=data.history_limit||10;
+  hTotalPages=Math.max(1,Math.ceil(hTotal/hLimit));
+  if(hPage>hTotalPages)hPage=hTotalPages;
+  var start=(hPage-1)*hLimit+1,end=Math.min(hPage*hLimit,hTotal);
+  $('historyPagerInfo').textContent=hTotal>0?('第 '+start+'-'+end+' 条，共 '+hTotal+' 条'):'暂无记录';
+  $('hpFirst').disabled=hPage<=1;$('hpPrev').disabled=hPage<=1;
+  $('hpNext').disabled=hPage>=hTotalPages;$('hpLast').disabled=hPage>=hTotalPages;
+  // Render page buttons
+  var pb='',maxBtns=5,half=Math.floor(maxBtns/2);
+  var pStart=Math.max(1,hPage-half),pEnd=Math.min(hTotalPages,pStart+maxBtns-1);
+  if(pEnd-pStart<maxBtns-1)pStart=Math.max(1,pEnd-maxBtns+1);
+  for(var p=pStart;p<=pEnd;p++){
+    pb+='<button class="pager-btn'+(p===hPage?' active':'')+'" onclick="goPage('+p+')">'+p+'</button>';
+  }
+  $('hpPages').innerHTML=pb;
+  $('historyPageSize').value=String(hLimit);
+
   $('rtGoroutines').textContent=rt.goroutine_count||0;
   $('rtGC').textContent=rt.num_gc||0;
   $('rtHeapAlloc').textContent=fmtBytes(rt.heap_alloc);
@@ -671,11 +746,14 @@ function update(data){
 }
 
 function fetchData(){
-  fetch('/api/web/index-api').then(function(r){return r.json()}).then(update).catch(function(e){
+  var url='/api/web/index-api?history_limit='+hLimit+'&history_page='+hPage;
+  fetch(url).then(function(r){return r.json()}).then(update).catch(function(e){
     console.error('Fetch error:',e);
     if($('content').style.display==='none'){$('loading').innerHTML='<div style="color:var(--red)">加载失败，请刷新页面</div>';}
   });
 }
+function goPage(p){p=Math.max(1,Math.min(p,hTotalPages));if(p!==hPage){hPage=p;fetchData()}}
+function changePageSize(v){hLimit=parseInt(v)||10;hPage=1;fetchData()}
 function initTheme(){var t=localStorage.getItem('wi-theme');if(t==='light')document.body.classList.add('light');updateThemeIcon()}
 function toggleTheme(){document.body.classList.toggle('light');localStorage.setItem('wi-theme',document.body.classList.contains('light')?'light':'dark');updateThemeIcon()}
 function updateThemeIcon(){var L=document.body.classList.contains('light');$('themeIcon').innerHTML=L?'<path d="M12 7c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zM2 13h2c.55 0 1-.45 1-1s-.45-1-1-1H2c-.55 0-1 .45-1 1s.45 1 1 1zm18 0h2c.55 0 1-.45 1-1s-.45-1-1-1h-2c-.55 0-1 .45-1 1s.45 1 1 1zM11 2v2c0 .55.45 1 1 1s1-.45 1-1V2c0-.55-.45-1-1-1s-1 .45-1 1zm0 18v2c0 .55.45 1 1 1s1-.45 1-1v-2c0-.55-.45-1-1-1s-1 .45-1 1zM5.99 4.58a.996.996 0 00-1.41 0 .996.996 0 000 1.41l1.06 1.06c.39.39 1.03.39 1.41 0s.39-1.03 0-1.41L5.99 4.58zm12.37 12.37a.996.996 0 00-1.41 0 .996.996 0 000 1.41l1.06 1.06c.39.39 1.03.39 1.41 0a.996.996 0 000-1.41l-1.06-1.06zm1.06-10.96a.996.996 0 000-1.41.996.996 0 00-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06zM7.05 18.36a.996.996 0 000-1.41.996.996 0 00-1.41 0l-1.06 1.06c-.39.39-.39 1.03 0 1.41s1.03.39 1.41 0l1.06-1.06z"/>':'<path d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>'}

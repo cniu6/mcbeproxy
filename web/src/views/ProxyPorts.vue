@@ -67,7 +67,7 @@
 
           <n-grid :cols="1" :x-gap="16">
             <n-gi>
-              <n-form-item label="代理出站">
+              <n-form-item label="代理节点">
                 <n-space align="center" style="width: 100%">
                   <n-input :value="getProxyOutboundDisplay(port.proxy_outbound)" readonly placeholder="点击选择代理" style="flex: 1" size="small" />
                   <n-button size="small" @click="openFormProxySelector(port)">选择</n-button>
@@ -111,7 +111,7 @@
       </n-card>
     </n-space>
 
-    <n-modal v-model:show="showFormProxySelector" preset="card" title="选择代理出站" style="width: 1200px; max-width: 95vw">
+    <n-modal v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
       <n-spin :show="formProxySelectorLoading">
         <n-space style="margin-bottom: 16px" align="center">
           <n-radio-group v-model:value="formProxyMode" size="small">

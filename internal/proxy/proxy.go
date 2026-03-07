@@ -434,6 +434,23 @@ func (p *ProxyServer) startAutoPingScheduler() {
 
 				p.pingAllNodesForServer(serverCfg)
 				lastRun[serverCfg.ID] = now
+
+				// Auto-switch: update selected node only when no active sessions
+				proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
+				sortBy := serverCfg.GetLoadBalanceSort()
+				bestNode, _ := p.outboundMgr.GetBestNodeForServer(serverCfg.ID, proxyOutbound, sortBy)
+				if bestNode != "" {
+					currentNode, _ := p.outboundMgr.GetServerSelectedNode(serverCfg.ID)
+					if currentNode != bestNode {
+						activeSessions := p.GetActiveSessionsForServer(serverCfg.ID)
+						if activeSessions == 0 {
+							p.outboundMgr.SetServerSelectedNode(serverCfg.ID, bestNode)
+							logger.Info("Auto-switch server %s node: %s -> %s (0 active sessions)", serverCfg.ID, currentNode, bestNode)
+						} else {
+							logger.Debug("Auto-switch deferred for server %s: %s -> %s (%d active sessions)", serverCfg.ID, currentNode, bestNode, activeSessions)
+						}
+					}
+				}
 			}
 		}
 	}()
