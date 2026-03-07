@@ -247,6 +247,7 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.POST("/detailed-test", a.proxyOutboundHandler.DetailedTestProxyOutbound)
 				proxyOutboundGroup.POST("/test-mcbe", a.proxyOutboundHandler.TestMCBEUDP)
 				proxyOutboundGroup.POST("/health", a.proxyOutboundHandler.GetProxyOutboundHealthByBody)
+				proxyOutboundGroup.POST("/fetch-subscription", a.proxyOutboundHandler.FetchSubscription)
 				proxyOutboundGroup.POST("/get", a.proxyOutboundHandler.GetProxyOutboundByBody)
 				proxyOutboundGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
 				proxyOutboundGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)

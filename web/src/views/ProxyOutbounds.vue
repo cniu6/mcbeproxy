@@ -236,12 +236,15 @@
           <n-input v-model:value="importText" type="textarea" :rows="8" placeholder="粘贴分享链接，每行一个..." />
         </n-tab-pane>
         <n-tab-pane name="subscription" tab="订阅导入">
-          <n-form-item label="订阅地址">
-            <n-input v-model:value="subscriptionUrl" placeholder="https://example.com/subscribe" />
-          </n-form-item>
-          <n-space>
-            <n-button @click="fetchSubscription" :loading="fetchingSubscription">获取订阅</n-button>
-            <n-checkbox v-model:checked="autoGroupFromSubscription">自动使用订阅名作为分组</n-checkbox>
+          <n-space vertical :size="10">
+            <n-input v-model:value="subscriptionUrl" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" placeholder="https://example.com/subscribe" />
+            <n-space align="center" :size="8" wrap>
+              <n-button size="small" @click="showSubProxySelectorModal = true">
+                {{ subscriptionProxy ? `代理: ${subscriptionProxy}` : '直连 (不使用代理)' }}
+              </n-button>
+              <n-button type="primary" size="small" @click="fetchSubscription" :loading="fetchingSubscription">获取订阅</n-button>
+            </n-space>
+            <n-input v-model:value="importText" type="textarea" :autosize="{ minRows: 6, maxRows: 20 }" placeholder="获取订阅后内容显示在此处..." />
           </n-space>
         </n-tab-pane>
       </n-tabs>
@@ -252,6 +255,26 @@
           <n-button @click="showImportModal = false">取消</n-button>
         </n-space>
       </template>
+    </n-modal>
+
+    <!-- 订阅代理选择器 Modal -->
+    <n-modal v-model:show="showSubProxySelectorModal" preset="card" title="选择获取订阅使用的代理" style="width: 1100px; max-width: 95vw">
+      <n-space vertical :size="8">
+        <n-space align="center" :size="8" wrap>
+          <n-input v-model:value="subProxySearch" size="small" placeholder="搜索节点..." clearable style="width: 200px" />
+          <n-select v-model:value="subProxyGroup" size="small" :options="subProxyGroupOptions" placeholder="全部分组" clearable style="width: 160px" />
+          <n-button size="small" @click="subscriptionProxy = ''; showSubProxySelectorModal = false">使用直连</n-button>
+          <n-text v-if="subscriptionProxy" depth="3" style="font-size: 12px">当前: {{ subscriptionProxy }}</n-text>
+        </n-space>
+        <n-data-table
+          :columns="subProxyColumns"
+          :data="filteredSubProxyList"
+          :bordered="true"
+          size="small"
+          :max-height="450"
+          :scroll-x="900"
+        />
+      </n-space>
     </n-modal>
 
     <!-- 测试选项 Modal -->
@@ -1311,12 +1334,86 @@ const runDetailedTest = async () => {
 const subscriptionUrl = ref('')
 const fetchingSubscription = ref(false)
 const importGroupName = ref('')
-const autoGroupFromSubscription = ref(true)
+const subscriptionProxy = ref('')
+const showSubProxySelectorModal = ref(false)
+const subProxySearch = ref('')
+const subProxyGroup = ref(null)
+
+const subProxyGroupOptions = computed(() => {
+  const groups = new Set()
+  outbounds.value.forEach(o => { if (o.group && o.enabled) groups.add(o.group) })
+  return Array.from(groups).sort().map(g => ({ label: g, value: g }))
+})
+
+const subProxyColumns = [
+  { title: '名称', key: 'name', width: 160, ellipsis: { tooltip: true }, sorter: (a, b) => a.name.localeCompare(b.name) },
+  { title: '分组', key: 'group', width: 90, ellipsis: { tooltip: true }, render: r => r.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => r.group) : '-' },
+  { title: '类型', key: 'type', width: 80, render: r => h(NTag, { size: 'small' }, () => r.type?.toUpperCase()) },
+  { title: '服务器', key: 'server', width: 150, ellipsis: { tooltip: true }, render: r => `${r.server}:${r.port}` },
+  { title: 'TCP', key: 'latency_ms', width: 70, sorter: (a, b) => (a.latency_ms || 99999) - (b.latency_ms || 99999), render: r => {
+    if (r.latency_ms > 0) { const t = r.latency_ms < 200 ? 'success' : r.latency_ms < 500 ? 'warning' : 'error'; return h(NTag, { type: t, size: 'small', bordered: false }, () => `${r.latency_ms}ms`) }
+    return '-'
+  }},
+  { title: 'HTTP', key: 'http_latency_ms', width: 70, sorter: (a, b) => (a.http_latency_ms || 99999) - (b.http_latency_ms || 99999), render: r => {
+    if (r.http_latency_ms > 0) { const t = r.http_latency_ms < 500 ? 'success' : r.http_latency_ms < 1500 ? 'warning' : 'error'; return h(NTag, { type: t, size: 'small', bordered: false }, () => `${r.http_latency_ms}ms`) }
+    return '-'
+  }},
+  { title: 'UDP', key: 'udp_latency_ms', width: 70, sorter: (a, b) => (a.udp_latency_ms || 99999) - (b.udp_latency_ms || 99999), render: r => {
+    if (r.udp_available === true) { const txt = r.udp_latency_ms > 0 ? `${r.udp_latency_ms}ms` : '✓'; const t = r.udp_latency_ms > 0 ? (r.udp_latency_ms < 200 ? 'success' : r.udp_latency_ms < 500 ? 'warning' : 'error') : 'success'; return h(NTag, { type: t, size: 'small', bordered: false }, () => txt) }
+    if (r.udp_available === false) return h(NTag, { type: 'error', size: 'small' }, () => '✗')
+    return '-'
+  }},
+  { title: '操作', key: 'actions', width: 200, fixed: 'right', render: r => h(NSpace, { size: 4, wrap: false }, () => [
+    h(NButton, { size: 'tiny', type: 'info', onClick: (e) => { e.stopPropagation(); subProxyTest(r.name, 'tcp') } }, () => 'TCP'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); subProxyTest(r.name, 'http') } }, () => 'HTTP'),
+    h(NButton, { size: 'tiny', type: 'warning', onClick: (e) => { e.stopPropagation(); subProxyTest(r.name, 'udp') } }, () => 'UDP'),
+    h(NButton, { size: 'tiny', type: 'success', onClick: (e) => { e.stopPropagation(); subscriptionProxy.value = r.name; showSubProxySelectorModal.value = false } }, () => '选择')
+  ])}
+]
+
+const subProxyTest = async (name, type) => {
+  try {
+    let res
+    if (type === 'tcp') {
+      res = await api('/api/proxy-outbounds/test', 'POST', { name })
+      if (res.success) {
+        updateOutboundData(name, { latency_ms: res.data?.latency_ms })
+        message.success(`${name} TCP: ${res.data?.latency_ms}ms`)
+      } else { message.error(res.msg || '测试失败') }
+    } else if (type === 'http') {
+      res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, targets: ['cloudflare'] })
+      if (res.success) {
+        const httpMs = res.data?.http_tests?.[0]?.latency_ms || 0
+        updateOutboundData(name, { http_latency_ms: httpMs })
+        message.success(`${name} HTTP: ${httpMs}ms`)
+      } else { message.error(res.msg || '测试失败') }
+    } else {
+      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: 'mco.cubecraft.net:19132' })
+      if (res.success) {
+        updateOutboundData(name, { udp_available: res.data?.available, udp_latency_ms: res.data?.latency_ms || 0 })
+        message.success(`${name} UDP: ${res.data?.available ? (res.data?.latency_ms ? res.data.latency_ms + 'ms' : '可用') : '不可用'}`)
+      } else { message.error(res.msg || '测试失败') }
+    }
+  } catch (e) { message.error('测试出错: ' + e.message) }
+}
+
+const filteredSubProxyList = computed(() => {
+  let list = outbounds.value.filter(o => o.enabled)
+  if (subProxyGroup.value) {
+    list = list.filter(o => o.group === subProxyGroup.value)
+  }
+  const q = subProxySearch.value.trim().toLowerCase()
+  if (q) {
+    list = list.filter(o => o.name.toLowerCase().includes(q) || (o.group || '').toLowerCase().includes(q) || (o.server || '').toLowerCase().includes(q))
+  }
+  return list
+})
 
 const openImportModal = () => {
   importText.value = ''
   subscriptionUrl.value = ''
   importGroupName.value = ''
+  subscriptionProxy.value = ''
   showImportModal.value = true
 }
 
@@ -1329,7 +1426,7 @@ const pasteImport = async () => {
   }
 }
 
-// 获取订阅
+// 获取订阅（通过后端API，支持代理）
 const fetchSubscription = async () => {
   if (!subscriptionUrl.value) {
     message.warning('请输入订阅地址')
@@ -1337,8 +1434,16 @@ const fetchSubscription = async () => {
   }
   fetchingSubscription.value = true
   try {
-    const res = await fetch(subscriptionUrl.value)
-    const text = await res.text()
+    const res = await api('/api/proxy-outbounds/fetch-subscription', 'POST', {
+      url: subscriptionUrl.value,
+      proxy_name: subscriptionProxy.value || ''
+    })
+    if (!res.success) {
+      message.error(res.msg || '获取订阅失败')
+      fetchingSubscription.value = false
+      return
+    }
+    const text = res.data.content || ''
     // 尝试 Base64 解码
     try {
       importText.value = decodeBase64UTF8(text.trim())
@@ -1346,25 +1451,9 @@ const fetchSubscription = async () => {
       importText.value = text
     }
     
-    // 自动从订阅 URL 提取分组名
-    if (autoGroupFromSubscription.value && !importGroupName.value) {
-      try {
-        const url = new URL(subscriptionUrl.value)
-        // 尝试从 URL 提取有意义的名称
-        const hostname = url.hostname.replace(/^(www\.|api\.|sub\.)/i, '')
-        const pathParts = url.pathname.split('/').filter(p => p && p !== 'subscribe' && p !== 'sub')
-        if (pathParts.length > 0) {
-          importGroupName.value = pathParts[pathParts.length - 1]
-        } else {
-          importGroupName.value = hostname.split('.')[0]
-        }
-      } catch {
-        // 提取失败，使用当前日期作为分组名
-        importGroupName.value = new Date().toLocaleDateString('zh-CN')
-      }
-    }
-    
-    message.success('订阅获取成功')
+    const lines = importText.value.split('\n').filter(l => l.trim())
+    const proxyInfo = res.data.proxy_used ? ` (通过 ${res.data.proxy_used})` : ' (直连)'
+    message.success(`订阅获取成功${proxyInfo}，共 ${lines.length} 行`)
   } catch (e) {
     message.error('获取订阅失败: ' + e.message)
   }

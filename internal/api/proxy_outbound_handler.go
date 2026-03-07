@@ -1652,3 +1652,103 @@ func (h *ProxyOutboundHandler) SwitchServerNode(c *gin.Context) {
 		"sort_by":      sortBy,
 	})
 }
+
+// FetchSubscription fetches a subscription URL, optionally through a proxy outbound.
+// POST /api/proxy-outbounds/fetch-subscription
+func (h *ProxyOutboundHandler) FetchSubscription(c *gin.Context) {
+	var req struct {
+		URL       string `json:"url"`
+		ProxyName string `json:"proxy_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request", err.Error())
+		return
+	}
+	req.URL = strings.TrimSpace(req.URL)
+	if req.URL == "" {
+		respondError(c, http.StatusBadRequest, "请输入订阅地址", "")
+		return
+	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		respondError(c, http.StatusBadRequest, "订阅地址必须以 http:// 或 https:// 开头", "")
+		return
+	}
+
+	// Build HTTP client, optionally through proxy
+	var httpClient *http.Client
+	var dialerToClose *proxy.SingboxDialer
+
+	proxyName := strings.TrimSpace(req.ProxyName)
+	if proxyName != "" && h.outboundMgr != nil {
+		cfg, exists := h.outboundMgr.GetOutbound(proxyName)
+		if !exists || cfg == nil {
+			respondError(c, http.StatusBadRequest, "代理节点不存在: "+proxyName, "")
+			return
+		}
+		if !cfg.Enabled {
+			respondError(c, http.StatusBadRequest, "代理节点未启用: "+proxyName, "")
+			return
+		}
+		dialer, err := proxy.CreateSingboxDialer(cfg)
+		if err != nil {
+			respondError(c, http.StatusInternalServerError, "创建代理连接失败: "+err.Error(), "")
+			return
+		}
+		dialerToClose = dialer
+		httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext: dialer.DialContext,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
+	} else {
+		httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
+	}
+
+	// Ensure dialer is closed after use
+	if dialerToClose != nil {
+		defer dialerToClose.Close()
+	}
+
+	// Fetch subscription
+	httpReq, err := http.NewRequest("GET", req.URL, nil)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "无效的订阅地址: "+err.Error(), "")
+		return
+	}
+	httpReq.Header.Set("User-Agent", "Mozilla/5.0")
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, "获取订阅失败: "+err.Error(), "")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respondError(c, http.StatusBadGateway, fmt.Sprintf("订阅服务器返回错误: HTTP %d", resp.StatusCode), "")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10MB limit
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "读取订阅内容失败: "+err.Error(), "")
+		return
+	}
+
+	respondSuccess(c, map[string]interface{}{
+		"content":    string(body),
+		"size":       len(body),
+		"proxy_used": proxyName,
+	})
+}

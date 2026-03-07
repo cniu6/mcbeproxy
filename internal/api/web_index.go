@@ -358,7 +358,7 @@ const webIndexHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Minecraft 服务器状态</title>
+<title>Minecraft BE 服务器状态</title>
 <style>
 :root{--bg:#080c18;--bg2:#0f1526;--card:#131a30;--card-hover:#182040;--border:#1c2848;--border2:#243058;--text:#c8d6e5;--text2:#8a96a8;--text3:#5a6578;--heading:#edf2f7;--accent:#4f8cff;--accent2:#6c5ce7;--green:#00d68f;--red:#ff6b6b;--orange:#ffa94d;--shadow:0 2px 12px rgba(0,0,0,0.3)}
 *{margin:0;padding:0;box-sizing:border-box}
