@@ -4,7 +4,7 @@
 > **版本**: v1.0.0  
 > **Go版本**: Go 1.24  
 > **前端**: Vue 3 + Vite + Naive UI  
-> **最后更新**: 2026-02-01  
+> **最后更新**: 2026-03-07  
 > **文档规模**: 50,000+ 字深度解析
 
 ---
@@ -72,105 +72,115 @@ mindmap
 
 ### 1.3 代码库规模统计
 
-| 模块 | 文件数 | 代码行数 | 核心复杂度 |
-|------|-------|---------|-----------|
-| internal/proxy | 18 | ~8,000行 | ★★★★★ |
-| internal/config | 6 | ~2,500行 | ★★★☆☆ |
-| internal/db | 8 | ~2,000行 | ★★★☆☆ |
-| internal/api | 3 | ~3,500行 | ★★★★☆ |
-| internal/session | 2 | ~800行 | ★★★☆☆ |
-| internal/acl | 1 | ~400行 | ★★☆☆☆ |
-| internal/auth | 3 | ~1,200行 | ★★★☆☆ |
-| internal/monitor | 3 | ~1,500行 | ★★★☆☆ |
-| internal/logger | 1 | ~1,200行 | ★★★☆☆ |
-| internal/protocol | 1 | ~300行 | ★★☆☆☆ |
-| web/frontend | 26 | ~5,000行 | ★★★☆☆ |
-| **总计** | **72** | **~26,000行** | - |
+| 模块 | 源文件数 | 测试文件数 | 源代码行数 | 核心复杂度 |
+|------|---------|-----------|-----------|-----------|
+| internal/proxy | 19 | 4 | ~12,860行 | ★★★★★ |
+| internal/api | 6 | 2 | ~3,740行 | ★★★★☆ |
+| internal/config | 5 | 3 | ~1,760行 | ★★★☆☆ |
+| internal/db | 9 | 2 | ~1,430行 | ★★★☆☆ |
+| internal/protocol | 2 | 1 | ~1,250行 | ★★★☆☆ |
+| internal/monitor | 3 | 0 | ~950行 | ★★★☆☆ |
+| internal/session | 2 | 2 | ~520行 | ★★★☆☆ |
+| internal/auth | 3 | 2 | ~450行 | ★★★☆☆ |
+| internal/logger | 1 | 0 | ~420行 | ★★★☆☆ |
+| internal/acl | 1 | 1 | ~420行 | ★★☆☆☆ |
+| internal/errors | 1 | 0 | ~180行 | ★★☆☆☆ |
+| cmd/mcpeserverproxy | 1 | 0 | ~194行 | ★★☆☆☆ |
+| web/frontend | 17 | 0 | ~8,710行 | ★★★☆☆ |
+| **总计** | **70** | **17** | **~32,880行** | - |
 
 ### 1.4 项目目录结构（完整版）
 
 ```
 mcpeserverproxy/
 ├── 📁 cmd/mcpeserverproxy/                    # 应用程序入口点
-│   └── 📄 main.go                             # 230行 - 初始化所有组件
+│   └── 📄 main.go                             # 194行 - 初始化所有组件
 ├── 📁 internal/                               # 内部实现（禁止外部导入）
-│   ├── 📁 proxy/                              # 代理核心 - 8,000+行
-│   │   ├── 📄 proxy.go                        # 1,278行 - ProxyServer核心
-│   │   ├── 📄 passthrough_proxy.go            # 1,538行 - 直通模式代理
-│   │   ├── 📄 outbound_manager.go             # 1,538行 - 上游节点管理
-│   │   ├── 📄 raknet_proxy.go                 # 800+行 - RakNet代理
-│   │   ├── 📄 mitm_proxy.go                   # 600+行 - MITM代理
-│   │   ├── 📄 raw_udp_proxy.go                # 500+行 - 原始UDP代理
-│   │   ├── 📄 listener.go                     # 400+行 - UDP监听器
-│   │   ├── 📄 forwarder.go                    # 300+行 - 流量转发器
-│   │   ├── 📄 load_balancer.go                # 400+行 - 负载均衡器
-│   │   ├── 📄 singbox_factory.go              # 500+行 - sing-box工厂
-│   │   ├── 📄 proxy_ports.go                  # 400+行 - 本地代理端口
-│   │   ├── 📄 proxy_dialer.go                 # 300+行 - 代理拨号器
-│   │   ├── 📄 buffer.go                       # 150行 - 缓冲区池
-│   │   ├── 📄 combined_listener.go            # 200行 - 组合监听器
-│   │   ├── 📄 plain_tcp_proxy.go              # 250行 - 纯TCP代理
-│   │   ├── 📄 plain_udp_proxy.go              # 300行 - 纯UDP代理
-│   │   └── 📄 errors.go                       # 100行 - 错误定义
-│   ├── 📁 config/                             # 配置管理 - 2,500+行
-│   │   ├── 📄 config.go                       # 794行 - 主配置结构
-│   │   ├── 📄 proxy_outbound.go               # 400+行 - 上游节点配置
-│   │   ├── 📄 proxy_outbound_manager.go       # 300+行 - 节点配置管理
-│   │   ├── 📄 proxy_port.go                   # 250行 - 代理端口配置
-│   │   └── 📄 proxy_port_manager.go           # 300+行 - 端口管理器
-│   ├── 📁 db/                                 # 数据库层 - 2,000+行
-│   │   ├── 📄 db.go                           # 161行 - 数据库连接
-│   │   ├── 📄 models.go                       # 76行 - 数据模型
-│   │   ├── 📄 session_repository.go           # 300+行 - 会话数据访问
-│   │   ├── 📄 player_repository.go            # 250+行 - 玩家数据访问
-│   │   ├── 📄 blacklist_repository.go         # 200+行 - 黑名单访问
-│   │   ├── 📄 whitelist_repository.go         # 200+行 - 白名单访问
-│   │   ├── 📄 acl_settings_repository.go      # 150+行 - ACL设置访问
-│   │   └── 📄 apikey_repository.go            # 200+行 - API密钥访问
-│   ├── 📁 api/                                # REST API - 3,500+行
-│   │   ├── 📄 api.go                          # 2,000+行 - Gin路由与API
-│   │   ├── 📄 dashboard.go                    # 800+行 - Dashboard服务
-│   │   └── 📄 proxy_outbound_handler.go       # 400+行 - 节点API处理器
-│   ├── 📁 session/                            # 会话管理 - 800行
-│   │   ├── 📄 session.go                      # 250行 - 会话结构
-│   │   └── 📄 manager.go                      # 450行 - 会话管理器
-│   ├── 📁 acl/                                # 访问控制 - 400行
-│   │   └── 📄 acl_manager.go                  # 400行 - ACL管理器
-│   ├── 📁 auth/                               # 认证系统 - 1,200行
-│   │   ├── 📄 xbox_auth.go                    # 500+行 - Xbox Live认证
-│   │   ├── 📄 token_cache.go                  # 200+行 - Token缓存
-│   │   └── 📄 external_verifier.go            # 300+行 - 外部认证验证
-│   ├── 📁 monitor/                            # 监控 - 1,500行
-│   │   ├── 📄 monitor.go                      # 400行 - 监控核心
-│   │   ├── 📄 prometheus.go                   # 300行 - Prometheus指标
-│   │   └── 📄 goroutine_manager.go            # 400行 - Goroutine管理
-│   ├── 📁 logger/                             # 日志 - 1,200行
-│   │   └── 📄 logger.go                       # 1,200行 - 结构化日志
-│   ├── 📁 protocol/                           # 协议 - 300行
-│   │   └── 📄 protocol.go                     # 300行 - 协议处理器
-│   └── 📁 errors/                             # 错误 - 200行
-│       └── 📄 errors.go                       # 200行 - 错误处理
-├── 📁 web/                                    # Vue 3前端 - 5,000+行
+│   ├── 📁 proxy/                              # 代理核心 - 12,860行（19源+4测试）
+│   │   ├── 📄 singbox_factory.go              # 2,201行 - sing-box协议工厂
+│   │   ├── 📄 passthrough_proxy.go            # 2,126行 - 直通模式代理
+│   │   ├── 📄 raw_udp_proxy.go                # 2,001行 - 原始UDP代理
+│   │   ├── 📄 outbound_manager.go             # 1,311行 - 上游节点管理
+│   │   ├── 📄 proxy.go                        # 1,210行 - ProxyServer核心
+│   │   ├── 📄 raknet_proxy.go                 # 793行 - RakNet代理
+│   │   ├── 📄 proxy_ports.go                  # 639行 - 本地代理端口
+│   │   ├── 📄 listener.go                     # 477行 - UDP监听器
+│   │   ├── 📄 mitm_proxy.go                   # 440行 - MITM代理
+│   │   ├── 📄 forwarder.go                    # 346行 - 流量转发器
+│   │   ├── 📄 proxy_dialer.go                 # 310行 - 代理拨号器
+│   │   ├── 📄 plain_udp_proxy.go              # 243行 - 纯UDP代理
+│   │   ├── 📄 udpspeeder.go                   # 185行 - UDPspeeder外置加速集成
+│   │   ├── 📄 buffer.go                       # 155行 - 缓冲区池
+│   │   ├── 📄 load_balancer.go                # 149行 - 负载均衡器
+│   │   ├── 📄 plain_tcp_proxy.go              # 147行 - 纯TCP代理
+│   │   ├── 📄 combined_listener.go            # 63行 - 组合监听器
+│   │   ├── 📄 decompress.go                   # 38行 - 解压缩工具
+│   │   └── 📄 listener_with_cleanup.go        # 23行 - 监听器清理辅助
+│   ├── 📁 config/                             # 配置管理 - 1,760行（5源+3测试）
+│   │   ├── 📄 config.go                       # 781行 - 主配置结构
+│   │   ├── 📄 proxy_outbound.go               # 346行 - 上游节点配置
+│   │   ├── 📄 proxy_outbound_manager.go       # 258行 - 节点配置管理
+│   │   ├── 📄 proxy_port_manager.go           # 214行 - 端口管理器
+│   │   └── 📄 proxy_port.go                   # 162行 - 代理端口配置
+│   ├── 📁 api/                                # REST API - 3,740行（6源+2测试）
+│   │   ├── 📄 api.go                          # 1,969行 - Gin路由与API
+│   │   ├── 📄 proxy_outbound_handler.go       # 1,310行 - 节点API处理器
+│   │   ├── 📄 security.go                     # 177行 - 安全中间件与鉴权
+│   │   ├── 📄 proxy_outbound_tester.go        # 100行 - 节点测试器
+│   │   ├── 📄 proxy_port_handler.go           # 94行 - 代理端口API处理器
+│   │   ├── 📄 dashboard.go                    # 92行 - Dashboard服务
+│   │   └── � dist/                           # 前端构建产物（embed）
+│   ├── 📁 db/                                 # 数据库层 - 1,430行（9源+2测试）
+│   │   ├── 📄 session_repository.go           # 265行 - 会话数据访问
+│   │   ├── 📄 blacklist_repository.go         # 209行 - 黑名单访问
+│   │   ├── 📄 apikey_repository.go            # 189行 - API密钥访问
+│   │   ├── � acl_models.go                   # 172行 - ACL数据模型定义
+│   │   ├── 📄 whitelist_repository.go         # 166行 - 白名单访问
+│   │   ├── 📄 player_repository.go            # 164行 - 玩家数据访问
+│   │   ├── 📄 db.go                           # 138行 - 数据库连接
+│   │   ├── 📄 acl_settings_repository.go      # 77行 - ACL设置访问
+│   │   └── 📄 models.go                       # 47行 - 数据模型
+│   ├── 📁 protocol/                           # 协议处理 - 1,250行（2源+1测试）
+│   │   ├── 📄 protocol.go                     # 789行 - MCBE协议处理器
+│   │   └── 📄 raknet.go                       # 458行 - RakNet协议工具
+│   ├── 📁 monitor/                            # 监控 - 950行（3源）
+│   │   ├── 📄 goroutine_manager.go            # 488行 - Goroutine管理
+│   │   ├── � monitor.go                      # 293行 - 监控核心
+│   │   └── 📄 prometheus.go                   # 166行 - Prometheus指标
+│   ├── 📁 session/                            # 会话管理 - 520行（2源+2测试）
+│   │   ├── 📄 manager.go                      # 316行 - 会话管理器
+│   │   └── 📄 session.go                      # 205行 - 会话结构
+│   ├── 📁 auth/                               # 认证系统 - 450行（3源+2测试）
+│   │   ├── 📄 xbox_auth.go                    # 203行 - Xbox Live认证
+│   │   ├── 📄 external_verifier.go            # 168行 - 外部认证验证
+│   │   └── 📄 token_cache.go                  # 82行 - Token缓存
+│   ├── 📁 logger/                             # 日志 - 420行（1源）
+│   │   └── 📄 logger.go                       # 423行 - 结构化日志+IsLevelEnabled
+│   ├── 📁 acl/                                # 访问控制 - 420行（1源+1测试）
+│   │   └── 📄 acl_manager.go                  # 420行 - ACL管理器
+│   └── 📁 errors/                             # 错误处理 - 180行（1源）
+│       └── 📄 errors.go                       # 179行 - 统一错误处理
+├── 📁 web/                                    # Vue 3前端 - 8,710行
 │   ├── 📁 src/
 │   │   ├── 📄 main.js                         # 入口
 │   │   ├── 📄 App.vue                         # 根组件
 │   │   ├── 📁 views/                          # 12个视图页面
-│   │   │   ├── 📄 Dashboard.vue               # 仪表盘
-│   │   │   ├── 📄 Servers.vue                 # 服务器管理
+│   │   │   ├── 📄 Servers.vue                 # 服务器管理（最大视图）
 │   │   │   ├── 📄 ProxyOutbounds.vue          # 上游节点
 │   │   │   ├── 📄 ProxyPorts.vue              # 代理端口
-│   │   │   ├── 📄 Players.vue                 # 玩家列表
-│   │   │   ├── 📄 Sessions.vue                # 会话监控
-│   │   │   ├── 📄 Whitelist.vue               # 白名单
-│   │   │   ├── 📄 Blacklist.vue               # 黑名单
-│   │   │   ├── 📄 Settings.vue                # 系统设置
+│   │   │   ├── 📄 Debug.vue                   # 调试工具
+│   │   │   ├── 📄 Dashboard.vue               # 仪表盘
 │   │   │   ├── 📄 ServiceStatus.vue           # 服务状态
+│   │   │   ├── 📄 Settings.vue                # 系统设置
+│   │   │   ├── 📄 Blacklist.vue               # 黑名单
+│   │   │   ├── 📄 Whitelist.vue               # 白名单
+│   │   │   ├── 📄 Sessions.vue                # 会话监控
 │   │   │   ├── 📄 Logs.vue                    # 日志查看
-│   │   │   └── 📄 Debug.vue                   # 调试工具
+│   │   │   └── 📄 Players.vue                 # 玩家列表
 │   │   └── 📁 components/                     # 可复用组件
 │   ├── 📄 package.json                        # npm配置
 │   └── 📄 vite.config.js                      # Vite配置
-├── 📁 doc/                                    # 文档
+├── 📁 doc/                                    # 文档（含UDPspeeder二进制）
 ├── 📄 go.mod                                  # Go模块定义
 ├── 📄 build.bat                               # Windows构建脚本
 └── 📄 README.md                               # 项目说明
@@ -779,7 +789,7 @@ flowchart LR
 
 ## 第4章 核心组件深度剖析
 
-### 4.1 入口点：main.go (230行)
+### 4.1 入口点：main.go (194行)
 
 #### 4.1.1 完整启动流程
 
@@ -1210,7 +1220,7 @@ flowchart TD
 
 ## 第5章 代理模式全解析
 
-### 5.1 PassthroughProxy 深度解析 (1,538行)
+### 5.1 PassthroughProxy 深度解析 (2,126行)
 
 PassthroughProxy是项目中最复杂的代理模式，实现了类似gamma的直通代理功能。
 
@@ -2016,7 +2026,7 @@ classDiagram
 
 ## 第8章 网络与协议层
 
-### 8.1 OutboundManager 深度解析 (1,538行)
+### 8.1 OutboundManager 深度解析 (1,311行)
 
 OutboundManager是整个项目最复杂的组件之一，负责管理所有上游代理节点。
 
@@ -2511,20 +2521,28 @@ classDiagram
 
 | 文件路径 | 行数 | 主要功能 | 关键结构/函数 |
 |---------|-----|---------|--------------|
-| cmd/mcpeserverproxy/main.go | 230 | 程序入口 | main(), ensureJSONFile() |
-| internal/proxy/proxy.go | 1,278 | ProxyServer核心 | ProxyServer struct, Start(), Stop(), Reload() |
-| internal/proxy/passthrough_proxy.go | 1,538 | 直通代理模式 | PassthroughProxy, handleConnection(), parseLoginPacket() |
-| internal/proxy/outbound_manager.go | 1,538 | 上游节点管理 | outboundManagerImpl, SelectOutbound(), DialPacketConn() |
-| internal/proxy/raknet_proxy.go | 800 | RakNet代理 | RakNetProxy, handleRakNetConn() |
-| internal/proxy/mitm_proxy.go | 600 | MITM代理 | MITMProxy, enable MITM handling |
-| internal/proxy/load_balancer.go | 400 | 负载均衡器 | LoadBalancer, Select(), strategies |
-| internal/proxy/singbox_factory.go | 500 | sing-box工厂 | CreateSingboxOutbound(), protocol handlers |
-| internal/config/config.go | 794 | 配置管理 | ServerConfig, GlobalConfig, ConfigManager |
-| internal/config/proxy_outbound.go | 400 | 上游节点配置 | ProxyOutbound struct, Validate() |
-| internal/db/db.go | 161 | 数据库连接 | Database, Initialize(), schema |
-| internal/db/models.go | 76 | 数据模型 | PlayerRecord, SessionRecord |
-| internal/api/api.go | 2,000+ | REST API | APIServer, Gin router, handlers |
-| internal/session/manager.go | 450 | 会话管理 | SessionManager, GarbageCollect() |
+| cmd/mcpeserverproxy/main.go | 194 | 程序入口 | main(), ensureJSONFile() |
+| internal/proxy/singbox_factory.go | 2,201 | sing-box协议工厂 | CreateSingboxOutbound(), protocol handlers |
+| internal/proxy/passthrough_proxy.go | 2,126 | 直通代理模式 | PassthroughProxy, handleConnection(), parseLoginPacket() |
+| internal/proxy/raw_udp_proxy.go | 2,001 | 原始UDP代理 | RawUDPProxy, handleUDPConn() |
+| internal/api/api.go | 1,969 | REST API | APIServer, Gin router, handlers |
+| internal/api/proxy_outbound_handler.go | 1,310 | 节点API处理器 | ProxyOutboundHandler, CRUD+test |
+| internal/proxy/outbound_manager.go | 1,311 | 上游节点管理 | outboundManagerImpl, SelectOutbound(), DialPacketConn() |
+| internal/proxy/proxy.go | 1,210 | ProxyServer核心 | ProxyServer struct, Start(), Stop(), Reload() |
+| internal/proxy/raknet_proxy.go | 793 | RakNet代理 | RakNetProxy, handleRakNetConn() |
+| internal/protocol/protocol.go | 789 | MCBE协议处理 | ProtocolHandler, packet parsing |
+| internal/config/config.go | 781 | 配置管理 | ServerConfig, GlobalConfig, ConfigManager |
+| internal/proxy/proxy_ports.go | 639 | 本地代理端口 | ProxyPortManager, Start(), Reload() |
+| internal/monitor/goroutine_manager.go | 488 | Goroutine管理 | GoroutineManager, Track(), List() |
+| internal/proxy/listener.go | 477 | UDP监听器 | Listener, transparent模式 |
+| internal/protocol/raknet.go | 458 | RakNet协议工具 | RakNet packet helpers |
+| internal/proxy/mitm_proxy.go | 440 | MITM代理 | MITMProxy, gophertunnel MITM |
+| internal/acl/acl_manager.go | 420 | ACL管理器 | ACLManager, CheckAccess() |
+| internal/logger/logger.go | 423 | 结构化日志 | Logger, IsLevelEnabled(), 轮转 |
+| internal/proxy/udpspeeder.go | 185 | UDPspeeder集成 | speederv2 sidecar管理 |
+| internal/api/security.go | 177 | 安全中间件 | API Key鉴权, 本机访问控制 |
+| internal/db/acl_models.go | 172 | ACL数据模型 | BlacklistEntry, WhitelistEntry |
+| internal/errors/errors.go | 179 | 统一错误处理 | ErrorHandler, 错误分类 |
 
 ### 11.2 数据结构索引
 
@@ -2570,16 +2588,17 @@ graph TB
 
 **文档结束**
 
-> 本文档基于对MCPE Server Proxy代码库的深度分析，涵盖了超过26,000行代码的完整架构解析。
+> 本文档基于对MCPE Server Proxy代码库的深度分析，涵盖了超过32,000行代码的完整架构解析。
 > 
 > **核心统计**：
-> - 分析代码文件：72个
-> - 总代码行数：~26,000行
+> - 源代码文件：70个（含前端17个）
+> - 测试文件：17个
+> - 总代码行数：~32,880行（含测试~39,000行）
 > - 核心结构体：28个
 > - 接口定义：8个
 > - 数据库表：8个
 > - API端点：60+
 > - Mermaid图表：20+
 >
-> **生成时间**：2026-02-01  
-> **文档版本**：v2.0-ultrawork
+> **最后更新**：2026-03-07  
+> **文档版本**：v2.1

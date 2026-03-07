@@ -34,19 +34,21 @@
 
 ```
 .
-├── cmd/mcpeserverproxy/    # 主程序入口
+├── cmd/mcpeserverproxy/    # 主程序入口（main.go, 194行）
 ├── internal/                # 核心业务逻辑
 │   ├── acl/                # 访问控制列表管理
-│   ├── api/                # REST API 服务
-│   ├── auth/               # 认证模块（Xbox Live、外部认证）
+│   ├── api/                # REST API 服务 + 安全中间件
+│   ├── auth/               # 认证模块（Xbox Live、外部认证、Token 缓存）
 │   ├── config/             # 配置管理与热更新
-│   ├── db/                 # 数据库层（SQLite）
+│   ├── db/                 # 数据库层（SQLite）+ ACL 数据模型
+│   ├── errors/             # 统一错误处理
 │   ├── logger/             # 日志系统
-│   ├── monitor/            # 系统监控（Prometheus）
-│   ├── proxy/              # 代理核心实现
+│   ├── monitor/            # 系统监控（Prometheus）+ Goroutine 管理
+│   ├── protocol/           # RakNet/MCBE 协议处理
+│   ├── proxy/              # 代理核心实现 + UDPspeeder 集成
 │   └── session/            # 会话管理
-├── web/                    # Vue 3 前端控制台
-├── doc/                    # 文档和示例配置
+├── web/                    # Vue 3 前端控制台（17 个源文件）
+├── doc/                    # 文档和示例配置（含 UDPspeeder）
 └── build.bat              # Windows 构建脚本
 ```
 
@@ -127,17 +129,21 @@ mcpeserverproxy.exe -version
 
 ## 整体架构
 
-入口：`cmd/mcpeserverproxy/main.go`
+入口：`cmd/mcpeserverproxy/main.go`（194 行）
 
-主要组件：
-- `internal/config`: 配置加载 + 热更新（fsnotify 监听 JSON 文件变化）
-- `internal/proxy`: 代理核心（多种 proxy_mode、会话、转发、上游节点、负载均衡、代理端口）
-- `internal/api`: Gin API + 内嵌 Dashboard（`internal/api/dist/` embed）
-- `internal/session`: 玩家会话与 GC
-- `internal/db`: SQLite 持久化（会话历史、玩家、ACL、API Keys）
-- `internal/acl`: 黑/白名单与访问控制策略
-- `internal/monitor`: 系统监控 + Prometheus
-- `internal/logger`: 分级日志 + 文件轮转
+主要组件（53 个源文件 + 17 个测试文件，约 24,000+ 行后端代码）：
+
+- `internal/proxy`: 代理核心（19 个源文件，~12,800 行）— 多种 proxy_mode、会话、转发、上游节点、负载均衡、代理端口、UDPspeeder 集成
+- `internal/api`: Gin API + 安全中间件 + 内嵌 Dashboard（6 个源文件，~3,700 行）— 含 `security.go` 鉴权、`proxy_port_handler.go` 端口管理、`proxy_outbound_tester.go` 节点测试
+- `internal/config`: 配置加载 + 热更新（5 个源文件，~1,760 行）— fsnotify 监听 JSON 文件变化
+- `internal/protocol`: RakNet/MCBE 协议处理（2 个源文件，~1,250 行）— 含 `raknet.go` 底层协议工具
+- `internal/db`: SQLite 持久化（9 个源文件，~1,430 行）— 会话历史、玩家、ACL 模型、API Keys
+- `internal/monitor`: 系统监控 + Prometheus + Goroutine 管理（3 个源文件，~950 行）
+- `internal/session`: 玩家会话与 GC（2 个源文件，~520 行）
+- `internal/auth`: Xbox Live 认证 + 外部认证 + Token 缓存（3 个源文件，~450 行）
+- `internal/logger`: 分级日志 + 文件轮转（1 个源文件，~420 行）
+- `internal/acl`: 黑/白名单与访问控制策略（1 个源文件，~420 行）
+- `internal/errors`: 统一错误处理（1 个源文件，~180 行）
 
 ## 核心流程图
 
