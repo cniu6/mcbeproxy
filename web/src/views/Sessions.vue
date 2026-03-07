@@ -43,7 +43,7 @@
           :data="sessions" 
           :bordered="false" 
           :pagination="pagination"
-          :scroll-x="1100"
+          :scroll-x="1250"
           @update:page="p => pagination.page = p"
           @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
         />
@@ -54,7 +54,7 @@
 
 <script setup>
 import { ref, onMounted, h } from 'vue'
-import { NButton, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NPopconfirm, NTag, NTooltip, useMessage } from 'naive-ui'
 import { api, formatTime, formatBytes, formatDuration } from '../api'
 
 const props = defineProps({ initialSearch: { type: String, default: '' } })
@@ -79,9 +79,35 @@ const getSearchString = (val) => {
 }
 const search = ref(getSearchString(props.initialSearch))
 
+const statusMap = {
+  'disconnected': { label: '正常断开', type: 'success' },
+  'blacklist': { label: '黑名单', type: 'error' },
+  'whitelist': { label: '白名单拒绝', type: 'warning' },
+  'auth_failed': { label: '验证失败', type: 'error' },
+  'kicked': { label: '被踢出', type: 'warning' },
+}
+
+const renderStatus = (r) => {
+  const status = r.status || 'disconnected'
+  const info = statusMap[status] || { label: status, type: 'default' }
+  const reason = r.status_reason || ''
+  const tag = h(NTag, { size: 'small', type: info.type, round: true }, () => info.label)
+  if (reason) {
+    return h(NTooltip, { trigger: 'hover' }, {
+      trigger: () => tag,
+      default: () => reason
+    })
+  }
+  return tag
+}
+
 const columns = [
   { title: '玩家', key: 'display_name', width: 110 },
   { title: '服务器', key: 'server_id', width: 90 },
+  { title: '连接状态', key: 'status', width: 110, render: renderStatus,
+    filterOptions: Object.entries(statusMap).map(([k, v]) => ({ label: v.label, value: k })),
+    filter: (value, row) => (row.status || 'disconnected') === value
+  },
   { title: '客户端', key: 'client_addr', width: 140 },
   { title: '开始时间', key: 'start_time', render: r => formatTime(r.start_time), width: 150 },
   { title: '结束时间', key: 'end_time', render: r => formatTime(r.end_time), width: 150 },

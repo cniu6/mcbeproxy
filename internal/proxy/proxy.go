@@ -203,16 +203,25 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 	endTime := time.Now()
 	snap := sess.Snapshot()
 	duration := endTime.Sub(snap.StartTime)
+	// Determine connection status
+	status := snap.DisconnectStatus
+	if status == "" {
+		status = "disconnected" // normal disconnect
+	}
+	statusReason := snap.DisconnectReason
+
 	record := &session.SessionRecord{
-		ID:          snap.ID,
-		ClientAddr:  snap.ClientAddr,
-		ServerID:    snap.ServerID,
-		UUID:        snap.UUID,
-		DisplayName: snap.DisplayName,
-		BytesUp:     snap.BytesUp,
-		BytesDown:   snap.BytesDown,
-		StartTime:   snap.StartTime,
-		EndTime:     endTime,
+		ID:           snap.ID,
+		ClientAddr:   snap.ClientAddr,
+		ServerID:     snap.ServerID,
+		UUID:         snap.UUID,
+		DisplayName:  snap.DisplayName,
+		BytesUp:      snap.BytesUp,
+		BytesDown:    snap.BytesDown,
+		StartTime:    snap.StartTime,
+		EndTime:      endTime,
+		Status:       status,
+		StatusReason: statusReason,
 	}
 
 	// Log player disconnect event (requirement 9.5)

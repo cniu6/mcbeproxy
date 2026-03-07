@@ -28,20 +28,26 @@ type Session struct {
 	LoginBuffer     []byte     `json:"-"`
 	LoginBufferLock sync.Mutex `json:"-"`
 	LoginExtracted  bool       `json:"-"` // Whether we've already extracted login info
+
+	// Connection status tracking
+	DisconnectStatus string `json:"-"` // e.g. "connected", "blacklist", "whitelist", "auth_failed", "kicked"
+	DisconnectReason string `json:"-"` // Human-readable reason
 }
 
 // SessionSnapshot provides a consistent view of session fields.
 type SessionSnapshot struct {
-	ID          string
-	ClientAddr  string
-	ServerID    string
-	UUID        string
-	DisplayName string
-	XUID        string
-	BytesUp     int64
-	BytesDown   int64
-	StartTime   time.Time
-	LastSeen    time.Time
+	ID               string
+	ClientAddr       string
+	ServerID         string
+	UUID             string
+	DisplayName      string
+	XUID             string
+	BytesUp          int64
+	BytesDown        int64
+	StartTime        time.Time
+	LastSeen         time.Time
+	DisconnectStatus string
+	DisconnectReason string
 }
 
 // Snapshot returns a copy of session fields under lock.
@@ -49,16 +55,18 @@ func (s *Session) Snapshot() SessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return SessionSnapshot{
-		ID:          s.ID,
-		ClientAddr:  s.ClientAddr,
-		ServerID:    s.ServerID,
-		UUID:        s.UUID,
-		DisplayName: s.DisplayName,
-		XUID:        s.XUID,
-		BytesUp:     s.BytesUp,
-		BytesDown:   s.BytesDown,
-		StartTime:   s.StartTime,
-		LastSeen:    s.LastSeen,
+		ID:               s.ID,
+		ClientAddr:       s.ClientAddr,
+		ServerID:         s.ServerID,
+		UUID:             s.UUID,
+		DisplayName:      s.DisplayName,
+		XUID:             s.XUID,
+		BytesUp:          s.BytesUp,
+		BytesDown:        s.BytesDown,
+		StartTime:        s.StartTime,
+		LastSeen:         s.LastSeen,
+		DisconnectStatus: s.DisconnectStatus,
+		DisconnectReason: s.DisconnectReason,
 	}
 }
 
@@ -161,6 +169,14 @@ func (s *Session) ClearLoginBuffer() {
 	s.LoginBuffer = nil
 }
 
+// SetDisconnectStatus sets the disconnect status and reason in a thread-safe manner.
+func (s *Session) SetDisconnectStatus(status, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.DisconnectStatus = status
+	s.DisconnectReason = reason
+}
+
 // IsLoginExtracted returns whether login info has been extracted.
 func (s *Session) IsLoginExtracted() bool {
 	s.mu.Lock()
@@ -202,17 +218,19 @@ type SessionDTO struct {
 
 // SessionRecord represents a session record for database persistence.
 type SessionRecord struct {
-	ID          string    `json:"id"`
-	ClientAddr  string    `json:"client_addr"`
-	ServerID    string    `json:"server_id"`
-	UUID        string    `json:"uuid,omitempty"`
-	DisplayName string    `json:"display_name,omitempty"`
-	XUID        string    `json:"xuid,omitempty"` // Xbox User ID (Requirements 2.5)
-	BytesUp     int64     `json:"bytes_up"`
-	BytesDown   int64     `json:"bytes_down"`
-	StartTime   time.Time `json:"start_time"`
-	EndTime     time.Time `json:"end_time,omitempty"`
-	Metadata    string    `json:"metadata,omitempty"` // JSON encoded additional data
+	ID           string    `json:"id"`
+	ClientAddr   string    `json:"client_addr"`
+	ServerID     string    `json:"server_id"`
+	UUID         string    `json:"uuid,omitempty"`
+	DisplayName  string    `json:"display_name,omitempty"`
+	XUID         string    `json:"xuid,omitempty"` // Xbox User ID (Requirements 2.5)
+	BytesUp      int64     `json:"bytes_up"`
+	BytesDown    int64     `json:"bytes_down"`
+	StartTime    time.Time `json:"start_time"`
+	EndTime      time.Time `json:"end_time,omitempty"`
+	Metadata     string    `json:"metadata,omitempty"` // JSON encoded additional data
+	Status       string    `json:"status,omitempty"`        // Connection status: connected, blacklist, whitelist, auth_failed, kicked
+	StatusReason string    `json:"status_reason,omitempty"` // Human-readable reason for the status
 }
 
 // ToJSON serializes the session record to JSON.

@@ -143,6 +143,16 @@ func (d *Database) Initialize() error {
 		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	// Migrations: add status and status_reason columns to sessions table
+	migrations := []string{
+		"ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT ''",
+		"ALTER TABLE sessions ADD COLUMN status_reason TEXT DEFAULT ''",
+		"CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
+	}
+	for _, m := range migrations {
+		_, _ = d.db.Exec(m) // ignore errors (column may already exist)
+	}
+
 	return nil
 }
 

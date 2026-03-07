@@ -1206,7 +1206,13 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 			// Format blacklist message - 换行显示玩家名字
 			formattedReason := fmt.Sprintf("§c黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, reason)
 			logger.Info("Player %s blocked by blacklist (serverID=%s): %s", playerName, p.serverID, reason)
+			// Set disconnect status on session for history tracking
+			if sess != nil {
+				sess.SetDisconnectStatus("blacklist", reason)
+			}
 			p.sendDisconnectToClient(clientInfo, formattedReason)
+			// Remove session so persistSession callback fires and record is saved
+			_ = p.sessionMgr.Remove(clientInfo.sessionID)
 			clientInfo.kicked.Store(true)
 			clientInfo.targetConn.Close()
 			return false // Player kicked
@@ -1250,8 +1256,16 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 				logger.Info("Player %s blocked by ACL (serverID=%s): %s", playerName, p.serverID, reason)
 			}
 
+			// Set disconnect status on session for history tracking
+			if sess != nil {
+				sess.SetDisconnectStatus("whitelist", formattedReason)
+			}
+
 			// Send disconnect packet to client
 			p.sendDisconnectToClient(clientInfo, formattedReason)
+
+			// Remove session so persistSession callback fires and record is saved
+			_ = p.sessionMgr.Remove(clientInfo.sessionID)
 
 			// Mark as kicked and close connection
 			clientInfo.kicked.Store(true)
@@ -1275,7 +1289,14 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 			if reason == "" {
 				reason = "授权验证失败"
 			}
+			// Set disconnect status on session for history tracking
+			if sess != nil {
+				sess.SetDisconnectStatus("auth_failed", reason)
+			}
 			p.sendDisconnectToClient(clientInfo, reason)
+
+			// Remove session so persistSession callback fires and record is saved
+			_ = p.sessionMgr.Remove(clientInfo.sessionID)
 
 			// Mark as kicked and close connection
 			clientInfo.kicked.Store(true)

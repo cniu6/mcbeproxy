@@ -40,8 +40,8 @@ func (r *SessionRepository) SetMaxRecords(maxRecords int) error {
 // Create inserts a new session record into the database.
 func (r *SessionRepository) Create(sr *session.SessionRecord) error {
 	query := `
-		INSERT INTO sessions (id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata, status, status_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var endTime interface{}
@@ -60,6 +60,8 @@ func (r *SessionRepository) Create(sr *session.SessionRecord) error {
 		sr.StartTime,
 		endTime,
 		sr.Metadata,
+		sr.Status,
+		sr.StatusReason,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create session: %w", err)
@@ -72,7 +74,7 @@ func (r *SessionRepository) Create(sr *session.SessionRecord) error {
 // GetByID retrieves a session record by its ID.
 func (r *SessionRepository) GetByID(id string) (*session.SessionRecord, error) {
 	query := `
-		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata
+		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata, status, status_reason
 		FROM sessions WHERE id = ?
 	`
 
@@ -83,7 +85,7 @@ func (r *SessionRepository) GetByID(id string) (*session.SessionRecord, error) {
 // GetByPlayerUUID retrieves all session records for a player UUID.
 func (r *SessionRepository) GetByPlayerUUID(uuid string) ([]*session.SessionRecord, error) {
 	query := `
-		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata
+		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata, status, status_reason
 		FROM sessions WHERE uuid = ? ORDER BY start_time DESC
 	`
 
@@ -99,7 +101,7 @@ func (r *SessionRepository) GetByPlayerUUID(uuid string) ([]*session.SessionReco
 // GetByPlayerName retrieves all session records for a player by display name.
 func (r *SessionRepository) GetByPlayerName(displayName string) ([]*session.SessionRecord, error) {
 	query := `
-		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata
+		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata, status, status_reason
 		FROM sessions WHERE display_name = ? ORDER BY start_time DESC
 	`
 
@@ -115,7 +117,7 @@ func (r *SessionRepository) GetByPlayerName(displayName string) ([]*session.Sess
 // List retrieves session records with pagination.
 func (r *SessionRepository) List(limit, offset int) ([]*session.SessionRecord, error) {
 	query := `
-		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata
+		SELECT id, client_addr, server_id, uuid, display_name, bytes_up, bytes_down, start_time, end_time, metadata, status, status_reason
 		FROM sessions ORDER BY start_time DESC LIMIT ? OFFSET ?
 	`
 
@@ -205,7 +207,7 @@ func (r *SessionRepository) DeleteHistory(id string) error {
 func (r *SessionRepository) scanSessionRecord(row *sql.Row) (*session.SessionRecord, error) {
 	var sr session.SessionRecord
 	var endTime sql.NullTime
-	var uuid, displayName, metadata sql.NullString
+	var uuid, displayName, metadata, status, statusReason sql.NullString
 
 	err := row.Scan(
 		&sr.ID,
@@ -218,6 +220,8 @@ func (r *SessionRepository) scanSessionRecord(row *sql.Row) (*session.SessionRec
 		&sr.StartTime,
 		&endTime,
 		&metadata,
+		&status,
+		&statusReason,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -238,6 +242,12 @@ func (r *SessionRepository) scanSessionRecord(row *sql.Row) (*session.SessionRec
 	if metadata.Valid {
 		sr.Metadata = metadata.String
 	}
+	if status.Valid {
+		sr.Status = status.String
+	}
+	if statusReason.Valid {
+		sr.StatusReason = statusReason.String
+	}
 
 	return &sr, nil
 }
@@ -249,7 +259,7 @@ func (r *SessionRepository) scanSessionRecords(rows *sql.Rows) ([]*session.Sessi
 	for rows.Next() {
 		var sr session.SessionRecord
 		var endTime sql.NullTime
-		var uuid, displayName, metadata sql.NullString
+		var uuid, displayName, metadata, status, statusReason sql.NullString
 
 		err := rows.Scan(
 			&sr.ID,
@@ -262,6 +272,8 @@ func (r *SessionRepository) scanSessionRecords(rows *sql.Rows) ([]*session.Sessi
 			&sr.StartTime,
 			&endTime,
 			&metadata,
+			&status,
+			&statusReason,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan session row: %w", err)
@@ -278,6 +290,12 @@ func (r *SessionRepository) scanSessionRecords(rows *sql.Rows) ([]*session.Sessi
 		}
 		if metadata.Valid {
 			sr.Metadata = metadata.String
+		}
+		if status.Valid {
+			sr.Status = status.String
+		}
+		if statusReason.Valid {
+			sr.StatusReason = statusReason.String
 		}
 
 		records = append(records, &sr)

@@ -135,6 +135,13 @@ func (a *APIServer) setupRoutes() {
 		public.GET("/status", a.getPublicStatus)
 	}
 
+	// Public web status page (no auth)
+	web := a.router.Group("/api/web")
+	{
+		web.GET("/index", a.getWebIndex)
+		web.GET("/index-api", a.getWebIndexAPI)
+	}
+
 	// API routes group
 	api := a.router.Group("/api")
 	{

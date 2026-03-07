@@ -780,8 +780,14 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					formattedReason = fmt.Sprintf("§c%s\n§7玩家名: %s", reason, playerName)
 				}
 				logger.Info("ACL denial - type=%s, player=%s, reason=%s", decision.Type, playerName, decision.Reason)
+				// Set disconnect status on session for history tracking
+				if sess != nil {
+					sess.SetDisconnectStatus(string(decision.Type), decision.Reason)
+				}
 				// Send disconnect packet with denial reason (Requirement 5.2)
 				p.sendDisconnect(clientConn, formattedReason, compression)
+				// Remove session so persistSession callback fires and record is saved
+				_ = p.sessionMgr.Remove(clientAddr)
 				return
 			}
 		}
@@ -795,7 +801,13 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 				if reason == "" {
 					reason = "验证失败，请稍后再试"
 				}
+				// Set disconnect status on session for history tracking
+				if sess != nil {
+					sess.SetDisconnectStatus("auth_failed", reason)
+				}
 				p.sendDisconnect(clientConn, "§c"+reason, compression)
+				// Remove session so persistSession callback fires and record is saved
+				_ = p.sessionMgr.Remove(clientAddr)
 				return
 			}
 		}
