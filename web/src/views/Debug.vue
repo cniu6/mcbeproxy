@@ -421,7 +421,7 @@
 
 <script setup>
 import { ref, h, onMounted, onUnmounted, computed } from 'vue'
-import { api, formatBytes, apiBase } from '../api'
+import { api, apiFetch, formatBytes } from '../api'
 import { useMessage } from 'naive-ui'
 import { NButton, NTag, NText } from 'naive-ui'
 
@@ -689,7 +689,7 @@ const captureCPUProfile = async () => {
   message.info(`开始采集 CPU Profile (${pprofConfig.value.cpuSeconds}秒)...`)
   try {
     // 使用 debug=1 获取文本格式
-    const res = await fetch(`${apiBase}/api/debug/pprof/profile?seconds=${pprofConfig.value.cpuSeconds}&debug=1`)
+    const res = await apiFetch(`/api/debug/pprof/profile?seconds=${pprofConfig.value.cpuSeconds}&debug=1`)
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.cpu = true
@@ -711,7 +711,7 @@ const captureHeapProfile = async () => {
   pprofResults.value.heap = null
   pprofResults.value.heapText = ''
   try {
-    const res = await fetch(`${apiBase}/api/debug/pprof/heap?debug=1`)
+    const res = await apiFetch('/api/debug/pprof/heap?debug=1')
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.heap = true
@@ -740,7 +740,7 @@ const captureGoroutineProfile = async () => {
   pprofLoading.value.goroutine = true
   pprofResults.value.goroutine = null
   try {
-    const res = await fetch(`${apiBase}/api/debug/pprof/goroutine?debug=2`)
+    const res = await apiFetch('/api/debug/pprof/goroutine?debug=2')
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.goroutine = text
@@ -763,7 +763,7 @@ const captureAllocsProfile = async () => {
   pprofResults.value.allocs = null
   pprofResults.value.allocsText = ''
   try {
-    const res = await fetch(`${apiBase}/api/debug/pprof/allocs?debug=1`)
+    const res = await apiFetch('/api/debug/pprof/allocs?debug=1')
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.allocs = true
@@ -784,7 +784,7 @@ const captureBlockProfile = async () => {
   pprofResults.value.block = null
   pprofResults.value.blockText = ''
   try {
-    const res = await fetch(`${apiBase}/api/debug/pprof/block?debug=1`)
+    const res = await apiFetch('/api/debug/pprof/block?debug=1')
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.block = true
@@ -805,7 +805,7 @@ const captureMutexProfile = async () => {
   pprofResults.value.mutex = null
   pprofResults.value.mutexText = ''
   try {
-    const res = await fetch(`${apiBase}/api/debug/pprof/mutex?debug=1`)
+    const res = await apiFetch('/api/debug/pprof/mutex?debug=1')
     if (res.ok) {
       const text = await res.text()
       pprofResults.value.mutex = true
@@ -822,11 +822,30 @@ const captureMutexProfile = async () => {
 }
 
 const downloadProfile = (type, seconds = 0) => {
-  let url = `${apiBase}/api/debug/pprof/${type}`
+  let url = `/api/debug/pprof/${type}`
   if (seconds > 0) {
     url += `?seconds=${seconds}`
   }
-  window.open(url, '_blank')
+  apiFetch(url)
+    .then(async (res) => {
+      if (!res.ok) {
+        throw new Error(await res.text())
+      }
+      return res.blob()
+    })
+    .then((blob) => {
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = `${type}${seconds > 0 ? `-${seconds}s` : ''}.pprof`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(objectUrl)
+    })
+    .catch((err) => {
+      message.error('下载失败: ' + err.message)
+    })
 }
 
 onMounted(() => {

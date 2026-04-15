@@ -23,17 +23,25 @@ export function hasApiKey() {
   return !!localStorage.getItem(API_KEY_STORAGE_KEY)
 }
 
-export async function api(url, method = 'GET', body = null) {
+export function apiFetch(url, options = {}) {
   const apiKey = getApiKey()
+  const headers = { ...(options.headers || {}) }
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey
+  }
+  return fetch(BASE_URL + url, {
+    ...options,
+    headers
+  })
+}
+
+export async function api(url, method = 'GET', body = null) {
   const opts = {
     method,
     headers: { 'Content-Type': 'application/json' }
   }
-  if (apiKey) {
-    opts.headers['X-API-Key'] = apiKey
-  }
   if (body) opts.body = JSON.stringify(body)
-  const res = await fetch(BASE_URL + url, opts)
+  const res = await apiFetch(url, opts)
   return res.json()
 }
 

@@ -1107,33 +1107,18 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, udpTimeout)
-		type udpResult struct {
-			conn hy2.HyUDPConn
-			err  error
-		}
-		resultCh := make(chan udpResult, 1)
-		go func() {
-			conn, err := currentClient.UDP()
-			if conn != nil {
-				select {
-				case <-attemptCtx.Done():
-					conn.Close()
-					return
-				case resultCh <- udpResult{conn: conn, err: err}:
-					return
-				}
-			}
-			select {
-			case <-attemptCtx.Done():
-				return
-			case resultCh <- udpResult{conn: conn, err: err}:
-				return
-			}
-		}()
+		stopClose := context.AfterFunc(attemptCtx, func() {
+			_ = currentClient.Close()
+		})
 
-		select {
-		case <-attemptCtx.Done():
-			cancel()
+		conn, err := currentClient.UDP()
+		stopClose()
+		cancel()
+
+		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			if conn != nil {
+				_ = conn.Close()
+			}
 			logger.Warn("Hysteria2: UDP session creation timeout for %s (attempt %d)", dest.String(), attempt+1)
 			lastErr = fmt.Errorf("hysteria2 UDP timeout after %v", udpTimeout)
 			if attempt == 0 {
@@ -1148,39 +1133,45 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 				continue
 			}
 			return nil, lastErr
-		case result := <-resultCh:
-			cancel()
-			if result.err != nil {
-				errStr := result.err.Error()
-				logger.Debug("Hysteria2: UDP session error: %s (attempt %d)", errStr, attempt+1)
-				lastErr = result.err
+		}
 
-				// Check for specific errors that indicate we should not retry
-				if strings.Contains(errStr, "UDP not enabled") {
-					logger.Error("Hysteria2: Server UDP relay disabled!")
-					return nil, fmt.Errorf("hysteria2 UDP failed: %w", result.err)
-				}
+		if ctx.Err() != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
+		}
 
-				// For "connection closed" errors, the ReconnectableClient should auto-reconnect
-				// on the next call, so we can retry once
-				if attempt == 0 && (strings.Contains(errStr, "connection closed") ||
-					strings.Contains(errStr, "closed") ||
-					strings.Contains(errStr, "EOF")) {
-					logger.Info("Hysteria2: connection issue detected, retrying... (attempt %d)", attempt+1)
-					time.Sleep(500 * time.Millisecond)
-					continue
-				}
+		if err != nil {
+			errStr := err.Error()
+			logger.Debug("Hysteria2: UDP session error: %s (attempt %d)", errStr, attempt+1)
+			lastErr = err
 
-				return nil, fmt.Errorf("hysteria2 UDP failed: %w", result.err)
+			// Check for specific errors that indicate we should not retry
+			if strings.Contains(errStr, "UDP not enabled") {
+				logger.Error("Hysteria2: Server UDP relay disabled!")
+				return nil, fmt.Errorf("hysteria2 UDP failed: %w", err)
 			}
 
-			logger.Debug("Hysteria2: UDP session created successfully for %s", dest.String())
-			return &hysteria2PacketConn{
-				conn:        result.conn,
-				destination: dest,
-				outbound:    s,
-			}, nil
+			// For "connection closed" errors, the ReconnectableClient should auto-reconnect
+			// on the next call, so we can retry once
+			if attempt == 0 && (strings.Contains(errStr, "connection closed") ||
+				strings.Contains(errStr, "closed") ||
+				strings.Contains(errStr, "EOF")) {
+				logger.Info("Hysteria2: connection issue detected, retrying... (attempt %d)", attempt+1)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			return nil, fmt.Errorf("hysteria2 UDP failed: %w", err)
 		}
+
+		logger.Debug("Hysteria2: UDP session created successfully for %s", dest.String())
+		return &hysteria2PacketConn{
+			conn:        conn,
+			destination: dest,
+			outbound:    s,
+		}, nil
 	}
 
 	if lastErr != nil {
