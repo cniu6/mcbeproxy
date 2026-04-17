@@ -38,6 +38,12 @@
           <n-gi :span="2" v-if="isRaknetProtocol"><n-form-item label="代理模式"><n-select v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="空闲超时"><n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi><n-form-item label="DNS刷新"><n-input-number v-model:value="form.resolve_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
+          <n-gi>
+            <n-form-item label="UDP Socket缓冲">
+              <n-input-number v-model:value="form.udp_socket_buffer_size" :min="-1" style="width: 100%" placeholder="0=自动, -1=系统默认" />
+              <template #feedback>单位: 字节。0=自动推荐值，-1=不调整系统 socket 缓冲，正数=精确字节数。</template>
+            </n-form-item>
+          </n-gi>
           <n-gi :span="2">
             <n-form-item label="代理节点">
               <n-space align="center" style="width: 100%">
@@ -114,6 +120,39 @@
                 </div>
               </div>
             </div>
+            <div v-if="editingId" style="margin-top: 10px; padding: 8px 12px; border: 1px solid var(--n-border-color); border-radius: 6px; background: var(--n-color-embedded);">
+              <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;">
+                <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                  <n-text style="font-size: 12px; white-space: nowrap;" depth="3">实时连接</n-text>
+                  <n-tag type="info" size="small" :bordered="false">连接 {{ editServerLiveSessions.length }}</n-tag>
+                  <n-tag :type="editServerLiveIdentifiedCount > 0 ? 'success' : 'default'" size="small" :bordered="false">玩家 {{ editServerLiveIdentifiedCount }}</n-tag>
+                </div>
+                <n-button size="tiny" secondary @click="refreshEditServerLiveSessions" :loading="editServerLiveLoading">刷新</n-button>
+              </div>
+              <div v-if="editServerLiveSessions.length === 0" style="margin-top: 8px;">
+                <n-text depth="3" style="font-size: 12px">暂无活跃连接</n-text>
+              </div>
+              <div v-else class="table-wrapper" style="margin-top: 8px;">
+                <n-table size="small" :bordered="false" :single-line="false">
+                  <thead>
+                    <tr>
+                      <th>玩家</th>
+                      <th>客户端</th>
+                      <th>在线时长</th>
+                      <th>流量</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="sess in editServerLiveSessions" :key="sess.id">
+                      <td>{{ sess.display_name || '连接建立中' }}</td>
+                      <td>{{ sess.client_addr }}</td>
+                      <td>{{ formatLiveSessionDuration(sess.duration_seconds) }}</td>
+                      <td>↑ {{ formatLiveSessionBytes(sess.bytes_up) }} / ↓ {{ formatLiveSessionBytes(sess.bytes_down) }}</td>
+                    </tr>
+                  </tbody>
+                </n-table>
+              </div>
+            </div>
           </n-gi>
         </n-grid>
       </n-form>
@@ -135,35 +174,45 @@
     <!-- 代理选择器 Modal -->
     <n-modal v-model:show="showProxySelector" preset="card" title="快速切换代理节点" style="width: 1400px; max-width: 95vw">
       <n-spin :show="proxySelectorLoading">
-        <!-- 视图切换和负载均衡选项 -->
-        <n-space style="margin-bottom: 12px;" align="center" justify="space-between" wrap>
-          <n-space align="center">
-            <n-radio-group v-model:value="proxyViewMode" size="small">
-              <n-radio-button value="groups">分组视图</n-radio-button>
-              <n-radio-button value="list">列表视图</n-radio-button>
-            </n-radio-group>
-            <n-divider vertical />
-            <span style="font-size: 13px; color: var(--n-text-color-3)">负载均衡:</span>
-            <n-select v-model:value="quickLoadBalance" :options="loadBalanceOptions" style="width: 130px" size="small" />
-            <span style="font-size: 13px; color: var(--n-text-color-3)">排序:</span>
-            <n-select v-model:value="quickLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 110px" size="small" />
-          </n-space>
-          <n-space align="center" wrap>
-            <span style="font-size: 12px; color: var(--n-text-color-3)">HTTP 测试地址:</span>
-            <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" style="width: 220px" size="small" clearable />
-            <span style="font-size: 12px; color: var(--n-text-color-3)">UDP(MCBE) 地址:</span>
-            <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" style="width: 200px" size="small" />
-          </n-space>
-          <n-space align="center" v-if="proxyViewMode === 'list'">
-            <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable />
-            <n-select v-model:value="proxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable />
-            <n-checkbox v-model:checked="proxyFilter.udpOnly">仅UDP可用</n-checkbox>
-            <n-input v-model:value="proxyFilter.search" placeholder="搜索" style="width: 150px" clearable />
-            <n-tag v-if="filteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
-              {{ filteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
-            </n-tag>
-          </n-space>
-        </n-space>
+        <div class="toolbar-stack">
+          <div class="toolbar-panel">
+            <div class="toolbar-panel-title">选择与排序</div>
+            <n-space align="center" wrap>
+              <n-radio-group v-model:value="proxyViewMode" size="small">
+                <n-radio-button value="groups">分组视图</n-radio-button>
+                <n-radio-button value="list">列表视图</n-radio-button>
+              </n-radio-group>
+              <n-divider vertical />
+              <span class="toolbar-label">负载均衡</span>
+              <n-select v-model:value="quickLoadBalance" :options="loadBalanceOptions" style="width: 130px" size="small" />
+              <span class="toolbar-label">延迟类型</span>
+              <n-select v-model:value="quickLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 130px" size="small" />
+              <span class="toolbar-label">顺序</span>
+              <n-select v-model:value="quickLatencySortOrder" :options="latencySortOrderOptions" style="width: 110px" size="small" :disabled="proxyViewMode !== 'list'" />
+            </n-space>
+          </div>
+          <div class="toolbar-panel">
+            <div class="toolbar-panel-title">测试参数</div>
+            <n-space align="center" wrap>
+              <span class="toolbar-label">HTTP 测试地址</span>
+              <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" class="toolbar-input-wide" size="small" clearable />
+              <span class="toolbar-label">UDP(MCBE) 地址</span>
+              <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" class="toolbar-input-medium" size="small" />
+            </n-space>
+          </div>
+          <div class="toolbar-panel" v-if="proxyViewMode === 'list'">
+            <div class="toolbar-panel-title">节点筛选</div>
+            <n-space align="center" wrap>
+              <n-select v-model:value="proxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable />
+              <n-select v-model:value="proxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable />
+              <n-checkbox v-model:checked="proxyFilter.udpOnly">仅UDP可用</n-checkbox>
+              <n-input v-model:value="proxyFilter.search" placeholder="搜索" class="toolbar-input-search" clearable />
+              <n-tag v-if="filteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
+                {{ filteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
+              </n-tag>
+            </n-space>
+          </div>
+        </div>
 
         <!-- 分组视图 -->
         <div v-if="proxyViewMode === 'groups'" class="group-cards-container">
@@ -329,6 +378,8 @@
             <n-select v-model:value="formLoadBalance" :options="loadBalanceOptions" style="width: 130px" size="small" />
             <span style="font-size: 13px; color: var(--n-text-color-3)">排序:</span>
             <n-select v-model:value="formLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 100px" size="small" />
+            <span style="font-size: 13px; color: var(--n-text-color-3)">顺序:</span>
+            <n-select v-model:value="formLatencySortOrder" :options="latencySortOrderOptions" style="width: 110px" size="small" />
           </template>
         </n-space>
         <n-space style="margin-bottom: 12px" align="center" wrap>
@@ -358,6 +409,8 @@
             <n-select v-model:value="formLoadBalance" :options="loadBalanceOptions" style="width: 140px" />
             <span>排序:</span>
             <n-select v-model:value="formLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 120px" />
+            <span>顺序:</span>
+            <n-select v-model:value="formLatencySortOrder" :options="latencySortOrderOptions" style="width: 120px" />
           </n-space>
           
           <!-- 分组卡片（包含未分组） -->
@@ -405,28 +458,30 @@
 
         <!-- 节点选择模式（支持多选） -->
         <div v-else-if="formProxyMode === 'single'">
-          <n-space style="margin-bottom: 12px" align="center" justify="space-between" wrap>
-            <n-space align="center">
-              <n-select v-model:value="formProxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 150px" clearable />
-              <n-select v-model:value="formProxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 130px" clearable />
-              <n-checkbox v-model:checked="formProxyFilter.udpOnly">仅UDP可用</n-checkbox>
-              <n-input v-model:value="formProxyFilter.search" placeholder="搜索节点" style="width: 180px" clearable />
-            </n-space>
-            <n-space align="center">
-              <n-tag v-if="formFilteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
-                {{ formFilteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
-              </n-tag>
-              <n-tag v-if="formSelectedNodes.length > 0" type="success" size="small">
-                已选 {{ formSelectedNodes.length }} 个节点
-              </n-tag>
-              <!-- 批量测试按钮 -->
-              <n-dropdown v-if="formSelectedNodes.length > 0" trigger="click" :options="batchTestOptions" @select="handleFormNodesBatchTest">
-                <n-button type="info" size="small" :loading="formBatchTesting">
-                  {{ formBatchTesting ? `测试中 ${formBatchProgress.current}/${formBatchProgress.total}` : `批量测试` }}
-                </n-button>
-              </n-dropdown>
-            </n-space>
-          </n-space>
+          <div class="toolbar-panel selector-panel">
+            <div class="toolbar-panel-title">节点筛选</div>
+            <div class="toolbar-panel-split">
+              <n-space align="center" wrap>
+                <n-select v-model:value="formProxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 150px" clearable />
+                <n-select v-model:value="formProxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 130px" clearable />
+                <n-checkbox v-model:checked="formProxyFilter.udpOnly">仅UDP可用</n-checkbox>
+                <n-input v-model:value="formProxyFilter.search" placeholder="搜索节点" class="toolbar-input-search" clearable />
+              </n-space>
+              <n-space align="center" wrap>
+                <n-tag v-if="formFilteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
+                  {{ formFilteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
+                </n-tag>
+                <n-tag v-if="formSelectedNodes.length > 0" type="success" size="small">
+                  已选 {{ formSelectedNodes.length }} 个节点
+                </n-tag>
+                <n-dropdown v-if="formSelectedNodes.length > 0" trigger="click" :options="batchTestOptions" @select="handleFormNodesBatchTest">
+                  <n-button type="info" size="small" :loading="formBatchTesting">
+                    {{ formBatchTesting ? `测试中 ${formBatchProgress.current}/${formBatchProgress.total}` : `批量测试` }}
+                  </n-button>
+                </n-dropdown>
+              </n-space>
+            </div>
+          </div>
 
           <n-data-table 
             :columns="formProxyColumnsWithActions" 
@@ -530,18 +585,20 @@
           <n-tab-pane name="config" tab="配置详情">
             <n-descriptions :column="2" bordered size="small">
               <n-descriptions-item label="TLS">{{ proxyDetailData.tls ? '启用' : '禁用' }}</n-descriptions-item>
-              <n-descriptions-item label="跳过证书验证">{{ proxyDetailData.skip_cert_verify ? '是' : '否' }}</n-descriptions-item>
+              <n-descriptions-item label="跳过证书验证">{{ (proxyDetailData.insecure || proxyDetailData.skip_cert_verify) ? '是' : '否' }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.sni" label="SNI">{{ proxyDetailData.sni }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.alpn" label="ALPN">{{ proxyDetailData.alpn }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.network" label="传输协议">{{ proxyDetailData.network }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.ws_path" label="WS路径">{{ proxyDetailData.ws_path }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.ws_host" label="WS Host">{{ proxyDetailData.ws_host }}</n-descriptions-item>
+              <n-descriptions-item v-if="proxyDetailData.xhttp_mode" label="XHTTP Mode">{{ proxyDetailData.xhttp_mode }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.grpc_service_name" label="gRPC服务名">{{ proxyDetailData.grpc_service_name }}</n-descriptions-item>
+              <n-descriptions-item v-if="proxyDetailData.grpc_authority" label="gRPC Authority">{{ proxyDetailData.grpc_authority }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.flow" label="Flow">{{ proxyDetailData.flow }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.reality" label="Reality">启用</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.reality_public_key" label="Reality公钥" :span="2">{{ proxyDetailData.reality_public_key }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.reality_short_id" label="Reality ShortID">{{ proxyDetailData.reality_short_id }}</n-descriptions-item>
-              <n-descriptions-item v-if="proxyDetailData.cipher" label="加密方式">{{ proxyDetailData.cipher }}</n-descriptions-item>
+              <n-descriptions-item v-if="(proxyDetailData.method || proxyDetailData.cipher)" label="加密方式">{{ proxyDetailData.method || proxyDetailData.cipher }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.uuid" label="UUID" :span="2">{{ proxyDetailData.uuid }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.password" label="密码" :span="2">{{ proxyDetailData.password }}</n-descriptions-item>
               <n-descriptions-item v-if="proxyDetailData.alter_id !== undefined" label="Alter ID">{{ proxyDetailData.alter_id }}</n-descriptions-item>
@@ -684,6 +741,8 @@
               <n-space size="small">
                 <n-tag type="info" size="small">{{ singleNodeData.type?.toUpperCase() }}</n-tag>
                 <n-tag v-if="singleNodeData.network === 'ws'" type="warning" size="small">WebSocket</n-tag>
+                <n-tag v-if="singleNodeData.network === 'httpupgrade'" type="warning" size="small">HTTPUpgrade</n-tag>
+                <n-tag v-if="singleNodeData.network === 'xhttp'" type="warning" size="small">XHTTP</n-tag>
                 <n-tag v-if="singleNodeData.network === 'grpc'" type="warning" size="small">gRPC</n-tag>
                 <n-tag v-if="singleNodeData.reality" type="success" size="small">Reality</n-tag>
                 <n-tag v-if="singleNodeData.flow === 'xtls-rprx-vision'" type="primary" size="small">Vision</n-tag>
@@ -696,18 +755,20 @@
               <n-tag :type="singleNodeData.enabled ? 'success' : 'error'" size="small">{{ singleNodeData.enabled ? '已启用' : '已禁用' }}</n-tag>
             </n-descriptions-item>
             <n-descriptions-item label="TLS">{{ singleNodeData.tls ? '启用' : '禁用' }}</n-descriptions-item>
-            <n-descriptions-item label="跳过证书验证">{{ singleNodeData.skip_cert_verify ? '是' : '否' }}</n-descriptions-item>
+            <n-descriptions-item label="跳过证书验证">{{ (singleNodeData.insecure || singleNodeData.skip_cert_verify) ? '是' : '否' }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.sni" label="SNI">{{ singleNodeData.sni }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.alpn" label="ALPN">{{ singleNodeData.alpn }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.network" label="传输协议">{{ singleNodeData.network }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.ws_path" label="WS路径">{{ singleNodeData.ws_path }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.ws_host" label="WS Host">{{ singleNodeData.ws_host }}</n-descriptions-item>
+            <n-descriptions-item v-if="singleNodeData.xhttp_mode" label="XHTTP Mode">{{ singleNodeData.xhttp_mode }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.grpc_service_name" label="gRPC服务名">{{ singleNodeData.grpc_service_name }}</n-descriptions-item>
+            <n-descriptions-item v-if="singleNodeData.grpc_authority" label="gRPC Authority">{{ singleNodeData.grpc_authority }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.flow" label="Flow">{{ singleNodeData.flow }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.reality" label="Reality">启用</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.reality_public_key" label="Reality公钥" :span="2">{{ singleNodeData.reality_public_key }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.reality_short_id" label="Reality ShortID">{{ singleNodeData.reality_short_id }}</n-descriptions-item>
-            <n-descriptions-item v-if="singleNodeData.cipher" label="加密方式">{{ singleNodeData.cipher }}</n-descriptions-item>
+            <n-descriptions-item v-if="(singleNodeData.method || singleNodeData.cipher)" label="加密方式">{{ singleNodeData.method || singleNodeData.cipher }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.uuid" label="UUID" :span="2">{{ singleNodeData.uuid }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.password" label="密码" :span="2">{{ singleNodeData.password }}</n-descriptions-item>
             <n-descriptions-item v-if="singleNodeData.alter_id !== undefined" label="Alter ID">{{ singleNodeData.alter_id }}</n-descriptions-item>
@@ -751,7 +812,7 @@
       <n-spin :show="bestNodeTesting">
         <n-space vertical>
           <n-alert type="info">
-            根据当前配置的延迟类型（{{ bestNodeSortType }}），显示所有候选节点。延迟最低的节点将高亮显示为"最优"。
+            高亮的“最优节点”仍按当前服务器配置的延迟类型（{{ bestNodeSortType }}）计算；下方排序控件只影响列表显示顺序。
           </n-alert>
 
           <!-- 批量操作按钮（选中节点时显示） -->
@@ -765,40 +826,48 @@
             <n-button size="small" @click="bestNodeCheckedKeys = []">取消选择</n-button>
           </n-space>
 
-          <!-- 操作工具栏 -->
-          <n-space justify="space-between" align="center" wrap>
-            <n-space>
-              <n-button type="primary" size="small" @click="batchTestBestNodes('tcp')" :loading="bestNodeTesting">
-                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg></n-icon></template>
-                测试全部TCP
-              </n-button>
-              <n-button size="small" @click="batchTestBestNodes('http')" :loading="bestNodeTesting">测试全部HTTP</n-button>
-              <n-button size="small" @click="batchTestBestNodes('udp')" :loading="bestNodeTesting">测试全部UDP</n-button>
-              <n-button size="small" @click="batchTestBestNodes('all')" :loading="bestNodeTesting">一键测试全部</n-button>
-              <n-divider vertical />
-              <n-button type="success" size="small" @click="recalculateBestNode">
-                <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></n-icon></template>
-                重新计算最优节点
-              </n-button>
-            </n-space>
-            <n-space align="center" wrap>
-              <span style="font-size: 12px; color: var(--n-text-color-3)">HTTP 测试地址:</span>
-              <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" style="width: 220px" size="small" clearable />
-              <span style="font-size: 12px; color: var(--n-text-color-3)">UDP(MCBE) 地址:</span>
-              <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" style="width: 200px" size="small" />
-            </n-space>
-          </n-space>
-
-          <!-- 筛选工具栏 -->
-          <n-space align="center" wrap>
-            <n-select v-model:value="bestNodeFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable size="small" />
-            <n-select v-model:value="bestNodeFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable size="small" />
-            <n-checkbox v-model:checked="bestNodeFilter.udpOnly" size="small">仅UDP可用</n-checkbox>
-            <n-input v-model:value="bestNodeFilter.search" placeholder="搜索" style="width: 150px" clearable size="small" />
-            <n-tag v-if="filteredBestNodeList.length !== bestNodeRawData.length" type="info" size="small">
-              {{ filteredBestNodeList.length }} / {{ bestNodeRawData.length }}
-            </n-tag>
-          </n-space>
+          <div class="toolbar-stack compact-stack">
+            <div class="toolbar-panel">
+              <div class="toolbar-panel-title">批量测试与重算</div>
+              <n-space align="center" wrap>
+                <n-button type="primary" size="small" @click="batchTestBestNodes('tcp')" :loading="bestNodeTesting">
+                  <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg></n-icon></template>
+                  测试全部TCP
+                </n-button>
+                <n-button size="small" @click="batchTestBestNodes('http')" :loading="bestNodeTesting">测试全部HTTP</n-button>
+                <n-button size="small" @click="batchTestBestNodes('udp')" :loading="bestNodeTesting">测试全部UDP</n-button>
+                <n-button size="small" @click="batchTestBestNodes('all')" :loading="bestNodeTesting">一键测试全部</n-button>
+                <n-divider vertical />
+                <n-button type="success" size="small" @click="recalculateBestNode">
+                  <template #icon><n-icon><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></n-icon></template>
+                  重新计算最优节点
+                </n-button>
+              </n-space>
+            </div>
+            <div class="toolbar-panel">
+              <div class="toolbar-panel-title">测试参数</div>
+              <n-space align="center" wrap>
+                <span class="toolbar-label">HTTP 测试地址</span>
+                <n-input v-model:value="customHttpUrl" placeholder="https://example.com (可选)" class="toolbar-input-wide" size="small" clearable />
+                <span class="toolbar-label">UDP(MCBE) 地址</span>
+                <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" class="toolbar-input-medium" size="small" />
+              </n-space>
+            </div>
+            <div class="toolbar-panel">
+              <div class="toolbar-panel-title">排序与筛选</div>
+              <n-space align="center" wrap>
+                <n-select v-model:value="bestNodeFilter.group" :options="proxyGroups" placeholder="分组" style="width: 120px" clearable size="small" />
+                <n-select v-model:value="bestNodeFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 120px" clearable size="small" />
+                <n-checkbox v-model:checked="bestNodeFilter.udpOnly" size="small">仅UDP可用</n-checkbox>
+                <n-select v-model:value="bestNodeSortMetric" :options="loadBalanceSortOptions" placeholder="延迟类型" style="width: 130px" size="small" />
+                <n-select v-model:value="bestNodeSortOrder" :options="latencySortOrderOptions" style="width: 110px" size="small" />
+                <n-input v-model:value="bestNodeFilter.search" placeholder="搜索" class="toolbar-input-search" clearable size="small" />
+                <n-tag v-if="filteredBestNodeList.length !== bestNodeRawData.length" type="info" size="small">
+                  {{ filteredBestNodeList.length }} / {{ bestNodeRawData.length }}
+                </n-tag>
+              </n-space>
+            </div>
+          </div>
 
           <!-- 测试进度 -->
           <n-progress v-if="bestNodeTesting" type="line" :percentage="bestNodeProgress.percentage" :status="bestNodeProgress.status">
@@ -841,12 +910,74 @@
 :deep(.best-node-row:hover) {
   background-color: rgba(24, 160, 88, 0.15) !important;
 }
+
+.toolbar-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.compact-stack {
+  gap: 10px;
+}
+
+.toolbar-panel {
+  border: 1px solid var(--n-border-color);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--n-color-embedded);
+}
+
+.selector-panel {
+  margin-bottom: 12px;
+}
+
+.toolbar-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--n-text-color-2);
+  margin-bottom: 10px;
+}
+
+.toolbar-panel-split {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.toolbar-label {
+  font-size: 12px;
+  color: var(--n-text-color-3);
+  white-space: nowrap;
+}
+
+.toolbar-input-wide {
+  width: 260px;
+}
+
+.toolbar-input-medium {
+  width: 220px;
+}
+
+.toolbar-input-search {
+  width: 190px;
+}
+
+@media (max-width: 900px) {
+  .toolbar-input-wide,
+  .toolbar-input-medium,
+  .toolbar-input-search {
+    width: 100%;
+  }
+}
 </style>
 
 <script setup>
 import { ref, computed, onMounted, h, nextTick, watch } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
-import { api } from '../api'
+import { api, apiStream } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
 
 const message = useMessage()
@@ -888,6 +1019,7 @@ const defaultForm = {
   disabled_message: '§c服务器维护中§r\n§7请稍后再试',
   custom_motd: '', // 留空则从远程服务器获取
   xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
+  udp_socket_buffer_size: 0,
   load_balance: 'least-latency', load_balance_sort: 'udp',
   auto_ping_enabled: true,
   auto_ping_interval_minutes: 10 // 负载均衡Ping间隔（分钟）
@@ -908,6 +1040,42 @@ const loadBalanceSortOptions = [
   { label: 'TCP延迟', value: 'tcp' },
   { label: 'HTTP延迟', value: 'http' }
 ]
+
+const latencySortOrderOptions = [
+  { label: '从小到大', value: 'asc' },
+  { label: '从大到小', value: 'desc' }
+]
+
+const getLatencySortValue = (row, metric) => {
+  if (metric === 'tcp') {
+    return row.latency_ms > 0 ? row.latency_ms : null
+  }
+  if (metric === 'http') {
+    return row.http_latency_ms > 0 ? row.http_latency_ms : null
+  }
+  if (metric === 'udp') {
+    if (row.udp_available === true) {
+      return row.udp_latency_ms > 0 ? row.udp_latency_ms : 0
+    }
+    return null
+  }
+  return null
+}
+
+const compareLatencySort = (a, b, metric, order) => {
+  const aValue = getLatencySortValue(a, metric)
+  const bValue = getLatencySortValue(b, metric)
+  const aMissing = aValue === null || aValue === undefined
+  const bMissing = bValue === null || bValue === undefined
+
+  if (aMissing !== bMissing) {
+    return aMissing ? 1 : -1
+  }
+  if (!aMissing && !bMissing && aValue !== bValue) {
+    return order === 'desc' ? bValue - aValue : aValue - bValue
+  }
+  return 0
+}
 
 // Check if proxy_outbound is a group or multi-node selection (needs load balance options)
 const isGroupSelection = computed(() => {
@@ -1028,6 +1196,8 @@ const proxyProtocolOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'SOCKS5', value: 'socks5' },
+  { label: 'HTTP', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
@@ -1103,6 +1273,7 @@ const groupStats = ref([])
 const expandedGroups = ref({})
 const quickLoadBalance = ref('') // 快速切换时的负载均衡策略
 const quickLoadBalanceSort = ref('') // 快速切换时的延迟排序
+const quickLatencySortOrder = ref('asc')
 
 // 表单代理选择器相关
 const showFormProxySelector = ref(false)
@@ -1112,6 +1283,7 @@ const formSelectedGroup = ref('')
 const formSelectedNodes = ref([]) // 选中的节点列表（支持多选）
 const formLoadBalance = ref('')
 const formLoadBalanceSort = ref('')
+const formLatencySortOrder = ref('asc')
 const formProxyFilter = ref({ group: '', protocol: '', udpOnly: false, search: '' })
 const formProxySelectorPagination = ref({
   page: 1,
@@ -1136,6 +1308,8 @@ const showBestNodeModal = ref(false)
 const bestNodeList = ref([])
 const bestNodeRawData = ref([]) // 保存原始节点数据
 const bestNodeSortType = ref('UDP')
+const bestNodeSortMetric = ref('udp')
+const bestNodeSortOrder = ref('asc')
 const bestNodeTesting = ref(false)
 const bestNodeProgress = ref({ current: 0, total: 0, success: 0, failed: 0, percentage: 0, status: 'default' })
 const bestNodeFilter = ref({ group: '', protocol: '', udpOnly: false, search: '' })
@@ -1144,6 +1318,15 @@ const bestNodeBatchTesting = ref(false) // 批量测试状态
 const bestNodeBatchProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
 const serverNodeLatencySortBy = ref('')
 const serverNodeLatencyMap = ref({})
+// In-flight guards to prevent duplicate concurrent requests (e.g. watcher
+// fires while an earlier fetch is still pending). Each request bumps the
+// token and checks it again after the fetch resolves so that only the
+// latest response is applied. This removes the "double request" seen
+// when opening the edit modal (openEditModal + reactive watcher both
+// firing) and the extra `/api/servers/:id/node-latency` burst when the
+// load_balance_sort dropdown changes rapidly.
+let serverNodeLatencyFetchToken = 0
+let editServerLiveSessionsFetchToken = 0
 const bestNodePagination = ref({
   page: 1,
   pageSize: 50,
@@ -1185,7 +1368,17 @@ const filteredBestNodeList = computed(() => {
     )
   }
 
-  return list
+  const metric = bestNodeSortMetric.value || form.value.load_balance_sort || serverNodeLatencySortBy.value || 'udp'
+  return list.sort((a, b) => {
+    const latencyCmp = compareLatencySort(a, b, metric, bestNodeSortOrder.value)
+    if (latencyCmp !== 0) {
+      return latencyCmp
+    }
+    if (!a.group && b.group) return -1
+    if (a.group && !b.group) return 1
+    if (a.group && b.group && a.group !== b.group) return a.group.localeCompare(b.group)
+    return a.name.localeCompare(b.name)
+  })
 })
 
 // 节点列表表格列定义（完全参考代理出站选择弹窗）
@@ -1254,6 +1447,78 @@ const bestNodeColumnsWithActions = computed(() => [
 // 选择的最终服务器
 const currentNodeData = ref({ has_node: false, current_node: '', latency_ms: 0, has_latency: false, best_node: '', best_latency: 0 })
 const switchingNode = ref(false)
+const editServerLiveLoading = ref(false)
+const editServerLiveSessions = ref([])
+const editServerLiveIdentifiedCount = computed(() => editServerLiveSessions.value.filter(sess => !!sess.display_name).length)
+
+const formatLiveSessionDuration = (seconds) => {
+  const value = Number(seconds || 0)
+  if (value < 60) return `${value}s`
+  if (value < 3600) return `${Math.floor(value / 60)}m ${value % 60}s`
+  return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`
+}
+
+const formatLiveSessionBytes = (bytes) => {
+  const value = Number(bytes || 0)
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+// Sync the active session counter back onto the cached server row and the
+// open edit form. IMPORTANT: we mutate in place here rather than replacing
+// the whole object with `{...obj, active_sessions: count}`.
+//
+// Why: the edit modal has two watchers with array-returning getters:
+//   watch(() => [showEditModal.value, form.value?.id, form.value?.proxy_outbound, form.value?.load_balance_sort], ...)
+//   watch(() => [showEditModal.value, editingId.value, form.value?.id], ...)
+// Reassigning `form.value = {...}` swaps the ref target to a brand-new
+// reactive proxy, which forces both getters to re-evaluate and returns a
+// fresh array. Vue's watcher hasChanged() compares array results by
+// Object.is on the array reference, so a new array ≠ old array — both
+// watchers fire on every session poll. The /api/sessions watcher then
+// restarts its tick() immediately, which re-calls this function, which
+// replaces form.value again → infinite loop at ~20 req/sec against
+// /api/sessions and /api/servers/:id/node-latency. In-place mutation only
+// notifies the `active_sessions` dep, which nobody watches, so the poll
+// stays on its 3 s schedule.
+const syncServerActiveSessionCount = (serverId, count) => {
+  if (!serverId) return
+  const index = servers.value.findIndex(server => server.id === serverId)
+  if (index >= 0 && servers.value[index].active_sessions !== count) {
+    servers.value[index].active_sessions = count
+  }
+  if (form.value?.id === serverId && form.value.active_sessions !== count) {
+    form.value.active_sessions = count
+  }
+}
+
+const refreshEditServerLiveSessions = async () => {
+  const serverId = form.value?.id
+  if (!editingId.value || !serverId) {
+    editServerLiveSessions.value = []
+    return
+  }
+  const token = ++editServerLiveSessionsFetchToken
+  editServerLiveLoading.value = true
+  try {
+    const res = await api('/api/sessions')
+    // Ignore the result if a newer fetch was issued while we were waiting,
+    // or the modal was closed / switched to a different server.
+    if (token !== editServerLiveSessionsFetchToken) return
+    if (!editingId.value || form.value?.id !== serverId) return
+    if (res?.success) {
+      const sessions = (res.data || []).filter(sess => sess.server_id === serverId)
+      editServerLiveSessions.value = sessions
+      syncServerActiveSessionCount(serverId, sessions.length)
+    }
+  } finally {
+    if (token === editServerLiveSessionsFetchToken) {
+      editServerLiveLoading.value = false
+    }
+  }
+}
 
 const fetchCurrentNode = async () => {
   const serverId = form.value?.id
@@ -1294,8 +1559,14 @@ const refreshServerNodeLatency = async () => {
   }
 
   const sortBy = form.value?.load_balance_sort || 'udp'
+  const token = ++serverNodeLatencyFetchToken
   try {
     const res = await api(`/api/servers/${serverId}/node-latency?sort_by=${sortBy}`)
+    // Drop stale responses: a newer fetch was issued (e.g. user switched
+    // sort from udp to tcp while the previous request was still in flight),
+    // or the modal was closed / switched to a different server.
+    if (token !== serverNodeLatencyFetchToken) return
+    if (form.value?.id !== serverId) return
     if (!res?.success || !res.data) {
       serverNodeLatencySortBy.value = ''
       serverNodeLatencyMap.value = {}
@@ -1309,6 +1580,7 @@ const refreshServerNodeLatency = async () => {
     serverNodeLatencySortBy.value = sortBy
     serverNodeLatencyMap.value = m
   } catch {
+    if (token !== serverNodeLatencyFetchToken) return
     serverNodeLatencySortBy.value = ''
     serverNodeLatencyMap.value = {}
   }
@@ -1384,9 +1656,16 @@ const { rowProps: bestNodeSelectRowProps } = useDragSelect(bestNodeCheckedKeys, 
 
 const buildHttpTestRequest = (name) => {
   if (customHttpUrl.value) {
-    return { name, custom_http: { url: customHttpUrl.value, method: 'GET' } }
+    return { name, include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
   }
-  return { name, targets: [batchHttpTarget.value] }
+  return { name, include_ping: false, targets: [batchHttpTarget.value] }
+}
+
+const buildBatchHttpTestRequest = () => {
+  if (customHttpUrl.value) {
+    return { include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
+  }
+  return { include_ping: false, targets: [batchHttpTarget.value] }
 }
 
 // 更新代理出站数据
@@ -1398,55 +1677,45 @@ const updateProxyOutboundData = (name, updates) => {
 
 // 执行单一类型的批量测试
 const runBatchTestType = async (names, type, progressRef) => {
-  const promises = names.map(async (name) => {
-    try {
-      let res
-      if (type === 'tcp') {
-        res = await api('/api/proxy-outbounds/test', 'POST', { name })
-        handleBatchTestResult(name, res, 'tcp', progressRef)
-      } else if (type === 'http') {
-        res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildHttpTestRequest(name))
-        handleBatchTestResult(name, res, 'http', progressRef)
-      } else {
-        res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, server_id: form.value?.id || '', address: batchMcbeAddress.value })
-        handleBatchTestResult(name, res, 'udp', progressRef)
-      }
-    } catch (e) {
-      handleBatchTestResult(name, { success: false, error: e.message }, type, progressRef)
+  const payload = { names, type, stream: true }
+  if (type === 'http') {
+    Object.assign(payload, buildBatchHttpTestRequest())
+  } else if (type === 'udp') {
+    payload.server_id = form.value?.id || ''
+    payload.address = batchMcbeAddress.value
+  }
+  await apiStream('/api/proxy-outbounds/batch-test', 'POST', payload, async (event) => {
+    if (event?.event === 'item' && event?.item) {
+      applyBatchTestItemResult(event.item, type, progressRef)
     }
   })
-  await Promise.all(promises)
 }
 
 // 处理批量测试结果
-const handleBatchTestResult = (name, res, type, progressRef) => {
+const applyBatchTestItemResult = (item, type, progressRef) => {
   progressRef.value.current++
+  const name = item?.name
 
   if (type === 'tcp') {
-    if (res?.success && res.data?.success) {
+    if (item?.success) {
       progressRef.value.success++
-      // 同时更新 bestNodeRawData 和 proxyOutboundDetails
-      updateBestNodeData(name, { latency_ms: res.data.latency_ms, healthy: true })
+      updateBestNodeData(name, { latency_ms: item.latency_ms || 0, healthy: true })
     } else {
       progressRef.value.failed++
       updateBestNodeData(name, { latency_ms: 0, healthy: false })
     }
   } else if (type === 'http') {
-    if (res?.success && res.data?.success) {
+    if (item?.success) {
       progressRef.value.success++
-      const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
-      updateBestNodeData(name, {
-        http_latency_ms: httpTest?.latency_ms || 0,
-        latency_ms: res.data.ping_test?.latency_ms || 0
-      })
+      updateBestNodeData(name, { http_latency_ms: item.http_latency_ms || 0 })
     } else {
       progressRef.value.failed++
       updateBestNodeData(name, { http_latency_ms: 0 })
     }
   } else {
-    if (res?.success && res.data?.success) {
+    if (item?.success) {
       progressRef.value.success++
-      updateBestNodeData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
+      updateBestNodeData(name, { udp_available: true, udp_latency_ms: item.udp_latency_ms || 0 })
     } else {
       progressRef.value.failed++
       updateBestNodeData(name, { udp_available: false })
@@ -1592,11 +1861,14 @@ const formFilteredProxyOutbounds = computed(() => {
   // 排序：已选中的节点排在前面，然后按名称排序
   // 排序：已选中的节点排在前面
   const selectedNodes = formSelectedNodes.value || []
+  const metric = formLoadBalanceSort.value || 'udp'
   return list.sort((a, b) => {
     const aSelected = selectedNodes.includes(a.name)
     const bSelected = selectedNodes.includes(b.name)
     if (aSelected && !bSelected) return -1
     if (!aSelected && bSelected) return 1
+    const latencyCmp = compareLatencySort(a, b, metric, formLatencySortOrder.value)
+    if (latencyCmp !== 0) return latencyCmp
     return a.name.localeCompare(b.name)
   })
 })
@@ -1834,6 +2106,7 @@ const openFormProxySelector = async () => {
   
   // 重置筛选和分页状态
   formProxyFilter.value = { group: '', protocol: '', udpOnly: false, search: '' }
+  formLatencySortOrder.value = 'asc'
   formProxySelectorPagination.value.page = 1
   
   // 根据当前值初始化选择器状态
@@ -2027,6 +2300,7 @@ const filteredProxyOutbounds = computed(() => {
   if (currentProxy && !currentProxy.startsWith('@')) {
     selectedNodes = currentProxy.includes(',') ? currentProxy.split(',') : [currentProxy]
   }
+  const metric = quickLoadBalanceSort.value || 'udp'
   
   // 排序：已选中的节点排在前面，然后按分组和名称排序
   return list.sort((a, b) => {
@@ -2034,6 +2308,8 @@ const filteredProxyOutbounds = computed(() => {
     const bSelected = selectedNodes.includes(b.name)
     if (aSelected && !bSelected) return -1
     if (!aSelected && bSelected) return 1
+    const latencyCmp = compareLatencySort(a, b, metric, quickLatencySortOrder.value)
+    if (latencyCmp !== 0) return latencyCmp
     // 未选中的按分组和名称排序
     if (!a.group && b.group) return -1
     if (a.group && !b.group) return 1
@@ -2090,6 +2366,7 @@ const openProxySelector = (serverId) => {
   
   // 重置筛选和分页状态
   proxyFilter.value = { group: '', protocol: '', udpOnly: false, search: '' }
+  quickLatencySortOrder.value = 'asc'
   proxySelectorPagination.value.page = 1
   
   // 根据当前服务器的代理设置初始化视图
@@ -2330,6 +2607,7 @@ const generateSingleNodeShareLink = () => {
   try {
     const type = node.type?.toLowerCase()
     let link = ''
+    const insecure = !!(node.insecure || node.skip_cert_verify)
     
     if (type === 'vmess') {
       // VMess 链接格式
@@ -2340,7 +2618,7 @@ const generateSingleNodeShareLink = () => {
         port: String(node.port),
         id: node.uuid || '',
         aid: String(node.alter_id || 0),
-        scy: node.cipher || 'auto',
+        scy: node.security || node.cipher || 'auto',
         net: node.network || 'tcp',
         type: 'none',
         host: node.ws_host || node.sni || '',
@@ -2348,6 +2626,11 @@ const generateSingleNodeShareLink = () => {
         tls: node.tls ? 'tls' : '',
         sni: node.sni || ''
       }
+      if (insecure) vmessConfig.allowInsecure = '1'
+      if (node.fingerprint) vmessConfig.fp = node.fingerprint
+      if (node.network === 'xhttp' && node.xhttp_mode) vmessConfig.mode = node.xhttp_mode
+      if (node.grpc_service_name) vmessConfig.serviceName = node.grpc_service_name
+      if (node.grpc_authority) vmessConfig.authority = node.grpc_authority
       link = 'vmess://' + btoa(JSON.stringify(vmessConfig))
     } else if (type === 'vless') {
       // VLESS 链接格式
@@ -2355,10 +2638,14 @@ const generateSingleNodeShareLink = () => {
       if (node.network) params.set('type', node.network)
       if (node.tls) params.set('security', node.reality ? 'reality' : 'tls')
       if (node.sni) params.set('sni', node.sni)
+      if (insecure) params.set('insecure', '1')
       if (node.flow) params.set('flow', node.flow)
+      if (node.alpn) params.set('alpn', node.alpn)
       if (node.ws_path) params.set('path', node.ws_path)
       if (node.ws_host) params.set('host', node.ws_host)
+      if (node.network === 'xhttp' && node.xhttp_mode) params.set('mode', node.xhttp_mode)
       if (node.grpc_service_name) params.set('serviceName', node.grpc_service_name)
+      if (node.grpc_authority) params.set('authority', node.grpc_authority)
       if (node.reality_public_key) params.set('pbk', node.reality_public_key)
       if (node.reality_short_id) params.set('sid', node.reality_short_id)
       if (node.fingerprint) params.set('fp', node.fingerprint)
@@ -2368,18 +2655,26 @@ const generateSingleNodeShareLink = () => {
       const params = new URLSearchParams()
       if (node.network && node.network !== 'tcp') params.set('type', node.network)
       if (node.sni) params.set('sni', node.sni)
+      if (insecure) params.set('insecure', '1')
+      if (node.alpn) params.set('alpn', node.alpn)
       if (node.ws_path) params.set('path', node.ws_path)
       if (node.ws_host) params.set('host', node.ws_host)
+      if (node.network === 'xhttp' && node.xhttp_mode) params.set('mode', node.xhttp_mode)
+      if (node.grpc_service_name) params.set('serviceName', node.grpc_service_name)
+      if (node.grpc_authority) params.set('authority', node.grpc_authority)
+      if (node.fingerprint) params.set('fp', node.fingerprint)
       link = `trojan://${encodeURIComponent(node.password)}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`
     } else if (type === 'shadowsocks' || type === 'ss') {
       // Shadowsocks 链接格式
-      const userinfo = btoa(`${node.cipher}:${node.password}`)
+      const userinfo = btoa(`${node.method || node.cipher}:${node.password}`)
       link = `ss://${userinfo}@${node.server}:${node.port}#${encodeURIComponent(node.name)}`
     } else if (type === 'hysteria2' || type === 'hy2') {
       // Hysteria2 链接格式
       const params = new URLSearchParams()
       if (node.sni) params.set('sni', node.sni)
-      if (node.skip_cert_verify) params.set('insecure', '1')
+      if (insecure) params.set('insecure', '1')
+      if (node.obfs) params.set('obfs', node.obfs)
+      if (node.obfs_password) params.set('obfs-password', node.obfs_password)
       link = `hysteria2://${encodeURIComponent(node.password)}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`
     } else {
       link = ''
@@ -2500,22 +2795,19 @@ const handleMultiDetailBatchTest = async (key) => {
   }
   
   multiDetailBatchTesting.value = true
-  multiDetailBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
-  
-  for (const name of names) {
-    multiDetailBatchProgress.value.current++
-    try {
-      await testSingleProxy(name, key)
-      multiDetailBatchProgress.value.success++
-      // 更新列表中的数据
-      const idx = proxyDetailNodesData.value.findIndex(n => n.name === name)
-      if (idx >= 0 && proxyOutboundDetails.value[name]) {
-        proxyDetailNodesData.value[idx] = { ...proxyOutboundDetails.value[name] }
-      }
-    } catch (e) {
-      multiDetailBatchProgress.value.failed++
-    }
+  if (key === 'all') {
+    multiDetailBatchProgress.value = { current: 0, total: names.length * 3, success: 0, failed: 0 }
+    await runBatchTestType(names, 'tcp', multiDetailBatchProgress)
+    await runBatchTestType(names, 'http', multiDetailBatchProgress)
+    await runBatchTestType(names, 'udp', multiDetailBatchProgress)
+  } else {
+    multiDetailBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
+    await runBatchTestType(names, key, multiDetailBatchProgress)
   }
+  proxyDetailNodesData.value = proxyDetailNodesData.value.map(node => ({
+    ...node,
+    ...(proxyOutboundDetails.value[node.name] || {})
+  }))
   
   multiDetailBatchTesting.value = false
   message.success(`批量测试完成: ${multiDetailBatchProgress.value.success} 成功, ${multiDetailBatchProgress.value.failed} 失败`)
@@ -2576,7 +2868,13 @@ const columns = [
 
 const load = async () => { const res = await api('/api/servers'); if (res.success) servers.value = res.data || [] }
 const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true; refreshBatchMcbeAddress() }
-const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; refreshBatchMcbeAddress(); refreshServerNodeLatency(); fetchCurrentNode() }
+// Note: refreshServerNodeLatency/refreshBatchMcbeAddress are intentionally
+// NOT called here. The watchers at the bottom of <script setup> react to
+// showEditModal/form.id/load_balance_sort changes and call them exactly
+// once per open, which avoids the "double burst" of /api/servers/:id/
+// node-latency and /api/sessions that the user saw. We still invoke
+// fetchCurrentNode() eagerly because there is no reactive watcher for it.
+const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; fetchCurrentNode() }
 
 const refreshBatchMcbeAddress = () => {
   const target = form.value?.target
@@ -2599,6 +2897,46 @@ watch(
   () => [showEditModal.value, form.value?.id, form.value?.proxy_outbound, form.value?.load_balance_sort],
   () => {
     if (showEditModal.value) refreshServerNodeLatency()
+  }
+)
+
+// Poll /api/sessions every 3 seconds while the edit modal is open so the
+// "实时连接" panel stays up to date. Uses a self-scheduling timeout (not
+// setInterval) so slow responses never stack: the next call is only
+// scheduled AFTER the current one resolves, and the cleanup flag prevents
+// a pending response from rescheduling after the modal closes. Also
+// pauses when the tab is hidden to save CPU/network on idle tabs.
+watch(
+  () => [showEditModal.value, editingId.value, form.value?.id],
+  ([visible, editId, serverId], _, onCleanup) => {
+    let timer = null
+    let cancelled = false
+    const tick = async () => {
+      if (cancelled) return
+      if (typeof document !== 'undefined' && document.hidden) {
+        // Skip the network call while the tab is hidden but keep
+        // rescheduling so we resume instantly when it becomes visible.
+        timer = setTimeout(tick, 3000)
+        return
+      }
+      try {
+        await refreshEditServerLiveSessions()
+      } finally {
+        if (!cancelled) {
+          timer = setTimeout(tick, 3000)
+        }
+      }
+    }
+    if (visible && editId && serverId) {
+      tick()
+    } else {
+      editServerLiveSessions.value = []
+      editServerLiveLoading.value = false
+    }
+    onCleanup(() => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    })
   }
 )
 
@@ -2641,6 +2979,8 @@ const showBestNodePreview = async () => {
 
   const sortType = form.value.load_balance_sort || 'udp'
   bestNodeSortType.value = sortType.toUpperCase()
+  bestNodeSortMetric.value = sortType
+  bestNodeSortOrder.value = 'asc'
 
   try {
     // 获取代理节点列表

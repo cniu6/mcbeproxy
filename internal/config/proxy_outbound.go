@@ -16,6 +16,8 @@ const (
 	ProtocolVMess       = "vmess"
 	ProtocolTrojan      = "trojan"
 	ProtocolVLESS       = "vless"
+	ProtocolSOCKS5      = "socks5"
+	ProtocolHTTP        = "http"
 	ProtocolHysteria2   = "hysteria2"
 	ProtocolAnyTLS      = "anytls"
 )
@@ -30,6 +32,20 @@ var supportedSSMethods = map[string]bool{
 	"2022-blake3-chacha20-poly1305": true,
 }
 
+type proxyOutboundRuntime struct {
+	mu             sync.RWMutex
+	healthy        bool
+	lastCheck      time.Time
+	latency        time.Duration
+	connCount      int64
+	lastError      string
+	bytesUp        int64
+	bytesDown      int64
+	lastActive     time.Time
+	activeSince    time.Time
+	activeDuration time.Duration
+}
+
 // ProxyOutbound represents a proxy outbound node configuration.
 type ProxyOutbound struct {
 	Name    string `json:"name"`            // Node name, unique identifier
@@ -38,6 +54,13 @@ type ProxyOutbound struct {
 	Port    int    `json:"port"`            // Server port
 	Enabled bool   `json:"enabled"`         // Whether enabled
 	Group   string `json:"group,omitempty"` // Node group for organization
+
+	SubscriptionID     string `json:"subscription_id,omitempty"`      // Source subscription ID if managed by a subscription
+	SubscriptionName   string `json:"subscription_name,omitempty"`    // Source subscription display name
+	SubscriptionNodeID string `json:"subscription_node_id,omitempty"` // Stable node key within the subscription
+
+	// SOCKS5 / HTTP proxy auth fields
+	Username string `json:"username,omitempty"`
 
 	// Shadowsocks specific fields
 	Method   string `json:"method,omitempty"`   // Encryption method
@@ -54,15 +77,18 @@ type ProxyOutbound struct {
 
 	// Hysteria2 specific fields
 	// Password is reused from Shadowsocks
-	Obfs            string `json:"obfs,omitempty"`             // Obfuscation type: salamander
-	ObfsPassword    string `json:"obfs_password,omitempty"`    // Obfuscation password
-	PortHopping     string `json:"port_hopping,omitempty"`     // Port hopping range (e.g., "20000-55000")
-	HopInterval     int    `json:"hop_interval,omitempty"`     // Port hopping interval in seconds (default: 10)
-	UpMbps          int    `json:"up_mbps,omitempty"`          // Upload bandwidth limit in Mbps
-	DownMbps        int    `json:"down_mbps,omitempty"`        // Download bandwidth limit in Mbps
-	ALPN            string `json:"alpn,omitempty"`             // TLS ALPN (comma-separated, e.g., "h3,h2")
-	CertFingerprint string `json:"cert_fingerprint,omitempty"` // Server certificate SHA256 fingerprint for pinning
-	DisableMTU      bool   `json:"disable_mtu,omitempty"`      // Disable Path MTU Discovery
+	Obfs                     string `json:"obfs,omitempty"`             // Obfuscation type: salamander
+	ObfsPassword             string `json:"obfs_password,omitempty"`    // Obfuscation password
+	PortHopping              string `json:"port_hopping,omitempty"`     // Port hopping range (e.g., "20000-55000")
+	HopInterval              int    `json:"hop_interval,omitempty"`     // Port hopping interval in seconds (default: 10)
+	UpMbps                   int    `json:"up_mbps,omitempty"`          // Upload bandwidth limit in Mbps
+	DownMbps                 int    `json:"down_mbps,omitempty"`        // Download bandwidth limit in Mbps
+	ALPN                     string `json:"alpn,omitempty"`             // TLS ALPN (comma-separated, e.g., "h3,h2")
+	CertFingerprint          string `json:"cert_fingerprint,omitempty"` // Server certificate SHA256 fingerprint for pinning
+	DisableMTU               bool   `json:"disable_mtu,omitempty"`      // Disable Path MTU Discovery
+	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
+	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
+	MinIdleSession           int    `json:"min_idle_session,omitempty"`
 
 	// TLS common fields
 	TLS         bool   `json:"tls,omitempty"`         // Enable TLS
@@ -76,9 +102,12 @@ type ProxyOutbound struct {
 	RealityShortID   string `json:"reality_short_id,omitempty"`   // Reality short ID (sid)
 
 	// Transport fields (WebSocket, gRPC, etc.)
-	Network string `json:"network,omitempty"` // Transport type: tcp, ws, grpc
-	WSPath  string `json:"ws_path,omitempty"` // WebSocket path
-	WSHost  string `json:"ws_host,omitempty"` // WebSocket Host header
+	Network         string `json:"network,omitempty"`          // Transport type: tcp, ws, grpc, httpupgrade, xhttp
+	WSPath          string `json:"ws_path,omitempty"`          // WebSocket/XHTTP path
+	WSHost          string `json:"ws_host,omitempty"`          // WebSocket/XHTTP Host header
+	XHTTPMode       string `json:"xhttp_mode,omitempty"`       // XHTTP mode override
+	GRPCServiceName string `json:"grpc_service_name,omitempty"` // gRPC service name
+	GRPCAuthority   string `json:"grpc_authority,omitempty"`   // gRPC authority / :authority header override
 
 	// Test results (persisted)
 	TCPLatencyMs  int64 `json:"tcp_latency_ms,omitempty"`  // TCP ping latency in milliseconds
@@ -87,12 +116,9 @@ type ProxyOutbound struct {
 	UDPLatencyMs  int64 `json:"udp_latency_ms,omitempty"`  // UDP (MCBE) latency in milliseconds
 
 	// Runtime state (not serialized)
-	mu        sync.RWMutex  `json:"-"`
-	healthy   bool          `json:"-"`
-	lastCheck time.Time     `json:"-"`
-	latency   time.Duration `json:"-"`
-	connCount int64         `json:"-"`
-	lastError string        `json:"-"`
+	mu            sync.RWMutex          `json:"-"`
+	runtime       *proxyOutboundRuntime `json:"-"`
+	runtimeInitMu sync.Mutex            `json:"-"`
 }
 
 // Validate checks if all required fields are present and valid based on protocol type.
@@ -121,12 +147,16 @@ func (p *ProxyOutbound) Validate() error {
 		return p.validateTrojan()
 	case ProtocolVLESS:
 		return p.validateVLESS()
+	case ProtocolSOCKS5:
+		return p.validateSOCKS5()
+	case ProtocolHTTP:
+		return p.validateHTTP()
 	case ProtocolHysteria2:
 		return p.validateHysteria2()
 	case ProtocolAnyTLS:
 		return p.validateAnyTLS()
 	default:
-		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, hysteria2, anytls, got %s", p.Type)
+		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, socks5, http, hysteria2, anytls, got %s", p.Type)
 	}
 }
 
@@ -161,7 +191,39 @@ func (p *ProxyOutbound) validateVLESS() error {
 	if p.UUID == "" {
 		return errors.New("missing required field: uuid (required for vless)")
 	}
+	if p.Reality && p.RealityPublicKey == "" {
+		return errors.New("missing required field: reality_public_key (required when reality is enabled)")
+	}
+	return p.validateTransport()
+}
+
+func (p *ProxyOutbound) validateSOCKS5() error {
+	return p.validateOptionalUsernamePassword()
+}
+
+func (p *ProxyOutbound) validateHTTP() error {
+	return p.validateOptionalUsernamePassword()
+}
+
+func (p *ProxyOutbound) validateOptionalUsernamePassword() error {
+	if p.Password != "" && p.Username == "" {
+		return errors.New("missing required field: username (required when password is set)")
+	}
 	return nil
+}
+
+func (p *ProxyOutbound) validateTransport() error {
+	switch strings.ToLower(strings.TrimSpace(p.Network)) {
+	case "", "tcp", "ws", "httpupgrade", "http-upgrade", "xhttp":
+		return nil
+	case "grpc":
+		if strings.TrimSpace(p.GRPCServiceName) == "" {
+			return errors.New("missing required field: grpc_service_name (required when network is grpc)")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid field: network must be one of tcp, ws, grpc, httpupgrade, xhttp, got %s", p.Network)
+	}
 }
 
 func (p *ProxyOutbound) validateHysteria2() error {
@@ -177,6 +239,18 @@ func (p *ProxyOutbound) validateAnyTLS() error {
 	}
 	if !p.TLS {
 		return errors.New("missing required field: tls must be enabled for anytls")
+	}
+	if p.Reality && p.RealityPublicKey == "" {
+		return errors.New("missing required field: reality_public_key (required when reality is enabled)")
+	}
+	if p.IdleSessionCheckInterval < 0 {
+		return errors.New("invalid field: idle_session_check_interval must be >= 0")
+	}
+	if p.IdleSessionTimeout < 0 {
+		return errors.New("invalid field: idle_session_timeout must be >= 0")
+	}
+	if p.MinIdleSession < 0 {
+		return errors.New("invalid field: min_idle_session must be >= 0")
 	}
 	return nil
 }
@@ -197,126 +271,185 @@ func FromJSON(data []byte) (*ProxyOutbound, error) {
 
 // Clone creates a deep copy of the ProxyOutbound (excluding runtime state).
 func (p *ProxyOutbound) Clone() *ProxyOutbound {
+	p.mu.RLock()
 	clone := &ProxyOutbound{
-		Name:             p.Name,
-		Type:             p.Type,
-		Server:           p.Server,
-		Port:             p.Port,
-		Enabled:          p.Enabled,
-		Group:            p.Group,
-		Method:           p.Method,
-		Password:         p.Password,
-		UUID:             p.UUID,
-		AlterID:          p.AlterID,
-		Security:         p.Security,
-		Flow:             p.Flow,
-		Obfs:             p.Obfs,
-		ObfsPassword:     p.ObfsPassword,
-		PortHopping:      p.PortHopping,
-		HopInterval:      p.HopInterval,
-		UpMbps:           p.UpMbps,
-		DownMbps:         p.DownMbps,
-		ALPN:             p.ALPN,
-		CertFingerprint:  p.CertFingerprint,
-		DisableMTU:       p.DisableMTU,
-		TLS:              p.TLS,
-		SNI:              p.SNI,
-		Insecure:         p.Insecure,
-		Fingerprint:      p.Fingerprint,
-		Reality:          p.Reality,
-		RealityPublicKey: p.RealityPublicKey,
-		RealityShortID:   p.RealityShortID,
-		Network:          p.Network,
-		WSPath:           p.WSPath,
-		WSHost:           p.WSHost,
-		TCPLatencyMs:     p.TCPLatencyMs,
-		HTTPLatencyMs:    p.HTTPLatencyMs,
-		UDPLatencyMs:     p.UDPLatencyMs,
+		Name:                     p.Name,
+		Type:                     p.Type,
+		Server:                   p.Server,
+		Port:                     p.Port,
+		Enabled:                  p.Enabled,
+		Group:                    p.Group,
+		SubscriptionID:           p.SubscriptionID,
+		SubscriptionName:         p.SubscriptionName,
+		SubscriptionNodeID:       p.SubscriptionNodeID,
+		Username:                 p.Username,
+		Method:                   p.Method,
+		Password:                 p.Password,
+		UUID:                     p.UUID,
+		AlterID:                  p.AlterID,
+		Security:                 p.Security,
+		Flow:                     p.Flow,
+		Obfs:                     p.Obfs,
+		ObfsPassword:             p.ObfsPassword,
+		PortHopping:              p.PortHopping,
+		HopInterval:              p.HopInterval,
+		UpMbps:                   p.UpMbps,
+		DownMbps:                 p.DownMbps,
+		ALPN:                     p.ALPN,
+		CertFingerprint:          p.CertFingerprint,
+		DisableMTU:               p.DisableMTU,
+		IdleSessionCheckInterval: p.IdleSessionCheckInterval,
+		IdleSessionTimeout:       p.IdleSessionTimeout,
+		MinIdleSession:           p.MinIdleSession,
+		TLS:                      p.TLS,
+		SNI:                      p.SNI,
+		Insecure:                 p.Insecure,
+		Fingerprint:              p.Fingerprint,
+		Reality:                  p.Reality,
+		RealityPublicKey:         p.RealityPublicKey,
+		RealityShortID:           p.RealityShortID,
+		Network:                  p.Network,
+		WSPath:                   p.WSPath,
+		WSHost:                   p.WSHost,
+		XHTTPMode:                p.XHTTPMode,
+		GRPCServiceName:          p.GRPCServiceName,
+		GRPCAuthority:            p.GRPCAuthority,
+		TCPLatencyMs:             p.TCPLatencyMs,
+		HTTPLatencyMs:            p.HTTPLatencyMs,
+		UDPLatencyMs:             p.UDPLatencyMs,
+		runtime:                  p.runtimeState(),
 	}
 	if p.UDPAvailable != nil {
 		udp := *p.UDPAvailable
 		clone.UDPAvailable = &udp
 	}
+	p.mu.RUnlock()
 	return clone
+}
+
+func (p *ProxyOutbound) runtimeState() *proxyOutboundRuntime {
+	if p.runtime != nil {
+		return p.runtime
+	}
+	p.runtimeInitMu.Lock()
+	defer p.runtimeInitMu.Unlock()
+	if p.runtime == nil {
+		p.runtime = &proxyOutboundRuntime{}
+	}
+	return p.runtime
 }
 
 // GetHealthy returns the health status.
 func (p *ProxyOutbound) GetHealthy() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.healthy
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.healthy
 }
 
 // SetHealthy sets the health status.
 func (p *ProxyOutbound) SetHealthy(healthy bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.healthy = healthy
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.healthy = healthy
 }
 
 // GetLastCheck returns the last health check time.
 func (p *ProxyOutbound) GetLastCheck() time.Time {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.lastCheck
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.lastCheck
 }
 
 // SetLastCheck sets the last health check time.
 func (p *ProxyOutbound) SetLastCheck(t time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.lastCheck = t
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.lastCheck = t
 }
 
 // GetLatency returns the latency.
 func (p *ProxyOutbound) GetLatency() time.Duration {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.latency
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.latency
 }
 
 // SetLatency sets the latency.
 func (p *ProxyOutbound) SetLatency(d time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.latency = d
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.latency = d
 }
 
 // GetConnCount returns the connection count.
 func (p *ProxyOutbound) GetConnCount() int64 {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.connCount
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.connCount
 }
 
 // IncrConnCount increments the connection count.
 func (p *ProxyOutbound) IncrConnCount() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.connCount++
+	now := time.Now()
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.connCount == 0 {
+		rt.activeSince = now
+	}
+	rt.connCount++
+	rt.lastActive = now
 }
 
 // DecrConnCount decrements the connection count.
 func (p *ProxyOutbound) DecrConnCount() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.connCount > 0 {
-		p.connCount--
+	now := time.Now()
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.connCount > 0 {
+		rt.connCount--
+		rt.lastActive = now
+		if rt.connCount == 0 && !rt.activeSince.IsZero() {
+			rt.activeDuration += now.Sub(rt.activeSince)
+			rt.activeSince = time.Time{}
+		}
 	}
 }
 
 // GetLastError returns the last error message.
 func (p *ProxyOutbound) GetLastError() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.lastError
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.lastError
 }
 
 // SetLastError sets the last error message.
 func (p *ProxyOutbound) SetLastError(err string) {
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.lastError = err
+}
+
+func (p *ProxyOutbound) GetTCPLatencyMs() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.TCPLatencyMs
+}
+
+func (p *ProxyOutbound) SetTCPLatencyMs(ms int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.lastError = err
+	p.TCPLatencyMs = ms
 }
 
 // GetHTTPLatencyMs returns the HTTP latency in milliseconds.
@@ -347,6 +480,74 @@ func (p *ProxyOutbound) SetUDPAvailable(available *bool) {
 	p.UDPAvailable = available
 }
 
+func (p *ProxyOutbound) GetUDPLatencyMs() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.UDPLatencyMs
+}
+
+func (p *ProxyOutbound) SetUDPLatencyMs(ms int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.UDPLatencyMs = ms
+}
+
+func (p *ProxyOutbound) AddBytesUp(n int64) {
+	if n <= 0 {
+		return
+	}
+	now := time.Now()
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.bytesUp += n
+	rt.lastActive = now
+}
+
+func (p *ProxyOutbound) AddBytesDown(n int64) {
+	if n <= 0 {
+		return
+	}
+	now := time.Now()
+	rt := p.runtimeState()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.bytesDown += n
+	rt.lastActive = now
+}
+
+func (p *ProxyOutbound) GetBytesUp() int64 {
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.bytesUp
+}
+
+func (p *ProxyOutbound) GetBytesDown() int64 {
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.bytesDown
+}
+
+func (p *ProxyOutbound) GetLastActive() time.Time {
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.lastActive
+}
+
+func (p *ProxyOutbound) GetActiveDuration() time.Duration {
+	now := time.Now()
+	rt := p.runtimeState()
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if rt.connCount > 0 && !rt.activeSince.IsZero() {
+		return rt.activeDuration + now.Sub(rt.activeSince)
+	}
+	return rt.activeDuration
+}
+
 // Equal checks if two ProxyOutbound configurations are equivalent (excluding runtime state).
 func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 	if other == nil {
@@ -358,6 +559,7 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.Port == other.Port &&
 		p.Enabled == other.Enabled &&
 		p.Group == other.Group &&
+		p.Username == other.Username &&
 		p.Method == other.Method &&
 		p.Password == other.Password &&
 		p.UUID == other.UUID &&
@@ -373,6 +575,9 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.ALPN == other.ALPN &&
 		p.CertFingerprint == other.CertFingerprint &&
 		p.DisableMTU == other.DisableMTU &&
+		p.IdleSessionCheckInterval == other.IdleSessionCheckInterval &&
+		p.IdleSessionTimeout == other.IdleSessionTimeout &&
+		p.MinIdleSession == other.MinIdleSession &&
 		p.TLS == other.TLS &&
 		p.SNI == other.SNI &&
 		p.Insecure == other.Insecure &&
@@ -382,5 +587,8 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.RealityShortID == other.RealityShortID &&
 		p.Network == other.Network &&
 		p.WSPath == other.WSPath &&
-		p.WSHost == other.WSHost
+		p.WSHost == other.WSHost &&
+		p.XHTTPMode == other.XHTTPMode &&
+		p.GRPCServiceName == other.GRPCServiceName &&
+		p.GRPCAuthority == other.GRPCAuthority
 }

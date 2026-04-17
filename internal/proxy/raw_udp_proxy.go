@@ -13,6 +13,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/db"
 	"mcpeserverproxy/internal/logger"
+	internalprotocol "mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
 
 	"github.com/golang-jwt/jwt/v4"
@@ -46,6 +48,11 @@ const (
 	RawUDPUnconnectedPingMinIntervalPerIP = 200 * time.Millisecond
 	// RawUDPUnconnectedPingCacheTTL 控制每个 IP 的 ping 时间戳保留时长。
 	RawUDPUnconnectedPingCacheTTL = 5 * time.Minute
+	// SplitPacketTimeout is the timeout for incomplete split packets (30 seconds)
+	SplitPacketTimeout = 30 * time.Second
+	// rawUDPKickCooldown is the cooldown period after kicking a client
+	rawUDPKickCooldown     = 3 * time.Second
+	rawUDPKickCleanupDelay = 350 * time.Millisecond
 )
 
 // RakNet packet IDs
@@ -65,19 +72,43 @@ const (
 	raknetOpenConnectionReply1 = 0x06
 	raknetOpenConnectionReq2   = 0x07
 	raknetOpenConnectionReply2 = 0x08
+	raknetACKMask              = 0x40
+	raknetNACKMask             = 0x20
 )
 
 // splitPacketBuffer stores fragments for reassembly
 type splitPacketBuffer struct {
-	splitCount int
-	fragments  map[int][]byte
-	received   int
-	totalBytes int
-	createdAt  time.Time // For cleanup of incomplete splits
+	splitCount   int
+	fragments    map[int][]byte
+	datagramSeqs map[uint32]struct{}
+	received     int
+	totalBytes   int
+	totalLen     int
+	createdAt    time.Time // For cleanup of incomplete splits
 }
 
-// SplitPacketTimeout is the timeout for incomplete split packets (30 seconds)
-const SplitPacketTimeout = 30 * time.Second
+type rawUDPKickReplay struct {
+	At               int64
+	Message          string
+	CompressionID    uint32
+	Encrypted        bool
+	SendDatagramSeq  atomic.Uint32
+	SendMessageIndex atomic.Uint32
+	SendOrderIndex   atomic.Uint32
+	LastReplayAt     atomic.Int64
+}
+
+type rawUDPPacketVariantOptions struct {
+	SendCompressed bool
+	SendRawBatch   bool
+	SendLegacy     bool
+}
+
+type rawUDPKickProfile struct {
+	SendPlayStatus       bool
+	SendRakNetDisconnect bool
+	PacketVariants       rawUDPPacketVariantOptions
+}
 
 // MaxSplitPacketsPerClient limits the number of concurrent split packet buffers per client
 const MaxSplitPacketsPerClient = 16
@@ -90,28 +121,32 @@ const MaxSplitPacketBytes = 1024 * 1024
 
 // rawUDPClientInfo stores information about a connected client
 type rawUDPClientInfo struct {
-	clientAddr       *net.UDPAddr
-	targetConn       net.PacketConn // Can be *net.UDPConn or proxy PacketConn
-	targetAddr       net.Addr       // Target address for WriteTo
-	startTime        time.Time      // Connection start time
-	lastSeen         atomic.Int64   // Unix nano timestamp for lock-free access
-	bytesUp          atomic.Int64   // Lock-free counter
-	bytesDown        atomic.Int64   // Lock-free counter
-	packetCount      atomic.Int64   // Lock-free counter
-	playerName       string         // Extracted from Login packet
-	playerUUID       string
-	playerXUID       string
-	proxyNode        string                        // Name of the proxy node used (empty if direct)
-	loginParsed      atomic.Bool                   // Whether we've tried to parse login
-	sessionID        string                        // Session ID for session manager
-	splitPackets     map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
-	compressionID    atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
-	sendDatagramSeq  atomic.Uint32                 // Best-effort outgoing datagram sequence for injected packets (24-bit)
-	sendMessageIndex atomic.Uint32                 // Best-effort outgoing messageIndex for reliable packets (24-bit)
-	sendOrderIndex   atomic.Uint32                 // Best-effort outgoing orderIndex for reliable ordered packets (24-bit)
-	encrypted        atomic.Bool                   // Whether we observed encrypted MC packets (0xfe + unknown ID)
-	kicked           atomic.Bool                   // Whether this client was kicked
-	mu               sync.Mutex                    // Only for splitPackets and player info writes
+	clientAddr           *net.UDPAddr
+	targetConn           net.PacketConn // Can be *net.UDPConn or proxy PacketConn
+	targetAddr           net.Addr       // Target address for WriteTo
+	startTime            time.Time      // Connection start time
+	lastSeen             atomic.Int64   // Unix nano timestamp for lock-free access
+	bytesUp              atomic.Int64   // Lock-free counter
+	bytesDown            atomic.Int64   // Lock-free counter
+	packetCount          atomic.Int64   // Lock-free counter
+	playerName           string         // Extracted from Login packet
+	playerUUID           string
+	playerXUID           string
+	proxyNode            string                        // Name of the proxy node used (empty if direct)
+	loginParsed          atomic.Bool                   // Whether we've tried to parse login
+	sessionID            string                        // Session ID for session manager
+	splitPackets         map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
+	compressionID        atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
+	sendDatagramSeq      atomic.Uint32                 // Best-effort outgoing datagram sequence for injected packets (24-bit)
+	sendMessageIndex     atomic.Uint32                 // Best-effort outgoing messageIndex for reliable packets (24-bit)
+	sendOrderIndex       atomic.Uint32                 // Best-effort outgoing orderIndex for reliable ordered packets (24-bit)
+	encrypted            atomic.Bool                   // Whether we observed encrypted MC packets (0xfe + unknown ID)
+	kicked               atomic.Bool                   // Whether this client was kicked
+	lastKickReplayAt     atomic.Int64
+	kickCleanupScheduled atomic.Bool
+	pendingACKSeqs       []uint32
+	mu                   sync.Mutex // Only for splitPackets and player info writes
+	kickMessage          string
 }
 
 // initSplitPackets initializes the split packet map if needed
@@ -158,6 +193,23 @@ func (c *rawUDPClientInfo) addSplitPacket(splitID uint16, buf *splitPacketBuffer
 	return true
 }
 
+func (c *rawUDPClientInfo) consumePendingACKSeqs() []uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pendingACKSeqs) == 0 {
+		return nil
+	}
+	seqs := append([]uint32(nil), c.pendingACKSeqs...)
+	c.pendingACKSeqs = nil
+	return seqs
+}
+
+func (c *rawUDPClientInfo) clearPendingACKSeqs() {
+	c.mu.Lock()
+	c.pendingACKSeqs = nil
+	c.mu.Unlock()
+}
+
 // IPBanDuration is how long an IP stays banned after being kicked
 const IPBanDuration = 5 * time.Minute
 
@@ -180,6 +232,7 @@ type RawUDPProxy struct {
 	externalVerifier ExternalVerifier // External auth verifier (defined in passthrough_proxy.go)
 	listener         *net.UDPConn
 	targetAddr       *net.UDPAddr
+	targetPacketAddr net.Addr
 	clients          sync.Map // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
 	bannedIPs        sync.Map // map[string]*bannedIPInfo (IP without port -> ban info)
 	closed           atomic.Bool
@@ -196,11 +249,12 @@ type RawUDPProxy struct {
 	lastPingTry   atomic.Int64
 	pingInFlight  atomic.Bool
 
-	clientInactiveTimeout time.Duration
+	clientInactiveTimeout          time.Duration
 	passthroughIdleTimeoutOverride time.Duration
 
 	// Basic unconnected ping rate limiting (per source IP, port-less).
 	lastUnconnectedPing sync.Map // map[string]int64 unixnano
+	recentlyKicked      sync.Map // map[string]*rawUDPKickReplay by clientAddr.String()
 }
 
 // ACLManager interface for access control
@@ -209,6 +263,38 @@ type ACLManager interface {
 	CheckAccessWithError(playerName, serverID string) (allowed bool, reason string, dbErr error)
 	IsBlacklisted(playerName, serverID string) (isBlacklisted bool, entry *db.BlacklistEntry)
 	GetSettings(serverID string) (*db.ACLSettings, error)
+}
+
+func (p *RawUDPProxy) getResolvedACLSettings(serverID string) *db.ACLSettings {
+	if p.aclManager == nil {
+		defaults := db.DefaultACLSettings()
+		defaults.ServerID = serverID
+		return defaults
+	}
+	settings, err := p.aclManager.GetSettings(serverID)
+	if err == nil && settings != nil {
+		return settings
+	}
+	if serverID != "" {
+		settings, err = p.aclManager.GetSettings("")
+		if err == nil && settings != nil {
+			return settings
+		}
+	}
+	defaults := db.DefaultACLSettings()
+	defaults.ServerID = serverID
+	return defaults
+}
+
+func (p *RawUDPProxy) refreshTargetAddrs() error {
+	shouldPreserveHostname := p.config != nil && p.outboundMgr != nil && !p.config.IsDirectConnection()
+	addr, udpAddr, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
+	if err != nil {
+		return err
+	}
+	p.targetPacketAddr = addr
+	p.targetAddr = udpAddr
+	return nil
 }
 
 // NewRawUDPProxy creates a new raw UDP forwarding proxy.
@@ -327,11 +413,11 @@ func (p *RawUDPProxy) Start() error {
 
 	// Log proxy mode
 	if p.shouldUseProxy() {
-		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (via proxy: %s)",
-			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr(), p.config.GetProxyOutbound())
+		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (via proxy: %s, kick_strategy: %s)",
+			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr(), p.config.GetProxyOutbound(), p.config.GetRawUDPKickStrategy())
 	} else {
-		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (direct)",
-			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr())
+		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (direct, kick_strategy: %s)",
+			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr(), p.config.GetRawUDPKickStrategy())
 	}
 
 	return nil
@@ -392,17 +478,11 @@ func (p *RawUDPProxy) shouldUseProxy() bool {
 
 // setUDPSocketOptions sets buffer sizes for UDP connections
 func (p *RawUDPProxy) setUDPSocketOptions(conn *net.UDPConn) error {
-	bufferSize := MaxUDPPacketSize * 10
-
-	if err := conn.SetReadBuffer(bufferSize); err != nil {
-		return fmt.Errorf("set read buffer: %w", err)
+	requested := 0
+	if p != nil && p.config != nil {
+		requested = p.config.GetUDPSocketBufferSize()
 	}
-
-	if err := conn.SetWriteBuffer(bufferSize); err != nil {
-		return fmt.Errorf("set write buffer: %w", err)
-	}
-
-	return nil
+	return configureUDPConnBuffers(conn, requested)
 }
 
 // Listen starts accepting and forwarding UDP packets.
@@ -457,13 +537,14 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			}
 
 			// Get or create client connection
-			clientInfo, isNew := p.getOrCreateClient(clientAddr)
+			clientInfo, isNew := p.getOrCreateClient(clientAddr, buffer[:n])
 			if clientInfo == nil {
 				continue
 			}
 
 			// Check if client was kicked - don't process packets from kicked clients
 			if clientInfo.kicked.Load() {
+				p.replayKickResponse(clientInfo, buffer[:n])
 				continue
 			}
 
@@ -502,10 +583,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 				// Check if player was kicked (lock-free)
 				if clientInfo.kicked.Load() {
-					// Player was kicked, remove client immediately
-					p.removeClient(clientAddr.String())
 					continue
 				}
+				clientInfo.clearPendingACKSeqs()
 
 				// Forward the packet (whether or not it's a Login packet)
 				clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
@@ -528,20 +608,28 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 }
 
 // getOrCreateClient gets or creates a client connection
-func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr) (*rawUDPClientInfo, bool) {
+func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte) (*rawUDPClientInfo, bool) {
 	clientKey := clientAddr.String()
 
 	// Check if client already exists
 	if val, ok := p.clients.Load(clientKey); ok {
 		existingClient := val.(*rawUDPClientInfo)
-		// If client was kicked, remove it and create a new one
+		// If client was kicked, keep replaying the kick response during cooldown.
 		if existingClient.kicked.Load() {
-			logger.Info("RawUDP: Removing kicked client %s for reconnection", clientKey)
-			p.clients.Delete(clientKey)
-			// Close the old connection
-			existingClient.targetConn.Close()
+			return existingClient, false
 		} else {
 			return existingClient, false
+		}
+	}
+
+	if kickedAt, ok := p.recentlyKicked.Load(clientKey); ok {
+		if replay, ok := kickedAt.(*rawUDPKickReplay); ok {
+			if time.Since(time.Unix(0, replay.At)) < rawUDPKickCooldown {
+				p.replayRecentKick(clientAddr, replay, incoming)
+				logger.Debug("RawUDP: ignoring immediate reconnect from recently kicked client %s", clientKey)
+				return nil, false
+			}
+			p.recentlyKicked.Delete(clientKey)
 		}
 	}
 
@@ -642,7 +730,13 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 // forwardResponses forwards responses from target back to client
 func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawUDPClientInfo) {
 	defer p.wg.Done()
-	defer p.removeClient(clientAddr.String())
+	defer func() {
+		if clientInfo.kicked.Load() {
+			p.scheduleKickCleanup(clientInfo)
+			return
+		}
+		p.removeClientIfMatch(clientAddr.String(), clientInfo)
+	}()
 
 	buffer := make([]byte, MaxUDPPacketSize)
 
@@ -695,6 +789,10 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				return
 			}
 
+			if clientInfo.kicked.Load() {
+				return
+			}
+
 			// Update stats (lock-free)
 			clientInfo.bytesDown.Add(int64(n))
 			clientInfo.lastSeen.Store(time.Now().UnixNano())
@@ -721,8 +819,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 }
 
 func (p *RawUDPProxy) updateRakNetSendStateFromDatagram(datagram []byte, clientInfo *rawUDPClientInfo) {
-	// RakNet datagrams have bitFlagDatagram (0x80) set in the first byte.
-	if len(datagram) < 4 || (datagram[0]&0x80) == 0 {
+	if !isRakNetDataDatagram(datagram) {
 		return
 	}
 
@@ -821,47 +918,55 @@ func atomicMaxUint24(a *atomic.Uint32, v uint32) {
 // removeClient removes a client and closes its connection
 func (p *RawUDPProxy) removeClient(clientKey string) {
 	if val, ok := p.clients.LoadAndDelete(clientKey); ok {
-		clientInfo := val.(*rawUDPClientInfo)
-		clientInfo.targetConn.Close()
+		p.finalizeClientRemoval(clientKey, val.(*rawUDPClientInfo))
+	}
+}
 
-		// Read stats (lock-free)
-		bytesUp := clientInfo.bytesUp.Load()
-		bytesDown := clientInfo.bytesDown.Load()
-		kicked := clientInfo.kicked.Load()
+func (p *RawUDPProxy) removeClientIfMatch(clientKey string, expected *rawUDPClientInfo) {
+	if !p.clients.CompareAndDelete(clientKey, expected) {
+		return
+	}
+	p.finalizeClientRemoval(clientKey, expected)
+}
 
-		// Read player info and clear splitPackets (needs lock)
-		clientInfo.mu.Lock()
-		playerName := clientInfo.playerName
-		playerUUID := clientInfo.playerUUID
-		// Clear splitPackets to release memory
-		clientInfo.splitPackets = nil
-		clientInfo.mu.Unlock()
+func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDPClientInfo) {
+	if clientInfo.kicked.Load() {
+		p.recentlyKicked.Store(clientKey, p.snapshotKickReplay(clientInfo, p.kickMessageOf(clientInfo)))
+	}
+	clientInfo.targetConn.Close()
 
-		startTime := clientInfo.startTime
-		duration := time.Since(startTime)
-		totalBytes := bytesUp + bytesDown
+	bytesUp := clientInfo.bytesUp.Load()
+	bytesDown := clientInfo.bytesDown.Load()
+	kicked := clientInfo.kicked.Load()
 
-		// Format duration
-		durationStr := formatDuration(duration)
+	clientInfo.mu.Lock()
+	playerName := clientInfo.playerName
+	playerUUID := clientInfo.playerUUID
+	clientInfo.splitPackets = nil
+	clientInfo.mu.Unlock()
 
-		// Log with player info if available
-		if playerName != "" {
-			if kicked {
-				logger.Info("Player kicked: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
-					playerName, playerUUID, clientKey, durationStr,
-					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
-			} else {
-				logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
-					playerName, playerUUID, clientKey, durationStr,
-					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
-			}
+	startTime := clientInfo.startTime
+	duration := time.Since(startTime)
+	totalBytes := bytesUp + bytesDown
+	durationStr := formatDuration(duration)
+
+	if playerName != "" {
+		if kicked {
+			logger.Info("Player kicked: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
+				playerName, playerUUID, clientKey, durationStr,
+				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
 		} else {
-			logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s",
-				clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+			logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
+				playerName, playerUUID, clientKey, durationStr,
+				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
 		}
+	} else {
+		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s",
+			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+	}
 
-		// Remove session
-		if err := p.sessionMgr.Remove(clientKey); err != nil {
+	if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
+		if !strings.Contains(err.Error(), "session not found") {
 			logger.Debug("Failed to remove session for %s: %v", clientKey, err)
 		}
 	}
@@ -991,6 +1096,47 @@ func (p *RawUDPProxy) Stop() error {
 	p.clients.Range(func(key, value interface{}) bool {
 		clientInfo := value.(*rawUDPClientInfo)
 		clientInfo.targetConn.Close()
+
+		// Read stats (lock-free)
+		bytesUp := clientInfo.bytesUp.Load()
+		bytesDown := clientInfo.bytesDown.Load()
+		kicked := clientInfo.kicked.Load()
+
+		// Read player info and clear splitPackets (needs lock)
+		clientInfo.mu.Lock()
+		playerName := clientInfo.playerName
+		playerUUID := clientInfo.playerUUID
+		// Clear splitPackets to release memory
+		clientInfo.splitPackets = nil
+		clientInfo.mu.Unlock()
+
+		startTime := clientInfo.startTime
+		duration := time.Since(startTime)
+		totalBytes := bytesUp + bytesDown
+
+		// Format duration
+		durationStr := formatDuration(duration)
+
+		// Log with player info if available
+		if playerName != "" {
+			if kicked {
+				logger.Info("Player kicked: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
+					playerName, playerUUID, key.(string), durationStr,
+					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+			} else {
+				logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
+					playerName, playerUUID, key.(string), durationStr,
+					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+			}
+		} else {
+			logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s",
+				key.(string), durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+		}
+
+		// Remove session
+		if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
+			logger.Debug("Failed to remove session for %s: %v", key.(string), err)
+		}
 		return true
 	})
 
@@ -1190,45 +1336,44 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 
 	// Check ACL (whitelist/blacklist) BEFORE forwarding Login packet
 	if p.aclManager != nil {
-		logger.Info("RawUDP ACL check: player=%s, serverID=%s", playerName, p.serverID)
-		
+		aclServerID := p.config.GetACLServerID()
+		settings := p.getResolvedACLSettings(aclServerID)
+		logger.Info("RawUDP ACL check: player=%s, serverID=%s", playerName, aclServerID)
+
 		// First check if player is blacklisted
-		isBlacklisted, blacklistEntry := p.aclManager.IsBlacklisted(playerName, p.serverID)
+		isBlacklisted, blacklistEntry := p.aclManager.IsBlacklisted(playerName, aclServerID)
 		if isBlacklisted && blacklistEntry != nil {
 			// 始终使用 ACL 设置中的 default_ban_message，忽略黑名单条目的自定义原因
-			settings, _ := p.aclManager.GetSettings(p.serverID)
 			var reason string
-			if settings != nil && settings.DefaultMessage != "" {
+			if settings != nil && settings.BlacklistEnabled && settings.DefaultMessage != "" {
 				reason = settings.DefaultMessage
 			} else {
-				reason = "违反服务器规则"
+				reason = blacklistEntry.Reason
 			}
-			// Format blacklist message - 换行显示玩家名字
-			formattedReason := fmt.Sprintf("§c黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, reason)
-			logger.Info("Player %s blocked by blacklist (serverID=%s): %s", playerName, p.serverID, reason)
-			// Set disconnect status on session for history tracking
-			if sess != nil {
-				sess.SetDisconnectStatus("blacklist", reason)
+			if settings == nil || settings.BlacklistEnabled {
+				// Format blacklist message - 换行显示玩家名字
+				formattedReason := fmt.Sprintf("§c黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, reason)
+				logger.Info("Player %s blocked by blacklist (serverID=%s): %s", playerName, aclServerID, reason)
+				// Set disconnect status on session for history tracking
+				if sess != nil {
+					sess.SetDisconnectStatus("blacklist", reason)
+				}
+				p.ackInterceptedClientDatagram(clientInfo, data)
+				p.sendDisconnectToClient(clientInfo, formattedReason)
+				return false // Player kicked
 			}
-			p.sendDisconnectToClient(clientInfo, formattedReason)
-			// Remove session so persistSession callback fires and record is saved
-			_ = p.sessionMgr.Remove(clientInfo.sessionID)
-			clientInfo.kicked.Store(true)
-			clientInfo.targetConn.Close()
-			return false // Player kicked
 		}
 
 		// Check access (includes whitelist check)
-		allowed, reason, dbErr := p.aclManager.CheckAccessWithError(playerName, p.serverID)
-		
+		allowed, reason, dbErr := p.aclManager.CheckAccessWithError(playerName, aclServerID)
+
 		// Log database errors if any
 		if dbErr != nil {
-			logger.LogACLCheckError(playerName, p.serverID, dbErr)
+			logger.LogACLCheckError(playerName, aclServerID, dbErr)
 		}
 
 		if !allowed {
 			// Check if this is a whitelist denial
-			settings, _ := p.aclManager.GetSettings(p.serverID)
 			var formattedReason string
 			if settings != nil && settings.WhitelistEnabled {
 				// 白名单拒绝：CheckAccessWithError 返回的 reason 已经是 WhitelistMessage
@@ -1253,7 +1398,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 					reason = "访问被拒绝"
 				}
 				formattedReason = "§c" + reason
-				logger.Info("Player %s blocked by ACL (serverID=%s): %s", playerName, p.serverID, reason)
+				logger.Info("Player %s blocked by ACL (serverID=%s): %s", playerName, aclServerID, reason)
 			}
 
 			// Set disconnect status on session for history tracking
@@ -1261,26 +1406,19 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 				sess.SetDisconnectStatus("whitelist", formattedReason)
 			}
 
-			// Send disconnect packet to client
+			p.ackInterceptedClientDatagram(clientInfo, data)
 			p.sendDisconnectToClient(clientInfo, formattedReason)
-
-			// Remove session so persistSession callback fires and record is saved
-			_ = p.sessionMgr.Remove(clientInfo.sessionID)
-
-			// Mark as kicked and close connection
-			clientInfo.kicked.Store(true)
-			clientInfo.targetConn.Close()
 
 			return false // Player kicked
 		}
-		logger.Info("Player %s passed ACL check (serverID=%s)", playerName, p.serverID)
+		logger.Info("Player %s passed ACL check (serverID=%s)", playerName, aclServerID)
 	} else {
 		logger.Warn("RawUDP: aclManager is nil, skipping ACL check for player %s", playerName)
 	}
 
 	// Check external auth verification (URL authorization)
 	if p.externalVerifier != nil && p.externalVerifier.IsEnabled() {
-		allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, p.serverID, clientInfo.clientAddr.String())
+		allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, p.config.GetACLServerID(), clientInfo.clientAddr.String())
 
 		if !allowed {
 			logger.Info("Player %s blocked by external auth: %s", playerName, reason)
@@ -1293,14 +1431,8 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 			if sess != nil {
 				sess.SetDisconnectStatus("auth_failed", reason)
 			}
+			p.ackInterceptedClientDatagram(clientInfo, data)
 			p.sendDisconnectToClient(clientInfo, reason)
-
-			// Remove session so persistSession callback fires and record is saved
-			_ = p.sessionMgr.Remove(clientInfo.sessionID)
-
-			// Mark as kicked and close connection
-			clientInfo.kicked.Store(true)
-			clientInfo.targetConn.Close()
 
 			return false // Player kicked
 		}
@@ -1409,6 +1541,8 @@ func (p *RawUDPProxy) parseRakNetFrame(data []byte, clientInfo *rawUDPClientInfo
 		return nil
 	}
 
+	datagramSeq := uint32(data[1]) | uint32(data[2])<<8 | uint32(data[3])<<16
+
 	// Skip frame type (1 byte) and sequence number (3 bytes LE)
 	offset := 4
 
@@ -1479,7 +1613,7 @@ func (p *RawUDPProxy) parseRakNetFrame(data []byte, clientInfo *rawUDPClientInfo
 
 		// Handle split packets
 		if hasSplit && clientInfo != nil {
-			reassembled := p.handleSplitPacket(clientInfo, splitID, splitIndex, splitCount, payload)
+			reassembled := p.handleSplitPacket(clientInfo, splitID, splitIndex, splitCount, datagramSeq, payload)
 			if reassembled != nil {
 				// Check if reassembled payload is a game packet
 				if len(reassembled) > 0 && reassembled[0] == raknetGamePacketHeader {
@@ -1499,7 +1633,7 @@ func (p *RawUDPProxy) parseRakNetFrame(data []byte, clientInfo *rawUDPClientInfo
 }
 
 // handleSplitPacket handles split packet reassembly
-func (p *RawUDPProxy) handleSplitPacket(clientInfo *rawUDPClientInfo, splitID uint16, splitIndex, splitCount uint32, payload []byte) []byte {
+func (p *RawUDPProxy) handleSplitPacket(clientInfo *rawUDPClientInfo, splitID uint16, splitIndex, splitCount, datagramSeq uint32, payload []byte) []byte {
 	if splitCount == 0 || splitCount > MaxSplitPacketFragments {
 		return nil
 	}
@@ -1533,14 +1667,19 @@ func (p *RawUDPProxy) handleSplitPacket(clientInfo *rawUDPClientInfo, splitID ui
 		}
 
 		buf = &splitPacketBuffer{
-			splitCount: int(splitCount),
-			fragments:  make(map[int][]byte),
-			received:   0,
-			totalBytes: 0,
-			createdAt:  time.Now(),
+			splitCount:   int(splitCount),
+			fragments:    make(map[int][]byte),
+			datagramSeqs: make(map[uint32]struct{}),
+			received:     0,
+			totalBytes:   0,
+			createdAt:    time.Now(),
 		}
 		clientInfo.splitPackets[splitID] = buf
 	}
+	if buf.datagramSeqs == nil {
+		buf.datagramSeqs = make(map[uint32]struct{})
+	}
+	buf.datagramSeqs[datagramSeq] = struct{}{}
 
 	// Store fragment (make a copy)
 	if _, alreadyHave := buf.fragments[int(splitIndex)]; !alreadyHave {
@@ -1581,6 +1720,14 @@ func (p *RawUDPProxy) handleSplitPacket(clientInfo *rawUDPClientInfo, splitID ui
 	}
 
 	// Clean up
+	if len(buf.datagramSeqs) > 0 {
+		seqs := make([]uint32, 0, len(buf.datagramSeqs))
+		for seq := range buf.datagramSeqs {
+			seqs = append(seqs, seq)
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		clientInfo.pendingACKSeqs = append(clientInfo.pendingACKSeqs[:0], seqs...)
+	}
 	delete(clientInfo.splitPackets, splitID)
 
 	logger.Debug("RawUDP: Reassembled split packet: splitID=%d, fragments=%d, totalLen=%d", splitID, buf.splitCount, totalLen)
@@ -1590,7 +1737,7 @@ func (p *RawUDPProxy) handleSplitPacket(clientInfo *rawUDPClientInfo, splitID ui
 
 // parseLoginPacket parses a Login packet to extract player info
 func (p *RawUDPProxy) parseLoginPacket(data []byte) (playerName, playerUUID, playerXUID string) {
-	if len(data) < 3 {
+	if len(data) < 2 {
 		return
 	}
 
@@ -1599,24 +1746,9 @@ func (p *RawUDPProxy) parseLoginPacket(data []byte) (playerName, playerUUID, pla
 		return
 	}
 
-	// Get compression ID
 	compressionID := data[1]
-	compressedData := data[2:]
-
-	// Decompress
-	var decompressed []byte
-	var err error
-
-	switch compressionID {
-	case 0x00: // Flate
-		decompressed, err = p.decompressFlate(compressedData)
-	case 0x01: // Snappy
-		decompressed, err = decompressSnappyLimited(compressedData)
-	default:
-		return // Unknown compression or encrypted
-	}
-
-	if err != nil {
+	decompressed := p.decodeGamePacketBatch(compressionID, data)
+	if len(decompressed) == 0 {
 		return
 	}
 
@@ -1686,10 +1818,20 @@ func (p *RawUDPProxy) parseConnectionRequest(data []byte) (playerName, playerUUI
 	// Read chain JSON
 	chainData := buf.Next(int(chainLen))
 
+	var rawToken string
+	if buf.Len() >= 4 {
+		var rawTokenLen int32
+		if err := binary.Read(buf, binary.LittleEndian, &rawTokenLen); err == nil && rawTokenLen >= 0 && rawTokenLen <= int32(buf.Len()) {
+			rawToken = string(buf.Next(int(rawTokenLen)))
+		}
+	}
+
 	// Parse outer JSON
 	var outerWrapper struct {
-		AuthenticationType int    `json:"AuthenticationType"`
-		Certificate        string `json:"Certificate"`
+		AuthenticationType int      `json:"AuthenticationType"`
+		Certificate        string   `json:"Certificate"`
+		Token              string   `json:"Token"`
+		Chain              []string `json:"chain"`
 	}
 	if err := json.Unmarshal(chainData, &outerWrapper); err != nil {
 		// Try direct chain format
@@ -1697,20 +1839,64 @@ func (p *RawUDPProxy) parseConnectionRequest(data []byte) (playerName, playerUUI
 			Chain []string `json:"chain"`
 		}
 		if err := json.Unmarshal(chainData, &chainWrapper); err != nil {
+			if rawToken != "" {
+				return p.extractIdentityFromClientDataToken(rawToken)
+			}
 			return
 		}
-		return p.extractIdentityFromChain(chainWrapper.Chain)
+		playerName, playerUUID, playerXUID = p.extractIdentityFromChain(chainWrapper.Chain)
+		if playerName == "" && rawToken != "" {
+			fallbackName, fallbackUUID, fallbackXUID := p.extractIdentityFromClientDataToken(rawToken)
+			if playerName == "" {
+				playerName = fallbackName
+			}
+			if playerUUID == "" {
+				playerUUID = fallbackUUID
+			}
+			if playerXUID == "" {
+				playerXUID = fallbackXUID
+			}
+		}
+		return
 	}
 
 	// Parse inner Certificate JSON
 	var chainWrapper struct {
 		Chain []string `json:"chain"`
 	}
-	if err := json.Unmarshal([]byte(outerWrapper.Certificate), &chainWrapper); err != nil {
-		return
+	if len(outerWrapper.Chain) > 0 {
+		playerName, playerUUID, playerXUID = p.extractIdentityFromChain(outerWrapper.Chain)
+	} else if err := json.Unmarshal([]byte(outerWrapper.Certificate), &chainWrapper); err == nil {
+		playerName, playerUUID, playerXUID = p.extractIdentityFromChain(chainWrapper.Chain)
 	}
 
-	return p.extractIdentityFromChain(chainWrapper.Chain)
+	if playerName == "" && outerWrapper.Token != "" {
+		oidcName, oidcUUID, oidcXUID := p.extractIdentityFromOIDCToken(outerWrapper.Token)
+		if playerName == "" {
+			playerName = oidcName
+		}
+		if playerUUID == "" {
+			playerUUID = oidcUUID
+		}
+		if playerXUID == "" {
+			playerXUID = oidcXUID
+		}
+	}
+
+	if playerName == "" && rawToken != "" {
+		fallbackName, fallbackUUID, fallbackXUID := p.extractIdentityFromClientDataToken(rawToken)
+		if playerName == "" {
+			playerName = fallbackName
+		}
+		if playerUUID == "" {
+			playerUUID = fallbackUUID
+		}
+		if playerXUID == "" {
+			playerXUID = fallbackXUID
+		}
+	}
+
+	return
 }
 
 // rawUDPIdentityClaims holds JWT claims for player identity
@@ -1738,6 +1924,60 @@ func (p *RawUDPProxy) extractIdentityFromChain(chain []string) (playerName, play
 		}
 	}
 	return
+}
+
+func (p *RawUDPProxy) extractIdentityFromOIDCToken(token string) (playerName, playerUUID, playerXUID string) {
+	jwtParser := jwt.Parser{}
+	claims := jwt.MapClaims{}
+	_, _, err := jwtParser.ParseUnverified(token, &claims)
+	if err != nil {
+		return
+	}
+	name, _ := claims["xname"].(string)
+	xuid, _ := claims["xid"].(string)
+	return name, "", xuid
+}
+
+func (p *RawUDPProxy) extractIdentityFromClientDataToken(token string) (playerName, playerUUID, playerXUID string) {
+	jwtParser := jwt.Parser{}
+	claims := jwt.MapClaims{}
+	_, _, err := jwtParser.ParseUnverified(token, &claims)
+	if err != nil {
+		return
+	}
+	name, _ := claims["ThirdPartyName"].(string)
+	uuid, _ := claims["SelfSignedId"].(string)
+	xuid, _ := claims["XUID"].(string)
+	return name, uuid, xuid
+}
+
+func (p *RawUDPProxy) decodeGamePacketBatch(compressionID byte, data []byte) []byte {
+	if len(data) < 2 || data[0] != raknetGamePacketHeader {
+		return nil
+	}
+
+	if len(data) >= 3 {
+		switch compressionID {
+		case 0x00:
+			decompressed, err := p.decompressFlate(data[2:])
+			if err == nil {
+				return decompressed
+			}
+		case 0x01:
+			decompressed, err := decompressSnappyLimited(data[2:])
+			if err == nil {
+				return decompressed
+			}
+		case 0xff:
+			return data[2:]
+		}
+	}
+
+	decompressed, err := p.decompressFlate(data[1:])
+	if err != nil {
+		return nil
+	}
+	return decompressed
 }
 
 // parseAndLogGamePacket parses and logs important game packets
@@ -1957,14 +2197,7 @@ func (p *RawUDPProxy) KickPlayer(playerName, reason string) int {
 		if name != "" && strings.EqualFold(name, playerName) {
 			logger.Info("RawUDP: Kicking player %s from %s (reason: %s)", playerName, key, reason)
 
-			// Send disconnect packet to client first
 			p.sendDisconnectToClient(clientInfo, reason)
-
-			// Mark as kicked
-			clientInfo.kicked.Store(true)
-
-			// Close the connection - this will trigger removeClient
-			clientInfo.targetConn.Close()
 			kickedCount++
 		}
 		return true
@@ -2023,28 +2256,183 @@ type PlayerStats struct {
 // sendDisconnectToClient sends a Minecraft disconnect packet to the client
 // This constructs a proper RakNet frame with a Disconnect game packet
 func (p *RawUDPProxy) sendDisconnectToClient(clientInfo *rawUDPClientInfo, message string) {
-	// Best-effort: try to send a proper game-level Disconnect message so the client shows the reason.
-	p.sendGameDisconnectPacket(clientInfo, message)
+	clientInfo.kicked.Store(true)
+	clientInfo.mu.Lock()
+	clientInfo.kickMessage = message
+	clientInfo.mu.Unlock()
+	p.recentlyKicked.Store(clientInfo.clientAddr.String(), p.snapshotKickReplay(clientInfo, message))
+	p.scheduleKickCleanup(clientInfo)
+	p.injectKickResponse(clientInfo, message, true)
+}
 
-	// Even if we sent a game-level disconnect, also send a RakNet-level disconnect shortly after to ensure the
-	// connection actually closes (game-level disconnect may be dropped).
-	time.Sleep(80 * time.Millisecond)
-	p.sendRakNetDisconnect(clientInfo)
+func (p *RawUDPProxy) currentKickProfile() rawUDPKickProfile {
+	strategy := p.config.GetRawUDPKickStrategy()
+	allVariants := rawUDPPacketVariantOptions{SendCompressed: true, SendRawBatch: true, SendLegacy: true}
+	switch strategy {
+	case config.RawUDPKickStrategyDisconnectOnly:
+		return rawUDPKickProfile{PacketVariants: allVariants}
+	case config.RawUDPKickStrategyPlayStatusDisconnect:
+		return rawUDPKickProfile{SendPlayStatus: true, PacketVariants: allVariants}
+	case config.RawUDPKickStrategyPlayStatusDisconnectRakNet:
+		return rawUDPKickProfile{SendPlayStatus: true, SendRakNetDisconnect: true, PacketVariants: allVariants}
+	case config.RawUDPKickStrategyCompressedDisconnectOnly:
+		return rawUDPKickProfile{PacketVariants: rawUDPPacketVariantOptions{SendCompressed: true}}
+	case config.RawUDPKickStrategyCompressedDisconnectRakNet:
+		return rawUDPKickProfile{SendRakNetDisconnect: true, PacketVariants: rawUDPPacketVariantOptions{SendCompressed: true}}
+	case config.RawUDPKickStrategyRawBatchDisconnectOnly:
+		return rawUDPKickProfile{PacketVariants: rawUDPPacketVariantOptions{SendRawBatch: true}}
+	case config.RawUDPKickStrategyRawBatchDisconnectRakNet:
+		return rawUDPKickProfile{SendRakNetDisconnect: true, PacketVariants: rawUDPPacketVariantOptions{SendRawBatch: true}}
+	case config.RawUDPKickStrategyLegacyDisconnectOnly:
+		return rawUDPKickProfile{PacketVariants: rawUDPPacketVariantOptions{SendLegacy: true}}
+	case config.RawUDPKickStrategyLegacyDisconnectRakNet:
+		return rawUDPKickProfile{SendRakNetDisconnect: true, PacketVariants: rawUDPPacketVariantOptions{SendLegacy: true}}
+	case config.RawUDPKickStrategyDisconnectRakNet:
+		fallthrough
+	default:
+		return rawUDPKickProfile{SendRakNetDisconnect: true, PacketVariants: allVariants}
+	}
+}
 
+func (p *RawUDPProxy) injectKickResponse(clientInfo *rawUDPClientInfo, message string, logResult bool) {
+	profile := p.currentKickProfile()
+	if profile.SendPlayStatus && !clientInfo.encrypted.Load() {
+		p.sendPlayStatusFailurePacket(clientInfo, profile.PacketVariants)
+		time.Sleep(35 * time.Millisecond)
+	}
+	p.sendGameDisconnectPacket(clientInfo, message, profile.PacketVariants)
+	if profile.SendRakNetDisconnect {
+		time.Sleep(80 * time.Millisecond)
+		p.sendRakNetDisconnect(clientInfo)
+	}
 	if clientInfo.encrypted.Load() {
-		logger.Info("Sent disconnect to client %s (encrypted session, message may not display): %s", clientInfo.clientAddr.String(), message)
+		if logResult {
+			logger.Info("Sent disconnect to client %s (encrypted session, message may not display): %s", clientInfo.clientAddr.String(), message)
+		}
 		return
 	}
-	logger.Info("Sent disconnect to client %s: %s", clientInfo.clientAddr.String(), message)
+	if logResult {
+		logger.Info("Sent disconnect to client %s: %s", clientInfo.clientAddr.String(), message)
+	}
+}
+
+func (p *RawUDPProxy) kickMessageOf(clientInfo *rawUDPClientInfo) string {
+	clientInfo.mu.Lock()
+	defer clientInfo.mu.Unlock()
+	if clientInfo.kickMessage != "" {
+		return clientInfo.kickMessage
+	}
+	return "§c访问被拒绝"
+}
+
+func (p *RawUDPProxy) snapshotKickReplay(clientInfo *rawUDPClientInfo, message string) *rawUDPKickReplay {
+	replay := &rawUDPKickReplay{
+		At:            time.Now().UnixNano(),
+		Message:       message,
+		CompressionID: clientInfo.compressionID.Load(),
+		Encrypted:     clientInfo.encrypted.Load(),
+	}
+	replay.SendDatagramSeq.Store(clientInfo.sendDatagramSeq.Load())
+	replay.SendMessageIndex.Store(clientInfo.sendMessageIndex.Load())
+	replay.SendOrderIndex.Store(clientInfo.sendOrderIndex.Load())
+	return replay
+}
+
+func shouldReplayKick(last *atomic.Int64) bool {
+	now := time.Now().UnixNano()
+	for {
+		prev := last.Load()
+		if prev != 0 && time.Since(time.Unix(0, prev)) < 75*time.Millisecond {
+			return false
+		}
+		if last.CompareAndSwap(prev, now) {
+			return true
+		}
+	}
+}
+
+func (p *RawUDPProxy) replayKickResponse(clientInfo *rawUDPClientInfo, datagram []byte) {
+	if !shouldReplayKick(&clientInfo.lastKickReplayAt) {
+		return
+	}
+	if len(datagram) > 0 {
+		p.sendRakNetACKToClient(clientInfo.clientAddr, datagram)
+	}
+	p.injectKickResponse(clientInfo, p.kickMessageOf(clientInfo), false)
+}
+
+func (p *RawUDPProxy) replayRecentKick(clientAddr *net.UDPAddr, replay *rawUDPKickReplay, datagram []byte) {
+	if replay == nil || !shouldReplayKick(&replay.LastReplayAt) {
+		return
+	}
+	tempClient := &rawUDPClientInfo{clientAddr: clientAddr}
+	tempClient.compressionID.Store(replay.CompressionID)
+	tempClient.encrypted.Store(replay.Encrypted)
+	tempClient.sendDatagramSeq.Store(replay.SendDatagramSeq.Load())
+	tempClient.sendMessageIndex.Store(replay.SendMessageIndex.Load())
+	tempClient.sendOrderIndex.Store(replay.SendOrderIndex.Load())
+	if len(datagram) > 0 {
+		p.sendRakNetACKToClient(clientAddr, datagram)
+	}
+	p.injectKickResponse(tempClient, replay.Message, false)
+	replay.SendDatagramSeq.Store(tempClient.sendDatagramSeq.Load())
+	replay.SendMessageIndex.Store(tempClient.sendMessageIndex.Load())
+	replay.SendOrderIndex.Store(tempClient.sendOrderIndex.Load())
+}
+
+func (p *RawUDPProxy) scheduleKickCleanup(clientInfo *rawUDPClientInfo) {
+	if !clientInfo.kickCleanupScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-time.After(rawUDPKickCleanupDelay):
+		}
+		p.removeClientIfMatch(clientInfo.clientAddr.String(), clientInfo)
+	}()
 }
 
 // sendGameDisconnectPacket sends a Minecraft game-level Disconnect packet
-func (p *RawUDPProxy) sendGameDisconnectPacket(clientInfo *rawUDPClientInfo, message string) {
-	// In raw_udp mode, we can't encrypt packets. We can still send a valid Disconnect packet
-	// for the pre-encryption stage (e.g., ACL rejection right after Login).
-	// For established encrypted sessions, the client may ignore this and only process the RakNet-level disconnect.
+func (p *RawUDPProxy) sendGameDisconnectPacket(clientInfo *rawUDPClientInfo, message string, options rawUDPPacketVariantOptions) {
+	formattedMsg := message
+	if !strings.HasPrefix(formattedMsg, "§") {
+		formattedMsg = "§c" + formattedMsg
+	}
 
-	// Determine the compression negotiated by the remote server by looking at the client's Login packet wrapper.
+	var packetBuf bytes.Buffer
+	mcprotocol.WriteVaruint32(&packetBuf, mcpacket.IDDisconnect)
+	mcprotocol.WriteVarint32(&packetBuf, 2)
+	packetBuf.WriteByte(0x00)
+	msgBytes := []byte(formattedMsg)
+	mcprotocol.WriteVaruint32(&packetBuf, uint32(len(msgBytes)))
+	packetBuf.Write(msgBytes)
+	mcprotocol.WriteVaruint32(&packetBuf, uint32(len(msgBytes)))
+	packetBuf.Write(msgBytes)
+	legacyPacket := internalprotocol.NewProtocolHandler().BuildDisconnectPacket(formattedMsg)
+	p.sendEncodedGamePacketVariants(clientInfo, packetBuf.Bytes(), legacyPacket, "disconnect", options)
+}
+
+func (p *RawUDPProxy) sendPlayStatusFailurePacket(clientInfo *rawUDPClientInfo, options rawUDPPacketVariantOptions) {
+	pk := &mcpacket.PlayStatus{Status: mcpacket.PlayStatusLoginFailedServerFull}
+	var packetBuf bytes.Buffer
+	packetWriter := mcprotocol.NewWriter(&packetBuf, 0)
+	mcprotocol.WriteVaruint32(&packetBuf, pk.ID())
+	pk.Marshal(packetWriter)
+	legacyPacket := internalprotocol.NewProtocolHandler().BuildPlayStatusPacket(mcpacket.PlayStatusLoginFailedServerFull)
+	p.sendEncodedGamePacketVariants(clientInfo, packetBuf.Bytes(), legacyPacket, "play status", options)
+}
+
+func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo, packetPayload, legacyPacket []byte, packetName string, options rawUDPPacketVariantOptions) {
+	if len(packetPayload) == 0 {
+		return
+	}
+	if !options.SendCompressed && !options.SendRawBatch && !options.SendLegacy {
+		options.SendCompressed = true
+	}
 	compID := byte(clientInfo.compressionID.Load())
 	var compression mcpacket.Compression
 	switch compID {
@@ -2056,29 +2444,11 @@ func (p *RawUDPProxy) sendGameDisconnectPacket(clientInfo *rawUDPClientInfo, mes
 		compression = mcpacket.FlateCompression
 	}
 
-	formattedMsg := message
-	if !strings.HasPrefix(formattedMsg, "§") {
-		formattedMsg = "§c" + formattedMsg
-	}
-
-	pk := &mcpacket.Disconnect{
-		Reason:                  mcpacket.DisconnectReasonKicked,
-		HideDisconnectionScreen: false,
-		Message:                 formattedMsg,
-		FilteredMessage:         formattedMsg,
-	}
-
-	// Encode the Disconnect packet as a single batch packet with negotiated compression.
-	var packetBuf bytes.Buffer
-	packetWriter := mcprotocol.NewWriter(&packetBuf, 0)
-	mcprotocol.WriteVaruint32(&packetBuf, pk.ID())
-	pk.Marshal(packetWriter)
-
 	var gameBuf bytes.Buffer
 	encoder := mcpacket.NewEncoder(&gameBuf)
 	encoder.EnableCompression(compression)
-	if err := encoder.Encode([][]byte{packetBuf.Bytes()}); err != nil {
-		logger.Error("Failed to encode disconnect packet: %v", err)
+	if err := encoder.Encode([][]byte{packetPayload}); err != nil {
+		logger.Error("Failed to encode %s packet: %v", packetName, err)
 		return
 	}
 	gamePacket := gameBuf.Bytes()
@@ -2086,48 +2456,68 @@ func (p *RawUDPProxy) sendGameDisconnectPacket(clientInfo *rawUDPClientInfo, mes
 		return
 	}
 	if len(gamePacket) > 8191 {
-		logger.Warn("Disconnect packet too large (%d bytes), not sending", len(gamePacket))
+		logger.Warn("%s packet too large (%d bytes), not sending", strings.Title(packetName), len(gamePacket))
 		return
 	}
 
-	// Build a RakNet datagram containing a single reliable-ordered encapsulated packet.
+	if options.SendCompressed {
+		compressedFrame := buildInjectedReliableOrderedFrame(clientInfo, gamePacket)
+		p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
+		if _, err := p.listener.WriteToUDP(compressedFrame, clientInfo.clientAddr); err != nil {
+			logger.Error("Failed to send %s packet to client: %v", packetName, err)
+		}
+	}
+
+	rawBatchPacket := buildRawBatchDisconnectPacket(packetPayload)
+	if options.SendRawBatch && len(rawBatchPacket) > 0 {
+		rawBatchFrame := buildInjectedReliableOrderedFrame(clientInfo, rawBatchPacket)
+		time.Sleep(35 * time.Millisecond)
+		p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
+		if _, err := p.listener.WriteToUDP(rawBatchFrame, clientInfo.clientAddr); err != nil {
+			logger.Debug("Failed to send raw batch %s packet to client: %v", packetName, err)
+		}
+	}
+
+	if options.SendLegacy && len(legacyPacket) > 0 {
+		legacyFrame := buildInjectedReliableOrderedFrame(clientInfo, legacyPacket)
+		time.Sleep(35 * time.Millisecond)
+		p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
+		if _, err := p.listener.WriteToUDP(legacyFrame, clientInfo.clientAddr); err != nil {
+			logger.Debug("Failed to send legacy %s packet to client: %v", packetName, err)
+		}
+	}
+}
+
+func buildInjectedReliableOrderedFrame(clientInfo *rawUDPClientInfo, payload []byte) []byte {
 	seq := clientInfo.sendDatagramSeq.Add(1) & 0xFFFFFF
 	msgIndex := clientInfo.sendMessageIndex.Add(1) & 0xFFFFFF
 	orderIndex := clientInfo.sendOrderIndex.Add(1) & 0xFFFFFF
 
 	var raknetFrame bytes.Buffer
-	raknetFrame.WriteByte(0x84) // Datagram (bitFlagDatagram + bitFlagNeedsBAndAS)
+	raknetFrame.WriteByte(0x84)
 	raknetFrame.WriteByte(byte(seq))
 	raknetFrame.WriteByte(byte(seq >> 8))
 	raknetFrame.WriteByte(byte(seq >> 16))
-
-	// Encapsulated packet header: reliability=3 (reliable ordered), no split.
 	raknetFrame.WriteByte(0x60)
-
-	// Bit length (2 bytes BE).
-	bitLen := uint16(len(gamePacket) * 8)
+	bitLen := uint16(len(payload) * 8)
 	raknetFrame.WriteByte(byte(bitLen >> 8))
 	raknetFrame.WriteByte(byte(bitLen & 0xff))
-
-	// Reliable message index (3 bytes LE).
 	writeUint24LE(&raknetFrame, msgIndex)
-
-	// Ordered index (3 bytes LE) + order channel (1 byte, use 0).
 	writeUint24LE(&raknetFrame, orderIndex)
 	raknetFrame.WriteByte(0)
+	raknetFrame.Write(payload)
+	return raknetFrame.Bytes()
+}
 
-	// Payload.
-	raknetFrame.Write(gamePacket)
-
-	// Send multiple times to ensure delivery (UDP is unreliable)
-	for i := 0; i < 3; i++ {
-		p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
-		_, err := p.listener.WriteToUDP(raknetFrame.Bytes(), clientInfo.clientAddr)
-		if err != nil {
-			logger.Error("Failed to send disconnect packet to client (attempt %d): %v", i+1, err)
-		}
-		time.Sleep(50 * time.Millisecond)
+func buildRawBatchDisconnectPacket(packetPayload []byte) []byte {
+	if len(packetPayload) == 0 {
+		return nil
 	}
+	var buf bytes.Buffer
+	buf.WriteByte(raknetGamePacketHeader)
+	mcprotocol.WriteVaruint32(&buf, uint32(len(packetPayload)))
+	buf.Write(packetPayload)
+	return buf.Bytes()
 }
 
 func writeUint24LE(w *bytes.Buffer, v uint32) {
@@ -2135,6 +2525,89 @@ func writeUint24LE(w *bytes.Buffer, v uint32) {
 	w.WriteByte(byte(v))
 	w.WriteByte(byte(v >> 8))
 	w.WriteByte(byte(v >> 16))
+}
+
+func isRakNetDataDatagram(datagram []byte) bool {
+	if len(datagram) < 4 || (datagram[0]&0x80) == 0 {
+		return false
+	}
+	if (datagram[0] & raknetACKMask) != 0 {
+		return false
+	}
+	if (datagram[0] & raknetNACKMask) != 0 {
+		return false
+	}
+	return true
+}
+
+func (p *RawUDPProxy) sendRakNetACKToClient(clientAddr *net.UDPAddr, datagram []byte) {
+	seq, ok := parseRakNetDatagramSeq(datagram)
+	if !ok {
+		return
+	}
+	p.sendRakNetACKsToClient(clientAddr, []uint32{seq})
+}
+
+func parseRakNetDatagramSeq(datagram []byte) (uint32, bool) {
+	if !isRakNetDataDatagram(datagram) {
+		return 0, false
+	}
+	return uint32(datagram[1]) | uint32(datagram[2])<<8 | uint32(datagram[3])<<16, true
+}
+
+func (p *RawUDPProxy) ackInterceptedClientDatagram(clientInfo *rawUDPClientInfo, datagram []byte) {
+	if clientInfo == nil {
+		return
+	}
+	seqs := clientInfo.consumePendingACKSeqs()
+	if seq, ok := parseRakNetDatagramSeq(datagram); ok {
+		if len(seqs) == 0 {
+			seqs = []uint32{seq}
+		} else {
+			found := false
+			for _, pendingSeq := range seqs {
+				if pendingSeq == seq {
+					found = true
+					break
+				}
+			}
+			if !found {
+				seqs = append(seqs, seq)
+			}
+		}
+	}
+	p.sendRakNetACKsToClient(clientInfo.clientAddr, seqs)
+}
+
+func (p *RawUDPProxy) sendRakNetACKsToClient(clientAddr *net.UDPAddr, seqs []uint32) {
+	if clientAddr == nil || len(seqs) == 0 {
+		return
+	}
+	sortedSeqs := append([]uint32(nil), seqs...)
+	sort.Slice(sortedSeqs, func(i, j int) bool { return sortedSeqs[i] < sortedSeqs[j] })
+	uniqueSeqs := sortedSeqs[:0]
+	for _, seq := range sortedSeqs {
+		if len(uniqueSeqs) == 0 || uniqueSeqs[len(uniqueSeqs)-1] != seq {
+			uniqueSeqs = append(uniqueSeqs, seq)
+		}
+	}
+	var ack bytes.Buffer
+	ack.WriteByte(0xC0)
+	binary.Write(&ack, binary.BigEndian, uint16(len(uniqueSeqs)))
+	for _, seq := range uniqueSeqs {
+		ack.WriteByte(1)
+		writeUint24LE(&ack, seq)
+	}
+	for i := 0; i < 2; i++ {
+		p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
+		if _, err := p.listener.WriteToUDP(ack.Bytes(), clientAddr); err != nil {
+			logger.Debug("Failed to send RakNet ACK to client %s: %v", clientAddr.String(), err)
+			return
+		}
+		if i == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 // sendRakNetDisconnect sends a RakNet-level disconnection notification (0x15)

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"mcpeserverproxy/internal/logger"
 )
 
 // LoadBalance strategy constants
@@ -32,35 +34,70 @@ const (
 )
 
 // ServerConfig represents a proxy target server configuration.
- type ServerConfig struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Target          string `json:"target"`
-	Port            int    `json:"port"`
-	ListenAddr      string `json:"listen_addr"`
-	Protocol        string `json:"protocol"`
-	Enabled         bool   `json:"enabled"`  // Whether to start the proxy listener
-	Disabled        bool   `json:"disabled"` // Whether to reject new connections (when enabled=true)
-	UDPSpeeder      *UDPSpeederConfig `json:"udp_speeder,omitempty"`
-	SendRealIP      bool   `json:"send_real_ip"`
-	ResolveInterval int    `json:"resolve_interval"`  // seconds
-	IdleTimeout     int    `json:"idle_timeout"`      // seconds
-	BufferSize      int    `json:"buffer_size"`       // UDP buffer size, -1 for auto
-	DisabledMessage string `json:"disabled_message"`  // Custom message when server is disabled
-	CustomMOTD      string `json:"custom_motd"`       // Custom MOTD for ping response (empty = forward from remote)
-	ProxyMode       string `json:"proxy_mode"`        // "transparent" (default) or "raknet" (full RakNet proxy)
-	XboxAuthEnabled bool   `json:"xbox_auth_enabled"` // Enable Xbox Live authentication for remote connections
-	XboxTokenPath   string `json:"xbox_token_path"`   // Custom token file path for Xbox Live tokens (optional)
-	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
-	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy in server list ping
-	LoadBalance     string `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
-	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
-	ProtocolVersion int    `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
+type ServerConfig struct {
+	ID                  string            `json:"id"`
+	Name                string            `json:"name"`
+	Target              string            `json:"target"`
+	Port                int               `json:"port"`
+	ListenAddr          string            `json:"listen_addr"`
+	Protocol            string            `json:"protocol"`
+	Enabled             bool              `json:"enabled"`  // Whether to start the proxy listener
+	Disabled            bool              `json:"disabled"` // Whether to reject new connections (when enabled=true)
+	UDPSpeeder          *UDPSpeederConfig `json:"udp_speeder,omitempty"`
+	SendRealIP          bool              `json:"send_real_ip"`
+	ResolveInterval     int               `json:"resolve_interval"`       // seconds
+	IdleTimeout         int               `json:"idle_timeout"`           // seconds
+	BufferSize          int               `json:"buffer_size"`            // UDP buffer size, -1 for auto
+	UDPSocketBufferSize int               `json:"udp_socket_buffer_size"` // UDP socket buffer size in bytes (0=auto, -1=OS default)
+	DisabledMessage     string            `json:"disabled_message"`       // Custom message when server is disabled
+	CustomMOTD          string            `json:"custom_motd"`            // Custom MOTD for ping response (empty = forward from remote)
+	ProxyMode           string            `json:"proxy_mode"`             // "transparent" (default) or "raknet" (full RakNet proxy)
+	ACLServerID         string            `json:"acl_server_id,omitempty"`
+	RawUDPKickStrategy  string            `json:"raw_udp_kick_strategy,omitempty"`
+	XboxAuthEnabled     bool              `json:"xbox_auth_enabled"` // Enable Xbox Live authentication for remote connections
+	XboxTokenPath       string            `json:"xbox_token_path"`   // Custom token file path for Xbox Live tokens (optional)
+	ProxyOutbound       string            `json:"proxy_outbound"`    // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
+	ShowRealLatency     bool              `json:"show_real_latency"` // Show real latency through proxy in server list ping
+	LoadBalance         string            `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
+	LoadBalanceSort     string            `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
+	ProtocolVersion     int               `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
 	// Load balancing ping interval
 	AutoPingEnabled         bool `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval in minutes
-	resolvedIP             string
-	lastResolved           time.Time
+	resolvedIP              string
+	lastResolved            time.Time
+}
+
+const (
+	RawUDPKickStrategyDisconnectRakNet           = "disconnect_raknet"
+	RawUDPKickStrategyDisconnectOnly             = "disconnect_only"
+	RawUDPKickStrategyPlayStatusDisconnect       = "playstatus_disconnect"
+	RawUDPKickStrategyPlayStatusDisconnectRakNet = "playstatus_disconnect_raknet"
+	RawUDPKickStrategyCompressedDisconnectOnly   = "compressed_disconnect_only"
+	RawUDPKickStrategyCompressedDisconnectRakNet = "compressed_disconnect_raknet"
+	RawUDPKickStrategyRawBatchDisconnectOnly     = "raw_batch_disconnect_only"
+	RawUDPKickStrategyRawBatchDisconnectRakNet   = "raw_batch_disconnect_raknet"
+	RawUDPKickStrategyLegacyDisconnectOnly       = "legacy_disconnect_only"
+	RawUDPKickStrategyLegacyDisconnectRakNet     = "legacy_disconnect_raknet"
+)
+
+func isValidRawUDPKickStrategy(strategy string) bool {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "",
+		RawUDPKickStrategyDisconnectRakNet,
+		RawUDPKickStrategyDisconnectOnly,
+		RawUDPKickStrategyPlayStatusDisconnect,
+		RawUDPKickStrategyPlayStatusDisconnectRakNet,
+		RawUDPKickStrategyCompressedDisconnectOnly,
+		RawUDPKickStrategyCompressedDisconnectRakNet,
+		RawUDPKickStrategyRawBatchDisconnectOnly,
+		RawUDPKickStrategyRawBatchDisconnectRakNet,
+		RawUDPKickStrategyLegacyDisconnectOnly,
+		RawUDPKickStrategyLegacyDisconnectRakNet:
+		return true
+	default:
+		return false
+	}
 }
 
 type UDPSpeederConfig struct {
@@ -167,6 +204,12 @@ func (sc *ServerConfig) Validate() error {
 	if sc.Protocol == "" {
 		return errors.New("protocol is required")
 	}
+	if sc.UDPSocketBufferSize < -1 {
+		return fmt.Errorf("udp_socket_buffer_size must be >= -1, got %d", sc.UDPSocketBufferSize)
+	}
+	if !isValidRawUDPKickStrategy(sc.RawUDPKickStrategy) {
+		return fmt.Errorf("invalid raw_udp_kick_strategy: %s", sc.RawUDPKickStrategy)
+	}
 	if sc.UDPSpeeder != nil && sc.UDPSpeeder.Enabled {
 		switch strings.ToLower(sc.Protocol) {
 		case "tcp", "tcp_udp":
@@ -219,31 +262,34 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 }
 
 // ServerConfigDTO is the data transfer object for server config API responses.
- type ServerConfigDTO struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Target          string `json:"target"`
-	Port            int    `json:"port"`
-	ListenAddr      string `json:"listen_addr"`
-	Protocol        string `json:"protocol"`
-	Enabled         bool   `json:"enabled"`
-	Disabled        bool   `json:"disabled"` // Whether to reject new connections
-	UDPSpeeder      *UDPSpeederConfigDTO `json:"udp_speeder,omitempty"`
-	SendRealIP      bool   `json:"send_real_ip"`
-	ResolveInterval int    `json:"resolve_interval"`
-	IdleTimeout     int    `json:"idle_timeout"`
-	BufferSize      int    `json:"buffer_size"`
-	DisabledMessage string `json:"disabled_message"`
-	CustomMOTD      string `json:"custom_motd"`
-	ProxyMode       string `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
-	XboxAuthEnabled bool   `json:"xbox_auth_enabled"`
-	XboxTokenPath   string `json:"xbox_token_path"`
-	ProxyOutbound   string `json:"proxy_outbound"`    // Proxy outbound node name or "@group" for group selection
-	ShowRealLatency bool   `json:"show_real_latency"` // Show real latency through proxy
-	LoadBalance     string `json:"load_balance"`      // Load balance strategy
-	LoadBalanceSort string `json:"load_balance_sort"` // Latency sort type
-	Status          string `json:"status"`            // running, stopped
-	ActiveSessions  int    `json:"active_sessions"`
+type ServerConfigDTO struct {
+	ID                  string               `json:"id"`
+	Name                string               `json:"name"`
+	Target              string               `json:"target"`
+	Port                int                  `json:"port"`
+	ListenAddr          string               `json:"listen_addr"`
+	Protocol            string               `json:"protocol"`
+	Enabled             bool                 `json:"enabled"`
+	Disabled            bool                 `json:"disabled"` // Whether to reject new connections
+	UDPSpeeder          *UDPSpeederConfigDTO `json:"udp_speeder,omitempty"`
+	SendRealIP          bool                 `json:"send_real_ip"`
+	ResolveInterval     int                  `json:"resolve_interval"`
+	IdleTimeout         int                  `json:"idle_timeout"`
+	BufferSize          int                  `json:"buffer_size"`
+	UDPSocketBufferSize int                  `json:"udp_socket_buffer_size"`
+	DisabledMessage     string               `json:"disabled_message"`
+	CustomMOTD          string               `json:"custom_motd"`
+	ProxyMode           string               `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
+	ACLServerID         string               `json:"acl_server_id,omitempty"`
+	RawUDPKickStrategy  string               `json:"raw_udp_kick_strategy,omitempty"`
+	XboxAuthEnabled     bool                 `json:"xbox_auth_enabled"`
+	XboxTokenPath       string               `json:"xbox_token_path"`
+	ProxyOutbound       string               `json:"proxy_outbound"`    // Proxy outbound node name or "@group" for group selection
+	ShowRealLatency     bool                 `json:"show_real_latency"` // Show real latency through proxy
+	LoadBalance         string               `json:"load_balance"`      // Load balance strategy
+	LoadBalanceSort     string               `json:"load_balance_sort"` // Latency sort type
+	Status              string               `json:"status"`            // running, stopped
+	ActiveSessions      int                  `json:"active_sessions"`
 	// Load balancing ping interval
 	AutoPingEnabled         bool `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval
@@ -252,30 +298,33 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 // ToDTO converts the server config to a DTO for API responses.
 func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO {
 	return ServerConfigDTO{
-		ID:              sc.ID,
-		Name:            sc.Name,
-		Target:          sc.Target,
-		Port:            sc.Port,
-		ListenAddr:      sc.ListenAddr,
-		Protocol:        sc.Protocol,
-		Enabled:         sc.Enabled,
-		Disabled:        sc.Disabled,
-		UDPSpeeder:      sc.UDPSpeeder.ToDTO(),
-		SendRealIP:      sc.SendRealIP,
-		ResolveInterval: sc.ResolveInterval,
-		IdleTimeout:     sc.IdleTimeout,
-		BufferSize:      sc.BufferSize,
-		DisabledMessage: sc.DisabledMessage,
-		CustomMOTD:      sc.CustomMOTD,
-		ProxyMode:       sc.ProxyMode,
-		XboxAuthEnabled: sc.XboxAuthEnabled,
-		XboxTokenPath:   sc.XboxTokenPath,
-		ProxyOutbound:   sc.ProxyOutbound,
-		ShowRealLatency: sc.ShowRealLatency,
-		LoadBalance:     sc.LoadBalance,
-		LoadBalanceSort: sc.LoadBalanceSort,
-		Status:          status,
-		ActiveSessions:  activeSessions,
+		ID:                      sc.ID,
+		Name:                    sc.Name,
+		Target:                  sc.Target,
+		Port:                    sc.Port,
+		ListenAddr:              sc.ListenAddr,
+		Protocol:                sc.Protocol,
+		Enabled:                 sc.Enabled,
+		Disabled:                sc.Disabled,
+		UDPSpeeder:              sc.UDPSpeeder.ToDTO(),
+		SendRealIP:              sc.SendRealIP,
+		ResolveInterval:         sc.ResolveInterval,
+		IdleTimeout:             sc.IdleTimeout,
+		BufferSize:              sc.BufferSize,
+		UDPSocketBufferSize:     sc.UDPSocketBufferSize,
+		DisabledMessage:         sc.DisabledMessage,
+		CustomMOTD:              sc.CustomMOTD,
+		ProxyMode:               sc.ProxyMode,
+		ACLServerID:             sc.GetACLServerID(),
+		RawUDPKickStrategy:      sc.GetRawUDPKickStrategy(),
+		XboxAuthEnabled:         sc.XboxAuthEnabled,
+		XboxTokenPath:           sc.XboxTokenPath,
+		ProxyOutbound:           sc.ProxyOutbound,
+		ShowRealLatency:         sc.ShowRealLatency,
+		LoadBalance:             sc.LoadBalance,
+		LoadBalanceSort:         sc.LoadBalanceSort,
+		Status:                  status,
+		ActiveSessions:          activeSessions,
 		AutoPingEnabled:         sc.AutoPingEnabled,
 		AutoPingIntervalMinutes: sc.AutoPingIntervalMinutes,
 	}
@@ -298,6 +347,15 @@ func (sc *ServerConfig) GetBufferSize() int {
 		return -1 // Default to auto
 	}
 	return sc.BufferSize
+}
+
+// GetUDPSocketBufferSize returns the configured UDP socket buffer size.
+// 0 means use the proxy's recommended default; -1 means keep the OS default.
+func (sc *ServerConfig) GetUDPSocketBufferSize() int {
+	if sc == nil {
+		return 0
+	}
+	return sc.UDPSocketBufferSize
 }
 
 // GetDisabledMessage returns the custom disabled message or a default.
@@ -381,6 +439,22 @@ func (sc *ServerConfig) GetProtocolVersion() int {
 	return sc.ProtocolVersion
 }
 
+func (sc *ServerConfig) GetACLServerID() string {
+	aclServerID := strings.TrimSpace(sc.ACLServerID)
+	if aclServerID == "" {
+		return sc.ID
+	}
+	return aclServerID
+}
+
+func (sc *ServerConfig) GetRawUDPKickStrategy() string {
+	strategy := strings.ToLower(strings.TrimSpace(sc.RawUDPKickStrategy))
+	if strategy == "" {
+		return RawUDPKickStrategyDisconnectOnly
+	}
+	return strategy
+}
+
 // GetLoadBalance returns the load balance strategy, defaulting to "least-latency".
 func (sc *ServerConfig) GetLoadBalance() string {
 	if sc.LoadBalance == "" {
@@ -400,6 +474,131 @@ func (sc *ServerConfig) GetLoadBalanceSort() string {
 // DNSResolver handles DNS resolution for server targets.
 type DNSResolver struct{}
 
+var dnsSpecialCIDRs = mustParseResolveCIDRs([]string{
+	"100.64.0.0/10",
+	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
+	"240.0.0.0/4",
+	"0.0.0.0/8",
+	"::/128",
+	"::1/128",
+	"fc00::/7",
+	"fe80::/10",
+	"2001:db8::/32",
+	"ff00::/8",
+})
+
+var publicDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53", "223.5.5.5:53"}
+
+func mustParseResolveCIDRs(cidrs []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			nets = append(nets, ipnet)
+		}
+	}
+	return nets
+}
+
+func isSpecialResolveIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, ipnet := range dnsSpecialCIDRs {
+		if ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterUsableResolveIPs(addrs []net.IPAddr) []net.IP {
+	result := make([]net.IP, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		ip := addr.IP
+		if ip == nil || isSpecialResolveIP(ip) {
+			continue
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, ip)
+	}
+	return result
+}
+
+func preferredResolveIP(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0]
+	}
+	return nil
+}
+
+func newResolveDNSResolver(server string, timeout time.Duration) *net.Resolver {
+	dialer := &net.Dialer{Timeout: timeout}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", server)
+		},
+	}
+}
+
+func resolveUsableIP(ctx context.Context, hostname string) (net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+	usable := filterUsableResolveIPs(addrs)
+	if ip := preferredResolveIP(usable); ip != nil {
+		logger.Debug("Config DNS resolve ok: host=%s source=system ip=%s", hostname, ip.String())
+		return ip, nil
+	}
+	if err != nil {
+		logger.Debug("Config DNS resolve system failed: host=%s err=%v", hostname, err)
+	} else if len(addrs) > 0 {
+		resolved := make([]string, 0, len(addrs))
+		for _, addr := range addrs {
+			if addr.IP != nil {
+				resolved = append(resolved, addr.IP.String())
+			}
+		}
+		logger.Debug("Config DNS resolve system returned only special-use IPs: host=%s ips=%s", hostname, strings.Join(resolved, ","))
+	}
+
+	var lastErr error
+	for _, dnsServer := range publicDNSServers {
+		resolver := newResolveDNSResolver(dnsServer, 3*time.Second)
+		addrs, err = resolver.LookupIPAddr(ctx, hostname)
+		usable = filterUsableResolveIPs(addrs)
+		if ip := preferredResolveIP(usable); ip != nil {
+			logger.Debug("Config DNS resolve ok: host=%s source=public_dns server=%s ip=%s", hostname, dnsServer, ip.String())
+			return ip, nil
+		}
+		if err != nil {
+			lastErr = err
+			logger.Debug("Config DNS resolve public dns failed: host=%s server=%s err=%v", hostname, dnsServer, err)
+			continue
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable public IP found")
+	}
+	return nil, lastErr
+}
+
 // Resolve resolves a hostname to an IP address.
 func (r *DNSResolver) Resolve(hostname string) (string, error) {
 	// Check if it's already an IP address
@@ -407,24 +606,13 @@ func (r *DNSResolver) Resolve(hostname string) (string, error) {
 		return hostname, nil
 	}
 
-	ips, err := net.LookupIP(hostname)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resolvedIP, err := resolveUsableIP(ctx, hostname)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve %s: %w", hostname, err)
 	}
-
-	// Prefer IPv4 addresses
-	for _, ip := range ips {
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String(), nil
-		}
-	}
-
-	// Fall back to first IP if no IPv4 found
-	if len(ips) > 0 {
-		return ips[0].String(), nil
-	}
-
-	return "", fmt.Errorf("no IP addresses found for %s", hostname)
+	return resolvedIP.String(), nil
 }
 
 // ConfigManager manages server configurations with hot reload support.

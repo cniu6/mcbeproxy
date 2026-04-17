@@ -27,10 +27,12 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/singboxcore"
 
 	hy2 "github.com/apernet/hysteria/core/v2/client"
 	hy2obfs "github.com/apernet/hysteria/extras/v2/obfs"
@@ -47,8 +49,16 @@ import (
 	"github.com/sagernet/sing/common/uot"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	anytls "github.com/anytls/sing-anytls"
+	xraynet "github.com/xtls/xray-core/common/net"
+	xrayinternet "github.com/xtls/xray-core/transport/internet"
+	xraygrpc "github.com/xtls/xray-core/transport/internet/grpc/encoding"
+	xrayreality "github.com/xtls/xray-core/transport/internet/reality"
+	xraysplithttp "github.com/xtls/xray-core/transport/internet/splithttp"
+	xraytls "github.com/xtls/xray-core/transport/internet/tls"
 )
 
 // SingboxOutbound wraps a sing protocol client for UDP connections.
@@ -78,20 +88,60 @@ var ErrUnsupportedProtocol = errors.New("unsupported protocol type")
 // ErrOutboundCreationFailed is returned when outbound creation fails.
 var ErrOutboundCreationFailed = errors.New("failed to create sing-box outbound")
 
+// globalTLSSessionCache enables TLS 1.3 session resumption across connections
+// to the same server, saving one round-trip on reconnections.
+var globalTLSSessionCache = tls.NewLRUClientSessionCache(128)
+
+// globalUTLSSessionCache is the uTLS equivalent for fingerprinted connections.
+var globalUTLSSessionCache = utls.NewLRUClientSessionCache(128)
+
 // directDialer implements N.Dialer for direct connections.
 type directDialer struct {
 	timeout time.Duration
 }
 
+func NewSingboxCoreFactory() singboxcore.Factory {
+	return singboxcore.FactoryFuncs{
+		CreateUDPOutboundFunc: func(_ context.Context, cfg *config.ProxyOutbound) (singboxcore.UDPOutbound, error) {
+			return CreateSingboxOutbound(cfg)
+		},
+		CreateDialerFunc: func(_ context.Context, cfg *config.ProxyOutbound) (singboxcore.Dialer, error) {
+			return CreateSingboxDialer(cfg)
+		},
+	}
+}
+
 func (d *directDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	dialer := &net.Dialer{
-		Timeout: d.timeout,
+		Timeout:   d.timeout,
+		KeepAlive: 30 * time.Second,
 	}
-	return dialer.DialContext(ctx, network, destination.String())
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && (dialer.Timeout == 0 || remaining < dialer.Timeout) {
+			dialer.Timeout = remaining
+		}
+		dialer.Deadline = deadline
+	}
+	conn, err := dialer.DialContext(ctx, network, destination.String())
+	if err != nil {
+		return nil, err
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetWriteBuffer(256 * 1024)
+		_ = tcpConn.SetReadBuffer(256 * 1024)
+	}
+	return conn, nil
 }
 
 func (d *directDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return net.ListenUDP("udp", nil)
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetReadBuffer(2 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
+	return conn, nil
 }
 
 var _ N.Dialer = (*directDialer)(nil)
@@ -358,6 +408,122 @@ func (c *portHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err err
 	return c.PacketConn.WriteTo(p, targetAddr)
 }
 
+func (c *portHoppingPacketConn) SetReadBuffer(bytes int) error {
+	if setter, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return setter.SetReadBuffer(bytes)
+	}
+	return errors.New("underlying packet conn does not support SetReadBuffer")
+}
+
+func (c *portHoppingPacketConn) SetWriteBuffer(bytes int) error {
+	if setter, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return setter.SetWriteBuffer(bytes)
+	}
+	return errors.New("underlying packet conn does not support SetWriteBuffer")
+}
+
+func (c *portHoppingPacketConn) SyscallConn() (syscall.RawConn, error) {
+	if conn, ok := c.PacketConn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	}); ok {
+		return conn.SyscallConn()
+	}
+	return nil, errors.New("underlying packet conn does not support SyscallConn")
+}
+
+func (c *portHoppingPacketConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	if conn, ok := c.PacketConn.(interface {
+		ReadMsgUDP([]byte, []byte) (int, int, int, *net.UDPAddr, error)
+	}); ok {
+		return conn.ReadMsgUDP(b, oob)
+	}
+	return 0, 0, 0, nil, errors.New("underlying packet conn does not support ReadMsgUDP")
+}
+
+func (c *portHoppingPacketConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (n, oobn int, err error) {
+	c.mu.Lock()
+	if time.Since(c.lastHop) >= c.hopInterval {
+		oldPort := c.currentPort
+		portRange := c.portEnd - c.portStart + 1
+		c.currentPort = c.portStart + int(time.Now().UnixNano()%int64(portRange))
+		c.lastHop = time.Now()
+		logger.Debug("Hysteria2 port hop: %d -> %d", oldPort, c.currentPort)
+	}
+	targetAddr := &net.UDPAddr{IP: c.serverIP, Port: c.currentPort}
+	c.mu.Unlock()
+
+	if conn, ok := c.PacketConn.(interface {
+		WriteMsgUDP([]byte, []byte, *net.UDPAddr) (int, int, error)
+	}); ok {
+		return conn.WriteMsgUDP(b, oob, targetAddr)
+	}
+	n, err = c.PacketConn.WriteTo(b, targetAddr)
+	return n, 0, err
+}
+
+func resolveOutboundServerIP(_ context.Context, host string) (net.IP, string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip, "literal", nil
+	}
+	resolver := &config.DNSResolver{}
+	resolved, err := resolver.Resolve(host)
+	if err != nil {
+		return nil, "", err
+	}
+	ip := net.ParseIP(resolved)
+	if ip == nil {
+		return nil, "", fmt.Errorf("invalid resolved IP %q", resolved)
+	}
+	return ip, "config_resolver", nil
+}
+
+func ResolveOutboundServerAddress(ctx context.Context, host string, port int) (string, error) {
+	ip, _, err := resolveOutboundServerIP(ctx, host)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)), nil
+}
+
+func DialOutboundServerTCP(ctx context.Context, host string, port int, timeout time.Duration) (net.Conn, string, error) {
+	addr, err := ResolveOutboundServerAddress(ctx, host, port)
+	if err != nil {
+		return nil, "", err
+	}
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && (dialer.Timeout == 0 || remaining < dialer.Timeout) {
+			dialer.Timeout = remaining
+		}
+		dialer.Deadline = deadline
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, addr, err
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetWriteBuffer(256 * 1024)
+		_ = tcpConn.SetReadBuffer(256 * 1024)
+	}
+	return conn, addr, nil
+}
+
+func wrapHysteria2UDPError(err error) error {
+	if err == nil {
+		return nil
+	}
+	errText := strings.ToLower(err.Error())
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(errText, "no recent network activity") || strings.Contains(errText, "timeout") {
+		return fmt.Errorf("hysteria2 UDP unreachable (QUIC handshake timed out; check local TUN/firewall or remote QUIC block): %w", err)
+	}
+	return fmt.Errorf("hysteria2 UDP failed: %w", err)
+}
+
 // initHysteria2 initializes a Hysteria2 client with full port hopping and TLS support.
 func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 	serverAddr := fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
@@ -371,24 +537,9 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 		return fmt.Errorf("invalid port: %w", err)
 	}
 
-	// Resolve host - prefer IPv4
-	ips, err := net.LookupIP(host)
+	serverIP, _, err := resolveOutboundServerIP(context.Background(), host)
 	if err != nil {
 		return fmt.Errorf("failed to resolve host: %w", err)
-	}
-	if len(ips) == 0 {
-		return errors.New("no IP addresses found for host")
-	}
-
-	var serverIP net.IP
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			serverIP = ip
-			break
-		}
-	}
-	if serverIP == nil {
-		serverIP = ips[0]
 	}
 
 	sni := cfg.SNI
@@ -655,14 +806,18 @@ func (s *SingboxOutbound) dialShadowsocksUDP(ctx context.Context, serverAddr, de
 
 // dialVMessUDP creates a UDP connection through VMess using sing-vmess library.
 func (s *SingboxOutbound) dialVMessUDP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.PacketConn, error) {
+	if err := ensureImplementedTransport(s.config, "UDP"); err != nil {
+		return nil, err
+	}
+
 	// Create TCP connection to server
 	conn, err := s.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TCP connection: %w", err)
 	}
 
-	// Apply TLS if configured
-	if s.config.TLS {
+	// Apply TLS if configured — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(s.config) && s.config.TLS {
 		tlsConn, err := dialTLSWithFingerprint(ctx, conn, s.config)
 		if err != nil {
 			conn.Close()
@@ -671,15 +826,12 @@ func (s *SingboxOutbound) dialVMessUDP(ctx context.Context, serverAddr, dest M.S
 		conn = tlsConn
 	}
 
-	// Apply WebSocket transport if configured
-	if s.config.Network == "ws" {
-		wsConn, err := upgradeToWebSocket(conn, s.config)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("WebSocket upgrade failed: %w", err)
-		}
-		conn = wsConn
+	transportConn, err := upgradeTransportConn(ctx, conn, s.config)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
 	}
+	conn = transportConn
 
 	// Create VMess client using sing-vmess library
 	security := s.config.Security
@@ -701,12 +853,375 @@ func (s *SingboxOutbound) dialVMessUDP(ctx context.Context, serverAddr, dest M.S
 	}, nil
 }
 
+func parseALPNList(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		result = append(result, part)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func ensureALPNFirst(alpn []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return alpn
+	}
+	if len(alpn) == 0 {
+		return []string{value}
+	}
+	result := make([]string, 0, len(alpn)+1)
+	result = append(result, value)
+	for _, item := range alpn {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" || strings.EqualFold(trimmed, value) {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func effectiveTLSALPN(cfg *config.ProxyOutbound) []string {
+	if cfg == nil {
+		return nil
+	}
+	alpn := parseALPNList(cfg.ALPN)
+	if normalizeTransportNetwork(cfg.Network) == "grpc" {
+		return ensureALPNFirst(alpn, "h2")
+	}
+	if len(alpn) > 0 {
+		return alpn
+	}
+	if cfg.Type == config.ProtocolTrojan {
+		return []string{"h2", "http/1.1"}
+	}
+	return nil
+}
+
+func normalizeTransportNetwork(network string) string {
+	return strings.ToLower(strings.TrimSpace(network))
+}
+
+// transportHandlesOwnTLS returns true for transports that manage their own
+// TLS/Reality handshake internally (e.g. xhttp via xray-core splithttp.Dial).
+// Callers must skip the outer TLS/Reality when this returns true.
+func transportHandlesOwnTLS(cfg *config.ProxyOutbound) bool {
+	if cfg == nil {
+		return false
+	}
+	return normalizeTransportNetwork(cfg.Network) == "xhttp"
+}
+
+func ensureImplementedTransport(cfg *config.ProxyOutbound, operation string) error {
+	if cfg == nil {
+		return nil
+	}
+
+	switch normalizeTransportNetwork(cfg.Network) {
+	case "", "tcp", "ws", "grpc", "httpupgrade", "http-upgrade", "xhttp":
+		return nil
+	default:
+		return fmt.Errorf("%s transport %q is not supported for %s in current outbound client", cfg.Type, strings.TrimSpace(cfg.Network), operation)
+	}
+}
+
+func grpcServiceAndTunNames(cfg *config.ProxyOutbound) (string, string, error) {
+	serviceName := "gun"
+	if cfg != nil && strings.TrimSpace(cfg.GRPCServiceName) != "" {
+		serviceName = strings.TrimSpace(cfg.GRPCServiceName)
+	}
+	if serviceName == "" {
+		return "", "", errors.New("grpc service name cannot be empty")
+	}
+	if !strings.HasPrefix(serviceName, "/") {
+		return serviceName, "Tun", nil
+	}
+
+	trimmed := strings.TrimPrefix(serviceName, "/")
+	parts := strings.Split(trimmed, "/")
+	if len(parts) < 2 {
+		return "", "", fmt.Errorf("invalid grpc service name: %q", serviceName)
+	}
+	tunName := strings.TrimSpace(parts[len(parts)-1])
+	if index := strings.Index(tunName, "|"); index >= 0 {
+		tunName = strings.TrimSpace(tunName[:index])
+	}
+	serviceName = strings.Trim(strings.Join(parts[:len(parts)-1], "/"), "/")
+	if serviceName == "" || tunName == "" {
+		return "", "", fmt.Errorf("invalid grpc service name: %q", trimmed)
+	}
+	return serviceName, tunName, nil
+}
+
+func grpcAuthority(cfg *config.ProxyOutbound) string {
+	if cfg == nil {
+		return ""
+	}
+	if authority := strings.TrimSpace(cfg.GRPCAuthority); authority != "" {
+		return authority
+	}
+	if sni := strings.TrimSpace(cfg.SNI); sni != "" {
+		return sni
+	}
+	return strings.TrimSpace(cfg.Server)
+}
+
+func persistentTransportContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}
+
+func upgradeToGRPC(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	serviceName, tunName, err := grpcServiceAndTunNames(cfg)
+	if err != nil {
+		return nil, err
+	}
+	authority := grpcAuthority(cfg)
+	options := []grpc.DialOption{
+		grpc.WithBlock(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(_ context.Context, _ string) (net.Conn, error) {
+			return conn, nil
+		}),
+	}
+	if authority != "" {
+		options = append(options, grpc.WithAuthority(authority))
+	}
+
+	target := "passthrough:///grpc"
+	if authority != "" {
+		target = "passthrough:///" + authority
+	}
+	clientConn, err := grpc.DialContext(ctx, target, options...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create grpc client: %w", err)
+	}
+	client, ok := xraygrpc.NewGRPCServiceClient(clientConn).(xraygrpc.GRPCServiceClientX)
+	if !ok {
+		clientConn.Close()
+		return nil, errors.New("failed to create grpc tunnel client")
+	}
+	streamCtx, cancel := context.WithCancel(persistentTransportContext(ctx))
+	stream, err := client.TunCustomName(streamCtx, serviceName, tunName)
+	if err != nil {
+		clientConn.Close()
+		cancel()
+		return nil, fmt.Errorf("failed to open grpc tunnel: %w", err)
+	}
+	logger.Debug("gRPC: tunnel established service=%s tun=%s authority=%s", serviceName, tunName, authority)
+	return &grpcTunnelConn{
+		Conn:       xraygrpc.NewHunkConn(stream, cancel),
+		clientConn: clientConn,
+	}, nil
+}
+
+func upgradeToHTTPUpgrade(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	keyBytes := make([]byte, 16)
+	if _, err := crand.Read(keyBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate HTTPUpgrade key: %w", err)
+	}
+	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
+
+	path := cfg.WSPath
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	host := cfg.WSHost
+	if host == "" {
+		host = cfg.Server
+		if cfg.Port != 80 && cfg.Port != 443 {
+			host = fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
+		}
+	}
+
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Connection: upgrade\r\n"+
+		"Sec-Websocket-Key: %s\r\n"+
+		"Sec-Websocket-Version: 13\r\n"+
+		"Upgrade: websocket\r\n"+
+		"\r\n", path, host, wsKey)
+
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, fmt.Errorf("failed to send HTTPUpgrade request: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read HTTPUpgrade response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("HTTPUpgrade failed: status %d", resp.StatusCode)
+	}
+
+	logger.Debug("HTTPUpgrade: upgrade successful to %s%s", host, path)
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+func decodeRealityPublicKeyValue(value string) ([]byte, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(value)
+}
+
+func decodeRealityShortIDValue(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	// Mirror xray-core's config loader: short ids are stored in a fixed
+	// 8-byte buffer and hex-decoded into it, so shorter values are zero-padded.
+	decoded := make([]byte, 8)
+	if value == "" {
+		return decoded, nil
+	}
+	if _, err := hex.Decode(decoded, []byte(value)); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+func xhttpRequestHost(cfg *config.ProxyOutbound) string {
+	if cfg == nil {
+		return ""
+	}
+	if host := strings.TrimSpace(cfg.WSHost); host != "" {
+		return host
+	}
+	if sni := strings.TrimSpace(cfg.SNI); sni != "" {
+		return sni
+	}
+	return strings.TrimSpace(cfg.Server)
+}
+
+func buildXHTTPStreamSettings(cfg *config.ProxyOutbound) (*xrayinternet.MemoryStreamConfig, error) {
+	if cfg == nil {
+		return nil, errors.New("xhttp config is nil")
+	}
+
+	streamSettings := &xrayinternet.MemoryStreamConfig{
+		ProtocolName: "splithttp",
+		ProtocolSettings: &xraysplithttp.Config{
+			Host: xhttpRequestHost(cfg),
+			Path: strings.TrimSpace(cfg.WSPath),
+			Mode: strings.TrimSpace(cfg.XHTTPMode),
+		},
+	}
+
+	if cfg.Reality {
+		publicKey, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode reality public key: %w", err)
+		}
+		if len(publicKey) != 32 {
+			return nil, fmt.Errorf("invalid reality public key length: %d (expected 32)", len(publicKey))
+		}
+		shortID, err := decodeRealityShortIDValue(cfg.RealityShortID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode reality short id: %w", err)
+		}
+		fingerprint := strings.TrimSpace(cfg.Fingerprint)
+		if fingerprint == "" {
+			fingerprint = "chrome"
+		}
+		serverName := strings.TrimSpace(cfg.SNI)
+		if serverName == "" {
+			serverName = strings.TrimSpace(cfg.Server)
+		}
+		streamSettings.SecurityType = "reality"
+		streamSettings.SecuritySettings = &xrayreality.Config{
+			Fingerprint: fingerprint,
+			ServerName:  serverName,
+			PublicKey:   publicKey,
+			ShortId:     shortID,
+		}
+		return streamSettings, nil
+	}
+
+	if cfg.TLS {
+		serverName := strings.TrimSpace(cfg.SNI)
+		if serverName == "" {
+			serverName = strings.TrimSpace(cfg.Server)
+		}
+		tlsSettings := &xraytls.Config{
+			AllowInsecure: cfg.Insecure,
+			ServerName:    serverName,
+			Fingerprint:   strings.TrimSpace(cfg.Fingerprint),
+		}
+		if alpn := parseALPNList(cfg.ALPN); len(alpn) > 0 {
+			tlsSettings.NextProtocol = alpn
+		}
+		streamSettings.SecurityType = "tls"
+		streamSettings.SecuritySettings = tlsSettings
+	}
+
+	return streamSettings, nil
+}
+
+func upgradeToXHTTP(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	if conn != nil {
+		_ = conn.Close()
+	}
+	streamSettings, err := buildXHTTPStreamSettings(cfg)
+	if err != nil {
+		return nil, err
+	}
+	resolvedAddr, err := ResolveOutboundServerAddress(ctx, cfg.Server, cfg.Port)
+	if err != nil {
+		return nil, err
+	}
+	dest, err := xraynet.ParseDestination("tcp:" + resolvedAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build xhttp destination: %w", err)
+	}
+	logger.Debug("XHTTP: dialing %s via host=%s path=%s mode=%s", dest.String(), xhttpRequestHost(cfg), strings.TrimSpace(cfg.WSPath), strings.TrimSpace(cfg.XHTTPMode))
+	return xraysplithttp.Dial(ctx, dest, streamSettings)
+}
+
+func upgradeTransportConn(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	switch normalizeTransportNetwork(cfg.Network) {
+	case "", "tcp":
+		return conn, nil
+	case "ws":
+		return upgradeToWebSocket(conn, cfg)
+	case "grpc":
+		return upgradeToGRPC(ctx, conn, cfg)
+	case "httpupgrade", "http-upgrade":
+		return upgradeToHTTPUpgrade(conn, cfg)
+	case "xhttp":
+		return upgradeToXHTTP(ctx, conn, cfg)
+	default:
+		return nil, fmt.Errorf("unsupported transport %q", cfg.Network)
+	}
+}
+
 // dialTLSWithFingerprint establishes a TLS connection with optional uTLS fingerprint support.
 func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
 	sni := cfg.SNI
 	if sni == "" {
 		sni = cfg.Server
 	}
+	alpn := effectiveTLSALPN(cfg)
 
 	// If fingerprint is specified, use uTLS for better compatibility
 	if cfg.Fingerprint != "" {
@@ -714,6 +1229,8 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 		utlsConfig := &utls.Config{
 			ServerName:         sni,
 			InsecureSkipVerify: cfg.Insecure,
+			NextProtos:         alpn,
+			ClientSessionCache: globalUTLSSessionCache,
 		}
 		utlsConn := utls.UClient(conn, utlsConfig, fingerprint)
 		if err := utlsConn.HandshakeContext(ctx); err != nil {
@@ -723,10 +1240,12 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 		return utlsConn, nil
 	}
 
-	// Standard TLS
+	// Standard TLS with session resumption
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: cfg.Insecure,
+		NextProtos:         alpn,
+		ClientSessionCache: globalTLSSessionCache,
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, err
@@ -737,6 +1256,10 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 
 // dialTrojanUDP creates a UDP connection through Trojan.
 func (s *SingboxOutbound) dialTrojanUDP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.PacketConn, error) {
+	if err := ensureImplementedTransport(s.config, "UDP"); err != nil {
+		return nil, err
+	}
+
 	// Trojan UDP uses TCP connection, optionally with TLS
 	conn, err := s.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
@@ -750,8 +1273,8 @@ func (s *SingboxOutbound) dialTrojanUDP(ctx context.Context, serverAddr, dest M.
 
 	var finalConn net.Conn = conn
 
-	// Apply TLS only if enabled (security != none)
-	if s.config.TLS {
+	// Apply TLS only if enabled — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(s.config) && s.config.TLS {
 		tlsConn, err := dialTLSWithFingerprint(ctx, conn, s.config)
 		if err != nil {
 			conn.Close()
@@ -759,6 +1282,12 @@ func (s *SingboxOutbound) dialTrojanUDP(ctx context.Context, serverAddr, dest M.
 		}
 		finalConn = tlsConn
 	}
+	transportConn, err := upgradeTransportConn(ctx, finalConn, s.config)
+	if err != nil {
+		finalConn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
+	}
+	finalConn = transportConn
 
 	// Send Trojan handshake for UDP
 	if err := writeTrojanHandshake(finalConn, s.config.Password, dest, true); err != nil {
@@ -784,6 +1313,10 @@ func (s *SingboxOutbound) dialAnyTLSUDP(ctx context.Context, _, dest M.Socksaddr
 
 // dialVLESSUDP creates a UDP connection through VLESS using sing-vmess/vless library.
 func (s *SingboxOutbound) dialVLESSUDP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.PacketConn, error) {
+	if err := ensureImplementedTransport(s.config, "UDP"); err != nil {
+		return nil, err
+	}
+
 	// VLESS UDP uses TCP connection
 	conn, err := s.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
@@ -798,32 +1331,40 @@ func (s *SingboxOutbound) dialVLESSUDP(ctx context.Context, serverAddr, dest M.S
 	// Determine if we're using Vision flow
 	isVisionFlow := strings.Contains(strings.ToLower(s.config.Flow), "vision")
 
-	// Apply TLS/Reality
-	if s.config.Reality {
-		realityConn, err := dialRealityTLS(ctx, conn, s.config)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("Reality handshake failed: %w", err)
-		}
-		conn = realityConn
-	} else if s.config.TLS {
-		// For Vision flow, we need to use uTLS with specific handling
-		if isVisionFlow && s.config.Fingerprint != "" {
-			tlsConn, err := dialVisionTLS(ctx, conn, s.config)
+	// Apply TLS/Reality — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(s.config) {
+		if s.config.Reality {
+			realityConn, err := dialRealityTLS(ctx, conn, s.config)
 			if err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("Vision TLS handshake failed: %w", err)
+				return nil, fmt.Errorf("Reality handshake failed: %w", err)
 			}
-			conn = tlsConn
-		} else {
-			tlsConn, err := dialTLSWithFingerprint(ctx, conn, s.config)
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("TLS handshake failed: %w", err)
+			conn = realityConn
+		} else if s.config.TLS {
+			// For Vision flow, we need to use uTLS with specific handling
+			if isVisionFlow && s.config.Fingerprint != "" {
+				tlsConn, err := dialVisionTLS(ctx, conn, s.config)
+				if err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("Vision TLS handshake failed: %w", err)
+				}
+				conn = tlsConn
+			} else {
+				tlsConn, err := dialTLSWithFingerprint(ctx, conn, s.config)
+				if err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("TLS handshake failed: %w", err)
+				}
+				conn = tlsConn
 			}
-			conn = tlsConn
 		}
 	}
+	transportConn, err := upgradeTransportConn(ctx, conn, s.config)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
+	}
+	conn = transportConn
 
 	// Determine flow to use
 	// For Vision nodes, UDP still needs the Vision flow so that the underlying
@@ -869,7 +1410,8 @@ func dialVisionTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound
 	utlsConfig := &utls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: cfg.Insecure,
-		NextProtos:         []string{"h2", "http/1.1"},
+		NextProtos:         ensureALPNFirst(effectiveTLSALPN(cfg), "h2"),
+		ClientSessionCache: globalUTLSSessionCache,
 	}
 
 	utlsConn := utls.UClient(conn, utlsConfig, fingerprint)
@@ -886,66 +1428,139 @@ func dialVisionTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound
 // Reality embeds authentication data in the TLS ClientHello sessionId field.
 // Based on XTLS/Xray-core Reality client implementation.
 func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
-	// Decode server's public key (base64 URL-safe without padding)
-	publicKeyBytes, err := base64.RawURLEncoding.DecodeString(cfg.RealityPublicKey)
-	if err != nil {
-		// Try standard base64
-		publicKeyBytes, err = base64.RawStdEncoding.DecodeString(cfg.RealityPublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode reality public key: %w", err)
+	primaryFingerprint := strings.TrimSpace(cfg.Fingerprint)
+	if primaryFingerprint == "" {
+		primaryFingerprint = "chrome"
+	}
+	realityConn, err := dialRealityTLSWithFingerprint(ctx, conn, cfg, primaryFingerprint)
+	if err == nil {
+		return realityConn, nil
+	}
+	if shouldRetryRealityWithAlternateFingerprint(primaryFingerprint, err) {
+		_ = conn.Close()
+		for _, altFingerprint := range realityAlternateFingerprints(primaryFingerprint) {
+			altRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+			if redialErr != nil {
+				return nil, fmt.Errorf("reality alternate fingerprint %s redial failed after %v: %w", altFingerprint, err, redialErr)
+			}
+			altConn, altErr := dialRealityTLSWithFingerprint(ctx, altRawConn, cfg, altFingerprint)
+			if altErr == nil {
+				logger.Debug("Reality: alternate fingerprint %s succeeded for %s after primary %s failed: %v", altFingerprint, cfg.Server, primaryFingerprint, err)
+				return altConn, nil
+			}
+			_ = altRawConn.Close()
 		}
+	}
+	if !shouldFallbackToLegacyReality(err) {
+		return nil, err
+	}
+	_ = conn.Close()
+	legacyRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+	if redialErr != nil {
+		return nil, fmt.Errorf("xray-core reality client rejected connection (%v) and legacy fallback redial failed: %w", err, redialErr)
+	}
+	legacyConn, legacyErr := dialRealityTLSLegacy(ctx, legacyRawConn, cfg)
+	if legacyErr != nil {
+		_ = legacyRawConn.Close()
+		return nil, fmt.Errorf("xray-core reality client rejected connection (%v); legacy fallback failed: %w", err, legacyErr)
+	}
+	logger.Debug("Reality: legacy metacubex fallback succeeded for %s after xray-core rejection: %v", cfg.Server, err)
+	return legacyConn, nil
+}
+
+func dialRealityTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprint string) (net.Conn, error) {
+	publicKey, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode reality public key: %w", err)
+	}
+	if len(publicKey) != 32 {
+		return nil, fmt.Errorf("invalid reality public key length: %d (expected 32)", len(publicKey))
+	}
+	shortID, err := decodeRealityShortIDValue(cfg.RealityShortID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode reality short id: %w", err)
+	}
+	serverName := strings.TrimSpace(cfg.SNI)
+	if serverName == "" {
+		serverName = strings.TrimSpace(cfg.Server)
+	}
+	dest := xraynet.TCPDestination(xraynet.ParseAddress(strings.TrimSpace(cfg.Server)), xraynet.Port(cfg.Port))
+	realityConn, err := xrayreality.UClient(conn, &xrayreality.Config{
+		Fingerprint: fingerprint,
+		ServerName:  serverName,
+		PublicKey:   publicKey,
+		ShortId:     shortID,
+		SpiderX:     "/",
+		SpiderY:     make([]int64, 10),
+	}, ctx, dest)
+	if err != nil {
+		return nil, err
+	}
+	logger.Debug("Reality: connected via xray-core client to %s, fingerprint=%s, shortId=%s", serverName, fingerprint, cfg.RealityShortID)
+	return realityConn, nil
+}
+
+func shouldFallbackToLegacyReality(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "processed invalid connection") ||
+		strings.Contains(errText, "non-reality certificate") ||
+		strings.Contains(errText, "invalid certificate signature")
+}
+
+func shouldRetryRealityWithAlternateFingerprint(primaryFingerprint string, err error) bool {
+	return strings.EqualFold(strings.TrimSpace(primaryFingerprint), "chrome") && shouldFallbackToLegacyReality(err)
+}
+
+func realityAlternateFingerprints(primaryFingerprint string) []string {
+	candidates := []string{"edge", "firefox", "ios"}
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if strings.EqualFold(candidate, primaryFingerprint) {
+			continue
+		}
+		result = append(result, candidate)
+	}
+	return result
+}
+
+func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	publicKeyBytes, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode reality public key: %w", err)
 	}
 	if len(publicKeyBytes) != 32 {
 		return nil, fmt.Errorf("invalid reality public key length: %d (expected 32)", len(publicKeyBytes))
 	}
-
-	// Decode short ID (hex string, optional)
-	var shortID []byte
-	if cfg.RealityShortID != "" {
-		shortID, err = hex.DecodeString(cfg.RealityShortID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode reality short id: %w", err)
-		}
-		// Xray allows 0..16 hex chars (i.e. 0..8 bytes), keep it lenient but bounded.
-		if len(shortID) > 16 {
-			return nil, fmt.Errorf("invalid reality short id length: %d bytes (max 16)", len(shortID))
-		}
+	shortID, err := decodeRealityShortIDValue(cfg.RealityShortID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode reality short id: %w", err)
 	}
 
-	// Get SNI
 	sni := cfg.SNI
 	if sni == "" {
 		sni = cfg.Server
 	}
-
-	// Get fingerprint
 	fingerprint := getUTLSFingerprint(cfg.Fingerprint)
-
-	// Create uTLS config
 	utlsConfig := &utls.Config{
 		ServerName:             sni,
-		InsecureSkipVerify:     true, // Reality doesn't verify server cert
+		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
 	}
-
 	utlsConn := utls.UClient(conn, utlsConfig, fingerprint)
-
-	// Build handshake state first so we can access ClientHello fields & TLS 1.3 keyshare.
 	if err := utlsConn.BuildHandshakeState(); err != nil {
 		return nil, fmt.Errorf("failed to build handshake state: %w", err)
 	}
 
 	hello := utlsConn.HandshakeState.Hello
-
-	// Construct plaintext session ID (first 16 bytes are authenticated & encrypted).
 	hello.SessionId = make([]byte, 32)
 	if len(hello.Raw) < 39+len(hello.SessionId) {
 		return nil, fmt.Errorf("unexpected client hello length: %d", len(hello.Raw))
 	}
-	copy(hello.Raw[39:], hello.SessionId) // fixed SessionId location in ClientHello
+	copy(hello.Raw[39:], hello.SessionId)
 
-	// Version bytes are used for optional server-side min/max client version checks.
-	// Use a plausible Xray-like version to maximize compatibility.
 	const (
 		realityVersionX = 1
 		realityVersionY = 8
@@ -954,18 +1569,14 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 	hello.SessionId[0] = realityVersionX
 	hello.SessionId[1] = realityVersionY
 	hello.SessionId[2] = realityVersionZ
-	hello.SessionId[3] = 0 // reserved
+	hello.SessionId[3] = 0
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
-	if len(shortID) > 0 {
-		copy(hello.SessionId[8:], shortID)
-	}
+	copy(hello.SessionId[8:], shortID)
 
-	// Compute auth key based on TLS 1.3 ECDHE keyshare and server's public key.
 	publicKey, err := ecdh.X25519().NewPublicKey(publicKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse reality public key: %w", err)
 	}
-
 	ecdhe := utlsConn.HandshakeState.State13.KeyShareKeys.Ecdhe
 	if ecdhe == nil {
 		ecdhe = utlsConn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe
@@ -973,7 +1584,6 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 	if ecdhe == nil {
 		return nil, errors.New("current fingerprint does not support TLS 1.3, reality handshake cannot establish")
 	}
-
 	authKey, err := ecdhe.ECDH(publicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute reality shared key: %w", err)
@@ -981,13 +1591,9 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 	if len(authKey) == 0 {
 		return nil, errors.New("failed to compute reality shared key")
 	}
-
-	// HKDF(authKey, hello.Random[:20], "REALITY") -> authKey (in place)
 	if _, err := io.ReadFull(hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")), authKey); err != nil {
 		return nil, fmt.Errorf("failed to derive reality auth key: %w", err)
 	}
-
-	// Encrypt first 16 bytes of plaintext session ID into 32-byte ciphertext.
 	block, err := aes.NewCipher(authKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reality cipher: %w", err)
@@ -1008,31 +1614,27 @@ func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutboun
 	copy(hello.SessionId, sealed)
 	copy(hello.Raw[39:], hello.SessionId)
 
-	// Perform TLS handshake.
 	if err := utlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("Reality TLS handshake failed: %w", err)
 	}
-
-	// Verify REALITY "temporary trusted certificate" signature.
 	state := utlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		utlsConn.Close()
+		_ = utlsConn.Close()
 		return nil, errors.New("reality: no peer certificates")
 	}
 	peerCert := state.PeerCertificates[0]
 	pubKey, ok := peerCert.PublicKey.(ed25519.PublicKey)
 	if !ok {
-		utlsConn.Close()
+		_ = utlsConn.Close()
 		return nil, errors.New("reality: server returned non-reality certificate (check pbk/sid/sni/fp)")
 	}
 	h := hmac.New(sha512.New, authKey)
 	h.Write(pubKey)
 	if !bytes.Equal(h.Sum(nil), peerCert.Signature) {
-		utlsConn.Close()
+		_ = utlsConn.Close()
 		return nil, errors.New("reality: invalid certificate signature (check pbk/sid/sni/fp)")
 	}
-
-	logger.Debug("Reality: verified certificate for %s, fingerprint=%s, shortId=%s", sni, cfg.Fingerprint, cfg.RealityShortID)
+	logger.Debug("Reality: legacy metacubex verification passed for %s, fingerprint=%s, shortId=%s", sni, cfg.Fingerprint, cfg.RealityShortID)
 	return utlsConn, nil
 }
 
@@ -1982,14 +2584,18 @@ func (d *SingboxDialer) dialShadowsocksTCP(ctx context.Context, serverAddr, dest
 
 // dialVMessTCP creates a TCP connection through VMess using sing-vmess library.
 func (d *SingboxDialer) dialVMessTCP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.Conn, error) {
+	if err := ensureImplementedTransport(d.config, "TCP"); err != nil {
+		return nil, err
+	}
+
 	// Create TCP connection to server
 	conn, err := d.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TCP connection: %w", err)
 	}
 
-	// Apply TLS if configured
-	if d.config.TLS {
+	// Apply TLS if configured — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(d.config) && d.config.TLS {
 		tlsConn, err := dialTLSWithFingerprint(ctx, conn, d.config)
 		if err != nil {
 			conn.Close()
@@ -1998,15 +2604,12 @@ func (d *SingboxDialer) dialVMessTCP(ctx context.Context, serverAddr, dest M.Soc
 		conn = tlsConn
 	}
 
-	// Apply WebSocket transport if configured
-	if d.config.Network == "ws" {
-		wsConn, err := upgradeToWebSocket(conn, d.config)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("WebSocket upgrade failed: %w", err)
-		}
-		conn = wsConn
+	transportConn, err := upgradeTransportConn(ctx, conn, d.config)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
 	}
+	conn = transportConn
 
 	// Create VMess client
 	security := d.config.Security
@@ -2025,6 +2628,10 @@ func (d *SingboxDialer) dialVMessTCP(ctx context.Context, serverAddr, dest M.Soc
 
 // dialTrojanTCP creates a TCP connection through Trojan.
 func (d *SingboxDialer) dialTrojanTCP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.Conn, error) {
+	if err := ensureImplementedTransport(d.config, "TCP"); err != nil {
+		return nil, err
+	}
+
 	// Create TCP connection to server
 	conn, err := d.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
@@ -2033,8 +2640,8 @@ func (d *SingboxDialer) dialTrojanTCP(ctx context.Context, serverAddr, dest M.So
 
 	var finalConn net.Conn = conn
 
-	// Apply TLS only if enabled (security != none)
-	if d.config.TLS {
+	// Apply TLS only if enabled — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(d.config) && d.config.TLS {
 		tlsConn, err := dialTLSWithFingerprint(ctx, conn, d.config)
 		if err != nil {
 			conn.Close()
@@ -2042,6 +2649,12 @@ func (d *SingboxDialer) dialTrojanTCP(ctx context.Context, serverAddr, dest M.So
 		}
 		finalConn = tlsConn
 	}
+	transportConn, err := upgradeTransportConn(ctx, finalConn, d.config)
+	if err != nil {
+		finalConn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
+	}
+	finalConn = transportConn
 
 	// Send Trojan handshake for TCP
 	if err := writeTrojanHandshake(finalConn, d.config.Password, dest, false); err != nil {
@@ -2054,6 +2667,10 @@ func (d *SingboxDialer) dialTrojanTCP(ctx context.Context, serverAddr, dest M.So
 
 // dialVLESSTCP creates a TCP connection through VLESS using sing-vmess/vless library.
 func (d *SingboxDialer) dialVLESSTCP(ctx context.Context, serverAddr, dest M.Socksaddr) (net.Conn, error) {
+	if err := ensureImplementedTransport(d.config, "TCP"); err != nil {
+		return nil, err
+	}
+
 	// Create TCP connection to server
 	conn, err := d.dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
@@ -2063,32 +2680,40 @@ func (d *SingboxDialer) dialVLESSTCP(ctx context.Context, serverAddr, dest M.Soc
 	// Determine if we're using Vision flow
 	isVisionFlow := strings.Contains(strings.ToLower(d.config.Flow), "vision")
 
-	// Apply TLS/Reality
-	if d.config.Reality {
-		realityConn, err := dialRealityTLS(ctx, conn, d.config)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("Reality handshake failed: %w", err)
-		}
-		conn = realityConn
-	} else if d.config.TLS {
-		// For Vision flow, use special TLS handling
-		if isVisionFlow && d.config.Fingerprint != "" {
-			tlsConn, err := dialVisionTLS(ctx, conn, d.config)
+	// Apply TLS/Reality — skip for transports that handle their own TLS (e.g. xhttp)
+	if !transportHandlesOwnTLS(d.config) {
+		if d.config.Reality {
+			realityConn, err := dialRealityTLS(ctx, conn, d.config)
 			if err != nil {
 				conn.Close()
-				return nil, fmt.Errorf("Vision TLS handshake failed: %w", err)
+				return nil, fmt.Errorf("Reality handshake failed: %w", err)
 			}
-			conn = tlsConn
-		} else {
-			tlsConn, err := dialTLSWithFingerprint(ctx, conn, d.config)
-			if err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("TLS handshake failed: %w", err)
+			conn = realityConn
+		} else if d.config.TLS {
+			// For Vision flow, use special TLS handling
+			if isVisionFlow && d.config.Fingerprint != "" {
+				tlsConn, err := dialVisionTLS(ctx, conn, d.config)
+				if err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("Vision TLS handshake failed: %w", err)
+				}
+				conn = tlsConn
+			} else {
+				tlsConn, err := dialTLSWithFingerprint(ctx, conn, d.config)
+				if err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("TLS handshake failed: %w", err)
+				}
+				conn = tlsConn
 			}
-			conn = tlsConn
 		}
 	}
+	transportConn, err := upgradeTransportConn(ctx, conn, d.config)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("transport setup failed: %w", err)
+	}
+	conn = transportConn
 
 	// Determine flow to use
 	// For TCP with Vision (including Reality+Vision), pass the flow to the client.
@@ -2390,6 +3015,35 @@ func upgradeToWebSocket(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, err
 	}, nil
 }
 
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type grpcTunnelConn struct {
+	net.Conn
+	clientConn *grpc.ClientConn
+}
+
+func (c *grpcTunnelConn) Close() error {
+	var err error
+	if c.Conn != nil {
+		err = c.Conn.Close()
+	}
+	if c.clientConn != nil {
+		if closeErr := c.clientConn.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+const maxWebSocketFramePayload = 16 * 1024 * 1024
+
 // wsConn wraps a net.Conn with WebSocket framing.
 type wsConn struct {
 	net.Conn
@@ -2436,6 +3090,9 @@ func (c *wsConn) Read(p []byte) (n int, err error) {
 			return 0, err
 		}
 		payloadLen = int(binary.BigEndian.Uint64(extLen))
+	}
+	if payloadLen > maxWebSocketFramePayload {
+		return 0, fmt.Errorf("websocket frame too large: %d", payloadLen)
 	}
 
 	// Read masking key if present

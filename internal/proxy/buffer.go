@@ -6,9 +6,9 @@ import (
 )
 
 // DefaultBufferSize is the default size for UDP packet buffers.
-// MCBE packets can be up to 1400 bytes typically, but we use a larger buffer
-// to handle potential fragmentation and larger packets.
-const DefaultBufferSize = 2048
+// Keep it aligned with the larger MCBE/RakNet packet paths so listeners don't
+// truncate packets that are valid elsewhere in the proxy stack.
+const DefaultBufferSize = 8192
 
 // MaxBufferSize is the maximum allowed buffer size.
 const MaxBufferSize = 65535

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"mcpeserverproxy/internal/proxy"
+	"mcpeserverproxy/internal/config"
 )
 
 const defaultMCBEUDPTestAddress = "mco.cubecraft.net:19132"
@@ -29,14 +29,13 @@ func (h *ProxyOutboundHandler) TestTCP(name string) error {
 	err := h.outboundMgr.CheckHealth(ctx, name)
 	latency := time.Since(startTime).Milliseconds()
 
-	if outbound, ok := h.configMgr.GetOutbound(name); ok {
+	h.updateOutboundRuntime(name, func(outbound *config.ProxyOutbound) {
 		if err == nil {
-			outbound.TCPLatencyMs = latency
+			outbound.SetTCPLatencyMs(latency)
 		} else {
-			outbound.TCPLatencyMs = 0
+			outbound.SetTCPLatencyMs(0)
 		}
-		_ = h.configMgr.UpdateOutbound(name, outbound)
-	}
+	})
 
 	return err
 }
@@ -52,23 +51,24 @@ func (h *ProxyOutboundHandler) TestHTTP(name string) error {
 		return fmt.Errorf("proxy outbound not found: %s", name)
 	}
 
-	dialer, err := proxy.CreateSingboxDialer(cfg)
+	dialer, err := h.singboxFactory.CreateDialer(context.Background(), cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy dialer: %w", err)
 	}
 	defer dialer.Close()
 
 	target := DefaultHTTPTestTargets[0]
-	httpResult := h.testHTTPThroughProxy(dialer, target)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	httpResult := h.testHTTPThroughProxy(ctx, cfg, dialer, target)
 
-	if outbound, ok := h.configMgr.GetOutbound(name); ok {
+	h.updateOutboundRuntime(name, func(outbound *config.ProxyOutbound) {
 		if httpResult.Success {
 			outbound.SetHTTPLatencyMs(httpResult.LatencyMs)
 		} else {
 			outbound.SetHTTPLatencyMs(0)
 		}
-		_ = h.configMgr.UpdateOutbound(name, outbound)
-	}
+	})
 
 	if httpResult.Success {
 		return nil
@@ -90,19 +90,20 @@ func (h *ProxyOutboundHandler) TestUDP(name string) error {
 		return fmt.Errorf("proxy outbound not found: %s", name)
 	}
 
-	result := h.testMCBEServer(cfg, defaultMCBEUDPTestAddress)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	result := h.testMCBEServer(ctx, cfg, defaultMCBEUDPTestAddress)
 	available := result.Success
 
-	if outbound, ok := h.configMgr.GetOutbound(name); ok {
+	h.updateOutboundRuntime(name, func(outbound *config.ProxyOutbound) {
 		udp := available
 		outbound.SetUDPAvailable(&udp)
 		if result.Success {
-			outbound.UDPLatencyMs = result.LatencyMs
+			outbound.SetUDPLatencyMs(result.LatencyMs)
 		} else {
-			outbound.UDPLatencyMs = 0
+			outbound.SetUDPLatencyMs(0)
 		}
-		_ = h.configMgr.UpdateOutbound(name, outbound)
-	}
+	})
 
 	if result.Success {
 		return nil

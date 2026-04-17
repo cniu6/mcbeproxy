@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +33,33 @@ type UDPListener struct {
 	cachedPongMu    sync.RWMutex
 	lastPongTime    time.Time
 	lastPongLatency int64 // milliseconds
+	pingInFlight    atomic.Bool
 	closed          atomic.Bool
+}
+
+type listenerPacketJob struct {
+	data       []byte
+	clientAddr *net.UDPAddr
+	buf        *[]byte
+}
+
+func defaultUDPListenerWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 4 {
+		workers = 4
+	}
+	workerCount := workers * 8
+	if workerCount < 32 {
+		workerCount = 32
+	}
+	if workerCount > 128 {
+		workerCount = 128
+	}
+	return workerCount
+}
+
+func defaultUDPListenerQueueSize() int {
+	return defaultUDPListenerWorkerCount() * 4
 }
 
 // NewUDPListener creates a new UDP listener for the specified server configuration.
@@ -51,13 +78,13 @@ func NewUDPListener(
 	)
 
 	return &UDPListener{
-		serverID:      serverID,
-		config:        cfg,
-		bufferPool:    bufferPool,
-		sessionMgr:    sessionMgr,
-		forwarder:     forwarder,
-		configMgr:     configMgr,
-		raknetHandler: raknetHandler,
+		serverID:        serverID,
+		config:          cfg,
+		bufferPool:      bufferPool,
+		sessionMgr:      sessionMgr,
+		forwarder:       forwarder,
+		configMgr:       configMgr,
+		raknetHandler:   raknetHandler,
 		lastPongLatency: -1,
 	}
 }
@@ -73,6 +100,9 @@ func (l *UDPListener) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", l.config.ListenAddr, err)
 	}
+	if err := configureUDPConnBuffers(conn, l.config.GetUDPSocketBufferSize()); err != nil {
+		logger.Warn("Failed to tune UDP listener socket buffers for %s: %v", l.serverID, err)
+	}
 
 	l.conn = conn
 	l.closed.Store(false)
@@ -87,6 +117,21 @@ func (l *UDPListener) Listen(ctx context.Context) error {
 
 	// Use longer timeout to reduce CPU usage from frequent deadline checks
 	const readTimeout = 500 * time.Millisecond
+	packetJobs := make(chan listenerPacketJob, defaultUDPListenerQueueSize())
+	var workerWG sync.WaitGroup
+	for i := 0; i < defaultUDPListenerWorkerCount(); i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for job := range packetJobs {
+				l.handlePacket(job.data, job.clientAddr, job.buf)
+			}
+		}()
+	}
+	defer func() {
+		close(packetJobs)
+		workerWG.Wait()
+	}()
 
 	for {
 		select {
@@ -124,8 +169,17 @@ func (l *UDPListener) Listen(ctx context.Context) error {
 				}
 			}
 
-			// Process packet in a goroutine to avoid blocking
-			go l.handlePacket((*buf)[:n], clientAddr, buf)
+			job := listenerPacketJob{
+				data:       (*buf)[:n],
+				clientAddr: clientAddr,
+				buf:        buf,
+			}
+			select {
+			case packetJobs <- job:
+			default:
+				// Backpressure instead of unbounded goroutine growth under burst load.
+				l.handlePacket(job.data, job.clientAddr, job.buf)
+			}
 		}
 	}
 }
@@ -170,6 +224,8 @@ func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, buf *[]
 
 	// Get or create session for this client
 	sess, isNew := l.sessionMgr.GetOrCreate(clientAddrStr, l.serverID)
+	sess.LockForward()
+	defer sess.UnlockForward()
 	if isNew {
 		// New session - establish connection to remote server
 		if err := l.setupRemoteConnection(sess, serverCfg); err != nil {
@@ -183,9 +239,6 @@ func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, buf *[]
 		}
 		logger.LogSessionCreated(clientAddrStr, l.serverID)
 	}
-
-	// Update session activity
-	l.sessionMgr.UpdateActivity(clientAddrStr)
 
 	// Forward packet to remote server
 	if err := l.forwarder.ForwardToRemote(sess, data, serverCfg); err != nil {
@@ -225,7 +278,19 @@ func (l *UDPListener) handlePingPacket(data []byte, clientAddr *net.UDPAddr, ser
 		return
 	}
 
-	// Forward ping to remote server asynchronously
+	// Avoid spawning duplicate upstream pings under server-list scanning bursts.
+	if !l.pingInFlight.CompareAndSwap(false, true) {
+		if cachedPong != nil {
+			pongCopy := make([]byte, len(cachedPong))
+			copy(pongCopy, cachedPong)
+			if len(data) >= 9 && len(pongCopy) >= 9 {
+				copy(pongCopy[1:9], data[1:9])
+			}
+			l.conn.WriteToUDP(pongCopy, clientAddr)
+		}
+		return
+	}
+
 	logger.Debug("Forwarding ping to remote server %s", serverCfg.GetTargetAddr())
 	go l.forwardPingAsync(data, clientAddr, serverCfg)
 }
@@ -270,6 +335,7 @@ func (l *UDPListener) buildCustomPongPacket(pingData []byte, motd string) []byte
 
 // forwardPingAsync forwards a ping packet to the remote server asynchronously.
 func (l *UDPListener) forwardPingAsync(data []byte, clientAddr *net.UDPAddr, serverCfg *config.ServerConfig) {
+	defer l.pingInFlight.Store(false)
 	targetAddr := serverCfg.GetTargetAddr()
 
 	// Use go-raknet to ping the server with latency measurement
@@ -308,7 +374,7 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 	targetAddr := serverCfg.GetTargetAddr()
 	logger.Debug("Direct UDP ping to %s", targetAddr)
 
-	remoteAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	remoteAddr, err := resolveUDPAddr(targetAddr)
 	if err != nil {
 		logger.Warn("Failed to resolve %s for ping: %v", targetAddr, err)
 		l.markPingFailure()
@@ -322,6 +388,9 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 		return
 	}
 	defer tempConn.Close()
+	if err := configureUDPConnBuffers(tempConn, serverCfg.GetUDPSocketBufferSize()); err != nil {
+		logger.Debug("Failed to tune direct ping UDP socket buffers for %s: %v", targetAddr, err)
+	}
 
 	tempConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
@@ -439,7 +508,7 @@ func (l *UDPListener) sendDisabledServerResponse(clientAddr *net.UDPAddr, messag
 // setupRemoteConnection establishes a UDP connection to the remote server.
 func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.ServerConfig) error {
 	targetAddr := cfg.GetTargetAddr()
-	remoteAddr, err := net.ResolveUDPAddr("udp", targetAddr)
+	remoteAddr, err := resolveUDPAddr(targetAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve remote address %s: %w", targetAddr, err)
 	}
@@ -447,6 +516,9 @@ func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.S
 	remoteConn, err := net.DialUDP("udp", nil, remoteAddr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to remote %s: %w", targetAddr, err)
+	}
+	if err := configureUDPConnBuffers(remoteConn, cfg.GetUDPSocketBufferSize()); err != nil {
+		logger.Debug("Failed to tune remote UDP socket buffers for %s: %v", targetAddr, err)
 	}
 
 	sess.RemoteConn = remoteConn
@@ -463,6 +535,11 @@ func (l *UDPListener) receiveFromRemote(sess *session.Session) {
 	bufPtr := l.bufferPool.Get()
 	buf := *bufPtr
 	defer l.bufferPool.Put(bufPtr)
+	clientAddr, err := net.ResolveUDPAddr("udp", sess.ClientAddr)
+	if err != nil {
+		logger.Warn("Failed to resolve client address %s: %v", sess.ClientAddr, err)
+		return
+	}
 
 	logger.Debug("Started receiving from remote for client %s", sess.ClientAddr)
 
@@ -504,13 +581,6 @@ func (l *UDPListener) receiveFromRemote(sess *session.Session) {
 			} else if packetID == 0x08 && n >= 21 { // OpenConnectionReply2
 				logger.Info("Connection established: client=%s", sess.ClientAddr)
 			}
-		}
-
-		// Parse client address
-		clientAddr, err := net.ResolveUDPAddr("udp", sess.ClientAddr)
-		if err != nil {
-			logger.Warn("Failed to resolve client address %s: %v", sess.ClientAddr, err)
-			continue
 		}
 
 		// Forward packet to client

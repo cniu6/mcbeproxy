@@ -285,6 +285,139 @@ func TestProperty13_JSONSerializationRoundTrip(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+func TestProxyOutboundValidate_GrpcTransportRequiresServiceName(t *testing.T) {
+	proxy := &ProxyOutbound{
+		Name:    "grpc-vless",
+		Type:    ProtocolVLESS,
+		Server:  "example.com",
+		Port:    443,
+		UUID:    "123e4567-e89b-12d3-a456-426614174000",
+		TLS:     true,
+		Network: "grpc",
+	}
+	err := proxy.Validate()
+	if err == nil || !strings.Contains(err.Error(), "grpc_service_name") {
+		t.Fatalf("expected grpc_service_name validation error, got: %v", err)
+	}
+}
+
+func TestProxyOutboundValidate_GrpcTransportAcceptsServiceName(t *testing.T) {
+	proxy := &ProxyOutbound{
+		Name:            "grpc-vless",
+		Type:            ProtocolVLESS,
+		Server:          "example.com",
+		Port:            443,
+		UUID:            "123e4567-e89b-12d3-a456-426614174000",
+		TLS:             true,
+		Network:         "grpc",
+		GRPCServiceName: "gun",
+	}
+	if err := proxy.Validate(); err != nil {
+		t.Fatalf("expected valid grpc proxy outbound, got: %v", err)
+	}
+}
+
+func TestProxyOutboundValidate_HTTPUpgradeTransportAccepted(t *testing.T) {
+	proxy := &ProxyOutbound{
+		Name:    "httpupgrade-vless",
+		Type:    ProtocolVLESS,
+		Server:  "example.com",
+		Port:    443,
+		UUID:    "123e4567-e89b-12d3-a456-426614174000",
+		TLS:     true,
+		Network: "httpupgrade",
+		WSPath:  "/upgrade",
+		WSHost:  "cdn.example.com",
+	}
+	if err := proxy.Validate(); err != nil {
+		t.Fatalf("expected valid httpupgrade proxy outbound, got: %v", err)
+	}
+}
+
+func TestProxyOutboundValidate_XHTTPTransportAccepted(t *testing.T) {
+	proxy := &ProxyOutbound{
+		Name:      "xhttp-vless",
+		Type:      ProtocolVLESS,
+		Server:    "example.com",
+		Port:      443,
+		UUID:      "123e4567-e89b-12d3-a456-426614174000",
+		TLS:       true,
+		Network:   "xhttp",
+		WSPath:    "/split",
+		WSHost:    "cdn.example.com",
+		XHTTPMode: "auto",
+	}
+	if err := proxy.Validate(); err != nil {
+		t.Fatalf("expected valid xhttp proxy outbound, got: %v", err)
+	}
+}
+
+func TestProxyOutboundJSONRoundTrip_PreservesGRPCAuthority(t *testing.T) {
+	original := &ProxyOutbound{
+		Name:            "grpc-vless",
+		Type:            ProtocolVLESS,
+		Server:          "example.com",
+		Port:            443,
+		UUID:            "123e4567-e89b-12d3-a456-426614174000",
+		TLS:             true,
+		SNI:             "cdn.example.com",
+		Network:         "grpc",
+		GRPCServiceName: "gun",
+		GRPCAuthority:   "grpc.example.com",
+		Enabled:         true,
+	}
+
+	jsonData, err := original.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON failed: %v", err)
+	}
+
+	parsed, err := FromJSON(jsonData)
+	if err != nil {
+		t.Fatalf("FromJSON failed: %v", err)
+	}
+
+	if parsed.GRPCAuthority != original.GRPCAuthority {
+		t.Fatalf("expected grpc authority %q, got %q", original.GRPCAuthority, parsed.GRPCAuthority)
+	}
+	if !original.Equal(parsed) {
+		t.Fatalf("expected round-trip equality, original=%+v parsed=%+v", original, parsed)
+	}
+}
+
+func TestProxyOutboundJSONRoundTrip_PreservesXHTTPMode(t *testing.T) {
+	original := &ProxyOutbound{
+		Name:      "xhttp-vless",
+		Type:      ProtocolVLESS,
+		Server:    "example.com",
+		Port:      443,
+		UUID:      "123e4567-e89b-12d3-a456-426614174000",
+		TLS:       true,
+		Network:   "xhttp",
+		WSPath:    "/split",
+		WSHost:    "cdn.example.com",
+		XHTTPMode: "stream-up",
+		Enabled:   true,
+	}
+
+	jsonData, err := original.ToJSON()
+	if err != nil {
+		t.Fatalf("ToJSON failed: %v", err)
+	}
+
+	parsed, err := FromJSON(jsonData)
+	if err != nil {
+		t.Fatalf("FromJSON failed: %v", err)
+	}
+
+	if parsed.XHTTPMode != original.XHTTPMode {
+		t.Fatalf("expected xhttp mode %q, got %q", original.XHTTPMode, parsed.XHTTPMode)
+	}
+	if !original.Equal(parsed) {
+		t.Fatalf("expected round-trip equality, original=%+v parsed=%+v", original, parsed)
+	}
+}
+
 // **Feature: singbox-outbound-proxy, Property 14: Validation error contains field name**
 // **Validates: Requirements 7.3**
 //
@@ -505,6 +638,27 @@ func TestProperty14_ValidationErrorContainsFieldName(t *testing.T) {
 			}
 			err := p.Validate()
 			return err != nil && strings.Contains(err.Error(), "tls")
+		},
+		genNonEmptyString(),
+		genNonEmptyString(),
+		genNonEmptyString(),
+		genValidPort(),
+	))
+
+	// Test missing reality public key for AnyTLS when Reality is enabled
+	properties.Property("missing AnyTLS reality public key error contains 'reality_public_key'", prop.ForAll(
+		func(name, server, password string, port int) bool {
+			p := &ProxyOutbound{
+				Name:     name,
+				Type:     ProtocolAnyTLS,
+				Server:   server,
+				Port:     port,
+				TLS:      true,
+				Password: password,
+				Reality:  true,
+			}
+			err := p.Validate()
+			return err != nil && strings.Contains(err.Error(), "reality_public_key")
 		},
 		genNonEmptyString(),
 		genNonEmptyString(),
