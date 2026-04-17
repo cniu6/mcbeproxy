@@ -32,7 +32,7 @@ func NewPlainTCPProxy(serverID string, cfg *config.ServerConfig) *PlainTCPProxy 
 	return &PlainTCPProxy{
 		serverID:   serverID,
 		config:     cfg,
-		dialerPool: newProxyPortDialerPool(),
+		dialerPool: newProxyPortDialerPool(nil),
 	}
 }
 
@@ -138,13 +138,7 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 	}
 
 	exclude := make([]string, 0, 4)
-	attempts := 3
-	if p.config.IsMultiNodeSelection() {
-		nodes := p.config.GetNodeList()
-		if len(nodes) > 0 {
-			attempts = len(nodes)
-		}
-	}
+	attempts := proxySelectionAttemptLimit(p.config, p.outboundMgr)
 
 	for i := 0; i < attempts; i++ {
 		selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, p.config.ProxyOutbound, p.config.GetLoadBalance(), p.config.GetLoadBalanceSort(), exclude)

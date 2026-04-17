@@ -14,6 +14,24 @@ import (
 	"mcpeserverproxy/internal/logger"
 )
 
+type outboundPacketConnNoRetryDialer interface {
+	DialPacketConnNoRetry(ctx context.Context, outboundName string, destination string) (net.PacketConn, error)
+}
+
+type proxySelectionConfig interface {
+	IsGroupSelection() bool
+	IsMultiNodeSelection() bool
+	GetNodeList() []string
+	GetGroupName() string
+}
+
+func dialPacketConnForFailover(ctx context.Context, outboundMgr OutboundManager, outboundName string, destination string) (net.PacketConn, error) {
+	if noRetryDialer, ok := outboundMgr.(outboundPacketConnNoRetryDialer); ok {
+		return noRetryDialer.DialPacketConnNoRetry(ctx, outboundName, destination)
+	}
+	return outboundMgr.DialPacketConn(ctx, outboundName, destination)
+}
+
 // ProxyDialer implements a custom dialer that routes connections through OutboundManager.
 // It implements the interface needed by go-raknet's Dialer.UpstreamDialer.
 // Supports load balancing and failover for group selections.
@@ -97,7 +115,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	logger.Debug("ProxyDialer: Dialing %s via proxy outbound %s (network=%s)", address, proxyOutbound, network)
 
 	// Get PacketConn through the outbound manager
-	packetConn, err := d.outboundMgr.DialPacketConn(ctx, proxyOutbound, address)
+	packetConn, packetConnCancel, err := d.dialDetachedPacketConn(ctx, proxyOutbound, address)
 	if err != nil {
 		// Requirements: 2.4 - Fallback to direct connection on error
 		logger.Warn("ProxyDialer: Failed to dial through proxy %s: %v, falling back to direct", proxyOutbound, err)
@@ -119,7 +137,30 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 		PacketConn: packetConn,
 		nodeName:   proxyOutbound,
 		remoteAddr: remoteAddr,
+		cancel:     packetConnCancel,
 	}, nil
+}
+
+func proxySelectionAttemptLimit(cfg proxySelectionConfig, outboundMgr OutboundManager) int {
+	if cfg == nil || outboundMgr == nil {
+		return 1
+	}
+	if cfg.IsMultiNodeSelection() {
+		nodes := cfg.GetNodeList()
+		if len(nodes) > 0 {
+			return len(nodes)
+		}
+	}
+	if cfg.IsGroupSelection() {
+		groupName := cfg.GetGroupName()
+		if groupName != "" {
+			nodes := outboundMgr.GetOutboundsByGroup(groupName)
+			if len(nodes) > 0 {
+				return len(nodes)
+			}
+		}
+	}
+	return 1
 }
 
 // dialWithLoadBalancing handles connection with load balancing and failover support.
@@ -131,8 +172,8 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 	sortBy := d.serverConfig.GetLoadBalanceSort()
 
 	d.mu.Lock()
-	excludedNodes := make([]string, len(d.excludedNodes))
-	copy(excludedNodes, d.excludedNodes)
+	d.excludedNodes = nil
+	excludedNodes := make([]string, 0, 4)
 	d.mu.Unlock()
 
 	// Determine selector type for logging
@@ -176,8 +217,33 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 		nodeName := selectedOutbound.Name
 		logger.Debug("ProxyDialer: Selected node '%s' (from %s %s) for %s", nodeName, selectorType, selectorDisplay, address)
 
+		// "direct" virtual node selected from a multi-node list: use a plain
+		// net.Dialer connection. Failover still applies if the direct dial
+		// itself fails (e.g. target is unreachable from this host).
+		if IsDirectSelection(selectedOutbound) {
+			directDialer := &net.Dialer{Timeout: d.timeout}
+			directConn, directErr := directDialer.DialContext(ctx, network, address)
+			if directErr == nil {
+				d.mu.Lock()
+				d.selectedNode = DirectNodeName
+				d.mu.Unlock()
+				return directConn, nil
+			}
+			excludedNodes = append(excludedNodes, DirectNodeName)
+			d.mu.Lock()
+			d.excludedNodes = excludedNodes
+			d.mu.Unlock()
+			logger.Warn("ProxyDialer: Failover - virtual 'direct' failed: %v, trying next node", directErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+				continue
+			}
+		}
+
 		// Try to connect through the selected node
-		packetConn, err := d.outboundMgr.DialPacketConn(ctx, nodeName, address)
+		packetConn, packetConnCancel, err := d.dialDetachedPacketConn(ctx, nodeName, address)
 		if err != nil {
 			// Connection failed - add to excluded list and try next node
 			// Requirements: 3.1, 3.2 - Automatic failover and logging
@@ -221,7 +287,44 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 			PacketConn: packetConn,
 			nodeName:   nodeName,
 			remoteAddr: remoteAddr,
+			cancel:     packetConnCancel,
 		}, nil
+	}
+}
+
+func (d *ProxyDialer) dialDetachedPacketConn(ctx context.Context, outboundName string, address string) (net.PacketConn, context.CancelFunc, error) {
+	type dialResult struct {
+		conn net.PacketConn
+		err  error
+	}
+
+	packetCtx, packetCancel := context.WithCancel(context.Background())
+	resultCh := make(chan dialResult, 1)
+
+	go func() {
+		conn, err := dialPacketConnForFailover(packetCtx, d.outboundMgr, outboundName, address)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		packetCancel()
+		go func() {
+			result := <-resultCh
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}()
+		return nil, nil, ctx.Err()
+	case result := <-resultCh:
+		if result.err != nil {
+			packetCancel()
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+			return nil, nil, result.err
+		}
+		return result.conn, packetCancel, nil
 	}
 }
 
@@ -244,7 +347,7 @@ func (d *ProxyDialer) shouldUseDirect() bool {
 
 // parseUDPAddr parses an address string into a UDP address.
 func parseUDPAddr(address string) *net.UDPAddr {
-	addr, err := net.ResolveUDPAddr("udp", address)
+	addr, err := resolveUDPAddr(address)
 	if err != nil {
 		return nil
 	}
@@ -257,6 +360,7 @@ type packetConnWrapper struct {
 	net.PacketConn
 	nodeName      string
 	remoteAddr    *net.UDPAddr
+	cancel        context.CancelFunc
 	readMu        sync.Mutex
 	writeMu       sync.Mutex
 	closed        bool
@@ -278,29 +382,58 @@ func (c *packetConnWrapper) Read(b []byte) (n int, err error) {
 	}
 	c.closedMu.Unlock()
 
-	n, addr, err := c.PacketConn.ReadFrom(b)
-	if err != nil {
-		// Normalize close-related errors to net.ErrClosed so go-raknet's Dialer.clientListen
-		// can exit cleanly instead of spinning/logging forever.
-		if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
-			return 0, net.ErrClosed
+	for {
+		n, addr, err := c.PacketConn.ReadFrom(b)
+		if err != nil {
+			// Normalize close-related errors to net.ErrClosed so go-raknet's Dialer.clientListen
+			// can exit cleanly instead of spinning/logging forever.
+			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") {
+				return 0, net.ErrClosed
+			}
+
+			// Only log the first error after close to avoid spam
+			c.errorLoggedMu.Lock()
+			if !c.errorLogged {
+				logger.Debug("packetConnWrapper.Read error: %v", err)
+				// Mark as logged if it's a close-related error
+				errStr := err.Error()
+				if strings.Contains(errStr, "closed") || strings.Contains(errStr, "EOF") {
+					c.errorLogged = true
+				}
+			}
+			c.errorLoggedMu.Unlock()
+			return n, err
 		}
 
-		// Only log the first error after close to avoid spam
-		c.errorLoggedMu.Lock()
-		if !c.errorLogged {
-			logger.Debug("packetConnWrapper.Read error: %v", err)
-			// Mark as logged if it's a close-related error
-			errStr := err.Error()
-			if strings.Contains(errStr, "closed") || strings.Contains(errStr, "EOF") {
-				c.errorLogged = true
-			}
+		if c.remoteAddr == nil || addr == nil || samePacketSource(addr, c.remoteAddr) {
+			return n, nil
 		}
-		c.errorLoggedMu.Unlock()
-	} else {
-		logger.Debug("packetConnWrapper.Read: received %d bytes from %v", n, addr)
+
+		if logger.IsLevelEnabled(logger.LevelDebug) {
+			logger.Debug("packetConnWrapper.Read dropped packet from unexpected source: expected=%v got=%v bytes=%d", c.remoteAddr, addr, n)
+		}
 	}
-	return n, err
+}
+
+func samePacketSource(addr net.Addr, expected *net.UDPAddr) bool {
+	if expected == nil || addr == nil {
+		return false
+	}
+
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return addr.String() == expected.String()
+	}
+
+	if udpAddr.Port != expected.Port {
+		return false
+	}
+
+	if udpAddr.IP == nil || expected.IP == nil {
+		return addr.String() == expected.String()
+	}
+
+	return udpAddr.IP.Equal(expected.IP)
 }
 
 // Write writes data to the connection.
@@ -310,7 +443,6 @@ func (c *packetConnWrapper) Write(b []byte) (n int, err error) {
 	if c.remoteAddr == nil {
 		return 0, fmt.Errorf("remote address not set")
 	}
-	logger.Debug("packetConnWrapper.Write: sending %d bytes to %v", len(b), c.remoteAddr)
 	n, err = c.PacketConn.WriteTo(b, c.remoteAddr)
 	if err != nil {
 		logger.Debug("packetConnWrapper.Write error: %v", err)
@@ -350,6 +482,9 @@ func (c *packetConnWrapper) Close() error {
 	if logger.IsLevelEnabled(logger.LevelDebug) {
 		// 关闭 sing-box UDP 上游连接属于正常生命周期事件，不再输出完整调用栈，避免在 ACL 踢出等场景下制造“错误”假象。
 		logger.Debug("packetConnWrapper.Close: node=%s local=%v remote=%v", c.nodeName, c.PacketConn.LocalAddr(), c.remoteAddr)
+	}
+	if c.cancel != nil {
+		c.cancel()
 	}
 	return c.PacketConn.Close()
 }

@@ -23,6 +23,23 @@
         <n-button type="primary" @click="showAddModal = true">添加</n-button>
       </n-space>
     </n-space>
+    <n-card size="small" style="margin-bottom: 16px">
+      <n-space justify="space-between" align="center">
+        <n-space align="center">
+          <n-text>白名单拦截</n-text>
+          <n-switch
+            :value="aclSettings.whitelist_enabled"
+            :loading="savingSettings"
+            :disabled="loadingSettings || savingSettings"
+            @update:value="updateWhitelistEnabled"
+          />
+          <n-tag size="small" :type="aclSettings.whitelist_enabled ? 'success' : 'default'">
+            {{ aclSettings.whitelist_enabled ? '已开启' : '已关闭' }}
+          </n-tag>
+        </n-space>
+        <n-text depth="3">关闭后会保留名单数据，但不会拦截非白名单玩家</n-text>
+      </n-space>
+    </n-card>
     <n-card>
       <div class="table-wrapper">
         <n-data-table
@@ -49,6 +66,10 @@
       <n-space vertical>
         <n-input v-model:value="form.player_name" placeholder="玩家名" />
         <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
+        <n-space justify="space-between" align="center">
+          <n-text>启用该白名单条目</n-text>
+          <n-switch v-model:value="form.enabled" />
+        </n-space>
         <n-button type="primary" block @click="submitForm">
           {{ editingEntry ? '保存修改' : '添加' }}
         </n-button>
@@ -100,7 +121,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, h } from 'vue'
-import { NButton, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NPopconfirm, NSwitch, useMessage } from 'naive-ui'
 import { api, formatTime } from '../api'
 
 const message = useMessage()
@@ -113,7 +134,17 @@ const exportText = ref('')
 const exportTab = ref('json')
 const importJson = ref('')
 const importText = ref('')
-const form = reactive({ player_name: '', server_id: '' })
+const loadingSettings = ref(false)
+const savingSettings = ref(false)
+const aclSettings = reactive({
+  server_id: '',
+  blacklist_enabled: true,
+  whitelist_enabled: false,
+  default_ban_message: '你已被封禁',
+  whitelist_message: '你不在白名单中'
+})
+const entryToggleLoading = reactive({})
+const form = reactive({ player_name: '', server_id: '', enabled: true })
 const editingEntry = ref(null)
 const search = ref('')
 const checkedRowKeys = ref([])
@@ -140,6 +171,23 @@ const filteredWhitelist = computed(() => {
 const columns = [
   { type: 'selection', width: 40 },
   { title: '玩家名', key: 'player_name' },
+  {
+    title: '状态',
+    key: 'enabled',
+    width: 140,
+    render: r => h('div', { style: 'display:flex;align-items:center;gap:8px;' }, [
+      h(NSwitch, {
+        size: 'small',
+        value: r.enabled ?? true,
+        loading: !!entryToggleLoading[rowKey(r)],
+        disabled: !!entryToggleLoading[rowKey(r)],
+        onUpdateValue: value => updateWhitelistEntryEnabled(r, value)
+      }),
+      h('span', {
+        style: `font-size:12px;color:${(r.enabled ?? true) ? '#18a058' : '#909399'};white-space:nowrap;`
+      }, () => ((r.enabled ?? true) ? '启用' : '禁用'))
+    ])
+  },
   { title: '服务器', key: 'server_id', render: r => r.server_id || '全局' },
   { title: '添加时间', key: 'created_at', render: r => formatTime(r.created_at) },
   {
@@ -169,7 +217,99 @@ const columns = [
 
 const load = async () => {
   const res = await api('/api/acl/whitelist')
-  if (res.success) whitelist.value = res.data || []
+  if (res.success) {
+    whitelist.value = (res.data || []).map(item => ({
+      ...item,
+      enabled: item.enabled ?? true
+    }))
+  }
+}
+
+const applyACLSettings = (data = {}) => {
+  aclSettings.server_id = data.server_id || ''
+  aclSettings.blacklist_enabled = data.blacklist_enabled ?? true
+  aclSettings.whitelist_enabled = data.whitelist_enabled ?? false
+  aclSettings.default_ban_message = data.default_ban_message || '你已被封禁'
+  aclSettings.whitelist_message = data.whitelist_message || '你不在白名单中'
+}
+
+const loadSettings = async () => {
+  loadingSettings.value = true
+  try {
+    const res = await api('/api/acl/settings')
+    if (res.success && res.data) {
+      applyACLSettings(res.data)
+    } else {
+      message.error(res.error || '加载白名单开关失败')
+    }
+  } catch (err) {
+    message.error('加载白名单开关失败')
+  } finally {
+    loadingSettings.value = false
+  }
+}
+
+const saveACLSettings = async () => {
+  return api('/api/acl/settings', 'PUT', {
+    server_id: aclSettings.server_id || '',
+    blacklist_enabled: aclSettings.blacklist_enabled,
+    whitelist_enabled: aclSettings.whitelist_enabled,
+    default_ban_message: aclSettings.default_ban_message || '你已被封禁',
+    whitelist_message: aclSettings.whitelist_message || '你不在白名单中'
+  })
+}
+
+const updateWhitelistEnabled = async (value) => {
+  const previous = aclSettings.whitelist_enabled
+  aclSettings.whitelist_enabled = value
+  savingSettings.value = true
+  try {
+    const res = await saveACLSettings()
+    if (res.success) {
+      if (res.data) applyACLSettings(res.data)
+      message.success(value ? '白名单已开启' : '白名单已关闭')
+    } else {
+      aclSettings.whitelist_enabled = previous
+      message.error(res.error || '保存白名单开关失败')
+    }
+  } catch (err) {
+    aclSettings.whitelist_enabled = previous
+    message.error('保存白名单开关失败')
+  } finally {
+    savingSettings.value = false
+  }
+}
+
+const setEntryToggleLoading = (key, loading) => {
+  if (loading) entryToggleLoading[key] = true
+  else delete entryToggleLoading[key]
+}
+
+const updateWhitelistEntryEnabled = async (row, value) => {
+  const key = rowKey(row)
+  if (entryToggleLoading[key]) return
+  const previous = row.enabled ?? true
+  row.enabled = value
+  setEntryToggleLoading(key, true)
+  try {
+    const query = row.server_id ? `?server_id=${encodeURIComponent(row.server_id)}` : ''
+    const res = await api(`/api/acl/whitelist/${encodeURIComponent(row.player_name)}/enabled${query}`, 'PUT', {
+      enabled: value
+    })
+    if (res.success) {
+      const updated = res.data?.entry || res.data
+      row.enabled = updated?.enabled ?? value
+      message.success(value ? '已启用该白名单玩家' : '已禁用该白名单玩家')
+    } else {
+      row.enabled = previous
+      message.error(res.msg || '更新白名单玩家开关失败')
+    }
+  } catch (err) {
+    row.enabled = previous
+    message.error('更新白名单玩家开关失败')
+  } finally {
+    setEntryToggleLoading(key, false)
+  }
 }
 
 const clearSearch = () => {
@@ -178,7 +318,11 @@ const clearSearch = () => {
 }
 
 const addToWhitelist = async () => {
-  const res = await api('/api/acl/whitelist', 'POST', { ...form, server_id: form.server_id || null })
+  const res = await api('/api/acl/whitelist', 'POST', {
+    ...form,
+    enabled: form.enabled,
+    server_id: form.server_id || null
+  })
   return res
 }
 
@@ -208,16 +352,18 @@ const submitForm = async () => {
     editingEntry.value = null
     form.player_name = ''
     form.server_id = ''
+    form.enabled = true
     load()
   } else {
-    message.error(res.error || '失败')
+    message.error(res.msg || '失败')
   }
 }
 
 const openEdit = (row) => {
-  editingEntry.value = { player_name: row.player_name, server_id: row.server_id || '' }
+  editingEntry.value = { player_name: row.player_name, server_id: row.server_id || '', enabled: row.enabled ?? true }
   form.player_name = row.player_name
   form.server_id = row.server_id || ''
+  form.enabled = row.enabled ?? true
   showAddModal.value = true
 }
 
@@ -228,7 +374,7 @@ const remove = async (name, serverId) => {
     message.success('已移除')
     load()
   } else {
-    message.error(res.error || '失败')
+    message.error(res.msg || '失败')
   }
 }
 
@@ -307,7 +453,10 @@ const importData = async () => {
   load()
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadSettings()
+})
 </script>
 
 <style scoped>

@@ -15,6 +15,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/singboxcore"
 )
 
 const (
@@ -23,19 +24,28 @@ const (
 
 // ProxyPortManager manages local proxy port listeners.
 type ProxyPortManager struct {
-	configMgr   *config.ProxyPortConfigManager
-	outboundMgr OutboundManager
-	mu          sync.Mutex
-	listeners   map[string]*proxyPortListener
-	dialerPool  *proxyPortDialerPool
+	configMgr      *config.ProxyPortConfigManager
+	outboundMgr    OutboundManager
+	singboxFactory singboxcore.Factory
+	mu             sync.Mutex
+	listeners      map[string]*proxyPortListener
+	dialerPool     *proxyPortDialerPool
 }
 
 func NewProxyPortManager(configMgr *config.ProxyPortConfigManager, outboundMgr OutboundManager) *ProxyPortManager {
+	return NewProxyPortManagerWithSingboxFactory(configMgr, outboundMgr, nil)
+}
+
+func NewProxyPortManagerWithSingboxFactory(configMgr *config.ProxyPortConfigManager, outboundMgr OutboundManager, factory singboxcore.Factory) *ProxyPortManager {
+	if factory == nil {
+		factory = NewSingboxCoreFactory()
+	}
 	return &ProxyPortManager{
-		configMgr:   configMgr,
-		outboundMgr: outboundMgr,
-		listeners:   make(map[string]*proxyPortListener),
-		dialerPool:  newProxyPortDialerPool(),
+		configMgr:      configMgr,
+		outboundMgr:    outboundMgr,
+		singboxFactory: factory,
+		listeners:      make(map[string]*proxyPortListener),
+		dialerPool:     newProxyPortDialerPool(factory),
 	}
 }
 
@@ -99,16 +109,21 @@ func (m *ProxyPortManager) stopListeners(wait bool, closeDialers bool) {
 
 type proxyPortDialerPool struct {
 	mu      sync.Mutex
-	dialers map[string]*SingboxDialer
+	factory singboxcore.Factory
+	dialers map[string]singboxcore.Dialer
 }
 
-func newProxyPortDialerPool() *proxyPortDialerPool {
+func newProxyPortDialerPool(factory singboxcore.Factory) *proxyPortDialerPool {
+	if factory == nil {
+		factory = NewSingboxCoreFactory()
+	}
 	return &proxyPortDialerPool{
-		dialers: make(map[string]*SingboxDialer),
+		factory: factory,
+		dialers: make(map[string]singboxcore.Dialer),
 	}
 }
 
-func (p *proxyPortDialerPool) Get(cfg *config.ProxyOutbound) (*SingboxDialer, error) {
+func (p *proxyPortDialerPool) Get(cfg *config.ProxyOutbound) (singboxcore.Dialer, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("outbound config is nil")
 	}
@@ -117,7 +132,7 @@ func (p *proxyPortDialerPool) Get(cfg *config.ProxyOutbound) (*SingboxDialer, er
 	if d, ok := p.dialers[cfg.Name]; ok {
 		return d, nil
 	}
-	dialer, err := CreateSingboxDialer(cfg)
+	dialer, err := p.factory.CreateDialer(context.Background(), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -583,22 +598,28 @@ func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (n
 	if l.cfg.IsDirectConnection() || l.outboundMgr == nil {
 		dialer := &net.Dialer{Timeout: defaultProxyDialTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", address)
-		return conn, "direct", err
+		return conn, DirectNodeName, err
 	}
 
 	exclude := make([]string, 0, 4)
-	attempts := 3
-	if l.cfg.IsMultiNodeSelection() {
-		nodes := l.cfg.GetNodeList()
-		if len(nodes) > 0 {
-			attempts = len(nodes)
-		}
-	}
+	attempts := proxySelectionAttemptLimit(l.cfg, l.outboundMgr)
 
 	for i := 0; i < attempts; i++ {
 		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer("", l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
 		if err != nil {
 			return nil, "", err
+		}
+		// "direct" token within a multi-node list: do a plain TCP dial
+		// instead of going through the outbound manager's dialer pool.
+		// Failover still applies if the direct dial itself fails.
+		if IsDirectSelection(selected) {
+			dialer := &net.Dialer{Timeout: defaultProxyDialTimeout}
+			conn, derr := dialer.DialContext(ctx, "tcp", address)
+			if derr == nil {
+				return conn, DirectNodeName, nil
+			}
+			exclude = append(exclude, DirectNodeName)
+			continue
 		}
 		dialer, err := l.dialerPool.Get(selected)
 		if err != nil {

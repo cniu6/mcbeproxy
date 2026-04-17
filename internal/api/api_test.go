@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,7 +22,12 @@ import (
 )
 
 // mockProxyController implements ProxyController for testing.
-type mockProxyController struct{}
+type mockProxyController struct {
+	lastKickPlayer string
+	lastKickReason string
+	kickCalls      int
+	kickReturn     int
+}
 
 func (m *mockProxyController) StartServer(serverID string) error               { return nil }
 func (m *mockProxyController) StopServer(serverID string) error                { return nil }
@@ -29,7 +36,12 @@ func (m *mockProxyController) IsServerRunning(serverID string) bool            {
 func (m *mockProxyController) GetServerStatus(serverID string) string          { return "stopped" }
 func (m *mockProxyController) GetActiveSessionsForServer(serverID string) int  { return 0 }
 func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO  { return nil }
-func (m *mockProxyController) KickPlayer(playerName string, reason string) int { return 0 }
+func (m *mockProxyController) KickPlayer(playerName string, reason string) int {
+	m.lastKickPlayer = playerName
+	m.lastKickReason = reason
+	m.kickCalls++
+	return m.kickReturn
+}
 func (m *mockProxyController) GetServerLatency(serverID string) (int64, bool)  { return 0, false }
 func (m *mockProxyController) ReloadProxyPorts() error                         { return nil }
 
@@ -115,6 +127,143 @@ func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {
 	}
 
 	return api, database, cleanup
+}
+
+func TestAddToBlacklist_UsesDetailedKickReason(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	controller, ok := api.proxyController.(*mockProxyController)
+	if !ok {
+		t.Fatalf("proxyController type = %T, want *mockProxyController", api.proxyController)
+	}
+	controller.kickReturn = 1
+
+	if err := api.aclManager.UpdateSettings(&db.ACLSettings{
+		ServerID:         "srv1",
+		BlacklistEnabled: true,
+		WhitelistEnabled: false,
+		DefaultMessage:   "你已被封禁12",
+		WhitelistMessage: "你不在白名单中",
+	}); err != nil {
+		t.Fatalf("UpdateSettings failed: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"player_name": "cniu666",
+		"reason":      "1222",
+		"server_id":   "srv1",
+	})
+	if err != nil {
+		t.Fatalf("Marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/acl/blacklist", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if controller.kickCalls != 1 {
+		t.Fatalf("kickCalls = %d, want 1", controller.kickCalls)
+	}
+	if controller.lastKickPlayer != "cniu666" {
+		t.Fatalf("lastKickPlayer = %q, want %q", controller.lastKickPlayer, "cniu666")
+	}
+	wantReason := "黑名单用户\n§7玩家名字：cniu666\n§7原因：你已被封禁12"
+	if controller.lastKickReason != wantReason {
+		t.Fatalf("lastKickReason = %q, want %q", controller.lastKickReason, wantReason)
+	}
+}
+
+func TestUpdateBlacklistEnabled_PersistsAndKicks(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	controller, ok := api.proxyController.(*mockProxyController)
+	if !ok {
+		t.Fatalf("proxyController type = %T, want *mockProxyController", api.proxyController)
+	}
+	controller.kickReturn = 1
+
+	entry := &db.BlacklistEntry{
+		DisplayName: "toggle-blacklist-user",
+		Enabled:     false,
+		Reason:      "test",
+		ServerID:    "srv1",
+		AddedAt:     time.Now(),
+	}
+	if err := api.aclManager.AddToBlacklist(entry); err != nil {
+		t.Fatalf("AddToBlacklist failed: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{"enabled": true})
+	if err != nil {
+		t.Fatalf("Marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/acl/blacklist/toggle-blacklist-user/enabled?server_id=srv1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+	updated, err := api.aclManager.GetBlacklist("srv1")
+	if err != nil {
+		t.Fatalf("GetBlacklist failed: %v", err)
+	}
+	if len(updated) != 1 || !updated[0].Enabled {
+		t.Fatalf("expected blacklist entry enabled=true, got %+v", updated)
+	}
+	if controller.kickCalls != 1 {
+		t.Fatalf("kickCalls = %d, want 1", controller.kickCalls)
+	}
+	if controller.lastKickPlayer != "toggle-blacklist-user" {
+		t.Fatalf("lastKickPlayer = %q, want %q", controller.lastKickPlayer, "toggle-blacklist-user")
+	}
+}
+
+func TestUpdateWhitelistEnabled_Persists(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	entry := &db.WhitelistEntry{
+		DisplayName: "toggle-whitelist-user",
+		Enabled:     true,
+		ServerID:    "srv1",
+		AddedAt:     time.Now(),
+	}
+	if err := api.aclManager.AddToWhitelist(entry); err != nil {
+		t.Fatalf("AddToWhitelist failed: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{"enabled": false})
+	if err != nil {
+		t.Fatalf("Marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/acl/whitelist/toggle-whitelist-user/enabled?server_id=srv1", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+	updated, err := api.aclManager.GetWhitelist("srv1")
+	if err != nil {
+		t.Fatalf("GetWhitelist failed: %v", err)
+	}
+	if len(updated) != 1 || updated[0].Enabled {
+		t.Fatalf("expected whitelist entry enabled=false, got %+v", updated)
+	}
 }
 
 // **Feature: mcpe-server-proxy, Property 10: API Key Authentication**

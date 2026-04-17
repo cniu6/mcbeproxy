@@ -42,7 +42,12 @@
         这些设置将应用到所有服务器。黑名单提示消息用于封禁玩家时显示，白名单提示消息用于非白名单玩家连接时显示。
       </n-alert>
       <n-space vertical size="large">
-        <n-checkbox v-model:checked="aclSettings.whitelist_enabled">启用白名单模式</n-checkbox>
+        <n-form-item label="启用黑名单拦截">
+          <n-switch v-model:value="aclSettings.blacklist_enabled" />
+        </n-form-item>
+        <n-form-item label="启用白名单模式">
+          <n-switch v-model:value="aclSettings.whitelist_enabled" />
+        </n-form-item>
         <n-form-item label="黑名单提示消息">
           <n-input 
             v-model:value="aclSettings.default_ban_message" 
@@ -235,6 +240,7 @@ const updateEntryPath = async () => {
 
 const aclSettings = reactive({
   server_id: '', // 空字符串表示全局设置
+  blacklist_enabled: true,
   whitelist_enabled: false,
   default_ban_message: '你已被封禁',
   whitelist_message: '你不在白名单中'
@@ -268,6 +274,7 @@ const loadConfig = async () => {
     if (acl.success && acl.data) {
       // 确保字段名匹配后端返回的 DTO
       aclSettings.server_id = acl.data.server_id || ''
+      aclSettings.blacklist_enabled = acl.data.blacklist_enabled ?? true
       aclSettings.whitelist_enabled = acl.data.whitelist_enabled || false
       aclSettings.default_ban_message = acl.data.default_ban_message || '你已被封禁'
       aclSettings.whitelist_message = acl.data.whitelist_message || '你不在白名单中'
@@ -292,6 +299,7 @@ const saveACL = async () => {
     // 确保发送的数据格式与后端 DTO 一致
     const payload = {
       server_id: aclSettings.server_id || '', // 空字符串表示全局设置
+      blacklist_enabled: aclSettings.blacklist_enabled,
       whitelist_enabled: aclSettings.whitelist_enabled,
       default_ban_message: aclSettings.default_ban_message || '你已被封禁',
       whitelist_message: aclSettings.whitelist_message || '你不在白名单中'

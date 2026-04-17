@@ -10,8 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/singboxcore"
 )
 
 // Error definitions for OutboundManager operations.
@@ -24,6 +26,42 @@ var (
 	ErrNoHealthyNodes     = errors.New("no healthy nodes available")
 	ErrAllFailoversFailed = errors.New("all failover attempts failed")
 )
+
+// DirectNodeName is the reserved token meaning "connect directly, no proxy".
+//
+// It has two supported positions:
+//  1. As the single / only value of proxy_outbound (e.g. "" or "direct") —
+//     handled by ServerConfig.IsDirectConnection() / ProxyPortConfig.IsDirectConnection().
+//  2. As one of several comma-separated tokens in a multi-node selector
+//     (e.g. "direct,HK-01,HK-02") — handled by selectFromNodeList below, which
+//     synthesizes a virtual healthy outbound so load balancing / failover
+//     can include "try direct" as a candidate alongside real proxy outbounds.
+//
+// Downstream dial paths MUST check selectedOutbound.Name == DirectNodeName
+// after selection and translate that into a plain net.Dialer / net.DialUDP
+// call instead of routing through the outbound manager (there is no
+// singbox outbound named "direct" — the sentinel only exists to drive
+// selection).
+const DirectNodeName = "direct"
+
+// IsDirectSelection reports whether the selection result from one of the
+// Select* methods means "use a plain direct dial". Callers should gate their
+// dial path on this so mixed lists like "direct,HK-01" work.
+func IsDirectSelection(outbound *config.ProxyOutbound) bool {
+	return outbound != nil && outbound.Name == DirectNodeName
+}
+
+// newDirectVirtualOutbound returns the sentinel outbound used to represent
+// the "direct" token inside a multi-node list during selection.
+func newDirectVirtualOutbound() *config.ProxyOutbound {
+	cfg := &config.ProxyOutbound{
+		Name:    DirectNodeName,
+		Type:    "direct",
+		Enabled: true,
+	}
+	cfg.SetHealthy(true)
+	return cfg
+}
 
 // Retry configuration constants
 // Requirements: 6.1
@@ -42,11 +80,15 @@ const (
 
 // HealthStatus represents the health status of a proxy outbound.
 type HealthStatus struct {
-	Healthy   bool          `json:"healthy"`
-	Latency   time.Duration `json:"latency"`
-	LastCheck time.Time     `json:"last_check"`
-	ConnCount int64         `json:"conn_count"`
-	LastError string        `json:"last_error,omitempty"`
+	Healthy        bool          `json:"healthy"`
+	Latency        time.Duration `json:"latency"`
+	LastCheck      time.Time     `json:"last_check"`
+	ConnCount      int64         `json:"conn_count"`
+	LastError      string        `json:"last_error,omitempty"`
+	BytesUp        int64         `json:"bytes_up"`
+	BytesDown      int64         `json:"bytes_down"`
+	LastActive     time.Time     `json:"last_active,omitempty"`
+	ActiveDuration time.Duration `json:"active_duration"`
 }
 
 // GroupStats represents statistics for a proxy outbound group.
@@ -187,8 +229,10 @@ type ServerConfigUpdater interface {
 type outboundManagerImpl struct {
 	mu                  sync.RWMutex
 	outbounds           map[string]*config.ProxyOutbound
-	singboxOutbounds    map[string]*SingboxOutbound
+	singboxOutbounds    map[string]singboxcore.UDPOutbound
 	singboxLastUsed     map[string]time.Time // Track last usage time for idle cleanup
+	singboxInitGroup    singleflight.Group
+	singboxFactory      singboxcore.Factory
 	serverConfigUpdater ServerConfigUpdater
 	cleanupCtx          context.Context
 	cleanupCancel       context.CancelFunc
@@ -213,10 +257,19 @@ type serverNodeLatencyValue struct {
 // NewOutboundManager creates a new OutboundManager instance.
 // The serverConfigUpdater parameter is optional and used for cascade updates on delete.
 func NewOutboundManager(serverConfigUpdater ServerConfigUpdater) OutboundManager {
+	return NewOutboundManagerWithSingboxFactory(serverConfigUpdater, nil)
+}
+
+// NewOutboundManagerWithSingboxFactory creates an OutboundManager with an injectable sing-box factory.
+func NewOutboundManagerWithSingboxFactory(serverConfigUpdater ServerConfigUpdater, factory singboxcore.Factory) OutboundManager {
+	if factory == nil {
+		factory = NewSingboxCoreFactory()
+	}
 	return &outboundManagerImpl{
 		outbounds:           make(map[string]*config.ProxyOutbound),
-		singboxOutbounds:    make(map[string]*SingboxOutbound),
+		singboxOutbounds:    make(map[string]singboxcore.UDPOutbound),
 		singboxLastUsed:     make(map[string]time.Time),
+		singboxFactory:      factory,
 		serverConfigUpdater: serverConfigUpdater,
 		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
 		serverSelectedNode:  make(map[string]string),
@@ -235,6 +288,28 @@ func normalizeSortBy(sortBy string) string {
 	default:
 		return config.LoadBalanceSortUDP
 	}
+}
+
+func outboundSupportsUDP(outbound *config.ProxyOutbound) bool {
+	if outbound == nil {
+		return false
+	}
+	switch outbound.Type {
+	case config.ProtocolHTTP:
+		return false
+	default:
+		return true
+	}
+}
+
+func outboundSupportsSort(outbound *config.ProxyOutbound, sortBy string) bool {
+	if outbound == nil {
+		return false
+	}
+	if normalizeSortBy(sortBy) == config.LoadBalanceSortUDP {
+		return outboundSupportsUDP(outbound)
+	}
+	return true
 }
 
 func (m *outboundManagerImpl) SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64) {
@@ -306,6 +381,19 @@ func (m *outboundManagerImpl) SetServerSelectedNode(serverID, nodeName string) {
 	m.serverSelectedMu.Unlock()
 }
 
+func (m *outboundManagerImpl) isSelectableOutboundLocked(outbound *config.ProxyOutbound) bool {
+	if outbound == nil || !outbound.Enabled {
+		return false
+	}
+	lastCheck := outbound.GetLastCheck()
+	hasError := outbound.GetLastError() != ""
+	isHealthy := outbound.GetHealthy()
+	if !isHealthy && hasError && !lastCheck.IsZero() && time.Since(lastCheck) < 30*time.Second {
+		return false
+	}
+	return true
+}
+
 func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy string) (string, int64) {
 	serverID = strings.TrimSpace(serverID)
 	sortBy = normalizeSortBy(sortBy)
@@ -320,19 +408,25 @@ func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy
 	if strings.HasPrefix(groupOrName, "@") {
 		groupName := strings.TrimPrefix(groupOrName, "@")
 		for _, o := range m.outbounds {
-			if o != nil && o.Enabled && (o.Group == groupName) {
+			if m.isSelectableOutboundLocked(o) && outboundSupportsSort(o, sortBy) && (o.Group == groupName) {
 				nodeNames = append(nodeNames, o.Name)
 			}
 		}
 	} else if strings.Contains(groupOrName, ",") {
 		for _, n := range strings.Split(groupOrName, ",") {
 			n = strings.TrimSpace(n)
-			if n != "" {
+			if n == "" {
+				continue
+			}
+			if outbound, exists := m.outbounds[n]; exists && m.isSelectableOutboundLocked(outbound) && outboundSupportsSort(outbound, sortBy) {
 				nodeNames = append(nodeNames, n)
 			}
 		}
 	} else {
-		return groupOrName, 0
+		if outbound, exists := m.outbounds[groupOrName]; exists && m.isSelectableOutboundLocked(outbound) && outboundSupportsSort(outbound, sortBy) {
+			return groupOrName, 0
+		}
+		return "", 0
 	}
 
 	var bestName string
@@ -381,6 +475,41 @@ func (m *outboundManagerImpl) selectLeastLatencyForServer(serverID string, nodes
 	return loadBalancer.Select(nodes, config.LoadBalanceLeastLatency, sortBy, "")
 }
 
+func selectorIncludesOutbound(groupOrName string, outbound *config.ProxyOutbound) bool {
+	groupOrName = strings.TrimSpace(groupOrName)
+	if groupOrName == "" || outbound == nil {
+		return false
+	}
+	if strings.HasPrefix(groupOrName, "@") {
+		return outbound.Group == strings.TrimPrefix(groupOrName, "@")
+	}
+	if strings.Contains(groupOrName, ",") {
+		for _, nodeName := range strings.Split(groupOrName, ",") {
+			if strings.TrimSpace(nodeName) == outbound.Name {
+				return true
+			}
+		}
+		return false
+	}
+	return groupOrName == outbound.Name
+}
+
+func shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency int64) bool {
+	if bestLatency <= 0 {
+		return false
+	}
+	if pinnedLatency <= 0 {
+		return true
+	}
+	improvement := pinnedLatency - bestLatency
+	if improvement <= 0 {
+		return false
+	}
+	absoluteGainOK := improvement >= autoSwitchMinLatencyGainMs
+	relativeGainOK := float64(improvement) >= float64(pinnedLatency)*autoSwitchMinRelativeGain
+	return absoluteGainOK || relativeGainOK
+}
+
 func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
 	serverID = strings.TrimSpace(serverID)
 	strategy = strings.TrimSpace(strategy)
@@ -389,6 +518,10 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 	// Empty serverID => preserve old behavior.
 	if serverID == "" {
 		return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, excludeNodes)
+	}
+	bestName, bestLatency := "", int64(0)
+	if strategy == config.LoadBalanceLeastLatency {
+		bestName, bestLatency = m.GetBestNodeForServer(serverID, groupOrName, sortBy)
 	}
 
 	// If a pinned node is set and not excluded, prefer it.
@@ -402,9 +535,24 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 		}
 		if !excluded {
 			m.mu.RLock()
-			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled {
-				m.mu.RUnlock()
-				return o, nil
+			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled && outboundSupportsSort(o, sortBy) && selectorIncludesOutbound(groupOrName, o) {
+				lastCheck := o.GetLastCheck()
+				hasError := o.GetLastError() != ""
+				isHealthy := o.GetHealthy()
+				if isHealthy || lastCheck.IsZero() || !hasError || time.Since(lastCheck) >= 30*time.Second {
+					usePinned := true
+					if strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
+						pinnedLatency, ok := m.GetServerNodeLatency(serverID, pinnedName, sortBy)
+						if !ok || shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency) {
+							usePinned = false
+						}
+					}
+					if usePinned {
+						selected := o.Clone()
+						m.mu.RUnlock()
+						return selected, nil
+					}
+				}
 			}
 			m.mu.RUnlock()
 		}
@@ -455,9 +603,21 @@ func (m *outboundManagerImpl) selectFromNodeListForServer(serverID, nodeListStr,
 			continue
 		}
 
+		// Reserved token "direct" means "connect without any proxy". We inject
+		// a synthetic virtual outbound into the candidate pool so load balancing
+		// and failover treat it as a first-class option alongside real nodes.
+		// Downstream dial paths check IsDirectSelection() to do a plain dial.
+		if nodeName == DirectNodeName {
+			healthyNodes = append(healthyNodes, newDirectVirtualOutbound())
+			continue
+		}
+
 		outbound, exists := m.outbounds[nodeName]
 		if !exists {
 			notFoundNodes = append(notFoundNodes, nodeName)
+			continue
+		}
+		if !outboundSupportsSort(outbound, sortBy) {
 			continue
 		}
 
@@ -525,6 +685,9 @@ func (m *outboundManagerImpl) selectFromGroupForServer(serverID, groupName, stra
 			groupExists = true
 
 			if excludeSet[outbound.Name] {
+				continue
+			}
+			if !outboundSupportsSort(outbound, sortBy) {
 				continue
 			}
 			if !outbound.Enabled {
@@ -636,6 +799,24 @@ func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 	if m.serverConfigUpdater != nil {
 		m.cascadeUpdateServerConfigs(name, deletedGroup)
 	}
+	return nil
+}
+
+func (m *outboundManagerImpl) DeleteOutboundNoCascade(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.outbounds[name]; !exists {
+		return ErrOutboundNotFound
+	}
+
+	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
+		singboxOutbound.Close()
+		delete(m.singboxOutbounds, name)
+		delete(m.singboxLastUsed, name)
+	}
+
+	delete(m.outbounds, name)
 	return nil
 }
 
@@ -778,11 +959,15 @@ func (m *outboundManagerImpl) GetHealthStatus(name string) *HealthStatus {
 	}
 
 	return &HealthStatus{
-		Healthy:   outbound.GetHealthy(),
-		Latency:   outbound.GetLatency(),
-		LastCheck: outbound.GetLastCheck(),
-		ConnCount: outbound.GetConnCount(),
-		LastError: outbound.GetLastError(),
+		Healthy:        outbound.GetHealthy(),
+		Latency:        outbound.GetLatency(),
+		LastCheck:      outbound.GetLastCheck(),
+		ConnCount:      outbound.GetConnCount(),
+		LastError:      outbound.GetLastError(),
+		BytesUp:        outbound.GetBytesUp(),
+		BytesDown:      outbound.GetBytesDown(),
+		LastActive:     outbound.GetLastActive(),
+		ActiveDuration: outbound.GetActiveDuration(),
 	}
 }
 
@@ -790,25 +975,23 @@ func (m *outboundManagerImpl) GetHealthStatus(name string) *HealthStatus {
 // to establish a connection and measuring the latency.
 // Requirements: 4.1, 4.2, 4.4
 func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) error {
-	m.mu.Lock()
+	m.mu.RLock()
 	cfg, exists := m.outbounds[name]
 	if !exists {
-		m.mu.Unlock()
+		m.mu.RUnlock()
 		return ErrOutboundNotFound
 	}
-
-	// If the node is unhealthy, recreate the singbox outbound to get a fresh connection
-	// This helps recover from transient DNS/connection issues
-	var singboxOutbound *SingboxOutbound
-	var err error
-	if !cfg.GetHealthy() && cfg.GetLastError() != "" {
-		singboxOutbound, err = m.recreateSingboxOutbound(name)
-	} else {
-		singboxOutbound, err = m.getOrCreateSingboxOutbound(cfg)
-	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	startTime := time.Now()
+	testDestination := "1.1.1.1:443"
+	checkCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	dialer, err := m.singboxFactory.CreateDialer(checkCtx, cfg)
+	if err == nil {
+		defer dialer.Close()
+	}
 
 	if err != nil {
 		// Mark as unhealthy on creation failure
@@ -824,15 +1007,7 @@ func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) erro
 		return fmt.Errorf("health check failed: %w", err)
 	}
 
-	// Perform a test connection to measure latency
-	// We use a well-known DNS server as a test destination
-	testDestination := "8.8.8.8:53"
-
-	// Create a context with timeout for the health check
-	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	conn, err := singboxOutbound.ListenPacket(checkCtx, testDestination)
+	conn, err := dialer.DialContext(checkCtx, "tcp", testDestination)
 	latency := time.Since(startTime)
 
 	m.mu.Lock()
@@ -869,46 +1044,59 @@ func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) erro
 	return nil
 }
 
+func (m *outboundManagerImpl) prepareDialPacketConn(outboundName string) error {
+	m.mu.RLock()
+	cfg, exists := m.outbounds[outboundName]
+	if !exists {
+		m.mu.RUnlock()
+		return ErrOutboundNotFound
+	}
+
+	if !cfg.Enabled {
+		m.mu.RUnlock()
+		return fmt.Errorf("outbound %s is disabled", outboundName)
+	}
+	if !outboundSupportsUDP(cfg) {
+		m.mu.RUnlock()
+		return fmt.Errorf("outbound %s does not support UDP packet relay", outboundName)
+	}
+
+	healthy := cfg.GetHealthy()
+	lastErr := cfg.GetLastError()
+	lastCheck := cfg.GetLastCheck()
+	m.mu.RUnlock()
+
+	if !healthy && lastErr != "" {
+		if time.Since(lastCheck) < 30*time.Second {
+			return fmt.Errorf("%w: %s - %s", ErrOutboundUnhealthy, outboundName, lastErr)
+		}
+		if _, err := m.recreateSingboxOutbound(outboundName); err != nil {
+			return fmt.Errorf("%w: %s - failed to recreate: %v", ErrOutboundUnhealthy, outboundName, err)
+		}
+	}
+
+	return nil
+}
+
 // DialPacketConn creates a UDP PacketConn through the specified outbound.
 // Implements retry logic with exponential backoff (max 3 attempts).
 // Fast-fails for unhealthy nodes without retrying.
 // Requirements: 3.1, 3.3, 3.4, 6.1, 6.2, 6.4
 func (m *outboundManagerImpl) DialPacketConn(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
-	// First, validate the outbound exists and is usable (with lock)
-	m.mu.Lock()
-	cfg, exists := m.outbounds[outboundName]
-	if !exists {
-		m.mu.Unlock()
-		return nil, ErrOutboundNotFound
+	if err := m.prepareDialPacketConn(outboundName); err != nil {
+		return nil, err
 	}
-
-	// Check if outbound is enabled
-	if !cfg.Enabled {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("outbound %s is disabled", outboundName)
-	}
-
-	// Fast-fail for unhealthy nodes - skip retries
-	// But allow retry after 30 seconds to recover from transient issues
-	// Requirements: 6.4
-	if !cfg.GetHealthy() && cfg.GetLastError() != "" {
-		lastCheck := cfg.GetLastCheck()
-		// Allow retry after 30 seconds of being unhealthy
-		if time.Since(lastCheck) < 30*time.Second {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s - %s", ErrOutboundUnhealthy, outboundName, cfg.GetLastError())
-		}
-		// Time to retry - recreate the singbox outbound
-		if _, err := m.recreateSingboxOutbound(outboundName); err != nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s - failed to recreate: %v", ErrOutboundUnhealthy, outboundName, err)
-		}
-	}
-	m.mu.Unlock()
 
 	// Attempt connection with retry logic
 	// Requirements: 6.1, 6.2
 	return m.dialWithRetry(ctx, outboundName, destination)
+}
+
+func (m *outboundManagerImpl) DialPacketConnNoRetry(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	if err := m.prepareDialPacketConn(outboundName); err != nil {
+		return nil, err
+	}
+	return m.dialPacketConnOnce(ctx, outboundName, destination)
 }
 
 // dialWithRetry implements exponential backoff retry logic for DialPacketConn.
@@ -974,17 +1162,16 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 
 // dialPacketConnOnce performs a single connection attempt without retry.
 func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
-	m.mu.Lock()
+	m.mu.RLock()
 	// Get the outbound configuration
 	cfg, exists := m.outbounds[outboundName]
+	m.mu.RUnlock()
 	if !exists {
-		m.mu.Unlock()
 		return nil, ErrOutboundNotFound
 	}
 
 	// Get or create sing-box outbound instance
 	singboxOutbound, err := m.getOrCreateSingboxOutbound(cfg)
-	m.mu.Unlock()
 	if err != nil {
 		// Mark as unhealthy on creation failure
 		cfg.SetHealthy(false)
@@ -1004,9 +1191,7 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 			strings.Contains(errStr, "after retries")
 
 		if cfg.Type == config.ProtocolHysteria2 && isTemporaryError {
-			m.mu.Lock()
 			newOutbound, recreateErr := m.recreateSingboxOutbound(outboundName)
-			m.mu.Unlock()
 			if recreateErr == nil {
 				conn, err = newOutbound.ListenPacket(ctx, destination)
 				if err == nil {
@@ -1046,6 +1231,7 @@ success:
 	// Wrap connection to track when it's closed
 	return &trackedPacketConn{
 		PacketConn: conn,
+		cfg:        cfg,
 		onClose: func() {
 			m.mu.Lock()
 			defer m.mu.Unlock()
@@ -1057,71 +1243,162 @@ success:
 }
 
 // getOrCreateSingboxOutbound gets an existing sing-box outbound or creates a new one.
-func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) {
-	// Check if we already have a sing-box outbound for this config
-	if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
-		// Update last used time
-		m.singboxLastUsed[cfg.Name] = time.Now()
-		return existing, nil
+func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbound) (singboxcore.UDPOutbound, error) {
+	if cfg == nil {
+		return nil, ErrOutboundNotFound
 	}
 
-	// Create new sing-box outbound
-	singboxOutbound, err := CreateSingboxOutbound(cfg)
+	m.mu.RLock()
+	if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+		m.mu.RUnlock()
+		m.mu.Lock()
+		if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
+			m.singboxLastUsed[cfg.Name] = time.Now()
+			existing = current
+		} else {
+			existing = nil
+		}
+		m.mu.Unlock()
+		if existing != nil {
+			return existing, nil
+		}
+	} else {
+		m.mu.RUnlock()
+	}
+
+	result, err, _ := m.singboxInitGroup.Do(cfg.Name, func() (interface{}, error) {
+		m.mu.RLock()
+		if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+			m.mu.RUnlock()
+			m.mu.Lock()
+			if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
+				m.singboxLastUsed[cfg.Name] = time.Now()
+				existing = current
+			} else {
+				existing = nil
+			}
+			m.mu.Unlock()
+			if existing != nil {
+				return existing, nil
+			}
+		} else {
+			m.mu.RUnlock()
+		}
+		m.mu.RLock()
+		currentCfg, exists := m.outbounds[cfg.Name]
+		m.mu.RUnlock()
+		if !exists || currentCfg == nil {
+			return nil, ErrOutboundNotFound
+		}
+
+		singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), currentCfg.Clone())
+		if createErr != nil {
+			return nil, createErr
+		}
+
+		m.mu.Lock()
+		if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+			m.singboxLastUsed[cfg.Name] = time.Now()
+			m.mu.Unlock()
+			_ = singboxOutbound.Close()
+			return existing, nil
+		}
+		m.singboxOutbounds[cfg.Name] = singboxOutbound
+		m.singboxLastUsed[cfg.Name] = time.Now()
+		m.mu.Unlock()
+		return singboxOutbound, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	// Cache the outbound and record creation time
-	m.singboxOutbounds[cfg.Name] = singboxOutbound
-	m.singboxLastUsed[cfg.Name] = time.Now()
+	singboxOutbound, ok := result.(singboxcore.UDPOutbound)
+	if !ok || singboxOutbound == nil {
+		return nil, fmt.Errorf("failed to initialize sing-box outbound for %s", cfg.Name)
+	}
 	return singboxOutbound, nil
 }
 
 // recreateSingboxOutbound closes and recreates a sing-box outbound.
 // This is useful for protocols like Hysteria2 that may need reconnection.
-func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*SingboxOutbound, error) {
-	cfg, exists := m.outbounds[name]
-	if !exists {
-		return nil, ErrOutboundNotFound
-	}
-
-	// Close existing outbound if it exists
-	if existing, ok := m.singboxOutbounds[name]; ok {
-		existing.Close()
+func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (singboxcore.UDPOutbound, error) {
+	result, err, _ := m.singboxInitGroup.Do(name, func() (interface{}, error) {
+		m.mu.Lock()
+		cfg, exists := m.outbounds[name]
+		if !exists || cfg == nil {
+			m.mu.Unlock()
+			return nil, ErrOutboundNotFound
+		}
+		cfgCopy := cfg.Clone()
+		existing := m.singboxOutbounds[name]
 		delete(m.singboxOutbounds, name)
 		delete(m.singboxLastUsed, name)
-	}
+		m.mu.Unlock()
 
-	// Create new sing-box outbound
-	singboxOutbound, err := CreateSingboxOutbound(cfg)
+		if existing != nil {
+			_ = existing.Close()
+		}
+
+		singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), cfgCopy)
+		if createErr != nil {
+			return nil, createErr
+		}
+
+		m.mu.Lock()
+		if current, ok := m.singboxOutbounds[name]; ok {
+			m.singboxLastUsed[name] = time.Now()
+			m.mu.Unlock()
+			_ = singboxOutbound.Close()
+			return current, nil
+		}
+		m.singboxOutbounds[name] = singboxOutbound
+		m.singboxLastUsed[name] = time.Now()
+		m.mu.Unlock()
+		return singboxOutbound, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	// Cache the outbound and record creation time
-	m.singboxOutbounds[name] = singboxOutbound
-	m.singboxLastUsed[name] = time.Now()
+	singboxOutbound, ok := result.(singboxcore.UDPOutbound)
+	if !ok || singboxOutbound == nil {
+		return nil, fmt.Errorf("failed to recreate sing-box outbound for %s", name)
+	}
 	return singboxOutbound, nil
 }
 
 // trackedPacketConn wraps a PacketConn to track when it's closed.
 type trackedPacketConn struct {
 	net.PacketConn
-	onClose func()
-	closed  bool
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
+	cfg       *config.ProxyOutbound
+}
+
+func (c *trackedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.PacketConn.ReadFrom(p)
+	if n > 0 && c.cfg != nil {
+		c.cfg.AddBytesDown(int64(n))
+	}
+	return n, addr, err
+}
+
+func (c *trackedPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = c.PacketConn.WriteTo(p, addr)
+	if n > 0 && c.cfg != nil {
+		c.cfg.AddBytesUp(int64(n))
+	}
+	return n, err
 }
 
 // Close closes the connection and calls the onClose callback.
 func (c *trackedPacketConn) Close() error {
-	if c.closed {
-		return nil
-	}
-	c.closed = true
-	err := c.PacketConn.Close()
-	if c.onClose != nil {
-		c.onClose()
-	}
-	return err
+	c.closeOnce.Do(func() {
+		c.closeErr = c.PacketConn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.closeErr
 }
 
 // Start initializes all sing-box outbound instances for configured proxy outbounds.
@@ -1225,7 +1502,7 @@ func (m *outboundManagerImpl) Stop() error {
 	}
 
 	// Clear the cached outbounds
-	m.singboxOutbounds = make(map[string]*SingboxOutbound)
+	m.singboxOutbounds = make(map[string]singboxcore.UDPOutbound)
 	m.singboxLastUsed = make(map[string]time.Time)
 
 	return nil
@@ -1254,7 +1531,7 @@ func (m *outboundManagerImpl) Reload() error {
 		// Check if we need to recreate the outbound
 		// For now, we recreate if the outbound doesn't exist in cache
 		if _, exists := m.singboxOutbounds[name]; !exists {
-			singboxOutbound, err := CreateSingboxOutbound(cfg)
+			singboxOutbound, err := m.singboxFactory.CreateUDPOutbound(context.Background(), cfg)
 			if err != nil {
 				cfg.SetHealthy(false)
 				cfg.SetLastError(fmt.Sprintf("failed to create outbound: %v", err))
@@ -1496,6 +1773,13 @@ func (m *outboundManagerImpl) selectFromNodeList(nodeListStr, strategy, sortBy s
 			continue
 		}
 
+		// Reserved token "direct" means "connect without any proxy". See
+		// DirectNodeName doc on why this synthetic outbound is injected here.
+		if nodeName == DirectNodeName {
+			healthyNodes = append(healthyNodes, newDirectVirtualOutbound())
+			continue
+		}
+
 		outbound, exists := m.outbounds[nodeName]
 		if !exists {
 			notFoundNodes = append(notFoundNodes, nodeName)
@@ -1568,6 +1852,9 @@ func (m *outboundManagerImpl) selectFromGroup(groupName, strategy, sortBy string
 
 			// Skip excluded nodes (for failover)
 			if excludeSet[outbound.Name] {
+				continue
+			}
+			if !outboundSupportsSort(outbound, sortBy) {
 				continue
 			}
 

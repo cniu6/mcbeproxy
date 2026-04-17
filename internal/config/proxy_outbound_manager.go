@@ -52,10 +52,15 @@ func (m *ProxyOutboundConfigManager) Load() error {
 	}
 
 	// Validate all configs before applying
+	seenNames := make(map[string]struct{}, len(configs))
 	for _, config := range configs {
 		if err := config.Validate(); err != nil {
 			return fmt.Errorf("invalid proxy outbound config for %s: %w", config.Name, err)
 		}
+		if _, exists := seenNames[config.Name]; exists {
+			return fmt.Errorf("duplicate proxy outbound name %s", config.Name)
+		}
+		seenNames[config.Name] = struct{}{}
 	}
 
 	// Clear existing and add new configs
@@ -154,6 +159,71 @@ func (m *ProxyOutboundConfigManager) GetByGroup(group string) []*ProxyOutbound {
 	return outbounds
 }
 
+// GetBySubscriptionID returns all proxy outbound configurations with the given subscription ID.
+func (m *ProxyOutboundConfigManager) GetBySubscriptionID(subscriptionID string) []*ProxyOutbound {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]*ProxyOutbound, 0)
+	for _, outbound := range m.outbounds {
+		if outbound.SubscriptionID == subscriptionID {
+			result = append(result, outbound.Clone())
+		}
+	}
+	return result
+}
+
+// ReplaceSubscriptionOutbounds replaces all proxy outbound configurations with the given subscription ID.
+func (m *ProxyOutboundConfigManager) ReplaceSubscriptionOutbounds(subscriptionID string, outbounds []*ProxyOutbound) error {
+	if subscriptionID == "" {
+		return fmt.Errorf("subscription id is required")
+	}
+	prepared := make([]*ProxyOutbound, 0, len(outbounds))
+	seenNames := make(map[string]struct{}, len(outbounds))
+	for _, outbound := range outbounds {
+		if outbound == nil {
+			return fmt.Errorf("proxy outbound cannot be nil")
+		}
+		clone := outbound.Clone()
+		if clone.SubscriptionID != subscriptionID {
+			return fmt.Errorf("proxy outbound %s has mismatched subscription_id %s", clone.Name, clone.SubscriptionID)
+		}
+		if err := clone.Validate(); err != nil {
+			return err
+		}
+		if _, exists := seenNames[clone.Name]; exists {
+			return fmt.Errorf("duplicate proxy outbound name %s", clone.Name)
+		}
+		seenNames[clone.Name] = struct{}{}
+		prepared = append(prepared, clone)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	replacedCount := 0
+	for _, outbound := range m.outbounds {
+		if outbound.SubscriptionID == subscriptionID {
+			replacedCount++
+		}
+	}
+	next := make(map[string]*ProxyOutbound, len(m.outbounds)-replacedCount+len(prepared))
+	for name, outbound := range m.outbounds {
+		if outbound.SubscriptionID == subscriptionID {
+			continue
+		}
+		next[name] = outbound.Clone()
+	}
+	for _, outbound := range prepared {
+		if _, exists := next[outbound.Name]; exists {
+			return fmt.Errorf("proxy outbound with name %s already exists", outbound.Name)
+		}
+		next[outbound.Name] = outbound.Clone()
+	}
+	m.outbounds = next
+	return m.saveToFile()
+}
+
 // AddOutbound adds a new proxy outbound configuration.
 func (m *ProxyOutboundConfigManager) AddOutbound(config *ProxyOutbound) error {
 	if err := config.Validate(); err != nil {
@@ -190,6 +260,21 @@ func (m *ProxyOutboundConfigManager) UpdateOutbound(name string, config *ProxyOu
 	}
 	m.outbounds[config.Name] = config.Clone()
 	return m.saveToFile()
+}
+
+// UpdateOutboundRuntime updates runtime/test state for an outbound without persisting the config file.
+func (m *ProxyOutboundConfigManager) UpdateOutboundRuntime(name string, update func(outbound *ProxyOutbound)) error {
+	m.mu.RLock()
+	outbound, exists := m.outbounds[name]
+	m.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("proxy outbound with name %s not found", name)
+	}
+	if update == nil {
+		return nil
+	}
+	update(outbound)
+	return nil
 }
 
 // DeleteOutbound removes a proxy outbound configuration.

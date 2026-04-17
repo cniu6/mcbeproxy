@@ -3,13 +3,21 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
+	xraynet "github.com/xtls/xray-core/common/net"
+	xrayinternet "github.com/xtls/xray-core/transport/internet"
+	xraysplithttp "github.com/xtls/xray-core/transport/internet/splithttp"
+	xraystat "github.com/xtls/xray-core/transport/internet/stat"
 
 	"mcpeserverproxy/internal/config"
 )
@@ -157,6 +165,331 @@ func TestProperty5_DirectRoutingForEmptyOrDirectProxyOutbound(t *testing.T) {
 	))
 
 	properties.TestingRun(t)
+}
+
+func TestEnsureImplementedTransport_GrpcIsAllowed(t *testing.T) {
+	cfg := &config.ProxyOutbound{
+		Name:            "grpc-vless",
+		Type:            config.ProtocolVLESS,
+		Server:          "example.com",
+		Port:            443,
+		Network:         "grpc",
+		GRPCServiceName: "gun",
+	}
+	if err := ensureImplementedTransport(cfg, "TCP"); err != nil {
+		t.Fatalf("expected grpc transport to be allowed, got: %v", err)
+	}
+}
+
+func TestEnsureImplementedTransport_HTTPUpgradeIsAllowed(t *testing.T) {
+	cfg := &config.ProxyOutbound{
+		Name:    "httpupgrade-vless",
+		Type:    config.ProtocolVLESS,
+		Server:  "example.com",
+		Port:    443,
+		Network: "httpupgrade",
+		WSPath:  "/edge-upgrade",
+		WSHost:  "cdn.example.com",
+	}
+	if err := ensureImplementedTransport(cfg, "TCP"); err != nil {
+		t.Fatalf("expected httpupgrade transport to be allowed, got: %v", err)
+	}
+}
+
+func TestEnsureImplementedTransport_XHTTPIsAllowed(t *testing.T) {
+	cfg := &config.ProxyOutbound{
+		Name:      "xhttp-vless",
+		Type:      config.ProtocolVLESS,
+		Server:    "example.com",
+		Port:      443,
+		Network:   "xhttp",
+		WSPath:    "/split",
+		WSHost:    "cdn.example.com",
+		XHTTPMode: "auto",
+	}
+	if err := ensureImplementedTransport(cfg, "TCP"); err != nil {
+		t.Fatalf("expected xhttp transport to be allowed, got: %v", err)
+	}
+}
+
+func TestUpgradeToXHTTP_DialsLocalSplitHTTP(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate test port: %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	if err := probe.Close(); err != nil {
+		t.Fatalf("failed to close probe listener: %v", err)
+	}
+
+	listen, err := xraysplithttp.ListenXH(context.Background(), xraynet.LocalHostIP, xraynet.Port(port), &xrayinternet.MemoryStreamConfig{
+		ProtocolName:     "splithttp",
+		ProtocolSettings: &xraysplithttp.Config{Path: "/split"},
+	}, func(conn xraystat.Connection) {
+		go func(c xraystat.Connection) {
+			defer c.Close()
+			var payload [4]byte
+			if _, err := io.ReadFull(c, payload[:]); err != nil {
+				return
+			}
+			if string(payload[:]) != "ping" {
+				return
+			}
+			_, _ = c.Write([]byte("pong"))
+		}(conn)
+	})
+	if err != nil {
+		t.Fatalf("failed to listen xhttp test server: %v", err)
+	}
+	defer listen.Close()
+
+	cfg := &config.ProxyOutbound{
+		Name:      "local-xhttp",
+		Type:      config.ProtocolVLESS,
+		Server:    "127.0.0.1",
+		Port:      port,
+		Network:   "xhttp",
+		WSPath:    "/split",
+		XHTTPMode: "packet-up",
+	}
+
+	conn, err := upgradeToXHTTP(context.Background(), nil, cfg)
+	if err != nil {
+		t.Fatalf("upgradeToXHTTP failed: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("failed to write xhttp payload: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("failed to read xhttp response: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("unexpected xhttp response %q", string(buf))
+	}
+}
+
+func TestGrpcServiceAndTunNames(t *testing.T) {
+	tests := []struct {
+		name        string
+		serviceName string
+		wantService string
+		wantTun     string
+		wantErr     bool
+	}{
+		{name: "simple service", serviceName: "gun", wantService: "gun", wantTun: "Tun"},
+		{name: "custom path", serviceName: "/my/sample/Tun", wantService: "my/sample", wantTun: "Tun"},
+		{name: "custom path alternatives", serviceName: "/my/sample/path1|path2", wantService: "my/sample", wantTun: "path1"},
+		{name: "invalid custom path", serviceName: "/broken", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.ProxyOutbound{GRPCServiceName: tt.serviceName}
+			gotService, gotTun, err := grpcServiceAndTunNames(cfg)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotService != tt.wantService || gotTun != tt.wantTun {
+				t.Fatalf("unexpected grpc service split, got (%q, %q), want (%q, %q)", gotService, gotTun, tt.wantService, tt.wantTun)
+			}
+		})
+	}
+}
+
+func TestGrpcAuthority(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *config.ProxyOutbound
+		want string
+	}{
+		{
+			name: "explicit grpc authority wins",
+			cfg: &config.ProxyOutbound{
+				Server:        "server.example.com",
+				SNI:           "sni.example.com",
+				GRPCAuthority: "authority.example.com",
+			},
+			want: "authority.example.com",
+		},
+		{
+			name: "sni fallback",
+			cfg: &config.ProxyOutbound{
+				Server: "server.example.com",
+				SNI:    "sni.example.com",
+			},
+			want: "sni.example.com",
+		},
+		{
+			name: "server fallback",
+			cfg: &config.ProxyOutbound{
+				Server: "server.example.com",
+			},
+			want: "server.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := grpcAuthority(tt.cfg); got != tt.want {
+				t.Fatalf("unexpected grpc authority, got %q want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveTLSALPN_GrpcPrependsH2(t *testing.T) {
+	cfg := &config.ProxyOutbound{
+		Type:    config.ProtocolVLESS,
+		Network: "grpc",
+		ALPN:    "http/1.1",
+	}
+	want := []string{"h2", "http/1.1"}
+	if got := effectiveTLSALPN(cfg); !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected ALPN list, got %v want %v", got, want)
+	}
+}
+
+func TestHostnamePortAddr_NetworkAndString(t *testing.T) {
+	addr := &HostnamePortAddr{Host: "mco.cubecraft.net", Port: 19132}
+	if got := addr.Network(); got != "udp" {
+		t.Fatalf("expected network=udp, got %q", got)
+	}
+	if got, want := addr.String(), "mco.cubecraft.net:19132"; got != want {
+		t.Fatalf("unexpected addr string, got %q want %q", got, want)
+	}
+
+	var _ net.Addr = addr
+}
+
+func TestBuildUDPDestinationAddr_PreserveHostnameForProxy(t *testing.T) {
+	addr, udpAddr, err := buildUDPDestinationAddr(context.Background(), "play.venitymc.com:19132", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if udpAddr != nil {
+		t.Fatalf("expected unresolved hostname to keep udpAddr nil, got %+v", udpAddr)
+	}
+	hostnameAddr, ok := addr.(*HostnamePortAddr)
+	if !ok {
+		t.Fatalf("expected HostnamePortAddr, got %T", addr)
+	}
+	if hostnameAddr.Host != "play.venitymc.com" || hostnameAddr.Port != 19132 {
+		t.Fatalf("unexpected hostname addr: %+v", hostnameAddr)
+	}
+}
+
+func TestRawUDPProxyRefreshTargetAddrs_PreserveHostnameWhenProxying(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "play.venitymc.com",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}
+	proxy := NewRawUDPProxy("server-1", cfg, nil, nil)
+	proxy.SetOutboundManager(NewOutboundManager(nil))
+
+	if err := proxy.refreshTargetAddrs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if proxy.targetAddr != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname, got %+v", proxy.targetAddr)
+	}
+	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	if !ok {
+		t.Fatalf("expected HostnamePortAddr, got %T", proxy.targetPacketAddr)
+	}
+	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
+		t.Fatalf("unexpected targetPacketAddr: %q", got)
+	}
+}
+
+func TestPlainUDPProxyRefreshTargetAddr_PreserveHostnameWhenProxying(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "play.venitymc.com",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}
+	proxy := NewPlainUDPProxy("server-1", cfg)
+	proxy.SetOutboundManager(NewOutboundManager(nil))
+	proxy.refreshTargetAddr()
+
+	hostnameAddr, ok := proxy.targetAddr.(*HostnamePortAddr)
+	if !ok {
+		t.Fatalf("expected HostnamePortAddr, got %T", proxy.targetAddr)
+	}
+	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
+		t.Fatalf("unexpected targetAddr: %q", got)
+	}
+}
+
+func TestWrapHysteria2UDPError(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     error
+		wantNil   bool
+		wantHint  bool
+		checkWrap bool
+	}{
+		{name: "nil", input: nil, wantNil: true},
+		{name: "idle timeout", input: errorf("connect error: timeout: no recent network activity"), wantHint: true, checkWrap: true},
+		{name: "deadline exceeded", input: context.DeadlineExceeded, wantHint: true, checkWrap: true},
+		{name: "generic", input: errorf("some other failure"), wantHint: false, checkWrap: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wrapHysteria2UDPError(tt.input)
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil error, got %v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected wrapped error, got nil")
+			}
+			if tt.wantHint {
+				msg := got.Error()
+				if !containsAny(msg, []string{"unreachable", "QUIC", "TUN", "firewall"}) {
+					t.Fatalf("expected actionable hint in error, got %q", msg)
+				}
+			}
+			if tt.checkWrap && tt.input != nil {
+				if unwrapped := errors.Unwrap(got); unwrapped == nil {
+					t.Fatalf("expected wrapped inner error, got nil")
+				}
+			}
+		})
+	}
+}
+
+func errorf(msg string) error { return &simpleErr{msg: msg} }
+
+type simpleErr struct{ msg string }
+
+func (e *simpleErr) Error() string { return e.msg }
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // **Feature: singbox-outbound-proxy, Property 6: Fallback to direct for non-existent outbound**

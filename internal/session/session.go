@@ -23,6 +23,7 @@ type Session struct {
 	StartTime   time.Time    `json:"start_time"`
 	LastSeen    time.Time    `json:"last_seen"`
 	mu          sync.Mutex   `json:"-"`
+	forwardMu   sync.Mutex   `json:"-"`
 
 	// Login packet reassembly buffer for fragmented RakNet packets
 	LoginBuffer     []byte     `json:"-"`
@@ -89,6 +90,32 @@ func (s *Session) UpdateLastSeen() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastSeen = time.Now()
+}
+
+func (s *Session) AddBytesUpAndUpdateLastSeen(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > 0 {
+		s.BytesUp += n
+	}
+	s.LastSeen = time.Now()
+}
+
+func (s *Session) AddBytesDownAndUpdateLastSeen(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > 0 {
+		s.BytesDown += n
+	}
+	s.LastSeen = time.Now()
+}
+
+func (s *Session) LockForward() {
+	s.forwardMu.Lock()
+}
+
+func (s *Session) UnlockForward() {
+	s.forwardMu.Unlock()
 }
 
 // SetPlayerInfo sets the player UUID, display name, and XUID.
@@ -228,7 +255,7 @@ type SessionRecord struct {
 	BytesDown    int64     `json:"bytes_down"`
 	StartTime    time.Time `json:"start_time"`
 	EndTime      time.Time `json:"end_time,omitempty"`
-	Metadata     string    `json:"metadata,omitempty"` // JSON encoded additional data
+	Metadata     string    `json:"metadata,omitempty"`      // JSON encoded additional data
 	Status       string    `json:"status,omitempty"`        // Connection status: connected, blacklist, whitelist, auth_failed, kicked
 	StatusReason string    `json:"status_reason,omitempty"` // Human-readable reason for the status
 }

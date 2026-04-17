@@ -55,14 +55,14 @@ func (m *ACLManager) IsBlacklisted(playerName, serverID string) (bool, *db.Black
 
 	// Check global blacklist first
 	entry, err := m.blacklistRepo.GetByName(playerName, "")
-	if err == nil && entry != nil && !entry.IsExpired() {
+	if err == nil && IsBlacklistedByEntry(playerName, entry) {
 		return true, entry
 	}
 
 	// Check server-specific blacklist if serverID is provided
 	if serverID != "" {
 		entry, err = m.blacklistRepo.GetByName(playerName, serverID)
-		if err == nil && entry != nil && !entry.IsExpired() {
+		if err == nil && IsBlacklistedByEntry(playerName, entry) {
 			return true, entry
 		}
 	}
@@ -78,14 +78,14 @@ func (m *ACLManager) IsWhitelisted(playerName, serverID string) bool {
 
 	// Check global whitelist first
 	entry, err := m.whitelistRepo.GetByName(playerName, "")
-	if err == nil && entry != nil {
+	if err == nil && IsWhitelistedByEntry(playerName, entry) {
 		return true
 	}
 
 	// Check server-specific whitelist if serverID is provided
 	if serverID != "" {
 		entry, err = m.whitelistRepo.GetByName(playerName, serverID)
-		if err == nil && entry != nil {
+		if err == nil && IsWhitelistedByEntry(playerName, entry) {
 			return true
 		}
 	}
@@ -171,56 +171,59 @@ func (m *ACLManager) CheckAccessFull(playerName, serverID string) (AccessDecisio
 	}
 
 	settings := loadSettings()
+	blacklistEnabled := settings == nil || settings.BlacklistEnabled
 
 	// Step 1: Global blacklist
-	entry, err := m.blacklistRepo.GetByName(playerName, "")
-	if err != nil && err != ErrNotFound {
-		lastErr = err
-	}
-	if err == nil && entry != nil && !entry.IsExpired() {
-		// 标题固定使用设置中的 DefaultMessage，如果为空则用默认文本
-		title := ""
-		if settings != nil {
-			title = strings.TrimSpace(settings.DefaultMessage)
-		}
-		if title == "" {
-			title = "你已被封禁"
-		}
-
-		// Detail 存放条目里的自定义原因
-		detail := strings.TrimSpace(entry.Reason)
-		if detail == "" {
-			detail = "无"
-		}
-
-		return AccessDecision{
-			Allowed: false,
-			Type:    DenyBlacklist,
-			Reason:  title,
-			Detail:  detail,
-		}, lastErr
-	}
-
-	// Step 2: Server-specific blacklist
-	if serverID != "" {
-		entry, err = m.blacklistRepo.GetByName(playerName, serverID)
+	if blacklistEnabled {
+		entry, err := m.blacklistRepo.GetByName(playerName, "")
 		if err != nil && err != ErrNotFound {
 			lastErr = err
 		}
-		if err == nil && entry != nil && !entry.IsExpired() {
-			reason := strings.TrimSpace(entry.Reason)
-			if reason == "" && settings != nil && strings.TrimSpace(settings.DefaultMessage) != "" {
-				reason = strings.TrimSpace(settings.DefaultMessage)
+		if err == nil && IsBlacklistedByEntry(playerName, entry) {
+			// 标题固定使用设置中的 DefaultMessage，如果为空则用默认文本
+			title := ""
+			if settings != nil {
+				title = strings.TrimSpace(settings.DefaultMessage)
 			}
-			if reason == "" {
-				reason = "你已被封禁"
+			if title == "" {
+				title = "你已被封禁"
 			}
+
+			// Detail 存放条目里的自定义原因
+			detail := strings.TrimSpace(entry.Reason)
+			if detail == "" {
+				detail = "无"
+			}
+
 			return AccessDecision{
 				Allowed: false,
 				Type:    DenyBlacklist,
-				Reason:  reason,
-				Detail:  entry.Reason,
+				Reason:  title,
+				Detail:  detail,
 			}, lastErr
+		}
+
+		// Step 2: Server-specific blacklist
+		if serverID != "" {
+			entry, err = m.blacklistRepo.GetByName(playerName, serverID)
+			if err != nil && err != ErrNotFound {
+				lastErr = err
+			}
+			if err == nil && IsBlacklistedByEntry(playerName, entry) {
+				reason := strings.TrimSpace(entry.Reason)
+				if reason == "" && settings != nil && strings.TrimSpace(settings.DefaultMessage) != "" {
+					reason = strings.TrimSpace(settings.DefaultMessage)
+				}
+				if reason == "" {
+					reason = "你已被封禁"
+				}
+				return AccessDecision{
+					Allowed: false,
+					Type:    DenyBlacklist,
+					Reason:  reason,
+					Detail:  entry.Reason,
+				}, lastErr
+			}
 		}
 	}
 
@@ -234,7 +237,7 @@ func (m *ACLManager) CheckAccessFull(playerName, serverID string) (AccessDecisio
 	if err != nil && err != ErrNotFound {
 		lastErr = err
 	}
-	if err == nil && whitelistEntry != nil {
+	if err == nil && IsWhitelistedByEntry(playerName, whitelistEntry) {
 		return AccessDecision{Allowed: true, Type: DenyNone}, lastErr
 	}
 
@@ -244,7 +247,7 @@ func (m *ACLManager) CheckAccessFull(playerName, serverID string) (AccessDecisio
 		if err != nil && err != ErrNotFound {
 			lastErr = err
 		}
-		if err == nil && whitelistEntry != nil {
+		if err == nil && IsWhitelistedByEntry(playerName, whitelistEntry) {
 			return AccessDecision{Allowed: true, Type: DenyNone}, lastErr
 		}
 	}
@@ -293,6 +296,15 @@ func (m *ACLManager) AddToBlacklist(entry *db.BlacklistEntry) error {
 	return m.blacklistRepo.Create(entry)
 }
 
+func (m *ACLManager) UpdateBlacklistEntryEnabled(displayName, serverID string, enabled bool) (*db.BlacklistEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.blacklistRepo.UpdateEnabled(displayName, serverID, enabled); err != nil {
+		return nil, err
+	}
+	return m.blacklistRepo.GetByName(displayName, serverID)
+}
+
 // RemoveFromBlacklist removes a player from the blacklist.
 func (m *ACLManager) RemoveFromBlacklist(displayName, serverID string) error {
 	m.mu.Lock()
@@ -328,6 +340,15 @@ func (m *ACLManager) AddToWhitelist(entry *db.WhitelistEntry) error {
 	return m.whitelistRepo.Create(entry)
 }
 
+func (m *ACLManager) UpdateWhitelistEntryEnabled(displayName, serverID string, enabled bool) (*db.WhitelistEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.whitelistRepo.UpdateEnabled(displayName, serverID, enabled); err != nil {
+		return nil, err
+	}
+	return m.whitelistRepo.GetByName(displayName, serverID)
+}
+
 // RemoveFromWhitelist removes a player from the whitelist.
 func (m *ACLManager) RemoveFromWhitelist(displayName, serverID string) error {
 	m.mu.Lock()
@@ -361,6 +382,9 @@ func IsBlacklistedByEntry(playerName string, entry *db.BlacklistEntry) bool {
 	if entry == nil {
 		return false
 	}
+	if !entry.Enabled {
+		return false
+	}
 	if entry.IsExpired() {
 		return false
 	}
@@ -370,6 +394,9 @@ func IsBlacklistedByEntry(playerName string, entry *db.BlacklistEntry) bool {
 // IsWhitelistedByEntry checks if a player name matches a whitelist entry (case-insensitive).
 func IsWhitelistedByEntry(playerName string, entry *db.WhitelistEntry) bool {
 	if entry == nil {
+		return false
+	}
+	if !entry.Enabled {
 		return false
 	}
 	return strings.EqualFold(playerName, entry.DisplayName)
@@ -386,25 +413,29 @@ func CheckAccessWithEntries(
 	serverWhitelist []*db.WhitelistEntry,
 	settings *db.ACLSettings,
 ) (allowed bool, reason string) {
-	// Step 1: Check global blacklist
-	for _, entry := range globalBlacklist {
-		if IsBlacklistedByEntry(playerName, entry) {
-			reason := entry.Reason
-			if reason == "" {
-				reason = "你已被封禁"
-			}
-			return false, reason
-		}
-	}
+	blacklistEnabled := settings == nil || settings.BlacklistEnabled
 
-	// Step 2: Check server-specific blacklist
-	for _, entry := range serverBlacklist {
-		if IsBlacklistedByEntry(playerName, entry) {
-			reason := entry.Reason
-			if reason == "" {
-				reason = "你已被封禁"
+	// Step 1: Check global blacklist
+	if blacklistEnabled {
+		for _, entry := range globalBlacklist {
+			if IsBlacklistedByEntry(playerName, entry) {
+				reason := entry.Reason
+				if reason == "" {
+					reason = "你已被封禁"
+				}
+				return false, reason
 			}
-			return false, reason
+		}
+
+		// Step 2: Check server-specific blacklist
+		for _, entry := range serverBlacklist {
+			if IsBlacklistedByEntry(playerName, entry) {
+				reason := entry.Reason
+				if reason == "" {
+					reason = "你已被封禁"
+				}
+				return false, reason
+			}
 		}
 	}
 
@@ -438,7 +469,7 @@ func CheckAccessWithEntries(
 // FindBlacklistEntry finds a blacklist entry for a player name (case-insensitive).
 func FindBlacklistEntry(playerName string, entries []*db.BlacklistEntry) *db.BlacklistEntry {
 	for _, entry := range entries {
-		if strings.EqualFold(playerName, entry.DisplayName) && !entry.IsExpired() {
+		if IsBlacklistedByEntry(playerName, entry) {
 			return entry
 		}
 	}
@@ -448,7 +479,7 @@ func FindBlacklistEntry(playerName string, entries []*db.BlacklistEntry) *db.Bla
 // FindWhitelistEntry finds a whitelist entry for a player name (case-insensitive).
 func FindWhitelistEntry(playerName string, entries []*db.WhitelistEntry) *db.WhitelistEntry {
 	for _, entry := range entries {
-		if strings.EqualFold(playerName, entry.DisplayName) {
+		if IsWhitelistedByEntry(playerName, entry) {
 			return entry
 		}
 	}

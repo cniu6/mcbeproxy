@@ -32,7 +32,7 @@ type PlainUDPProxy struct {
 	config      *config.ServerConfig
 	outboundMgr OutboundManager
 	listener    *net.UDPConn
-	targetAddr  *net.UDPAddr
+	targetAddr  net.Addr
 	clients     sync.Map
 	closed      atomic.Bool
 	wg          sync.WaitGroup
@@ -55,6 +55,7 @@ func (p *PlainUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
 	p.config = cfg
 	p.refreshTargetAddr()
 	p.updateIdleTimeout()
+	p.bufferPool = NewBufferPool(p.effectiveBufferSize())
 }
 
 func (p *PlainUDPProxy) Start() error {
@@ -72,11 +73,7 @@ func (p *PlainUDPProxy) Start() error {
 	p.refreshTargetAddr()
 	p.updateIdleTimeout()
 
-	bufferSize := p.config.BufferSize
-	if bufferSize <= 0 || bufferSize > MaxBufferSize {
-		bufferSize = MaxBufferSize
-	}
-	p.bufferPool = NewBufferPool(bufferSize)
+	p.bufferPool = NewBufferPool(p.effectiveBufferSize())
 
 	return nil
 }
@@ -117,13 +114,12 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		}
 
 		clientInfo.lastSeen.Store(time.Now().UnixNano())
-		p.listener.SetWriteDeadline(time.Now().Add(plainUDPWriteTimeout))
 		clientInfo.targetConn.SetWriteDeadline(time.Now().Add(plainUDPWriteTimeout))
-		_, err = clientInfo.targetConn.WriteTo((*buf)[:n], clientInfo.targetAddr)
+		_, err = writePacketConn(clientInfo.targetConn, (*buf)[:n], clientInfo.targetAddr)
 		p.bufferPool.Put(buf)
 		if err != nil && !isTimeoutError(err) {
 			logger.Debug("PlainUDPProxy: write to target failed for %s: %v", clientAddr.String(), err)
-			p.removeClient(clientAddr.String())
+			p.removeClientIfMatch(clientAddr.String(), clientInfo)
 		}
 	}
 }
@@ -142,6 +138,21 @@ func (p *PlainUDPProxy) Stop() error {
 	})
 	p.wg.Wait()
 	return nil
+}
+
+func (p *PlainUDPProxy) effectiveTargetAddrString() string {
+	if p.targetAddr != nil {
+		return p.targetAddr.String()
+	}
+	if p.config != nil {
+		return p.config.GetTargetAddr()
+	}
+	return ""
+}
+
+func (p *PlainUDPProxy) resolvedTargetAddr() (*net.UDPAddr, bool) {
+	udpAddr, ok := p.targetAddr.(*net.UDPAddr)
+	return udpAddr, ok
 }
 
 func (p *PlainUDPProxy) getOrCreateClient(ctx context.Context, clientAddr *net.UDPAddr) (*plainUDPClient, bool) {
@@ -176,26 +187,51 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 		return nil, nil, fmt.Errorf("target address not resolved")
 	}
 	if p.config == nil || p.outboundMgr == nil || p.config.IsDirectConnection() {
-		conn, err := net.DialUDP("udp", nil, p.targetAddr)
+		udpAddr, ok := p.resolvedTargetAddr()
+		if !ok || udpAddr == nil {
+			return nil, nil, fmt.Errorf("target address %s is not resolved for direct dialing", p.effectiveTargetAddrString())
+		}
+		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
 			return nil, nil, err
 		}
-		return conn, p.targetAddr, nil
+		return conn, udpAddr, nil
 	}
 
 	proxyOutbound := p.config.GetProxyOutbound()
 	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
 		strategy := p.config.GetLoadBalance()
 		sortBy := p.config.GetLoadBalanceSort()
-		selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil)
-		if err != nil {
-			return nil, nil, err
+		exclude := make([]string, 0, 4)
+		attempts := proxySelectionAttemptLimit(p.config, p.outboundMgr)
+		for i := 0; i < attempts; i++ {
+			selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, exclude)
+			if err != nil {
+				return nil, nil, err
+			}
+			// "direct" token within a multi-node list: skip the outbound
+			// dial path and resolve+dial the target ourselves. Failover
+			// semantics still apply if the direct dial fails.
+			if IsDirectSelection(selected) {
+				udpAddr, ok := p.resolvedTargetAddr()
+				if !ok || udpAddr == nil {
+					exclude = append(exclude, DirectNodeName)
+					continue
+				}
+				conn, derr := net.DialUDP("udp", nil, udpAddr)
+				if derr == nil {
+					return conn, p.targetAddr, nil
+				}
+				exclude = append(exclude, DirectNodeName)
+				continue
+			}
+			conn, err := dialPacketConnForFailover(ctx, p.outboundMgr, selected.Name, p.config.GetTargetAddr())
+			if err == nil {
+				return conn, p.targetAddr, nil
+			}
+			exclude = append(exclude, selected.Name)
 		}
-		conn, err := p.outboundMgr.DialPacketConn(ctx, selected.Name, p.config.GetTargetAddr())
-		if err != nil {
-			return nil, nil, err
-		}
-		return conn, p.targetAddr, nil
+		return nil, nil, fmt.Errorf("all proxy outbounds failed")
 	}
 
 	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, p.config.GetTargetAddr())
@@ -207,9 +243,11 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 
 func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, clientInfo *plainUDPClient) {
 	defer p.wg.Done()
-	defer p.removeClient(clientKey)
+	defer p.removeClientIfMatch(clientKey, clientInfo)
 
-	buffer := make([]byte, MaxBufferSize)
+	bufPtr := p.bufferPool.Get()
+	buffer := *bufPtr
+	defer p.bufferPool.Put(bufPtr)
 
 	for {
 		select {
@@ -253,15 +291,40 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 }
 
 func (p *PlainUDPProxy) removeClient(clientKey string) {
-	if val, ok := p.clients.Load(clientKey); ok {
+	p.removeClientIfMatch(clientKey, nil)
+}
+
+func (p *PlainUDPProxy) removeClientIfMatch(clientKey string, expected *plainUDPClient) {
+	if expected != nil {
+		if !p.clients.CompareAndDelete(clientKey, expected) {
+			return
+		}
+		_ = expected.targetConn.Close()
+		return
+	}
+	if val, ok := p.clients.LoadAndDelete(clientKey); ok {
 		client := val.(*plainUDPClient)
 		_ = client.targetConn.Close()
-		p.clients.Delete(clientKey)
 	}
 }
 
+func (p *PlainUDPProxy) effectiveBufferSize() int {
+	if p.config == nil {
+		return MaxUDPPacketSize
+	}
+	bufferSize := p.config.GetBufferSize()
+	if bufferSize == AutoBufferSize || bufferSize <= 0 {
+		return MaxUDPPacketSize
+	}
+	if bufferSize > MaxBufferSize {
+		return MaxBufferSize
+	}
+	return bufferSize
+}
+
 func (p *PlainUDPProxy) refreshTargetAddr() {
-	addr, err := net.ResolveUDPAddr("udp", p.config.GetTargetAddr())
+	shouldPreserveHostname := p.config != nil && p.outboundMgr != nil && !p.config.IsDirectConnection()
+	addr, _, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
 	if err != nil {
 		logger.Warn("PlainUDPProxy: failed to resolve target %s: %v", p.config.GetTargetAddr(), err)
 		return

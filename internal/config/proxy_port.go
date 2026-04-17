@@ -18,14 +18,22 @@ const (
 )
 
 // ProxyPortConfig represents a local proxy port configuration.
+//
+// Username/Password are deliberately NOT tagged `omitempty`. If they were,
+// an empty password would be stripped from GET responses, the frontend
+// would have no idea the field existed, and any PUT (including batch
+// enable/disable/type-change) would silently re-send `password: ""`,
+// clobbering whatever credential was previously saved on disk. Since this
+// API is already admin-authenticated and the value is stored in plaintext
+// JSON on disk anyway, round-tripping the value is strictly safer.
 type ProxyPortConfig struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	ListenAddr      string   `json:"listen_addr"`
 	Type            string   `json:"type"` // http, socks5, socks4, mixed
 	Enabled         bool     `json:"enabled"`
-	Username        string   `json:"username,omitempty"`
-	Password        string   `json:"password,omitempty"`
+	Username        string   `json:"username"`
+	Password        string   `json:"password"`
 	ProxyOutbound   string   `json:"proxy_outbound"`    // Proxy outbound name or "@group" or "node1,node2"
 	LoadBalance     string   `json:"load_balance"`      // least-latency, round-robin, random, least-connections
 	LoadBalanceSort string   `json:"load_balance_sort"` // tcp, http, udp

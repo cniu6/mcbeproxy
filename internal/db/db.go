@@ -104,8 +104,9 @@ func (d *Database) Initialize() error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		display_name TEXT NOT NULL,
 		display_name_lower TEXT NOT NULL,
+		enabled BOOLEAN DEFAULT TRUE,
 		reason TEXT,
-		server_id TEXT,
+		server_id TEXT, -- NULL or empty for global blacklist
 		added_at DATETIME NOT NULL,
 		expires_at DATETIME,
 		added_by TEXT,
@@ -120,7 +121,8 @@ func (d *Database) Initialize() error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		display_name TEXT NOT NULL,
 		display_name_lower TEXT NOT NULL,
-		server_id TEXT,
+		enabled BOOLEAN DEFAULT TRUE,
+		server_id TEXT, -- NULL or empty for global whitelist
 		added_at DATETIME NOT NULL,
 		added_by TEXT,
 		UNIQUE(display_name_lower, server_id)
@@ -132,6 +134,7 @@ func (d *Database) Initialize() error {
 	-- acl_settings table
 	CREATE TABLE IF NOT EXISTS acl_settings (
 		server_id TEXT PRIMARY KEY,
+		blacklist_enabled BOOLEAN DEFAULT TRUE,
 		whitelist_enabled BOOLEAN DEFAULT FALSE,
 		default_ban_message TEXT DEFAULT '你已被封禁',
 		whitelist_message TEXT DEFAULT '你不在白名单中'
@@ -148,6 +151,12 @@ func (d *Database) Initialize() error {
 		"ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT ''",
 		"ALTER TABLE sessions ADD COLUMN status_reason TEXT DEFAULT ''",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
+		"ALTER TABLE blacklist ADD COLUMN enabled BOOLEAN DEFAULT TRUE",
+		"UPDATE blacklist SET enabled = TRUE WHERE enabled IS NULL",
+		"ALTER TABLE whitelist ADD COLUMN enabled BOOLEAN DEFAULT TRUE",
+		"UPDATE whitelist SET enabled = TRUE WHERE enabled IS NULL",
+		"ALTER TABLE acl_settings ADD COLUMN blacklist_enabled BOOLEAN DEFAULT TRUE",
+		"UPDATE acl_settings SET blacklist_enabled = TRUE WHERE blacklist_enabled IS NULL",
 	}
 	for _, m := range migrations {
 		_, _ = d.db.Exec(m) // ignore errors (column may already exist)

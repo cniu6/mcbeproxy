@@ -1,22 +1,43 @@
 <template>
   <div class="page-container">
-    <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">代理节点管理</n-h2>
-      <n-space>
-        <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
-          <n-button type="info">批量测试 ({{ checkedRowKeys.length }})</n-button>
+    <n-space justify="space-between" align="center" class="page-header" wrap>
+      <n-space vertical :size="6">
+        <n-h2 style="margin: 0">代理节点管理</n-h2>
+        <n-space :size="8" wrap>
+          <n-tag type="info" bordered="false">总计 {{ outbounds.length }}</n-tag>
+          <n-tag type="success" bordered="false">在线连接 {{ activeRuntimeCount }}</n-tag>
+          <n-tag v-if="checkedRowKeys.length > 0" type="warning" bordered="false">已选 {{ checkedRowKeys.length }}</n-tag>
+        </n-space>
+      </n-space>
+      <n-space class="page-actions" wrap>
+        <n-dropdown v-if="filteredOutbounds.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleQuickBatchTestSelect">
+          <n-button type="info" secondary>一键测试当前筛选 ({{ filteredOutbounds.length }})</n-button>
         </n-dropdown>
-        <n-button v-if="batchTesting" type="info" :loading="true">
+        <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
+          <n-button type="info" secondary>批量测试 ({{ checkedRowKeys.length }})</n-button>
+        </n-dropdown>
+        <n-button v-if="batchTesting" type="info" :loading="true" secondary>
           测试中 {{ batchTestProgress.current }}/{{ batchTestProgress.total }}
         </n-button>
         <n-popconfirm v-if="checkedRowKeys.length > 0 && !batchTesting" @positive-click="batchDelete">
-          <template #trigger><n-button type="error">批量删除 ({{ checkedRowKeys.length }})</n-button></template>
+          <template #trigger><n-button type="error" secondary>批量删除 ({{ checkedRowKeys.length }})</n-button></template>
           确定删除选中的 {{ checkedRowKeys.length }} 个节点吗？
         </n-popconfirm>
-        <n-button @click="openImportModal">导入节点</n-button>
+        <n-button secondary @click="showSubscriptionsModal = true">订阅管理</n-button>
+        <n-button secondary @click="openImportModal">导入节点</n-button>
         <n-button type="primary" @click="openAddModal">添加代理节点</n-button>
       </n-space>
     </n-space>
+
+    <!-- 订阅管理入口：从顶部常驻面板挪到按钮弹窗，节省垂直空间让节点列表更高 -->
+    <n-modal v-model:show="showSubscriptionsModal" preset="card" title="订阅管理" style="width: 1280px; max-width: 96vw">
+      <ProxySubscriptionsPanel
+        v-if="showSubscriptionsModal"
+        :outbounds="outbounds"
+        @refresh="onSubscriptionsPanelRefresh"
+        @focus-subscription="onSubscriptionsPanelFocus"
+      />
+    </n-modal>
     
     <!-- 分组卡片 -->
     <div class="group-cards-container" v-if="groupStatsData.length > 0">
@@ -91,49 +112,74 @@
     </div>
 
     <!-- 分组筛选 -->
-    <n-card size="small" style="margin-bottom: 16px">
-      <n-space align="center" wrap>
-        <span>协议:</span>
-        <n-select 
-          v-model:value="selectedProtocol" 
-          :options="protocolFilterOptions" 
-          style="width: 150px" 
-          placeholder="全部协议"
-          clearable
-        />
-        <span style="margin-left: 16px">状态:</span>
-        <n-select 
-          v-model:value="selectedStatus" 
-          :options="statusFilterOptions" 
-          style="width: 120px" 
-          placeholder="全部"
-          clearable
-        />
-        <n-input 
-          v-model:value="searchKeyword" 
-          placeholder="搜索节点名称/服务器" 
-          style="width: 200px; margin-left: 16px"
-          clearable
-        />
-        <n-tag v-if="filteredOutbounds.length !== outbounds.length" type="info">
-          {{ filteredOutbounds.length }} / {{ outbounds.length }}
-        </n-tag>
-      </n-space>
+    <n-card size="small" class="toolbar-card">
+      <div class="filter-stack">
+        <n-space align="center" wrap class="filter-row">
+          <span class="filter-label">协议</span>
+          <n-select
+            v-model:value="selectedProtocol"
+            :options="protocolFilterOptions"
+            style="width: 150px"
+            placeholder="全部协议"
+            clearable
+          />
+          <span class="filter-label">状态</span>
+          <n-select
+            v-model:value="selectedStatus"
+            :options="statusFilterOptions"
+            style="width: 120px"
+            placeholder="全部"
+            clearable
+          />
+          <span class="filter-label">运行态</span>
+          <n-switch v-model:value="showRuntimeOnly" />
+        </n-space>
+        <n-space align="center" wrap class="filter-row">
+          <span class="filter-label">质量排序</span>
+          <n-select
+            v-model:value="qualitySortMetric"
+            :options="qualitySortOptions"
+            style="width: 140px"
+            placeholder="默认排序"
+            clearable
+          />
+          <n-select
+            v-model:value="qualitySortOrder"
+            :options="qualitySortOrderOptions"
+            style="width: 110px"
+            :disabled="!qualitySortMetric"
+          />
+          <n-input
+            v-model:value="searchKeywordInput"
+            placeholder="搜索节点名称/服务器/订阅"
+            class="filter-search"
+            clearable
+          />
+          <n-button quaternary size="small" @click="clearFilters">重置筛选</n-button>
+          <n-tag v-if="filteredOutbounds.length !== outbounds.length" type="info">
+            {{ filteredOutbounds.length }} / {{ outbounds.length }}
+          </n-tag>
+          <n-tag v-if="showRuntimeOnly" type="success" bordered="false">仅看有流量/连接的节点</n-tag>
+        </n-space>
+      </div>
     </n-card>
-    
+
     <n-card>
       <div class="table-wrapper">
-        <n-data-table 
-          :columns="columns" 
-          :data="filteredOutbounds" 
-          :bordered="false" 
-          :scroll-x="1500"
-          :row-key="r => r.name"
+        <n-data-table
+          class="proxy-table"
+          :columns="columns"
+          :data="sortedOutbounds"
+          :bordered="false"
+          size="small"
+          :scroll-x="1560"
+          :row-key="rowKey"
           :row-props="proxyTableRowProps"
           v-model:checked-row-keys="checkedRowKeys"
-          :pagination="pagination"
-          @update:page="handlePageChange"
-          @update:page-size="handlePageSizeChange"
+          :loading="loading"
+          :max-height="tableMaxHeight"
+          :virtual-scroll="false"
+          :pagination="mainTablePagination"
         />
       </div>
     </n-card>
@@ -168,9 +214,19 @@
             <n-gi :span="2"><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
           </template>
 
+          <!-- SOCKS5 / HTTP 字段 -->
+          <template v-if="['socks5', 'http'].includes(form.type)">
+            <n-gi><n-form-item label="用户名"><n-input v-model:value="form.username" placeholder="可选" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="可选" /></n-form-item></n-gi>
+          </template>
+
           <!-- AnyTLS 字段 -->
           <template v-if="form.type === 'anytls'">
-            <n-gi :span="2"><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="如: h2,http/1.1" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="空闲检查(s)"><n-input-number v-model:value="form.idle_session_check_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="空闲超时(s)"><n-input-number v-model:value="form.idle_session_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="最小空闲会话"><n-input-number v-model:value="form.min_idle_session" :min="0" style="width: 100%" /></n-form-item></n-gi>
           </template>
           
           <!-- VLESS 字段 -->
@@ -185,6 +241,7 @@
             <n-gi><n-form-item label="端口跳跃"><n-input v-model:value="form.port_hopping" placeholder="如: 20000-55000 (可选)" /></n-form-item></n-gi>
             <n-gi><n-form-item label="混淆类型"><n-select v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable /></n-form-item></n-gi>
             <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input v-model:value="form.obfs_password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
           </template>
           
           <!-- TLS 通用字段 -->
@@ -194,8 +251,8 @@
             <n-gi :span="2"><n-form-item label="TLS 指纹"><n-select v-model:value="form.fingerprint" :options="fingerprintOptions" clearable /></n-form-item></n-gi>
           </template>
 
-          <!-- Reality 字段 (VLESS) -->
-          <template v-if="form.type === 'vless'">
+          <!-- Reality 字段 (VLESS/AnyTLS) -->
+          <template v-if="['vless', 'anytls'].includes(form.type)">
             <n-gi><n-form-item label="Reality"><n-switch v-model:value="form.reality" /></n-form-item></n-gi>
             <template v-if="form.reality">
               <n-gi><n-form-item label="公钥"><n-input v-model:value="form.reality_public_key" placeholder="Reality Public Key (pbk)" /></n-form-item></n-gi>
@@ -203,13 +260,20 @@
             </template>
           </template>
 
-          <!-- 传输层设置 (VMess/VLESS) -->
-          <template v-if="['vmess', 'vless'].includes(form.type)">
+          <!-- 传输层设置 -->
+          <template v-if="['vmess', 'trojan', 'vless'].includes(form.type)">
             <n-gi :span="2"><n-divider style="margin: 8px 0">传输层设置</n-divider></n-gi>
             <n-gi><n-form-item label="传输协议"><n-select v-model:value="form.network" :options="networkOptions" clearable placeholder="tcp (默认)" /></n-form-item></n-gi>
-            <template v-if="form.network === 'ws'">
-              <n-gi><n-form-item label="WS 路径"><n-input v-model:value="form.ws_path" placeholder="/" /></n-form-item></n-gi>
-              <n-gi :span="2"><n-form-item label="WS Host"><n-input v-model:value="form.ws_host" placeholder="可选，默认使用服务器地址" /></n-form-item></n-gi>
+            <template v-if="['ws', 'httpupgrade', 'xhttp'].includes(form.network)">
+              <n-gi><n-form-item :label="form.network === 'xhttp' ? 'XHTTP 路径' : 'WS 路径'"><n-input v-model:value="form.ws_path" placeholder="/" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item :label="form.network === 'httpupgrade' ? 'HTTPUpgrade Host' : (form.network === 'xhttp' ? 'XHTTP Host' : 'WS Host')"><n-input v-model:value="form.ws_host" placeholder="可选，默认使用服务器地址" /></n-form-item></n-gi>
+            </template>
+            <template v-if="form.network === 'xhttp'">
+              <n-gi :span="2"><n-form-item label="XHTTP Mode"><n-input v-model:value="form.xhttp_mode" placeholder="可选，如 auto / packet-up / stream-up" /></n-form-item></n-gi>
+            </template>
+            <template v-if="form.network === 'grpc'">
+              <n-gi :span="2"><n-form-item label="gRPC 服务名"><n-input v-model:value="form.grpc_service_name" placeholder="如 grpc、GunService、/custom/Tun" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item label="gRPC Authority"><n-input v-model:value="form.grpc_authority" placeholder="可选，覆盖 :authority / Host" /></n-form-item></n-gi>
             </template>
           </template>
         </n-grid>
@@ -263,15 +327,19 @@
         <n-space align="center" :size="8" wrap>
           <n-input v-model:value="subProxySearch" size="small" placeholder="搜索节点..." clearable style="width: 200px" />
           <n-select v-model:value="subProxyGroup" size="small" :options="subProxyGroupOptions" placeholder="全部分组" clearable style="width: 160px" />
+          <n-dropdown v-if="filteredSubProxyList.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleSubProxyQuickTestSelect">
+            <n-button size="small">一键测试当前列表 ({{ filteredSubProxyList.length }})</n-button>
+          </n-dropdown>
           <n-button size="small" @click="subscriptionProxy = ''; showSubProxySelectorModal = false">使用直连</n-button>
           <n-text v-if="subscriptionProxy" depth="3" style="font-size: 12px">当前: {{ subscriptionProxy }}</n-text>
         </n-space>
         <n-data-table
+          class="sub-proxy-table"
           :columns="subProxyColumns"
           :data="filteredSubProxyList"
           :bordered="true"
           size="small"
-          :max-height="450"
+          :max-height="520"
           :scroll-x="900"
         />
       </n-space>
@@ -293,12 +361,13 @@
           </n-checkbox-group>
         </n-form-item>
         <n-divider style="margin: 12px 0" />
-        <n-form-item label="测速">
-          <n-switch v-model:value="enableSpeedTest" />
+        <n-form-item label="UDP(MCBE)">
+          <n-switch v-model:value="enableDetailedUdp" />
+          <span style="margin-left: 8px; color: #999">通过代理测试游戏 UDP</span>
         </n-form-item>
-        <template v-if="enableSpeedTest">
-          <n-form-item label="测速地址">
-            <n-input v-model:value="speedTestUrl" placeholder="https://speed.cloudflare.com/__down?bytes=10000000" />
+        <template v-if="enableDetailedUdp">
+          <n-form-item label="UDP地址">
+            <n-input v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
           </n-form-item>
         </template>
         <n-divider style="margin: 12px 0" />
@@ -327,7 +396,7 @@
       <template #footer>
         <n-space justify="end">
           <n-button @click="showTestOptionsModal = false">取消</n-button>
-          <n-button type="primary" @click="runDetailedTest" :disabled="selectedTargets.length === 0 && !enableSpeedTest && !enableCustomHttp">开始测试</n-button>
+          <n-button type="primary" @click="runDetailedTest">开始测试</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -354,6 +423,23 @@
             <n-descriptions-item v-if="testResultData.ping_test.error" label="错误" :span="3">{{ testResultData.ping_test.error }}</n-descriptions-item>
           </n-descriptions>
         </template>
+
+        <template v-if="testResultData.udp_test">
+          <n-h4>UDP 测试 (MCBE 通过代理)</n-h4>
+          <n-descriptions :column="2" bordered style="margin-bottom: 16px">
+            <n-descriptions-item label="目标">{{ testResultData.udp_test.target }}</n-descriptions-item>
+            <n-descriptions-item label="延迟">{{ testResultData.udp_test.latency_ms }} ms</n-descriptions-item>
+            <n-descriptions-item label="状态">
+              <n-tag :type="testResultData.udp_test.success ? 'success' : 'error'" size="small">
+                {{ testResultData.udp_test.success ? '成功' : '失败' }}
+              </n-tag>
+            </n-descriptions-item>
+            <n-descriptions-item label="服务器名">{{ testResultData.udp_test.server_name || '-' }}</n-descriptions-item>
+            <n-descriptions-item label="玩家">{{ testResultData.udp_test.players || '-' }}</n-descriptions-item>
+            <n-descriptions-item label="版本">{{ testResultData.udp_test.version || '-' }}</n-descriptions-item>
+            <n-descriptions-item v-if="testResultData.udp_test.error" label="错误" :span="2">{{ testResultData.udp_test.error }}</n-descriptions-item>
+          </n-descriptions>
+        </template>
         
         <!-- HTTP 测试 -->
         <template v-if="testResultData.http_tests && testResultData.http_tests.length > 0">
@@ -361,23 +447,6 @@
           <div class="table-wrapper">
             <n-data-table :columns="httpTestColumns" :data="testResultData.http_tests" :bordered="true" size="small" style="margin-bottom: 16px" :scroll-x="600" />
           </div>
-        </template>
-        
-        <!-- 测速 -->
-        <template v-if="testResultData.speed_test">
-          <n-h4>下载速度测试</n-h4>
-          <n-descriptions :column="2" bordered style="margin-bottom: 16px">
-            <n-descriptions-item label="状态">
-              <n-tag :type="testResultData.speed_test.success ? 'success' : 'error'" size="small">
-                {{ testResultData.speed_test.success ? '成功' : '失败' }}
-              </n-tag>
-            </n-descriptions-item>
-            <n-descriptions-item label="下载速度">{{ testResultData.speed_test.download_speed_mbps?.toFixed(2) || 0 }} Mbps</n-descriptions-item>
-            <n-descriptions-item label="下载大小">{{ formatBytes(testResultData.speed_test.download_bytes) }}</n-descriptions-item>
-            <n-descriptions-item label="耗时">{{ testResultData.speed_test.duration_ms }} ms</n-descriptions-item>
-            <n-descriptions-item v-if="testResultData.speed_test.url" label="测速地址" :span="2">{{ testResultData.speed_test.url }}</n-descriptions-item>
-            <n-descriptions-item v-if="testResultData.speed_test.error" label="错误" :span="2">{{ testResultData.speed_test.error }}</n-descriptions-item>
-          </n-descriptions>
         </template>
 
         <!-- 自定义 HTTP -->
@@ -489,9 +558,10 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, h, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, h, watch } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
-import { api } from '../api'
+import { api, formatBytes, formatDuration, formatTime } from '../api'
+import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
 import { useDragSelect } from '../composables/useDragSelect'
 
 const props = defineProps({
@@ -501,6 +571,7 @@ const props = defineProps({
 
 const message = useMessage()
 const outbounds = ref([])
+const loading = ref(false)
 const highlightName = ref('')
 const showEditModal = ref(false)
 const showImportModal = ref(false)
@@ -514,9 +585,10 @@ const importText = ref('')
 const checkedRowKeys = ref([])
 const pagination = ref({
   page: 1,
-  pageSize: 100,
-  pageSizes: [100, 200, 500, 1000],
+  pageSize: 50,
+  pageSizes: [20, 50, 100, 200, 300, 400, 500, 1000, 2000, 10000],
   showSizePicker: true,
+  showQuickJumper: true,
   prefix: ({ itemCount }) => `共 ${itemCount} 条`
 })
 
@@ -527,7 +599,23 @@ const { rowProps: proxyTableRowProps } = useDragSelect(checkedRowKeys, 'name')
 const selectedGroup = ref(null)
 const selectedProtocol = ref(null)
 const selectedStatus = ref(null)
+const qualitySortMetric = ref(null)
+const qualitySortOrder = ref('asc')
+const showRuntimeOnly = ref(false)
+const searchKeywordInput = ref('')
 const searchKeyword = ref('')
+let searchKeywordTimer = null
+
+const qualitySortOptions = [
+  { label: 'TCP', value: 'tcp' },
+  { label: 'HTTP', value: 'http' },
+  { label: 'UDP', value: 'udp' }
+]
+
+const qualitySortOrderOptions = [
+  { label: '从小到大', value: 'asc' },
+  { label: '从大到小', value: 'desc' }
+]
 
 // 分组统计数据
 const groupStatsData = ref([])
@@ -554,6 +642,12 @@ const totalStats = computed(() => {
   })
   return { total, healthy, udp }
 })
+
+function hasRuntimeActivity(row) {
+  return (row?.conn_count || 0) > 0 || (row?.bytes_up || 0) > 0 || (row?.bytes_down || 0) > 0 || !!row?.last_active
+}
+
+const activeRuntimeCount = computed(() => outbounds.value.filter(hasRuntimeActivity).length)
 
 // 获取分组健康状态样式类
 const getGroupHealthClass = (group) => {
@@ -601,6 +695,8 @@ const protocolFilterOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'SOCKS5', value: 'socks5' },
+  { label: 'HTTP', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
@@ -612,6 +708,22 @@ const statusFilterOptions = [
   { label: '健康', value: 'healthy' },
   { label: '不健康', value: 'unhealthy' }
 ]
+
+const getQualitySortValue = (row, metric) => {
+  if (metric === 'tcp') {
+    return row.latency_ms > 0 ? row.latency_ms : null
+  }
+  if (metric === 'http') {
+    return row.http_latency_ms > 0 ? row.http_latency_ms : null
+  }
+  if (metric === 'udp') {
+    if (row.udp_available === true) {
+      return row.udp_latency_ms > 0 ? row.udp_latency_ms : 0
+    }
+    return null
+  }
+  return null
+}
 
 // 筛选后的数据
 const filteredOutbounds = computed(() => {
@@ -649,6 +761,10 @@ const filteredOutbounds = computed(() => {
         break
     }
   }
+
+  if (showRuntimeOnly.value) {
+    result = result.filter(o => hasRuntimeActivity(o))
+  }
   
   // 关键词搜索
   if (searchKeyword.value) {
@@ -656,7 +772,8 @@ const filteredOutbounds = computed(() => {
     result = result.filter(o => 
       o.name.toLowerCase().includes(kw) || 
       o.server.toLowerCase().includes(kw) ||
-      (o.group && o.group.toLowerCase().includes(kw))
+      (o.group && o.group.toLowerCase().includes(kw)) ||
+      (o.subscription_name && o.subscription_name.toLowerCase().includes(kw))
     )
   }
   
@@ -666,6 +783,18 @@ const filteredOutbounds = computed(() => {
     if (highlightName.value) {
       if (a.name === highlightName.value) return -1
       if (b.name === highlightName.value) return 1
+    }
+    if (qualitySortMetric.value) {
+      const aValue = getQualitySortValue(a, qualitySortMetric.value)
+      const bValue = getQualitySortValue(b, qualitySortMetric.value)
+      const aMissing = aValue === null || aValue === undefined
+      const bMissing = bValue === null || bValue === undefined
+      if (aMissing !== bMissing) {
+        return aMissing ? 1 : -1
+      }
+      if (!aMissing && !bMissing && aValue !== bValue) {
+        return qualitySortOrder.value === 'desc' ? bValue - aValue : aValue - bValue
+      }
     }
     // 分组排序：无分组在前
     if (!a.group && b.group) return -1
@@ -680,12 +809,79 @@ const filteredOutbounds = computed(() => {
 
 // 排序后的数据（保留兼容性）
 const sortedOutbounds = computed(() => filteredOutbounds.value)
+const rowKey = (row) => row.name
+// Node list height grows with the browser viewport so the table fills the
+// available space instead of being stuck at a cramped 780px regardless of
+// screen size. The 360px offset reserves room for the page header,
+// filter/stats cards and bottom padding; we never go below 500px so the
+// table remains usable on short screens. `undefined` when there are very
+// few rows lets the table shrink to its natural content height.
+const viewportHeight = ref(typeof window !== 'undefined' ? window.innerHeight : 900)
+let _viewportResizeHandler = null
+onMounted(() => {
+  if (typeof window === 'undefined') return
+  _viewportResizeHandler = () => { viewportHeight.value = window.innerHeight }
+  window.addEventListener('resize', _viewportResizeHandler)
+})
+onBeforeUnmount(() => {
+  if (typeof window !== 'undefined' && _viewportResizeHandler) {
+    window.removeEventListener('resize', _viewportResizeHandler)
+    _viewportResizeHandler = null
+  }
+})
+const tableMaxHeight = computed(() => {
+  if (filteredOutbounds.value.length <= 10) return undefined
+  return Math.max(500, viewportHeight.value - 360)
+})
+const mainTablePagination = computed(() => ({
+  ...pagination.value,
+  itemCount: sortedOutbounds.value.length,
+  onUpdatePage: handlePageChange,
+  onUpdatePageSize: handlePageSizeChange
+}))
+
+const clearFilters = () => {
+  selectedGroup.value = null
+  selectedProtocol.value = null
+  selectedStatus.value = null
+  qualitySortMetric.value = null
+  qualitySortOrder.value = 'asc'
+  showRuntimeOnly.value = false
+  searchKeywordInput.value = ''
+  searchKeyword.value = ''
+  pagination.value.page = 1
+}
+
+watch(searchKeywordInput, (value) => {
+  if (searchKeywordTimer) {
+    clearTimeout(searchKeywordTimer)
+  }
+  searchKeywordTimer = setTimeout(() => {
+    searchKeyword.value = (value || '').trim()
+  }, 120)
+})
+
+onBeforeUnmount(() => {
+  if (searchKeywordTimer) {
+    clearTimeout(searchKeywordTimer)
+  }
+})
+
+watch([selectedGroup, selectedProtocol, selectedStatus, qualitySortMetric, qualitySortOrder, showRuntimeOnly, searchKeyword], () => {
+  pagination.value.page = 1
+})
+
+watch(() => filteredOutbounds.value.length, (count) => {
+  const pageCount = Math.max(1, Math.ceil(count / pagination.value.pageSize))
+  if (pagination.value.page > pageCount) {
+    pagination.value.page = pageCount
+  }
+})
 
 const handlePageChange = (page) => { pagination.value.page = page }
 const handlePageSizeChange = (pageSize) => { pagination.value.pageSize = pageSize; pagination.value.page = 1 }
 const selectedTargets = ref(['cloudflare', 'google', 'baidu'])
-const enableSpeedTest = ref(false)
-const speedTestUrl = ref('https://speed.cloudflare.com/__down?bytes=10000000')
+const enableDetailedUdp = ref(true)
 const enableCustomHttp = ref(false)
 const httpViewMode = ref('text')
 const customHttpConfig = ref({
@@ -710,6 +906,8 @@ const protocolOptions = [
   { label: 'VMess', value: 'vmess' },
   { label: 'Trojan', value: 'trojan' },
   { label: 'VLESS', value: 'vless' },
+  { label: 'SOCKS5', value: 'socks5' },
+  { label: 'HTTP Proxy', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' }
 ]
@@ -754,86 +952,147 @@ const fingerprintOptions = [
 const networkOptions = [
   { label: 'TCP (默认)', value: '' },
   { label: 'WebSocket', value: 'ws' },
+  { label: 'HTTPUpgrade', value: 'httpupgrade' },
+  { label: 'XHTTP', value: 'xhttp' },
   { label: 'gRPC', value: 'grpc' }
 ]
 
 const defaultForm = {
   name: '', type: 'shadowsocks', server: '', port: 443, enabled: true, group: '',
-  method: 'aes-256-gcm', password: '', uuid: '', alter_id: 0, security: 'auto',
-  flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '',
+  username: '', method: 'aes-256-gcm', password: '', uuid: '', alter_id: 0, security: 'auto',
+  flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '',
+  idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
   reality: false, reality_public_key: '', reality_short_id: '',
-  network: '', ws_path: '', ws_host: ''
+  network: '', ws_path: '', ws_host: '', xhttp_mode: '', grpc_service_name: '', grpc_authority: ''
 }
 const form = ref({ ...defaultForm })
 
-const columns = [
-  { type: 'selection' },
-  { title: '名称', key: 'name', width: 180, ellipsis: { tooltip: true }, sorter: (a, b) => a.name.localeCompare(b.name), render: r => h('span', { 
-    style: r.name === highlightName.value ? 'background: #63e2b7; padding: 2px 6px; border-radius: 4px; color: #000' : '' 
-  }, r.name) },
-  { title: '分组', key: 'group', width: 100, ellipsis: { tooltip: true }, sorter: (a, b) => {
-    // 没有分组的排在前面
-    if (!a.group && !b.group) return 0
-    if (!a.group) return -1
-    if (!b.group) return 1
-    return a.group.localeCompare(b.group)
-  }, render: r => r.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => r.group) : '-' },
-  { title: '协议', key: 'type', width: 150, render: r => {
-    const tags = [h(NTag, { type: 'info', size: 'small' }, () => r.type.toUpperCase())]
-    if (r.network === 'ws') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'WS'))
-    if (r.network === 'grpc') tags.push(h(NTag, { type: 'warning', size: 'small', style: 'margin-left: 4px' }, () => 'gRPC'))
-    if (r.reality) tags.push(h(NTag, { type: 'success', size: 'small', style: 'margin-left: 4px' }, () => 'Reality'))
-    if (r.flow === 'xtls-rprx-vision') tags.push(h(NTag, { type: 'primary', size: 'small', style: 'margin-left: 4px' }, () => 'Vision'))
-    if (r.port_hopping) tags.push(h(NTag, { type: 'default', size: 'small', style: 'margin-left: 4px' }, () => 'Hop'))
-    return h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, tags)
-  }},
-  { title: '服务器', key: 'server', width: 180, ellipsis: { tooltip: true }, render: r => `${r.server}:${r.port}` },
-  { title: 'TLS', key: 'tls', width: 70, render: r => {
-    if (r.reality) return h(NTag, { type: 'success', size: 'small' }, () => 'Reality')
-    if (r.tls) return h(NTag, { type: r.insecure ? 'warning' : 'success', size: 'small' }, () => r.insecure ? 'TLS*' : 'TLS')
-    return h(NTag, { type: 'default', size: 'small' }, () => '无')
-  }},
-  { title: 'TCP', key: 'latency_ms', width: 70, sorter: (a, b) => (a.latency_ms || 9999) - (b.latency_ms || 9999), render: r => {
-    if (r.latency_ms > 0) {
-      const type = r.latency_ms < 200 ? 'success' : r.latency_ms < 500 ? 'warning' : 'error'
-      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.latency_ms}ms`)
+const renderLatencyTag = (latency, good, medium) => {
+  if (!latency || latency <= 0) {
+    return h(NTag, { size: 'small', bordered: false }, () => '-')
+  }
+  const type = latency < good ? 'success' : latency < medium ? 'warning' : 'error'
+  return h(NTag, { type, size: 'small', bordered: false }, () => `${latency}ms`)
+}
+
+const renderUdpTag = (row) => {
+  if (row.udp_available === true) {
+    if (row.udp_latency_ms > 0) {
+      return renderLatencyTag(row.udp_latency_ms, 200, 500)
     }
-    return '-'
-  }},
-  { title: 'HTTP', key: 'http_latency_ms', width: 70, sorter: (a, b) => (a.http_latency_ms || 9999) - (b.http_latency_ms || 9999), render: r => {
-    if (r.http_latency_ms > 0) {
-      const type = r.http_latency_ms < 500 ? 'success' : r.http_latency_ms < 1500 ? 'warning' : 'error'
-      return h(NTag, { type, size: 'small', bordered: false }, () => `${r.http_latency_ms}ms`)
-    }
-    return '-'
-  }},
-  { title: 'UDP', key: 'udp_available', width: 80, sorter: (a, b) => {
-    // 排序优先级: 有延迟的 > 成功无延迟 > 未测试 > 失败
-    const getScore = (o) => {
-      if (o.udp_available === true && o.udp_latency_ms > 0) return o.udp_latency_ms
-      if (o.udp_available === true) return 10000
-      if (o.udp_available === false) return 99999
-      return 50000 // 未测试
-    }
-    return getScore(a) - getScore(b)
-  }, render: r => {
-    if (r.udp_available === true) {
-      // 显示可用性和延迟
-      const latencyText = r.udp_latency_ms > 0 ? `${r.udp_latency_ms}ms` : '✓'
-      const type = r.udp_latency_ms > 0 ? (r.udp_latency_ms < 200 ? 'success' : r.udp_latency_ms < 500 ? 'warning' : 'error') : 'success'
-      return h(NTag, { type, size: 'small', bordered: false }, () => latencyText)
-    }
-    if (r.udp_available === false) return h(NTag, { type: 'error', size: 'small' }, () => '✗')
-    return '-'
-  }},
-  { title: '启用', key: 'enabled', width: 50, render: r => h(NTag, { type: r.enabled ? 'success' : 'default', size: 'small' }, () => r.enabled ? '是' : '否') },
-  { title: '操作', key: 'actions', width: 180, fixed: 'right', render: r => h(NSpace, { size: 'small', wrap: true }, () => [
-    h(NButton, { size: 'tiny', type: 'info', onClick: () => openTestOptions(r.name) }, () => 'HTTP'),
-    h(NButton, { size: 'tiny', type: 'warning', onClick: () => testMCBE(r.name) }, () => 'UDP'),
-    h(NButton, { size: 'tiny', onClick: () => openEditModal(r) }, () => '编辑'),
-    h(NPopconfirm, { onPositiveClick: () => deleteOutbound(r.name) }, { trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'), default: () => '确定删除?' })
-  ])}
-]
+    return h(NTag, { type: 'success', size: 'small', bordered: false }, () => '可用')
+  }
+  if (row.udp_available === false) {
+    return h(NTag, { type: 'error', size: 'small', bordered: false }, () => '失败')
+  }
+  return h(NTag, { size: 'small', bordered: false }, () => '-')
+}
+
+const renderStatusTag = (row) => {
+  if (!row.enabled) {
+    return h(NTag, { size: 'small', bordered: false }, () => '已禁用')
+  }
+  if (!row.last_check) {
+    return h(NTag, { type: 'default', size: 'small', bordered: false }, () => '未检测')
+  }
+  return h(NTag, { type: row.healthy ? 'success' : 'error', size: 'small', bordered: false }, () => row.healthy ? '健康' : '异常')
+}
+
+const formatLastActive = (value) => {
+  if (!value) return '最近活跃 -'
+  return `最近活跃 ${formatTime(value)}`
+}
+
+const columns = computed(() => [
+  { type: 'selection', fixed: 'left' },
+  {
+    title: '节点',
+    key: 'name',
+    width: 280,
+    fixed: 'left',
+    sorter: (a, b) => a.name.localeCompare(b.name),
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h('div', { class: row.name === highlightName.value ? 'node-name node-name-highlight' : 'node-name' }, row.name),
+      h('div', { class: 'table-secondary-text' }, `${row.server}:${row.port}`),
+      h(NSpace, { size: 4, wrap: true }, () => [
+        row.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => row.group) : null,
+        row.subscription_name ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => `订阅: ${row.subscription_name}`) : null
+      ])
+    ])
+  },
+  {
+    title: '协议',
+    key: 'type',
+    width: 210,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h(NSpace, { size: 4, wrap: true }, () => [
+        h(NTag, { type: 'info', size: 'small' }, () => row.type.toUpperCase()),
+        row.reality ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => 'Reality') : null,
+        row.flow === 'xtls-rprx-vision' ? h(NTag, { type: 'primary', size: 'small', bordered: false }, () => 'Vision') : null,
+        row.network === 'ws' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'WS') : null,
+        row.network === 'httpupgrade' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'HTTPU') : null,
+        row.network === 'xhttp' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'XHTTP') : null,
+        row.network === 'grpc' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'gRPC') : null,
+        row.port_hopping ? h(NTag, { size: 'small', bordered: false }, () => 'Hop') : null,
+        row.tls ? h(NTag, { type: row.insecure ? 'warning' : 'success', size: 'small', bordered: false }, () => row.insecure ? 'TLS*' : 'TLS') : null
+      ]),
+      h('div', { class: 'table-secondary-text' }, row.sni ? `SNI ${row.sni}` : (row.alpn ? `ALPN ${row.alpn}` : '-'))
+    ])
+  },
+  {
+    title: '质量',
+    key: 'quality',
+    width: 250,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h(NSpace, { size: 6, wrap: true }, () => [
+        h('span', { class: 'metric-label' }, 'TCP'),
+        renderLatencyTag(row.latency_ms, 200, 500),
+        h('span', { class: 'metric-label' }, 'HTTP'),
+        renderLatencyTag(row.http_latency_ms, 500, 1500),
+        h('span', { class: 'metric-label' }, 'UDP'),
+        renderUdpTag(row)
+      ]),
+      h('div', { class: 'table-secondary-text' }, row.last_check ? `最后检测 ${formatTime(row.last_check)}` : '尚未进行连通性检测')
+    ])
+  },
+  {
+    title: '运行态',
+    key: 'runtime',
+    width: 260,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h(NSpace, { size: 4, wrap: true }, () => [
+        h(NTag, { type: (row.conn_count || 0) > 0 ? 'success' : 'default', size: 'small', bordered: false }, () => `连接 ${row.conn_count || 0}`),
+        h(NTag, { size: 'small', bordered: false }, () => `活跃 ${formatDuration(row.active_duration_seconds)}`)
+      ]),
+      h('div', { class: 'table-secondary-text' }, `↑ ${formatBytes(row.bytes_up || 0)} / ↓ ${formatBytes(row.bytes_down || 0)}`),
+      h('div', { class: 'table-secondary-text' }, formatLastActive(row.last_active))
+    ])
+  },
+  {
+    title: '状态',
+    key: 'status',
+    width: 210,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h(NSpace, { size: 4, wrap: true }, () => [
+        h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启用中' : '已禁用'),
+        renderStatusTag(row)
+      ]),
+      h('div', { class: row.last_error ? 'table-error-text' : 'table-secondary-text', title: row.last_error || '' }, row.last_error || '无最近错误')
+    ])
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 210,
+    fixed: 'right',
+    render: (row) => h(NSpace, { size: 6, wrap: true }, () => [
+      h(NButton, { size: 'small', type: 'primary', ghost: true, onClick: () => openTestOptions(row.name) }, () => '测试'),
+      h(NButton, { size: 'small', type: 'warning', ghost: true, onClick: () => testMCBE(row.name) }, () => 'UDP'),
+      h(NButton, { size: 'small', onClick: () => openEditModal(row) }, () => '编辑'),
+      h(NPopconfirm, { onPositiveClick: () => deleteOutbound(row.name) }, { trigger: () => h(NButton, { size: 'small', type: 'error', ghost: true }, () => '删除'), default: () => '确定删除该节点吗？' })
+    ])
+  }
+])
 
 const httpTestColumns = [
   { title: '目标', key: 'target', width: 100 },
@@ -843,14 +1102,6 @@ const httpTestColumns = [
   { title: '状态', key: 'success', width: 80, render: r => h(NTag, { type: r.success ? 'success' : 'error', size: 'small' }, () => r.success ? '成功' : '失败') },
   { title: '错误', key: 'error', ellipsis: { tooltip: true } }
 ]
-
-const formatBytes = (bytes) => {
-  if (!bytes || bytes <= 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i]
-}
 
 const formatHeaders = (headers) => {
   return Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\n')
@@ -903,8 +1154,40 @@ const sanitizedHtml = computed(() => {
 })
 
 const load = async () => {
-  const res = await api('/api/proxy-outbounds')
-  if (res.success) outbounds.value = res.data || []
+  loading.value = true
+  try {
+    const res = await api('/api/proxy-outbounds')
+    if (res.success) {
+      outbounds.value = res.data || []
+    } else {
+      message.error(res.msg || '加载代理节点失败')
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+const refreshManagedData = async () => {
+  await Promise.all([load(), fetchGroupStats()])
+}
+
+const focusSubscriptionNodes = (subscriptionName) => {
+  if (!subscriptionName) return
+  selectedGroup.value = null
+  searchKeywordInput.value = subscriptionName
+  searchKeyword.value = subscriptionName
+}
+
+// Modal wrapping for the subscription panel. Kept as a separate pair of
+// handlers so the modal auto-closes when the user clicks a subscription row
+// to focus its nodes (which filters the underlying table behind the modal).
+const showSubscriptionsModal = ref(false)
+const onSubscriptionsPanelRefresh = async () => {
+  await refreshManagedData()
+}
+const onSubscriptionsPanelFocus = (subscriptionName) => {
+  focusSubscriptionNodes(subscriptionName)
+  showSubscriptionsModal.value = false
 }
 
 const openAddModal = () => {
@@ -923,6 +1206,30 @@ const onProtocolChange = () => {
   form.value.method = form.value.type === 'shadowsocks' ? 'aes-256-gcm' : ''
   form.value.security = form.value.type === 'vmess' ? 'auto' : ''
   form.value.tls = ['trojan', 'vless', 'anytls'].includes(form.value.type)
+  if (!['vmess', 'trojan', 'vless'].includes(form.value.type)) {
+    form.value.network = ''
+    form.value.ws_path = ''
+    form.value.ws_host = ''
+    form.value.xhttp_mode = ''
+    form.value.grpc_service_name = ''
+    form.value.grpc_authority = ''
+  }
+  if (!['socks5', 'http'].includes(form.value.type)) {
+    form.value.username = ''
+  }
+  if (form.value.type !== 'anytls') {
+    form.value.idle_session_check_interval = 0
+    form.value.idle_session_timeout = 0
+    form.value.min_idle_session = 0
+  }
+  if (!['vless', 'anytls'].includes(form.value.type)) {
+    form.value.reality = false
+    form.value.reality_public_key = ''
+    form.value.reality_short_id = ''
+  }
+  if (form.value.type === 'hysteria2' && !form.value.alpn) {
+    form.value.alpn = 'h3'
+  }
 }
 
 const saveOutbound = async () => {
@@ -1101,6 +1408,28 @@ const handleBatchTestSelect = (key) => {
   }
 }
 
+const handleQuickBatchTestSelect = (key) => {
+  const names = filteredOutbounds.value
+    .filter(item => !isMetadataLikeNodeName(item.name))
+    .map(item => item.name)
+  if (names.length === 0) {
+    message.warning('当前筛选结果没有可测试节点')
+    return
+  }
+  checkedRowKeys.value = names
+  handleBatchTestSelect(key)
+}
+
+const handleSubProxyQuickTestSelect = (key) => {
+  const names = filteredSubProxyList.value.map(item => item.name)
+  if (names.length === 0) {
+    message.warning('当前列表没有可测试节点')
+    return
+  }
+  checkedRowKeys.value = names
+  handleBatchTestSelect(key)
+}
+
 // 批量测试状态
 const batchTesting = ref(false)
 const batchTestProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
@@ -1173,7 +1502,7 @@ const runBatchTestType = async (names, type) => {
         const target = batchHttpTarget.value === 'custom' 
           ? { custom_http: { url: batchHttpCustomUrl.value, method: 'GET' } }
           : { targets: [batchHttpTarget.value] }
-        res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, ...target })
+        res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, include_ping: false, ...target })
         handleTestResult(name, res, 'http')
       } else {
         res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
@@ -1202,10 +1531,7 @@ const handleTestResult = (name, res, type) => {
     if (res?.success && res.data?.success) {
       batchTestProgress.value.success++
       const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
-      updateOutboundData(name, { 
-        http_latency_ms: httpTest?.latency_ms || 0,
-        latency_ms: res.data.ping_test?.latency_ms || 0
-      })
+      updateOutboundData(name, { http_latency_ms: httpTest?.latency_ms || 0 })
     } else {
       batchTestProgress.value.failed++
       updateOutboundData(name, { http_latency_ms: 0 })
@@ -1281,17 +1607,18 @@ const runDetailedTest = async () => {
   httpViewMode.value = 'text'
   
   let loadingText = '正在测试 Ping'
+  if (enableDetailedUdp.value) loadingText += '、UDP'
   if (selectedTargets.value.length > 0) loadingText += '、HTTP'
-  if (enableSpeedTest.value) loadingText += '、速度'
   if (enableCustomHttp.value) loadingText += '、自定义HTTP'
   testLoading.value = loadingText + '...'
   showTestResultModal.value = true
   
   const requestBody = {
     name: testingName.value,
-    targets: selectedTargets.value,
-    speed_test: enableSpeedTest.value,
-    speed_test_url: enableSpeedTest.value ? speedTestUrl.value : ''
+    include_ping: true,
+    include_udp: enableDetailedUdp.value,
+    udp_address: enableDetailedUdp.value ? mcbeTestAddress.value : '',
+    targets: selectedTargets.value
   }
   
   // 添加自定义 HTTP 测试配置
@@ -1313,14 +1640,26 @@ const runDetailedTest = async () => {
     const name = testingName.value
     const updates = {}
     // TCP 延迟
-    if (res.data.ping_test?.success) {
+	    if (res.data.ping_test?.success) {
       updates.latency_ms = res.data.ping_test.latency_ms
       updates.healthy = true
+	    } else if (res.data.ping_test) {
+	      updates.latency_ms = 0
+	      updates.healthy = false
     }
     // HTTP 延迟
     const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
     if (httpTest?.success) {
       updates.http_latency_ms = httpTest.latency_ms
+	    } else if ((res.data.http_tests && res.data.http_tests.length > 0) || res.data.custom_http) {
+	      updates.http_latency_ms = 0
+	    }
+	    if (res.data.udp_test?.success) {
+	      updates.udp_available = true
+	      updates.udp_latency_ms = res.data.udp_test.latency_ms
+	    } else if (res.data.udp_test) {
+	      updates.udp_available = false
+	      updates.udp_latency_ms = 0
     }
     if (Object.keys(updates).length > 0) {
       updateOutboundData(name, updates)
@@ -1341,7 +1680,9 @@ const subProxyGroup = ref(null)
 
 const subProxyGroupOptions = computed(() => {
   const groups = new Set()
-  outbounds.value.forEach(o => { if (o.group && o.enabled) groups.add(o.group) })
+  outbounds.value.forEach(o => {
+    if (o.group && o.enabled && !isMetadataLikeNodeName(o.name)) groups.add(o.group)
+  })
   return Array.from(groups).sort().map(g => ({ label: g, value: g }))
 })
 
@@ -1381,7 +1722,7 @@ const subProxyTest = async (name, type) => {
         message.success(`${name} TCP: ${res.data?.latency_ms}ms`)
       } else { message.error(res.msg || '测试失败') }
     } else if (type === 'http') {
-      res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, targets: ['cloudflare'] })
+      res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, include_ping: false, targets: ['cloudflare'] })
       if (res.success) {
         const httpMs = res.data?.http_tests?.[0]?.latency_ms || 0
         updateOutboundData(name, { http_latency_ms: httpMs })
@@ -1398,7 +1739,7 @@ const subProxyTest = async (name, type) => {
 }
 
 const filteredSubProxyList = computed(() => {
-  let list = outbounds.value.filter(o => o.enabled)
+  let list = outbounds.value.filter(o => o.enabled && !isMetadataLikeNodeName(o.name))
   if (subProxyGroup.value) {
     list = list.filter(o => o.group === subProxyGroup.value)
   }
@@ -1470,6 +1811,97 @@ const decodeBase64UTF8 = (base64) => {
   return new TextDecoder('utf-8').decode(bytes)
 }
 
+const parseBoolQueryValue = (value) => {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase())
+}
+
+const parseCustomLinkParts = (link, scheme) => {
+  const prefix = `${scheme}://`
+  if (!link.toLowerCase().startsWith(prefix)) {
+    return null
+  }
+
+  let raw = link.slice(prefix.length).trim()
+  let hash = ''
+  let query = ''
+
+  const hashIndex = raw.indexOf('#')
+  if (hashIndex >= 0) {
+    hash = raw.slice(hashIndex + 1)
+    raw = raw.slice(0, hashIndex)
+  }
+
+  const queryIndex = raw.indexOf('?')
+  if (queryIndex >= 0) {
+    query = raw.slice(queryIndex + 1)
+    raw = raw.slice(0, queryIndex)
+  }
+
+  const atIndex = raw.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex === raw.length - 1) {
+    return null
+  }
+
+  const username = decodeURIComponent(raw.slice(0, atIndex))
+  const hostPort = raw.slice(atIndex + 1)
+
+  let hostname = ''
+  let port = 0
+
+  if (hostPort.startsWith('[')) {
+    const bracketIndex = hostPort.indexOf(']')
+    if (bracketIndex <= 0) {
+      return null
+    }
+    hostname = hostPort.slice(1, bracketIndex)
+    const portPart = hostPort.slice(bracketIndex + 1)
+    if (!portPart.startsWith(':')) {
+      return null
+    }
+    port = Number.parseInt(portPart.slice(1), 10)
+  } else {
+    const colonIndex = hostPort.lastIndexOf(':')
+    if (colonIndex <= 0 || colonIndex === hostPort.length - 1) {
+      return null
+    }
+    hostname = hostPort.slice(0, colonIndex)
+    port = Number.parseInt(hostPort.slice(colonIndex + 1), 10)
+  }
+
+  if (!hostname || !Number.isFinite(port) || port <= 0) {
+    return null
+  }
+
+  return {
+    username,
+    hostname: decodeURIComponent(hostname),
+    port,
+    searchParams: new URLSearchParams(query),
+    hash: hash ? decodeURIComponent(hash) : ''
+  }
+}
+
+const getImportConfigValidationError = (config) => {
+  if (!config) return '无法识别链接'
+  if (!config.server) return '解析结果缺少 server'
+  if (!config.port) return '解析结果缺少 port'
+  if (['vmess', 'vless'].includes(config.type) && !config.uuid) return '解析结果缺少 uuid'
+  if (config.type === 'shadowsocks' && (!config.method || !config.password)) return '解析结果缺少 Shadowsocks 鉴权信息'
+  if (['trojan', 'anytls', 'hysteria2'].includes(config.type) && !config.password) return '解析结果缺少密码'
+  return ''
+}
+
+const isMetadataLikeNodeName = (name) => {
+  return /^(剩余流量|套餐到期|到期时间|过期时间|流量重置|订阅信息|订阅更新时间|更新时间|使用说明|官网|公告|客服|telegram|tg|email|邮箱)\s*[：:]/i.test(String(name || '').trim())
+}
+
+const shouldIgnoreImportLine = (line) => {
+  const text = (line || '').trim()
+  if (!text) return true
+  if (text.includes('://')) return false
+  return isMetadataLikeNodeName(text)
+}
+
 // 解析 VMess 链接
 const parseVmess = (link) => {
   try {
@@ -1493,11 +1925,27 @@ const parseVmess = (link) => {
                 (useTls && json.sni && json.sni !== (json.add || json.address)),
       enabled: true
     }
-    // WebSocket 传输
-    if (json.net === 'ws') {
+    const transport = String(json.net || '').toLowerCase()
+    if (transport === 'ws') {
       result.network = 'ws'
       result.ws_path = json.path || '/'
       result.ws_host = json.host || ''
+    }
+    if (transport === 'httpupgrade' || transport === 'http-upgrade') {
+      result.network = 'httpupgrade'
+      result.ws_path = json.path || '/'
+      result.ws_host = json.host || ''
+    }
+    if (transport === 'xhttp') {
+      result.network = 'xhttp'
+      result.ws_path = json.path || '/'
+      result.ws_host = json.host || ''
+      result.xhttp_mode = json.mode || json.xhttp_mode || json['xhttp-mode'] || ''
+    }
+    if (transport === 'grpc') {
+      result.network = 'grpc'
+      result.grpc_service_name = json.serviceName || json.service_name || json.path || ''
+      result.grpc_authority = json.authority || json.grpc_authority || ''
     }
     return result
   } catch (e) {
@@ -1571,7 +2019,7 @@ const parseTrojan = (link) => {
     const security = url.searchParams.get('security') || 'tls'
     const useTls = security !== 'none'
     const sni = url.searchParams.get('sni') || ''
-    return {
+    const result = {
       name: originalName,
       type: 'trojan',
       server: url.hostname,
@@ -1581,11 +2029,34 @@ const parseTrojan = (link) => {
       sni: useTls ? (sni || url.hostname) : '',
       fingerprint: url.searchParams.get('fp') || '',
       // 如果 SNI 与服务器不同，默认跳过验证
-      insecure: url.searchParams.get('allowInsecure') === '1' || 
-                url.searchParams.get('insecure') === '1' ||
+      insecure: parseBoolQueryValue(url.searchParams.get('allowInsecure')) ||
+                parseBoolQueryValue(url.searchParams.get('insecure')) ||
                 (useTls && sni && sni !== url.hostname),
       enabled: true
     }
+    const transport = (url.searchParams.get('type') || 'tcp').toLowerCase()
+    if (transport === 'ws') {
+      result.network = 'ws'
+      result.ws_path = url.searchParams.get('path') || '/'
+      result.ws_host = url.searchParams.get('host') || url.searchParams.get('wsHost') || ''
+    }
+    if (transport === 'httpupgrade' || transport === 'http-upgrade') {
+      result.network = 'httpupgrade'
+      result.ws_path = url.searchParams.get('path') || '/'
+      result.ws_host = url.searchParams.get('host') || url.searchParams.get('wsHost') || ''
+    }
+    if (transport === 'xhttp') {
+      result.network = 'xhttp'
+      result.ws_path = url.searchParams.get('path') || '/'
+      result.ws_host = url.searchParams.get('host') || url.searchParams.get('wsHost') || ''
+      result.xhttp_mode = url.searchParams.get('mode') || url.searchParams.get('xhttp-mode') || url.searchParams.get('xhttp_mode') || ''
+    }
+    if (transport === 'grpc') {
+      result.network = 'grpc'
+      result.grpc_service_name = url.searchParams.get('serviceName') || url.searchParams.get('service_name') || url.searchParams.get('grpc_service_name') || ''
+      result.grpc_authority = url.searchParams.get('authority') || url.searchParams.get('grpc_authority') || ''
+    }
+    return result
   } catch (e) {
     console.error('Trojan parse error:', e)
     return null
@@ -1597,6 +2068,8 @@ const parseAnyTLS = (link) => {
   try {
     const url = new URL(link)
     const originalName = url.hash ? decodeURIComponent(url.hash.slice(1)) : `${url.hostname}:${url.port}`
+    const security = (url.searchParams.get('security') || '').toLowerCase()
+    const isReality = security === 'reality'
     return {
       name: originalName,
       type: 'anytls',
@@ -1605,8 +2078,12 @@ const parseAnyTLS = (link) => {
       password: decodeURIComponent(url.username),
       tls: true,
       sni: url.searchParams.get('sni') || url.hostname,
+      alpn: url.searchParams.get('alpn') || '',
       fingerprint: url.searchParams.get('fp') || '',
-      insecure: url.searchParams.get('allowInsecure') === '1' || url.searchParams.get('insecure') === '1',
+      insecure: isReality || parseBoolQueryValue(url.searchParams.get('allowInsecure')) || parseBoolQueryValue(url.searchParams.get('insecure')),
+      reality: isReality,
+      reality_public_key: isReality ? (url.searchParams.get('pbk') || '') : '',
+      reality_short_id: isReality ? (url.searchParams.get('sid') || '') : '',
       enabled: true
     }
   } catch (e) {
@@ -1618,40 +2095,66 @@ const parseAnyTLS = (link) => {
 // 解析 VLESS 链接
 const parseVless = (link) => {
   try {
-    const url = new URL(link)
-    const originalName = url.hash ? decodeURIComponent(url.hash.slice(1)) : `${url.hostname}:${url.port}`
-    const security = url.searchParams.get('security') || ''
+    const parts = parseCustomLinkParts(link, 'vless')
+    if (!parts) {
+      return null
+    }
+
+    const params = parts.searchParams
+    const originalName = parts.hash || `${parts.hostname}:${parts.port}`
+    const security = (params.get('security') || '').toLowerCase()
     const isReality = security === 'reality'
     const isTls = security === 'tls' || isReality
     
     const result = {
       name: originalName,
       type: 'vless',
-      server: url.hostname,
-      port: parseInt(url.port) || 443,
-      uuid: decodeURIComponent(url.username),
-      flow: url.searchParams.get('flow') || '',
+      server: parts.hostname,
+      port: parts.port,
+      uuid: parts.username,
+      flow: params.get('flow') || '',
       tls: isTls,
-      sni: url.searchParams.get('sni') || url.hostname,
-      fingerprint: url.searchParams.get('fp') || '',
-      insecure: url.searchParams.get('allowInsecure') === '1' || url.searchParams.get('insecure') === '1',
+      sni: params.get('sni') || parts.hostname,
+      alpn: params.get('alpn') || '',
+      fingerprint: params.get('fp') || '',
+      insecure: parseBoolQueryValue(params.get('allowInsecure')) || parseBoolQueryValue(params.get('insecure')),
       enabled: true
+    }
+
+    if (!result.server || !result.uuid) {
+      return null
     }
     
     // Reality 参数
     if (isReality) {
       result.reality = true
-      result.reality_public_key = url.searchParams.get('pbk') || ''
-      result.reality_short_id = url.searchParams.get('sid') || ''
+      result.reality_public_key = params.get('pbk') || ''
+      result.reality_short_id = params.get('sid') || ''
       result.insecure = true // Reality 不验证证书
     }
     
     // WebSocket 传输
-    const transport = url.searchParams.get('type') || 'tcp'
+    const transport = (params.get('type') || 'tcp').toLowerCase()
     if (transport === 'ws') {
       result.network = 'ws'
-      result.ws_path = url.searchParams.get('path') || '/'
-      result.ws_host = url.searchParams.get('host') || ''
+      result.ws_path = params.get('path') || '/'
+      result.ws_host = params.get('host') || ''
+    }
+    if (transport === 'httpupgrade' || transport === 'http-upgrade') {
+      result.network = 'httpupgrade'
+      result.ws_path = params.get('path') || '/'
+      result.ws_host = params.get('host') || params.get('wsHost') || ''
+    }
+    if (transport === 'xhttp') {
+      result.network = 'xhttp'
+      result.ws_path = params.get('path') || '/'
+      result.ws_host = params.get('host') || params.get('wsHost') || ''
+      result.xhttp_mode = params.get('mode') || params.get('xhttp-mode') || params.get('xhttp_mode') || ''
+    }
+    if (transport === 'grpc') {
+      result.network = 'grpc'
+      result.grpc_service_name = params.get('serviceName') || params.get('service_name') || params.get('grpc_service_name') || ''
+      result.grpc_authority = params.get('authority') || params.get('grpc_authority') || ''
     }
     
     return result
@@ -1679,7 +2182,8 @@ const parseHysteria2 = (link) => {
       port_hopping: mport,
       tls: true,
       sni: url.searchParams.get('sni') || url.hostname,
-      insecure: url.searchParams.get('insecure') === '1',
+      alpn: url.searchParams.get('alpn') || '',
+      insecure: parseBoolQueryValue(url.searchParams.get('insecure')),
       enabled: true
     }
   } catch (e) {
@@ -1705,36 +2209,37 @@ const parseLink = (link) => {
 
 // 导入节点
 const importNodes = async () => {
-  let text = importText.value.trim()
-  
-  // 尝试 Base64 解码（订阅内容通常是 Base64 编码的）
-  if (text && !text.includes('://')) {
-    try {
-      text = decodeBase64UTF8(text)
-    } catch {
-      // 不是 Base64，保持原样
-    }
-  }
-  
-  const lines = text.split('\n').filter(l => l.trim())
-  if (lines.length === 0) {
+  const text = importText.value.trim()
+  if (!text) {
     message.warning('请输入要导入的链接')
     return
   }
   
   const groupName = importGroupName.value.trim()
+  let parsedItems = []
+  let ignored = 0
+  try {
+    const parseRes = await api('/api/proxy-outbounds/parse-import', 'POST', { content: text })
+    if (!parseRes?.success) {
+      message.error(parseRes?.msg || '解析导入内容失败')
+      return
+    }
+    parsedItems = Array.isArray(parseRes?.data?.items) ? parseRes.data.items : []
+    ignored = Number(parseRes?.data?.filtered || 0)
+  } catch (e) {
+    message.error((e && e.message) ? e.message : '解析导入内容失败')
+    return
+  }
+  if (parsedItems.length === 0) {
+    message.warning('未找到可导入的节点')
+    return
+  }
   
   let success = 0
   const failedReasons = []
-  const invalidLinks = []
-  for (const line of lines) {
-    const config = parseLink(line)
-    if (!config) {
-      invalidLinks.push(line)
-      continue
-    }
+  for (const rawConfig of parsedItems) {
+    const config = { ...rawConfig }
     
-    // 添加分组名称
     if (groupName) {
       config.group = groupName
     }
@@ -1757,21 +2262,23 @@ const importNodes = async () => {
     }
   }
   
-  const failed = failedReasons.length + invalidLinks.length
+  const failed = failedReasons.length
   const groupSuffix = groupName ? ` (分组: ${groupName})` : ''
 
+  if (success === 0 && failed === 0 && ignored > 0) {
+    message.info(`没有可导入的节点，已忽略 ${ignored} 行元数据${groupSuffix}`)
+    return
+  }
+
   if (failed === 0) {
-    message.success(`导入完成: ${success} 成功, ${failed} 失败${groupSuffix}`)
+    message.success(`导入完成: ${success} 成功, ${failed} 失败${ignored > 0 ? `, 忽略 ${ignored}` : ''}${groupSuffix}`)
   } else {
     const maxShown = 6
-    const details = [
-      ...failedReasons.map(r => `${r.name}: ${r.msg}`),
-      ...invalidLinks.map(l => `无法识别链接: ${l.length > 120 ? l.slice(0, 120) + '…' : l}`)
-    ]
+    const details = failedReasons.map(r => `${r.name}: ${r.msg}`)
     message.error(
       () => h('div', { style: 'max-width: 520px' }, [
         h('div', { style: 'font-weight: 600; margin-bottom: 6px' }, '导入失败'),
-        h('div', { style: 'margin-bottom: 8px' }, `成功 ${success}，失败 ${failed}${groupSuffix}`),
+        h('div', { style: 'margin-bottom: 8px' }, `成功 ${success}，失败 ${failed}${ignored > 0 ? `，忽略 ${ignored}` : ''}${groupSuffix}`),
         h('ol', { style: 'padding-left: 18px; margin: 0' }, details.slice(0, maxShown).map(item =>
           h('li', { style: 'line-height: 1.4; margin: 0 0 4px' }, item)
         )),
@@ -1796,6 +2303,10 @@ onMounted(async () => {
   // 优先使用 initialHighlight，否则使用 initialSearch
   const highlightTarget = props.initialHighlight || props.initialSearch
   if (highlightTarget) {
+    if (props.initialSearch) {
+      searchKeywordInput.value = props.initialSearch
+      searchKeyword.value = props.initialSearch
+    }
     highlightName.value = highlightTarget
     // 5秒后取消高亮（但保持排序）
     setTimeout(() => { highlightName.value = '' }, 5000)
@@ -1805,6 +2316,10 @@ onMounted(async () => {
 // 监听 initialSearch 和 initialHighlight 变化
 watch([() => props.initialSearch, () => props.initialHighlight], ([search, highlight]) => {
   const target = highlight || search
+  if (search) {
+    searchKeywordInput.value = search
+    searchKeyword.value = search
+  }
   if (target) {
     highlightName.value = target
     setTimeout(() => { highlightName.value = '' }, 5000)
@@ -1817,9 +2332,67 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
   width: 100%;
   overflow-x: auto;
 }
+.page-header {
+  margin-bottom: 16px;
+}
+.page-actions {
+  justify-content: flex-end;
+}
+.toolbar-card {
+  margin-bottom: 16px;
+}
+.filter-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.filter-row {
+  row-gap: 10px;
+}
+.filter-label {
+  font-size: 12px;
+  color: var(--n-text-color-3);
+  white-space: nowrap;
+}
+.filter-search {
+  width: 260px;
+}
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
+}
+.node-name {
+  font-weight: 600;
+  color: var(--n-text-color-1);
+}
+.node-name-highlight {
+  display: inline-block;
+  background: #63e2b7;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: #000;
+}
+.table-secondary-text {
+  font-size: 11px;
+  color: var(--n-text-color-3);
+  line-height: 1.35;
+}
+.table-error-text {
+  font-size: 11px;
+  color: #ef4444;
+  line-height: 1.35;
+}
+.metric-label {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  color: var(--n-text-color-3);
+}
+:deep(.proxy-table .n-data-table-th),
+:deep(.proxy-table .n-data-table-td),
+:deep(.sub-proxy-table .n-data-table-th),
+:deep(.sub-proxy-table .n-data-table-td) {
+  font-size: 12px;
 }
 .http-body-container {
   border: 1px solid #e0e0e6;
@@ -1835,6 +2408,12 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 .html-preview img {
   max-width: 100%;
   height: auto;
+}
+
+@media (max-width: 900px) {
+  .filter-search {
+    width: 100%;
+  }
 }
 
 /* 分组卡片容器 */

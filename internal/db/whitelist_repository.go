@@ -20,8 +20,8 @@ func NewWhitelistRepository(db *Database) *WhitelistRepository {
 // Create inserts a new whitelist entry into the database.
 func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 	query := `
-		INSERT INTO whitelist (display_name, display_name_lower, server_id, added_at, added_by)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO whitelist (display_name, display_name_lower, enabled, server_id, added_at, added_by)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`
 
 	// Convert empty string to NULL for server_id (global whitelist)
@@ -35,6 +35,7 @@ func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 	result, err := r.db.DB().Exec(query,
 		entry.DisplayName,
 		strings.ToLower(entry.DisplayName),
+		entry.Enabled,
 		serverID,
 		entry.AddedAt,
 		entry.AddedBy,
@@ -56,7 +57,7 @@ func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 // Uses case-insensitive matching on display name.
 func (r *WhitelistRepository) GetByName(displayName, serverID string) (*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, server_id, added_at, added_by
+		SELECT id, display_name, enabled, server_id, added_at, added_by
 		FROM whitelist 
 		WHERE display_name_lower = ? AND (
 			server_id = ? OR 
@@ -67,6 +68,33 @@ func (r *WhitelistRepository) GetByName(displayName, serverID string) (*Whitelis
 
 	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	return r.scanWhitelistEntry(row)
+}
+
+func (r *WhitelistRepository) UpdateEnabled(displayName, serverID string, enabled bool) error {
+	query := `
+		UPDATE whitelist
+		SET enabled = ?
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
+	`
+
+	result, err := r.db.DB().Exec(query, enabled, strings.ToLower(displayName), serverID, serverID, serverID)
+	if err != nil {
+		return fmt.Errorf("failed to update whitelist entry enabled state: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get affected rows: %w", err)
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
 }
 
 // Delete removes a whitelist entry by display name and server ID.
@@ -100,7 +128,7 @@ func (r *WhitelistRepository) Delete(displayName, serverID string) error {
 // List retrieves all whitelist entries for a specific server (or global if serverID is empty).
 func (r *WhitelistRepository) List(serverID string) ([]*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, server_id, added_at, added_by
+		SELECT id, display_name, enabled, server_id, added_at, added_by
 		FROM whitelist 
 		WHERE server_id = ? OR (server_id IS NULL AND ? = '')
 		ORDER BY added_at DESC
@@ -118,7 +146,7 @@ func (r *WhitelistRepository) List(serverID string) ([]*WhitelistEntry, error) {
 // ListAll retrieves all whitelist entries from all servers.
 func (r *WhitelistRepository) ListAll() ([]*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, server_id, added_at, added_by
+		SELECT id, display_name, enabled, server_id, added_at, added_by
 		FROM whitelist 
 		ORDER BY added_at DESC
 	`
@@ -135,11 +163,13 @@ func (r *WhitelistRepository) ListAll() ([]*WhitelistEntry, error) {
 // scanWhitelistEntry scans a single row into a WhitelistEntry.
 func (r *WhitelistRepository) scanWhitelistEntry(row *sql.Row) (*WhitelistEntry, error) {
 	var entry WhitelistEntry
+	var enabled sql.NullBool
 	var serverID, addedBy sql.NullString
 
 	err := row.Scan(
 		&entry.ID,
 		&entry.DisplayName,
+		&enabled,
 		&serverID,
 		&entry.AddedAt,
 		&addedBy,
@@ -151,6 +181,11 @@ func (r *WhitelistRepository) scanWhitelistEntry(row *sql.Row) (*WhitelistEntry,
 		return nil, fmt.Errorf("failed to scan whitelist entry: %w", err)
 	}
 
+	if enabled.Valid {
+		entry.Enabled = enabled.Bool
+	} else {
+		entry.Enabled = true
+	}
 	if serverID.Valid {
 		entry.ServerID = serverID.String
 	}
@@ -167,11 +202,13 @@ func (r *WhitelistRepository) scanWhitelistEntries(rows *sql.Rows) ([]*Whitelist
 
 	for rows.Next() {
 		var entry WhitelistEntry
+		var enabled sql.NullBool
 		var serverID, addedBy sql.NullString
 
 		err := rows.Scan(
 			&entry.ID,
 			&entry.DisplayName,
+			&enabled,
 			&serverID,
 			&entry.AddedAt,
 			&addedBy,
@@ -180,6 +217,11 @@ func (r *WhitelistRepository) scanWhitelistEntries(rows *sql.Rows) ([]*Whitelist
 			return nil, fmt.Errorf("failed to scan whitelist entry row: %w", err)
 		}
 
+		if enabled.Valid {
+			entry.Enabled = enabled.Bool
+		} else {
+			entry.Enabled = true
+		}
 		if serverID.Valid {
 			entry.ServerID = serverID.String
 		}

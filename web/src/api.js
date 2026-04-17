@@ -45,6 +45,57 @@ export async function api(url, method = 'GET', body = null) {
   return res.json()
 }
 
+export async function apiStream(url, method = 'GET', body = null, onMessage = async () => {}) {
+  const opts = {
+    method,
+    headers: { 'Content-Type': 'application/json' }
+  }
+  if (body) opts.body = JSON.stringify(body)
+  const res = await apiFetch(url, opts)
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try {
+      const data = await res.json()
+      msg = data?.msg || msg
+    } catch {
+    }
+    throw new Error(msg)
+  }
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    const text = await res.text()
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const lines = trimmed.split(/\r?\n/)
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line) continue
+      await onMessage(JSON.parse(line))
+    }
+    return
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    let newlineIndex = buffer.indexOf('\n')
+    while (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).trim()
+      buffer = buffer.slice(newlineIndex + 1)
+      if (line) {
+        await onMessage(JSON.parse(line))
+      }
+      newlineIndex = buffer.indexOf('\n')
+    }
+    if (done) break
+  }
+  const tail = buffer.trim()
+  if (tail) {
+    await onMessage(JSON.parse(tail))
+  }
+}
+
 export function formatBytes(bytes) {
   if (!bytes) return '0 B'
   const k = 1024

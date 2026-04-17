@@ -36,8 +36,7 @@ func (f *Forwarder) ForwardToRemote(sess *session.Session, data []byte, cfg *con
 	}
 
 	// Update bytes up counter and keep session alive
-	sess.AddBytesUp(int64(len(data)))
-	sess.UpdateLastSeen()
+	sess.AddBytesUpAndUpdateLastSeen(int64(len(data)))
 
 	// Try to extract player info from login packets (read-only operation)
 	f.tryExtractPlayerInfo(sess, data)
@@ -92,20 +91,14 @@ func (f *Forwarder) fixOpenConnectionRequest2(data []byte, cfg *config.ServerCon
 		return data
 	}
 
-	// Resolve the hostname to IP if needed
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		logger.Debug("Failed to resolve host %s: %v", host, err)
-		return data
-	}
-
-	// Find an IPv4 address
 	var ipv4 net.IP
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			ipv4 = v4
-			break
-		}
+	if ip := net.ParseIP(host); ip != nil {
+		ipv4 = ip.To4()
+	} else if resolvedAddr, resolveErr := ResolveUDPAddress(targetAddr); resolveErr == nil {
+		ipv4 = resolvedAddr.IP.To4()
+	} else {
+		logger.Debug("Failed to resolve host %s: %v", host, resolveErr)
+		return data
 	}
 
 	if ipv4 == nil {
@@ -148,8 +141,7 @@ func (f *Forwarder) fixOpenConnectionRequest2(data []byte, cfg *config.ServerCon
 // It operates in transparent mode, preserving original packet bytes without modification.
 func (f *Forwarder) ForwardToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte, sess *session.Session) error {
 	// Update bytes down counter and keep session alive
-	sess.AddBytesDown(int64(len(data)))
-	sess.UpdateLastSeen()
+	sess.AddBytesDownAndUpdateLastSeen(int64(len(data)))
 
 	// Try to extract player info from server responses too
 	// Some servers may echo player info in certain packets

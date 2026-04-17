@@ -65,21 +65,21 @@ type connInfo struct {
 // It accepts RakNet connections, extracts player info from login packets,
 // then forwards the raw bytes to the remote server (preserving client auth).
 type PassthroughProxy struct {
-	serverID         string
-	config           *config.ServerConfig
-	configMgr        *config.ConfigManager
-	sessionMgr       *session.SessionManager
-	listener         *raknet.Listener
-	aclManager       *acl.ACLManager  // ACL manager for access control
-	externalVerifier ExternalVerifier // External auth verifier
-	outboundMgr      OutboundManager  // Outbound manager for proxy routing
-	rawCompat        *RawUDPProxy
-	useRawCompat     bool
+	serverID                       string
+	config                         *config.ServerConfig
+	configMgr                      *config.ConfigManager
+	sessionMgr                     *session.SessionManager
+	listener                       *raknet.Listener
+	aclManager                     *acl.ACLManager  // ACL manager for access control
+	externalVerifier               ExternalVerifier // External auth verifier
+	outboundMgr                    OutboundManager  // Outbound manager for proxy routing
+	rawCompat                      *RawUDPProxy
+	useRawCompat                   bool
 	passthroughIdleTimeoutOverride time.Duration
-	closed           atomic.Bool
-	wg               sync.WaitGroup
-	activeConns      map[*raknet.Conn]*connInfo // Track active connections with player info
-	activeConnsMu    sync.Mutex
+	closed                         atomic.Bool
+	wg                             sync.WaitGroup
+	activeConns                    map[*raknet.Conn]*connInfo // Track active connections with player info
+	activeConnsMu                  sync.Mutex
 	// Cached pong data with real latency
 	cachedPong      []byte
 	cachedPongMu    sync.RWMutex
@@ -87,6 +87,12 @@ type PassthroughProxy struct {
 	// Context for background goroutines
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+func (p *PassthroughProxy) hasActiveConnections() bool {
+	p.activeConnsMu.Lock()
+	defer p.activeConnsMu.Unlock()
+	return len(p.activeConns) > 0
 }
 
 // NewPassthroughProxy creates a new passthrough proxy.
@@ -97,11 +103,11 @@ func NewPassthroughProxy(
 	sessionMgr *session.SessionManager,
 ) *PassthroughProxy {
 	return &PassthroughProxy{
-		serverID:    serverID,
-		config:      cfg,
-		configMgr:   configMgr,
-		sessionMgr:  sessionMgr,
-		activeConns: make(map[*raknet.Conn]*connInfo),
+		serverID:        serverID,
+		config:          cfg,
+		configMgr:       configMgr,
+		sessionMgr:      sessionMgr,
+		activeConns:     make(map[*raknet.Conn]*connInfo),
 		lastPongLatency: -1,
 	}
 }
@@ -257,6 +263,9 @@ func (p *PassthroughProxy) startPongRefresh(ctx context.Context) {
 		case <-time.After(waitTime):
 			if p.closed.Load() {
 				return
+			}
+			if p.hasActiveConnections() {
+				continue
 			}
 			// Check if ping was successful
 			success := p.fetchRemotePongWithLatencyWithResult()
@@ -666,7 +675,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		} else {
 			nodeDisplay = "直连"
 		}
-		
+
 		reason := fmt.Sprintf(
 			"§c出口节点 / 远程服务器连接失败\n§7目标: %s\n§7节点: %s\n§7错误: %v",
 			targetAddr,
@@ -739,6 +748,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 	// Create session
 	sess, _ := p.sessionMgr.GetOrCreate(clientAddr, p.serverID)
+	accessServerID := p.config.GetACLServerID()
 	if playerName != "" {
 		sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 		// Update connInfo with player name for kick functionality
@@ -748,7 +758,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 		// Check ACL access control (Requirements 5.1, 5.2, 5.3, 5.4)
 		if p.aclManager != nil {
-			decision, _ := p.checkACLAccess(playerName, p.serverID, clientAddr)
+			decision, _ := p.checkACLAccess(playerName, accessServerID, clientAddr)
 			if !decision.Allowed {
 				// Format the denial message based on decision type
 				var formattedReason string
@@ -794,9 +804,9 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 		// Check external auth verification
 		if p.externalVerifier != nil && p.externalVerifier.IsEnabled() {
-			allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, p.serverID, clientAddr)
+			allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, accessServerID, clientAddr)
 			if !allowed {
-				logger.LogAccessDenied(playerName, p.serverID, clientAddr, "external auth: "+reason)
+				logger.LogAccessDenied(playerName, accessServerID, clientAddr, "external auth: "+reason)
 				// Use reason directly - external verifier now always provides meaningful messages
 				if reason == "" {
 					reason = "验证失败，请稍后再试"
@@ -925,8 +935,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					p.tryParseAndLogPacket(pk, clientAddr, "S->C")
 				}
 
-				sess.AddBytesDown(int64(len(pk)))
-				sess.UpdateLastSeen() // Keep session alive while data is flowing
+				sess.AddBytesDownAndUpdateLastSeen(int64(len(pk)))
 				gm.UpdateActivity(gid)
 				if _, err := clientConn.Write(pk); err != nil {
 					logger.Info("Connection closed (write to client) for %s: %v", clientAddr, err)
@@ -988,8 +997,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					p.tryParseAndLogPacket(pk, clientAddr, "C->S")
 				}
 
-				sess.AddBytesUp(int64(len(pk)))
-				sess.UpdateLastSeen() // Keep session alive while data is flowing
+				sess.AddBytesUpAndUpdateLastSeen(int64(len(pk)))
 				gm.UpdateActivity(gid)
 				if _, err := remoteConn.Write(pk); err != nil {
 					logger.Info("Connection closed (write to remote) for %s: %v", clientAddr, err)
@@ -1279,17 +1287,29 @@ func (p *PassthroughProxy) parseConnectionRequest(data []byte) (displayName, uui
 	// Read chain JSON
 	chainData := buf.Next(int(chainLen))
 	logger.Debug("Chain data (first 200 chars): %s", string(chainData[:min(200, len(chainData))]))
+	var rawToken string
+	if buf.Len() >= 4 {
+		var rawTokenLen int32
+		if err := binary.Read(buf, binary.LittleEndian, &rawTokenLen); err == nil && rawTokenLen >= 0 && rawTokenLen <= int32(buf.Len()) {
+			rawToken = string(buf.Next(int(rawTokenLen)))
+		}
+	}
 
 	// Parse the outer JSON structure
 	// Format: {"AuthenticationType":0,"Certificate":"{\"chain\":[...]}"}
 	var outerWrapper struct {
 		AuthenticationType int    `json:"AuthenticationType"`
 		Certificate        string `json:"Certificate"`
+		Token              string `json:"Token"`
 	}
 	if err := json.Unmarshal(chainData, &outerWrapper); err != nil {
 		logger.Debug("Failed to parse outer JSON: %v", err)
 		// Try direct chain format as fallback
-		return p.parseChainDirect(chainData)
+		displayName, uuid, xuid = p.parseChainDirect(chainData)
+		if displayName == "" && rawToken != "" {
+			return p.extractIdentityFromClientDataToken(rawToken)
+		}
+		return
 	}
 
 	logger.Debug("AuthenticationType: %d, Certificate length: %d", outerWrapper.AuthenticationType, len(outerWrapper.Certificate))
@@ -1300,12 +1320,43 @@ func (p *PassthroughProxy) parseConnectionRequest(data []byte) (displayName, uui
 	}
 	if err := json.Unmarshal([]byte(outerWrapper.Certificate), &chainWrapper); err != nil {
 		logger.Debug("Failed to parse certificate JSON: %v", err)
+		if outerWrapper.Token != "" {
+			return p.extractIdentityFromOIDCToken(outerWrapper.Token)
+		}
+		if rawToken != "" {
+			return p.extractIdentityFromClientDataToken(rawToken)
+		}
 		return
 	}
 
 	logger.Debug("Found %d JWT tokens in chain", len(chainWrapper.Chain))
 
-	return p.extractIdentityFromChain(chainWrapper.Chain)
+	displayName, uuid, xuid = p.extractIdentityFromChain(chainWrapper.Chain)
+	if displayName == "" && outerWrapper.Token != "" {
+		oidcName, oidcUUID, oidcXUID := p.extractIdentityFromOIDCToken(outerWrapper.Token)
+		if displayName == "" {
+			displayName = oidcName
+		}
+		if uuid == "" {
+			uuid = oidcUUID
+		}
+		if xuid == "" {
+			xuid = oidcXUID
+		}
+	}
+	if displayName == "" && rawToken != "" {
+		fallbackName, fallbackUUID, fallbackXUID := p.extractIdentityFromClientDataToken(rawToken)
+		if displayName == "" {
+			displayName = fallbackName
+		}
+		if uuid == "" {
+			uuid = fallbackUUID
+		}
+		if xuid == "" {
+			xuid = fallbackXUID
+		}
+	}
+	return
 }
 
 // parseChainDirect tries to parse chain data in direct format {"chain":[...]}
@@ -1344,6 +1395,31 @@ func (p *PassthroughProxy) extractIdentityFromChain(chain []string) (displayName
 		}
 	}
 
+	return
+}
+
+func (p *PassthroughProxy) extractIdentityFromOIDCToken(token string) (displayName, uuid, xuid string) {
+	jwtParser := jwt.Parser{}
+	claims := jwt.MapClaims{}
+	_, _, err := jwtParser.ParseUnverified(token, &claims)
+	if err != nil {
+		return
+	}
+	displayName, _ = claims["xname"].(string)
+	xuid, _ = claims["xid"].(string)
+	return
+}
+
+func (p *PassthroughProxy) extractIdentityFromClientDataToken(token string) (displayName, uuid, xuid string) {
+	jwtParser := jwt.Parser{}
+	claims := jwt.MapClaims{}
+	_, _, err := jwtParser.ParseUnverified(token, &claims)
+	if err != nil {
+		return
+	}
+	displayName, _ = claims["ThirdPartyName"].(string)
+	uuid, _ = claims["SelfSignedId"].(string)
+	xuid, _ = claims["XUID"].(string)
 	return
 }
 

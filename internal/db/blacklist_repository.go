@@ -22,9 +22,10 @@ func NewBlacklistRepository(db *Database) *BlacklistRepository {
 // If the entry already exists (same display_name and server_id), it will be updated.
 func (r *BlacklistRepository) Create(entry *BlacklistEntry) error {
 	query := `
-		INSERT INTO blacklist (display_name, display_name_lower, reason, server_id, added_at, expires_at, added_by)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO blacklist (display_name, display_name_lower, enabled, reason, server_id, added_at, expires_at, added_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(display_name_lower, server_id) DO UPDATE SET
+			enabled = excluded.enabled,
 			reason = excluded.reason,
 			added_at = excluded.added_at,
 			expires_at = excluded.expires_at,
@@ -42,6 +43,7 @@ func (r *BlacklistRepository) Create(entry *BlacklistEntry) error {
 	result, err := r.db.DB().Exec(query,
 		entry.DisplayName,
 		strings.ToLower(entry.DisplayName),
+		entry.Enabled,
 		entry.Reason,
 		serverID,
 		entry.AddedAt,
@@ -65,7 +67,7 @@ func (r *BlacklistRepository) Create(entry *BlacklistEntry) error {
 // Uses case-insensitive matching on display name.
 func (r *BlacklistRepository) GetByName(displayName, serverID string) (*BlacklistEntry, error) {
 	query := `
-		SELECT id, display_name, reason, server_id, added_at, expires_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM blacklist 
 		WHERE display_name_lower = ? AND (
 			server_id = ? OR 
@@ -76,6 +78,33 @@ func (r *BlacklistRepository) GetByName(displayName, serverID string) (*Blacklis
 
 	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID, serverID)
 	return r.scanBlacklistEntry(row)
+}
+
+func (r *BlacklistRepository) UpdateEnabled(displayName, serverID string, enabled bool) error {
+	query := `
+		UPDATE blacklist
+		SET enabled = ?
+		WHERE display_name_lower = ? AND (
+			server_id = ? OR
+			(server_id IS NULL AND ? = '') OR
+			(server_id = '' AND ? = '')
+		)
+	`
+
+	result, err := r.db.DB().Exec(query, enabled, strings.ToLower(displayName), serverID, serverID, serverID)
+	if err != nil {
+		return fmt.Errorf("failed to update blacklist entry enabled state: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get affected rows: %w", err)
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+
+	return nil
 }
 
 // Delete removes a blacklist entry by display name and server ID.
@@ -109,7 +138,7 @@ func (r *BlacklistRepository) Delete(displayName, serverID string) error {
 // List retrieves all blacklist entries for a specific server (or global if serverID is empty).
 func (r *BlacklistRepository) List(serverID string) ([]*BlacklistEntry, error) {
 	query := `
-		SELECT id, display_name, reason, server_id, added_at, expires_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM blacklist 
 		WHERE server_id = ? OR (server_id IS NULL AND ? = '') OR (server_id = '' AND ? = '')
 		ORDER BY added_at DESC
@@ -127,7 +156,7 @@ func (r *BlacklistRepository) List(serverID string) ([]*BlacklistEntry, error) {
 // ListAll retrieves all blacklist entries from all servers.
 func (r *BlacklistRepository) ListAll() ([]*BlacklistEntry, error) {
 	query := `
-		SELECT id, display_name, reason, server_id, added_at, expires_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM blacklist 
 		ORDER BY added_at DESC
 	`
@@ -164,12 +193,14 @@ func (r *BlacklistRepository) DeleteExpired() (int, error) {
 // scanBlacklistEntry scans a single row into a BlacklistEntry.
 func (r *BlacklistRepository) scanBlacklistEntry(row *sql.Row) (*BlacklistEntry, error) {
 	var entry BlacklistEntry
+	var enabled sql.NullBool
 	var reason, serverID, addedBy sql.NullString
 	var expiresAt sql.NullTime
 
 	err := row.Scan(
 		&entry.ID,
 		&entry.DisplayName,
+		&enabled,
 		&reason,
 		&serverID,
 		&entry.AddedAt,
@@ -183,6 +214,11 @@ func (r *BlacklistRepository) scanBlacklistEntry(row *sql.Row) (*BlacklistEntry,
 		return nil, fmt.Errorf("failed to scan blacklist entry: %w", err)
 	}
 
+	if enabled.Valid {
+		entry.Enabled = enabled.Bool
+	} else {
+		entry.Enabled = true
+	}
 	if reason.Valid {
 		entry.Reason = reason.String
 	}
@@ -205,12 +241,14 @@ func (r *BlacklistRepository) scanBlacklistEntries(rows *sql.Rows) ([]*Blacklist
 
 	for rows.Next() {
 		var entry BlacklistEntry
+		var enabled sql.NullBool
 		var reason, serverID, addedBy sql.NullString
 		var expiresAt sql.NullTime
 
 		err := rows.Scan(
 			&entry.ID,
 			&entry.DisplayName,
+			&enabled,
 			&reason,
 			&serverID,
 			&entry.AddedAt,
@@ -221,6 +259,11 @@ func (r *BlacklistRepository) scanBlacklistEntries(rows *sql.Rows) ([]*Blacklist
 			return nil, fmt.Errorf("failed to scan blacklist entry row: %w", err)
 		}
 
+		if enabled.Valid {
+			entry.Enabled = enabled.Bool
+		} else {
+			entry.Enabled = true
+		}
 		if reason.Valid {
 			entry.Reason = reason.String
 		}

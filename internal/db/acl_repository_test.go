@@ -23,7 +23,7 @@ func TestProperty_ACLEntryRoundTrip_Blacklist(t *testing.T) {
 	properties := gopter.NewProperties(parameters)
 
 	properties.Property("Blacklist entry round-trip preserves data", prop.ForAll(
-		func(displayName string, reason string, serverID string, addedBy string, hasExpiry bool, expiryOffsetHours int) bool {
+		func(displayName string, reason string, serverID string, addedBy string, enabled bool, hasExpiry bool, expiryOffsetHours int) bool {
 			// Skip empty display names as they are invalid
 			if displayName == "" {
 				return true
@@ -59,6 +59,7 @@ func TestProperty_ACLEntryRoundTrip_Blacklist(t *testing.T) {
 				DisplayName: displayName,
 				Reason:      reason,
 				ServerID:    serverID,
+				Enabled:     enabled,
 				AddedAt:     now,
 				ExpiresAt:   expiresAt,
 				AddedBy:     addedBy,
@@ -92,6 +93,10 @@ func TestProperty_ACLEntryRoundTrip_Blacklist(t *testing.T) {
 			}
 			if retrieved.AddedBy != entry.AddedBy {
 				t.Logf("AddedBy mismatch: expected %q, got %q", entry.AddedBy, retrieved.AddedBy)
+				return false
+			}
+			if retrieved.Enabled != entry.Enabled {
+				t.Logf("Enabled mismatch: expected %v, got %v", entry.Enabled, retrieved.Enabled)
 				return false
 			}
 			// Compare times with second precision
@@ -141,6 +146,8 @@ func TestProperty_ACLEntryRoundTrip_Blacklist(t *testing.T) {
 			}
 			return s
 		}),
+		// Generate enabled state
+		gen.Bool(),
 		// Generate whether entry has expiry
 		gen.Bool(),
 		// Generate expiry offset in hours (1-720 hours = 1 hour to 30 days)
@@ -162,7 +169,7 @@ func TestProperty_ACLEntryRoundTrip_Whitelist(t *testing.T) {
 	properties := gopter.NewProperties(parameters)
 
 	properties.Property("Whitelist entry round-trip preserves data", prop.ForAll(
-		func(displayName string, serverID string, addedBy string) bool {
+		func(displayName string, serverID string, addedBy string, enabled bool) bool {
 			// Skip empty display names as they are invalid
 			if displayName == "" {
 				return true
@@ -192,6 +199,7 @@ func TestProperty_ACLEntryRoundTrip_Whitelist(t *testing.T) {
 			entry := &WhitelistEntry{
 				DisplayName: displayName,
 				ServerID:    serverID,
+				Enabled:     enabled,
 				AddedAt:     now,
 				AddedBy:     addedBy,
 			}
@@ -222,6 +230,10 @@ func TestProperty_ACLEntryRoundTrip_Whitelist(t *testing.T) {
 				t.Logf("AddedBy mismatch: expected %q, got %q", entry.AddedBy, retrieved.AddedBy)
 				return false
 			}
+			if retrieved.Enabled != entry.Enabled {
+				t.Logf("Enabled mismatch: expected %v, got %v", entry.Enabled, retrieved.Enabled)
+				return false
+			}
 			// Compare times with second precision
 			if !retrieved.AddedAt.Truncate(time.Second).Equal(entry.AddedAt.Truncate(time.Second)) {
 				t.Logf("AddedAt mismatch: expected %v, got %v", entry.AddedAt, retrieved.AddedAt)
@@ -246,6 +258,8 @@ func TestProperty_ACLEntryRoundTrip_Whitelist(t *testing.T) {
 			}
 			return s
 		}),
+		// Generate enabled state
+		gen.Bool(),
 	))
 
 	properties.TestingRun(t)

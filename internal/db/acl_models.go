@@ -10,6 +10,7 @@ import (
 type BlacklistEntry struct {
 	ID          int64      `json:"id"`
 	DisplayName string     `json:"display_name"`
+	Enabled     bool       `json:"enabled"`
 	Reason      string     `json:"reason,omitempty"`
 	ServerID    string     `json:"server_id,omitempty"` // empty for global
 	AddedAt     time.Time  `json:"added_at"`
@@ -43,6 +44,7 @@ func (be *BlacklistEntry) IsExpired() bool {
 type WhitelistEntry struct {
 	ID          int64     `json:"id"`
 	DisplayName string    `json:"display_name"`
+	Enabled     bool      `json:"enabled"`
 	ServerID    string    `json:"server_id,omitempty"` // empty for global
 	AddedAt     time.Time `json:"added_at"`
 	AddedBy     string    `json:"added_by,omitempty"`
@@ -65,6 +67,7 @@ func WhitelistEntryFromJSON(data []byte) (*WhitelistEntry, error) {
 // ACLSettings represents access control settings for a server.
 type ACLSettings struct {
 	ServerID         string `json:"server_id,omitempty"` // empty for global
+	BlacklistEnabled bool   `json:"blacklist_enabled"`
 	WhitelistEnabled bool   `json:"whitelist_enabled"`
 	DefaultMessage   string `json:"default_ban_message"`
 	WhitelistMessage string `json:"whitelist_message"`
@@ -88,6 +91,7 @@ func ACLSettingsFromJSON(data []byte) (*ACLSettings, error) {
 func DefaultACLSettings() *ACLSettings {
 	return &ACLSettings{
 		ServerID:         "",
+		BlacklistEnabled: true,
 		WhitelistEnabled: false,
 		DefaultMessage:   "你已被封禁",
 		WhitelistMessage: "你不在白名单中",
@@ -98,6 +102,7 @@ func DefaultACLSettings() *ACLSettings {
 type BlacklistEntryDTO struct {
 	ID         int64      `json:"id"`
 	PlayerName string     `json:"player_name"`
+	Enabled    bool       `json:"enabled"`
 	Reason     string     `json:"reason,omitempty"`
 	ServerID   string     `json:"server_id,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
@@ -110,6 +115,7 @@ func (be *BlacklistEntry) ToDTO() BlacklistEntryDTO {
 	return BlacklistEntryDTO{
 		ID:         be.ID,
 		PlayerName: be.DisplayName,
+		Enabled:    be.Enabled,
 		Reason:     be.Reason,
 		ServerID:   be.ServerID,
 		CreatedAt:  be.AddedAt,
@@ -122,6 +128,7 @@ func (be *BlacklistEntry) ToDTO() BlacklistEntryDTO {
 type WhitelistEntryDTO struct {
 	ID         int64     `json:"id"`
 	PlayerName string    `json:"player_name"`
+	Enabled    bool      `json:"enabled"`
 	ServerID   string    `json:"server_id,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	AddedBy    string    `json:"added_by,omitempty"`
@@ -132,6 +139,7 @@ func (we *WhitelistEntry) ToDTO() WhitelistEntryDTO {
 	return WhitelistEntryDTO{
 		ID:         we.ID,
 		PlayerName: we.DisplayName,
+		Enabled:    we.Enabled,
 		ServerID:   we.ServerID,
 		CreatedAt:  we.AddedAt,
 		AddedBy:    we.AddedBy,
@@ -141,6 +149,7 @@ func (we *WhitelistEntry) ToDTO() WhitelistEntryDTO {
 // ACLSettingsDTO is the data transfer object for ACL settings API responses.
 type ACLSettingsDTO struct {
 	ServerID         string `json:"server_id,omitempty"`
+	BlacklistEnabled bool   `json:"blacklist_enabled"`
 	WhitelistEnabled bool   `json:"whitelist_enabled"`
 	DefaultMessage   string `json:"default_ban_message"`
 	WhitelistMessage string `json:"whitelist_message"`
@@ -150,6 +159,7 @@ type ACLSettingsDTO struct {
 func (as *ACLSettings) ToDTO() ACLSettingsDTO {
 	return ACLSettingsDTO{
 		ServerID:         as.ServerID,
+		BlacklistEnabled: as.BlacklistEnabled,
 		WhitelistEnabled: as.WhitelistEnabled,
 		DefaultMessage:   as.DefaultMessage,
 		WhitelistMessage: as.WhitelistMessage,
@@ -160,6 +170,7 @@ func (as *ACLSettings) ToDTO() ACLSettingsDTO {
 type AddBlacklistRequest struct {
 	DisplayName string     `json:"display_name"`
 	PlayerName  string     `json:"player_name"`
+	Enabled     *bool      `json:"enabled,omitempty"`
 	Reason      string     `json:"reason"`
 	ServerID    string     `json:"server_id,omitempty"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
@@ -177,6 +188,7 @@ func (r *AddBlacklistRequest) GetPlayerName() string {
 type AddWhitelistRequest struct {
 	DisplayName string `json:"display_name"`
 	PlayerName  string `json:"player_name"`
+	Enabled     *bool  `json:"enabled,omitempty"`
 	ServerID    string `json:"server_id,omitempty"`
 }
 

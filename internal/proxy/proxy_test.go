@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -118,6 +119,76 @@ func TestProperty_PacketContentPreservation(t *testing.T) {
 	))
 
 	properties.TestingRun(t)
+}
+
+type testPlayerKickerListener struct {
+	kickCount int
+	reason    string
+	player    string
+}
+
+func (l *testPlayerKickerListener) Start() error { return nil }
+
+func (l *testPlayerKickerListener) Listen(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (l *testPlayerKickerListener) Stop() error { return nil }
+
+func (l *testPlayerKickerListener) KickPlayer(playerName, reason string) int {
+	l.kickCount++
+	l.player = playerName
+	l.reason = reason
+	return 1
+}
+
+func TestProxyServerKickPlayer_PersistsBlacklistDisconnectStatus(t *testing.T) {
+	sessionMgr := session.NewSessionManager(time.Minute)
+	var ended *session.Session
+	sessionMgr.OnSessionEnd = func(sess *session.Session) {
+		ended = sess
+	}
+
+	sess, _ := sessionMgr.GetOrCreate("127.0.0.1:19132", "srv1")
+	sess.SetPlayerInfoWithXUID("uuid-1", "cniu666", "xuid-1")
+
+	listener := &testPlayerKickerListener{}
+	proxyServer := &ProxyServer{
+		sessionMgr: sessionMgr,
+		listeners: map[string]Listener{
+			"srv1": listener,
+		},
+	}
+
+	reason := "黑名单用户\n§7玩家名字：cniu666\n§7原因：1222"
+	kicked := proxyServer.KickPlayer("cniu666", reason)
+
+	if kicked != 1 {
+		t.Fatalf("KickPlayer() = %d, want 1", kicked)
+	}
+	if listener.kickCount != 1 {
+		t.Fatalf("listener.kickCount = %d, want 1", listener.kickCount)
+	}
+	if listener.player != "cniu666" {
+		t.Fatalf("listener.player = %q, want %q", listener.player, "cniu666")
+	}
+	if listener.reason != reason {
+		t.Fatalf("listener.reason = %q, want %q", listener.reason, reason)
+	}
+	if ended == nil {
+		t.Fatal("OnSessionEnd was not called")
+	}
+	snap := ended.Snapshot()
+	if snap.DisconnectStatus != "blacklist" {
+		t.Fatalf("DisconnectStatus = %q, want %q", snap.DisconnectStatus, "blacklist")
+	}
+	if snap.DisconnectReason != reason {
+		t.Fatalf("DisconnectReason = %q, want %q", snap.DisconnectReason, reason)
+	}
+	if _, exists := sessionMgr.Get("127.0.0.1:19132"); exists {
+		t.Fatal("session still exists after KickPlayer")
+	}
 }
 
 // **Feature: mcpe-server-proxy, Property 12: Parse Failure Transparency**

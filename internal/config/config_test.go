@@ -186,6 +186,13 @@ func TestProperty6_ConfigurationValidation(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+func TestGetRawUDPKickStrategy_DefaultsToDisconnectOnly(t *testing.T) {
+	config := &ServerConfig{}
+	if got := config.GetRawUDPKickStrategy(); got != RawUDPKickStrategyDisconnectOnly {
+		t.Fatalf("GetRawUDPKickStrategy() = %q, want %q", got, RawUDPKickStrategyDisconnectOnly)
+	}
+}
+
 // **Feature: xbox-live-auth-proxy, Property 4: Configuration Field Parsing**
 // **Validates: Requirements 5.1, 5.2**
 //

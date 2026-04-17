@@ -40,6 +40,7 @@ func TestProperty_BlacklistMembershipDeterminesAccessDenial(t *testing.T) {
 			entry := &db.BlacklistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				Reason:      reason,
 				AddedAt:     now,
 				ExpiresAt:   &futureExpiry,
@@ -56,6 +57,7 @@ func TestProperty_BlacklistMembershipDeterminesAccessDenial(t *testing.T) {
 			// Settings with whitelist disabled
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: false,
 			}
 
@@ -107,6 +109,55 @@ func TestProperty_BlacklistMembershipDeterminesAccessDenial(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+func TestCheckAccessWithEntries_DisabledBlacklistEntryIgnored(t *testing.T) {
+	now := time.Now()
+	futureExpiry := now.Add(24 * time.Hour)
+	allowed, _ := CheckAccessWithEntries(
+		"PlayerOne",
+		"server1",
+		[]*db.BlacklistEntry{{
+			ID:          1,
+			DisplayName: "PlayerOne",
+			Enabled:     false,
+			Reason:      "Disabled ban",
+			ServerID:    "",
+			AddedAt:     now,
+			ExpiresAt:   &futureExpiry,
+		}},
+		nil,
+		nil,
+		nil,
+		&db.ACLSettings{BlacklistEnabled: true, WhitelistEnabled: false},
+	)
+	if !allowed {
+		t.Fatalf("expected disabled blacklist entry to be ignored")
+	}
+}
+
+func TestCheckAccessWithEntries_DisabledWhitelistEntryIgnored(t *testing.T) {
+	allowed, reason := CheckAccessWithEntries(
+		"PlayerOne",
+		"server1",
+		nil,
+		nil,
+		[]*db.WhitelistEntry{{
+			ID:          1,
+			DisplayName: "PlayerOne",
+			Enabled:     false,
+			ServerID:    "",
+			AddedAt:     time.Now(),
+		}},
+		nil,
+		&db.ACLSettings{BlacklistEnabled: true, WhitelistEnabled: true, WhitelistMessage: "Not whitelisted"},
+	)
+	if allowed {
+		t.Fatalf("expected disabled whitelist entry to be ignored")
+	}
+	if reason != "Not whitelisted" {
+		t.Fatalf("reason = %q, want %q", reason, "Not whitelisted")
+	}
+}
+
 // **Feature: player-access-control, Property 2: Expired Blacklist Entries Are Ignored**
 // **Validates: Requirements 1.5**
 // *For any* blacklist entry with an expiry time in the past, the entry SHALL be treated
@@ -132,6 +183,7 @@ func TestProperty_ExpiredBlacklistEntriesAreIgnored(t *testing.T) {
 			entry := &db.BlacklistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				Reason:      "Test ban",
 				ServerID:    "",
 				AddedAt:     now.Add(-48 * time.Hour),
@@ -143,6 +195,7 @@ func TestProperty_ExpiredBlacklistEntriesAreIgnored(t *testing.T) {
 			// Settings with whitelist disabled
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: false,
 			}
 
@@ -203,6 +256,7 @@ func TestProperty_CaseInsensitiveNameMatching(t *testing.T) {
 			entry := &db.BlacklistEntry{
 				ID:          1,
 				DisplayName: baseName,
+				Enabled:     true,
 				Reason:      "Test ban",
 				ServerID:    "",
 				AddedAt:     now,
@@ -210,7 +264,7 @@ func TestProperty_CaseInsensitiveNameMatching(t *testing.T) {
 			}
 
 			globalBlacklist := []*db.BlacklistEntry{entry}
-			settings := &db.ACLSettings{WhitelistEnabled: false}
+			settings := &db.ACLSettings{BlacklistEnabled: true, WhitelistEnabled: false}
 
 			// Test with different case variations
 			variations := []string{
@@ -260,6 +314,7 @@ func TestProperty_CaseInsensitiveNameMatching(t *testing.T) {
 			entry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: baseName,
+				Enabled:     true,
 				ServerID:    "",
 				AddedAt:     now,
 			}
@@ -267,6 +322,7 @@ func TestProperty_CaseInsensitiveNameMatching(t *testing.T) {
 			globalWhitelist := []*db.WhitelistEntry{entry}
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}
@@ -384,6 +440,7 @@ func TestProperty_WhitelistModeRestrictsAccess(t *testing.T) {
 			entry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: whitelistedName,
+				Enabled:     true,
 				ServerID:    "",
 				AddedAt:     now,
 			}
@@ -391,6 +448,7 @@ func TestProperty_WhitelistModeRestrictsAccess(t *testing.T) {
 			globalWhitelist := []*db.WhitelistEntry{entry}
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}
@@ -445,6 +503,7 @@ func TestProperty_WhitelistModeRestrictsAccess(t *testing.T) {
 			entry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				AddedAt:     now,
 			}
 
@@ -461,6 +520,7 @@ func TestProperty_WhitelistModeRestrictsAccess(t *testing.T) {
 
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}
@@ -522,6 +582,7 @@ func TestProperty_GlobalBlacklistPriority(t *testing.T) {
 			blacklistEntry := &db.BlacklistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				Reason:      "Global ban",
 				ServerID:    "",
 				AddedAt:     now,
@@ -532,6 +593,7 @@ func TestProperty_GlobalBlacklistPriority(t *testing.T) {
 			whitelistEntry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				ServerID:    serverID,
 				AddedAt:     now,
 			}
@@ -541,6 +603,7 @@ func TestProperty_GlobalBlacklistPriority(t *testing.T) {
 
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}
@@ -605,6 +668,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 			blacklistEntry := &db.BlacklistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				Reason:      "Server ban",
 				ServerID:    serverID,
 				AddedAt:     now,
@@ -615,6 +679,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: false,
 			}
 
@@ -659,6 +724,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 			whitelistEntry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				ServerID:    "",
 				AddedAt:     now,
 			}
@@ -667,6 +733,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 
 			settings := &db.ACLSettings{
 				ServerID:         serverID,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}
@@ -714,6 +781,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 			whitelistEntry := &db.WhitelistEntry{
 				ID:          1,
 				DisplayName: playerName,
+				Enabled:     true,
 				ServerID:    whitelistServer,
 				AddedAt:     now,
 			}
@@ -726,6 +794,7 @@ func TestProperty_GlobalAndServerACLMerge(t *testing.T) {
 
 			settings := &db.ACLSettings{
 				ServerID:         accessServer,
+				BlacklistEnabled: true,
 				WhitelistEnabled: true,
 				WhitelistMessage: "Not whitelisted",
 			}

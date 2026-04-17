@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ func (m *ProxyPortConfigManager) Load() error {
 	}
 
 	newPorts := make(map[string]*ProxyPortConfig)
+	seenListenAddrs := make(map[string]string)
 	for _, cfg := range configs {
 		if cfg == nil {
 			continue
@@ -58,6 +60,14 @@ func (m *ProxyPortConfigManager) Load() error {
 		if err := cfg.Validate(); err != nil {
 			return fmt.Errorf("invalid proxy port config for %s: %w", cfg.ID, err)
 		}
+		if _, exists := newPorts[cfg.ID]; exists {
+			return fmt.Errorf("duplicate proxy port id %s", cfg.ID)
+		}
+		listenAddr := normalizeProxyPortListenAddr(cfg.ListenAddr)
+		if existingID, exists := seenListenAddrs[listenAddr]; exists {
+			return fmt.Errorf("duplicate proxy port listen_addr %s for %s and %s", cfg.ListenAddr, existingID, cfg.ID)
+		}
+		seenListenAddrs[listenAddr] = cfg.ID
 		newPorts[cfg.ID] = cfg.Clone()
 	}
 
@@ -120,6 +130,38 @@ func (m *ProxyPortConfigManager) GetAllPorts() []*ProxyPortConfig {
 	return result
 }
 
+func normalizeProxyPortListenAddr(addr string) string {
+	return strings.ToLower(strings.TrimSpace(addr))
+}
+
+func (m *ProxyPortConfigManager) ensurePortUniqueLocked(cfg *ProxyPortConfig, existingID string, stagedListenAddrs map[string]string) error {
+	if cfg == nil {
+		return fmt.Errorf("proxy port config is nil")
+	}
+	if cfg.ID == "" {
+		return fmt.Errorf("proxy port id is required")
+	}
+	if current, exists := m.ports[cfg.ID]; exists && (existingID == "" || cfg.ID != existingID) && current != nil {
+		return fmt.Errorf("proxy port with id %s already exists", cfg.ID)
+	}
+	listenAddr := normalizeProxyPortListenAddr(cfg.ListenAddr)
+	for id, existing := range m.ports {
+		if id == existingID || existing == nil {
+			continue
+		}
+		if normalizeProxyPortListenAddr(existing.ListenAddr) == listenAddr {
+			return fmt.Errorf("proxy port listen_addr %s already exists", cfg.ListenAddr)
+		}
+	}
+	if stagedListenAddrs != nil {
+		if existingID, exists := stagedListenAddrs[listenAddr]; exists && existingID != cfg.ID {
+			return fmt.Errorf("proxy port listen_addr %s already exists", cfg.ListenAddr)
+		}
+		stagedListenAddrs[listenAddr] = cfg.ID
+	}
+	return nil
+}
+
 // AddPort adds a new proxy port configuration.
 func (m *ProxyPortConfigManager) AddPort(cfg *ProxyPortConfig) error {
 	if cfg == nil {
@@ -130,10 +172,44 @@ func (m *ProxyPortConfigManager) AddPort(cfg *ProxyPortConfig) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.ports[cfg.ID]; exists {
-		return fmt.Errorf("proxy port with id %s already exists", cfg.ID)
+	if err := m.ensurePortUniqueLocked(cfg, "", nil); err != nil {
+		return err
 	}
 	m.ports[cfg.ID] = cfg.Clone()
+	return m.saveToFile()
+}
+
+func (m *ProxyPortConfigManager) AddPorts(cfgs []*ProxyPortConfig) error {
+	if len(cfgs) == 0 {
+		return fmt.Errorf("proxy port config list is empty")
+	}
+	prepared := make([]*ProxyPortConfig, 0, len(cfgs))
+	seenIDs := make(map[string]struct{}, len(cfgs))
+	for _, cfg := range cfgs {
+		if cfg == nil {
+			return fmt.Errorf("proxy port config is nil")
+		}
+		clone := cfg.Clone()
+		if err := clone.Validate(); err != nil {
+			return err
+		}
+		if _, exists := seenIDs[clone.ID]; exists {
+			return fmt.Errorf("proxy port with id %s already exists", clone.ID)
+		}
+		seenIDs[clone.ID] = struct{}{}
+		prepared = append(prepared, clone)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stagedListenAddrs := make(map[string]string, len(prepared))
+	for _, cfg := range prepared {
+		if err := m.ensurePortUniqueLocked(cfg, "", stagedListenAddrs); err != nil {
+			return err
+		}
+	}
+	for _, cfg := range prepared {
+		m.ports[cfg.ID] = cfg.Clone()
+	}
 	return m.saveToFile()
 }
 
@@ -149,6 +225,9 @@ func (m *ProxyPortConfigManager) UpdatePort(id string, cfg *ProxyPortConfig) err
 	defer m.mu.Unlock()
 	if _, exists := m.ports[id]; !exists {
 		return fmt.Errorf("proxy port with id %s not found", id)
+	}
+	if err := m.ensurePortUniqueLocked(cfg, id, nil); err != nil {
+		return err
 	}
 	if id != cfg.ID {
 		delete(m.ports, id)

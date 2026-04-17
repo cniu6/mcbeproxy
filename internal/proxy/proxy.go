@@ -2,7 +2,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -32,6 +31,81 @@ type Listener interface {
 }
 
 const defaultAutoPingIntervalMinutes = 10
+const autoPingParallelism = 4
+const autoPingGlobalParallelism = 8
+
+type connectedPacketWriter interface {
+	Write([]byte) (int, error)
+}
+
+func writePacketConn(conn net.PacketConn, payload []byte, addr net.Addr) (int, error) {
+	n, err := conn.WriteTo(payload, addr)
+	if err == nil {
+		return n, nil
+	}
+	if writer, ok := conn.(connectedPacketWriter); ok && shouldFallbackToConnectedWrite(err) {
+		return writer.Write(payload)
+	}
+	return n, err
+}
+
+// HostnamePortAddr is a net.Addr that carries an unresolved hostname and port.
+// Proxy-tunneled PacketConns (VLESS/Trojan/VMess/Hysteria2/SS/SOCKS5) embed the
+// destination at ListenPacket time and ignore the addr passed to WriteTo, so
+// callers can pass this type to avoid a local DNS lookup that would be
+// poisoned by a running TUN proxy's fake-IP replies (100.64/10, 198.18/15, ...).
+type HostnamePortAddr struct {
+	Host string
+	Port int
+}
+
+// Network returns "udp" so this addr is compatible with UDP PacketConns.
+func (a *HostnamePortAddr) Network() string { return "udp" }
+
+// String returns the canonical host:port form.
+func (a *HostnamePortAddr) String() string {
+	return net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
+}
+
+func buildUDPDestinationAddr(ctx context.Context, address string, preserveHostname bool) (net.Addr, *net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, nil, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		udpAddr := &net.UDPAddr{IP: ip, Port: port}
+		return udpAddr, udpAddr, nil
+	}
+	if preserveHostname {
+		return &HostnamePortAddr{Host: host, Port: port}, nil, nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	resolvedIP, _, err := resolveOutboundServerIP(lookupCtx, host)
+	if err != nil {
+		return nil, nil, err
+	}
+	udpAddr := &net.UDPAddr{IP: resolvedIP, Port: port}
+	return udpAddr, udpAddr, nil
+}
+
+func shouldFallbackToConnectedWrite(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "pre-connected") ||
+		strings.Contains(errText, "use of writeto with") ||
+		strings.Contains(errText, "connected connection")
+}
+
+const autoSwitchMinDwell = 3 * time.Minute
+const autoSwitchMinLatencyGainMs int64 = 8
+const autoSwitchMinRelativeGain = 0.10
 
 // ProxyServer is the main entry point that integrates all proxy components.
 // It manages UDP listeners, session management, configuration, and database persistence.
@@ -403,6 +477,8 @@ func (p *ProxyServer) startAutoPingScheduler() {
 		defer ticker.Stop()
 
 		lastRun := make(map[string]time.Time)
+		lastSwitch := make(map[string]time.Time)
+		observedSelectedNode := make(map[string]string)
 
 		for {
 			select {
@@ -413,6 +489,7 @@ func (p *ProxyServer) startAutoPingScheduler() {
 
 			servers := p.configMgr.GetAllServers()
 			now := time.Now()
+			var dueServers []*config.ServerConfig
 
 			for _, serverCfg := range servers {
 				if serverCfg == nil {
@@ -432,31 +509,102 @@ func (p *ProxyServer) startAutoPingScheduler() {
 					}
 				}
 
-				p.pingAllNodesForServer(serverCfg)
-				lastRun[serverCfg.ID] = now
+				dueServers = append(dueServers, serverCfg)
+			}
 
-				// Auto-switch: update selected node only when no active sessions
-				proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
-				sortBy := serverCfg.GetLoadBalanceSort()
-				bestNode, _ := p.outboundMgr.GetBestNodeForServer(serverCfg.ID, proxyOutbound, sortBy)
-				if bestNode != "" {
-					currentNode, _ := p.outboundMgr.GetServerSelectedNode(serverCfg.ID)
-					if currentNode != bestNode {
-						activeSessions := p.GetActiveSessionsForServer(serverCfg.ID)
-						if activeSessions == 0 {
-							p.outboundMgr.SetServerSelectedNode(serverCfg.ID, bestNode)
-							logger.Info("Auto-switch server %s node: %s -> %s (0 active sessions)", serverCfg.ID, currentNode, bestNode)
-						} else {
-							logger.Debug("Auto-switch deferred for server %s: %s -> %s (%d active sessions)", serverCfg.ID, currentNode, bestNode, activeSessions)
-						}
-					}
-				}
+			if len(dueServers) == 0 {
+				continue
+			}
+
+			pingBudget := make(chan struct{}, autoPingGlobalParallelism)
+			var pingWG sync.WaitGroup
+			for _, serverCfg := range dueServers {
+				pingWG.Add(1)
+				go func(serverCfg *config.ServerConfig) {
+					defer pingWG.Done()
+					p.pingAllNodesForServer(serverCfg, pingBudget)
+				}(serverCfg)
+			}
+			pingWG.Wait()
+			completedAt := time.Now()
+			for _, serverCfg := range dueServers {
+				lastRun[serverCfg.ID] = completedAt
+				p.maybeAutoSwitchServerNode(serverCfg, completedAt, lastSwitch, observedSelectedNode)
 			}
 		}
 	}()
 }
 
-func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig) {
+func (p *ProxyServer) maybeAutoSwitchServerNode(serverCfg *config.ServerConfig, now time.Time, lastSwitch map[string]time.Time, observedSelectedNode map[string]string) {
+	if serverCfg == nil || p.outboundMgr == nil {
+		return
+	}
+
+	proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
+	sortBy := serverCfg.GetLoadBalanceSort()
+	bestNode, bestLatency := p.outboundMgr.GetBestNodeForServer(serverCfg.ID, proxyOutbound, sortBy)
+	if bestNode == "" {
+		return
+	}
+
+	currentNode, _ := p.outboundMgr.GetServerSelectedNode(serverCfg.ID)
+	if observedSelectedNode[serverCfg.ID] != currentNode {
+		observedSelectedNode[serverCfg.ID] = currentNode
+		if currentNode == "" {
+			delete(lastSwitch, serverCfg.ID)
+		} else {
+			lastSwitch[serverCfg.ID] = now
+		}
+	}
+	if currentNode == bestNode {
+		return
+	}
+
+	activeSessions := p.GetActiveSessionsForServer(serverCfg.ID)
+	if activeSessions != 0 {
+		logger.Debug("Auto-switch deferred for server %s: %s -> %s (%d active sessions)", serverCfg.ID, currentNode, bestNode, activeSessions)
+		return
+	}
+
+	currentLatency, currentLatencyOK := p.outboundMgr.GetServerNodeLatency(serverCfg.ID, currentNode, sortBy)
+	if shouldSwitch, reason := shouldAutoSwitchNode(currentNode, currentLatency, currentLatencyOK, bestLatency, lastSwitch[serverCfg.ID], now); !shouldSwitch {
+		logger.Debug("Auto-switch skipped for server %s: %s (current=%s, best=%s, current_latency=%dms, best_latency=%dms)",
+			serverCfg.ID, reason, currentNode, bestNode, currentLatency, bestLatency)
+		return
+	}
+
+	p.outboundMgr.SetServerSelectedNode(serverCfg.ID, bestNode)
+	observedSelectedNode[serverCfg.ID] = bestNode
+	lastSwitch[serverCfg.ID] = now
+	logger.Info("Auto-switch server %s node: %s -> %s (0 active sessions, current=%dms, best=%dms)", serverCfg.ID, currentNode, bestNode, currentLatency, bestLatency)
+}
+
+func shouldAutoSwitchNode(currentNode string, currentLatency int64, currentLatencyOK bool, bestLatency int64, lastSwitchAt time.Time, now time.Time) (bool, string) {
+	if bestLatency <= 0 {
+		return false, "best node has no latency sample"
+	}
+	if currentNode == "" {
+		return true, ""
+	}
+	if !currentLatencyOK || currentLatency <= 0 {
+		return true, ""
+	}
+	improvement := currentLatency - bestLatency
+	if improvement <= 0 {
+		return false, "best node is not faster than current node"
+	}
+	absoluteGainOK := improvement >= autoSwitchMinLatencyGainMs
+	relativeGainOK := float64(improvement) >= float64(currentLatency)*autoSwitchMinRelativeGain
+	if !absoluteGainOK && !relativeGainOK {
+		return false, "latency improvement is below hysteresis threshold"
+	}
+	if !lastSwitchAt.IsZero() && now.Sub(lastSwitchAt) < autoSwitchMinDwell {
+		return false, "minimum dwell time not reached"
+	}
+	return true, ""
+}
+
+func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, globalSem chan struct{}) {
 	if serverCfg == nil || p.outboundMgr == nil {
 		return
 	}
@@ -465,9 +613,12 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig) {
 	if proxyOutbound == "" || proxyOutbound == "direct" {
 		return
 	}
+	if p.GetActiveSessionsForServer(serverCfg.ID) > 0 {
+		return
+	}
 
 	targetAddr := serverCfg.GetTargetAddr()
-	destAddr, err := resolveUDPAddr(targetAddr)
+	destAddr, _, err := buildUDPDestinationAddr(context.Background(), targetAddr, true)
 	if err != nil {
 		logger.Debug("auto ping resolve target failed: server=%s target=%s err=%v", serverCfg.ID, targetAddr, err)
 		return
@@ -483,20 +634,64 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig) {
 		return
 	}
 
+	parallelism := autoPingParallelism
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	if len(nodeNames) < parallelism {
+		parallelism = len(nodeNames)
+	}
+	if parallelism <= 0 {
+		return
+	}
+
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
 	for _, nodeName := range nodeNames {
-		select {
-		case <-p.ctx.Done():
+		if !acquireAutoPingSlot(p.ctx, sem, globalSem) {
+			wg.Wait()
 			return
-		default:
 		}
 
-		latencyMs := p.pingServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr)
-		if latencyMs > 0 {
-			p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, latencyMs)
-		} else {
-			p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, 0)
-		}
+		wg.Add(1)
+		go func(nodeName string) {
+			defer wg.Done()
+			defer releaseAutoPingSlot(sem, globalSem)
+
+			latencyMs := p.pingServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr)
+			if latencyMs > 0 {
+				p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, latencyMs)
+			} else {
+				p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, 0)
+			}
+		}(nodeName)
 	}
+	wg.Wait()
+}
+
+func acquireAutoPingSlot(ctx context.Context, localSem chan struct{}, globalSem chan struct{}) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case localSem <- struct{}{}:
+	}
+	if globalSem == nil {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		<-localSem
+		return false
+	case globalSem <- struct{}{}:
+		return true
+	}
+}
+
+func releaseAutoPingSlot(localSem chan struct{}, globalSem chan struct{}) {
+	if globalSem != nil {
+		<-globalSem
+	}
+	<-localSem
 }
 
 func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []string {
@@ -540,7 +735,7 @@ func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []strin
 	return []string{proxyOutbound}
 }
 
-func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr string, destAddr *net.UDPAddr) int64 {
+func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr string, destAddr net.Addr) int64 {
 	if p.outboundMgr == nil {
 		return -1
 	}
@@ -559,13 +754,15 @@ func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr strin
 
 	startTime := time.Now()
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = conn.WriteTo(pingPacket, destAddr)
+	_, err = writePacketConn(conn, pingPacket, destAddr)
 	if err != nil {
 		logger.Debug("auto ping write failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
 		return -1
 	}
 
-	buf := make([]byte, 1500)
+	bufPtr := GetSmallBuffer()
+	buf := *bufPtr
+	defer PutSmallBuffer(bufPtr)
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err := conn.ReadFrom(buf)
 	latencyMs := time.Since(startTime).Milliseconds()
@@ -582,38 +779,32 @@ func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr strin
 }
 
 func buildRakNetPingPacket() []byte {
-	// 0x01 + timestamp(8 bytes BE) + MAGIC(16 bytes) + clientGUID(8 bytes)
-	var pingPacket bytes.Buffer
-	pingPacket.WriteByte(0x01)
-	_ = binary.Write(&pingPacket, binary.BigEndian, time.Now().UnixMilli())
-	pingPacket.Write(raknetMagic)
-	_ = binary.Write(&pingPacket, binary.BigEndian, uint64(12345678901234567))
-	return pingPacket.Bytes()
+	pkt := make([]byte, 33)
+	pkt[0] = raknetUnconnectedPing
+	binary.BigEndian.PutUint64(pkt[1:9], uint64(time.Now().UnixMilli()))
+	copy(pkt[9:25], raknetMagic)
+	binary.BigEndian.PutUint64(pkt[25:33], uint64(12345678901234567))
+	return pkt
+}
+
+func resolveUDPAddrWithContext(ctx context.Context, address string) (*net.UDPAddr, error) {
+	_, udpAddr, err := buildUDPDestinationAddr(ctx, address, false)
+	if err != nil {
+		return nil, err
+	}
+	return udpAddr, nil
 }
 
 func resolveUDPAddr(address string) (*net.UDPAddr, error) {
-	host, portStr, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, err
-	}
+	return resolveUDPAddrWithContext(context.Background(), address)
+}
 
-	udpAddr := &net.UDPAddr{IP: net.ParseIP(host), Port: port}
-	if udpAddr.IP != nil {
-		return udpAddr, nil
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil || len(ips) == 0 {
-		if err == nil {
-			err = fmt.Errorf("no A/AAAA records")
-		}
-		return nil, err
-	}
-	udpAddr.IP = ips[0]
-	return udpAddr, nil
+func ResolveUDPAddress(address string) (*net.UDPAddr, error) {
+	return resolveUDPAddr(address)
+}
+
+func ResolveUDPAddressContext(ctx context.Context, address string) (*net.UDPAddr, error) {
+	return resolveUDPAddrWithContext(ctx, address)
 }
 
 // startListener creates and starts a listener for a server configuration.
@@ -1321,6 +1512,14 @@ func (p *ProxyServer) KickPlayer(playerName string, reason string) int {
 	for _, sess := range sessions {
 		name := sess.GetDisplayName()
 		if name != "" && strings.EqualFold(name, playerName) {
+			status := "kicked"
+			switch {
+			case strings.Contains(reason, "黑名单用户"):
+				status = "blacklist"
+			case strings.Contains(reason, "白名单") || strings.Contains(reason, "不在白名单"):
+				status = "whitelist"
+			}
+			sess.SetDisconnectStatus(status, reason)
 			p.sessionMgr.Remove(sess.ClientAddr)
 			logger.Info("Removed session for kicked player %s", playerName)
 		}

@@ -20,7 +20,7 @@ func NewACLSettingsRepository(db *Database) *ACLSettingsRepository {
 // Returns sql.ErrNoRows if no settings exist (to allow fallback to global settings).
 func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 	query := `
-		SELECT server_id, whitelist_enabled, default_ban_message, whitelist_message
+		SELECT server_id, blacklist_enabled, whitelist_enabled, default_ban_message, whitelist_message
 		FROM acl_settings 
 		WHERE server_id = ?
 	`
@@ -29,9 +29,10 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 
 	var settings ACLSettings
 	var srvID, defaultMsg, whitelistMsg sql.NullString
+	var blacklistEnabled sql.NullBool
 	var whitelistEnabled sql.NullBool
 
-	err := row.Scan(&srvID, &whitelistEnabled, &defaultMsg, &whitelistMsg)
+	err := row.Scan(&srvID, &blacklistEnabled, &whitelistEnabled, &defaultMsg, &whitelistMsg)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Return error to allow caller to fallback to global settings
@@ -42,6 +43,11 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 
 	if srvID.Valid {
 		settings.ServerID = srvID.String
+	}
+	if blacklistEnabled.Valid {
+		settings.BlacklistEnabled = blacklistEnabled.Bool
+	} else {
+		settings.BlacklistEnabled = true
 	}
 	if whitelistEnabled.Valid {
 		settings.WhitelistEnabled = whitelistEnabled.Bool
@@ -67,9 +73,10 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 // Uses UPSERT to handle both insert and update cases.
 func (r *ACLSettingsRepository) Update(settings *ACLSettings) error {
 	query := `
-		INSERT INTO acl_settings (server_id, whitelist_enabled, default_ban_message, whitelist_message)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO acl_settings (server_id, blacklist_enabled, whitelist_enabled, default_ban_message, whitelist_message)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(server_id) DO UPDATE SET
+			blacklist_enabled = excluded.blacklist_enabled,
 			whitelist_enabled = excluded.whitelist_enabled,
 			default_ban_message = excluded.default_ban_message,
 			whitelist_message = excluded.whitelist_message
@@ -77,6 +84,7 @@ func (r *ACLSettingsRepository) Update(settings *ACLSettings) error {
 
 	_, err := r.db.DB().Exec(query,
 		settings.ServerID,
+		settings.BlacklistEnabled,
 		settings.WhitelistEnabled,
 		settings.DefaultMessage,
 		settings.WhitelistMessage,

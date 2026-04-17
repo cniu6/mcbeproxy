@@ -76,6 +76,42 @@ type LatencyInfoProvider interface {
 	GetServerLatencyInfoRaw(serverID string) (latency int64, online bool, motd string, ok bool)
 }
 
+func (a *APIServer) getResolvedACLSettings(serverID string) *db.ACLSettings {
+	if a.aclManager == nil {
+		defaults := db.DefaultACLSettings()
+		defaults.ServerID = serverID
+		return defaults
+	}
+	settings, err := a.aclManager.GetSettings(serverID)
+	if err == nil && settings != nil {
+		return settings
+	}
+	if serverID != "" {
+		settings, err = a.aclManager.GetSettings("")
+		if err == nil && settings != nil {
+			return settings
+		}
+	}
+	defaults := db.DefaultACLSettings()
+	defaults.ServerID = serverID
+	return defaults
+	}
+
+func (a *APIServer) buildBlacklistKickMessage(playerName, serverID, reason string) string {
+	settings := a.getResolvedACLSettings(serverID)
+	resolvedReason := strings.TrimSpace(reason)
+	if settings != nil && settings.BlacklistEnabled && strings.TrimSpace(settings.DefaultMessage) != "" {
+		resolvedReason = strings.TrimSpace(settings.DefaultMessage)
+	}
+	if resolvedReason == "" {
+		resolvedReason = "你已被封禁"
+	}
+	if playerName == "" {
+		playerName = "未知玩家"
+	}
+	return fmt.Sprintf("黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, resolvedReason)
+}
+
 // NewAPIServer creates a new API server instance.
 func NewAPIServer(
 	globalConfig *config.GlobalConfig,
@@ -223,11 +259,13 @@ func (a *APIServer) setupRoutes() {
 			// Blacklist endpoints
 			aclGroup.GET("/blacklist", a.getBlacklist)
 			aclGroup.POST("/blacklist", a.addToBlacklist)
+			aclGroup.PUT("/blacklist/:name/enabled", a.updateBlacklistEnabled)
 			aclGroup.DELETE("/blacklist/:name", a.removeFromBlacklist)
 
 			// Whitelist endpoints
 			aclGroup.GET("/whitelist", a.getWhitelist)
 			aclGroup.POST("/whitelist", a.addToWhitelist)
+			aclGroup.PUT("/whitelist/:name/enabled", a.updateWhitelistEnabled)
 			aclGroup.DELETE("/whitelist/:name", a.removeFromWhitelist)
 
 			// Settings endpoints
@@ -242,8 +280,10 @@ func (a *APIServer) setupRoutes() {
 			{
 				proxyOutboundGroup.GET("", a.proxyOutboundHandler.ListProxyOutbounds)
 				proxyOutboundGroup.POST("", a.proxyOutboundHandler.CreateProxyOutbound)
+				proxyOutboundGroup.POST("/parse-import", a.proxyOutboundHandler.ParseImportContent)
 				// New endpoints with name in body (recommended for special characters)
 				proxyOutboundGroup.POST("/test", a.proxyOutboundHandler.TestProxyOutboundByBody)
+				proxyOutboundGroup.POST("/batch-test", a.proxyOutboundHandler.BatchTestProxyOutbounds)
 				proxyOutboundGroup.POST("/detailed-test", a.proxyOutboundHandler.DetailedTestProxyOutbound)
 				proxyOutboundGroup.POST("/test-mcbe", a.proxyOutboundHandler.TestMCBEUDP)
 				proxyOutboundGroup.POST("/health", a.proxyOutboundHandler.GetProxyOutboundHealthByBody)
@@ -262,6 +302,16 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.POST("/:name/test", a.proxyOutboundHandler.TestProxyOutbound)
 				proxyOutboundGroup.GET("/:name/health", a.proxyOutboundHandler.GetProxyOutboundHealth)
 			}
+
+			proxySubscriptionGroup := api.Group("/proxy-subscriptions")
+			{
+				proxySubscriptionGroup.GET("", a.proxyOutboundHandler.ListProxySubscriptions)
+				proxySubscriptionGroup.POST("", a.proxyOutboundHandler.CreateProxySubscription)
+				proxySubscriptionGroup.POST("/update-all", a.proxyOutboundHandler.UpdateAllProxySubscriptions)
+				proxySubscriptionGroup.PUT("/:id", a.proxyOutboundHandler.UpdateProxySubscription)
+				proxySubscriptionGroup.DELETE("/:id", a.proxyOutboundHandler.DeleteProxySubscription)
+				proxySubscriptionGroup.POST("/:id/update", a.proxyOutboundHandler.UpdateProxySubscriptionNow)
+			}
 		}
 
 		// Proxy port endpoints
@@ -270,8 +320,10 @@ func (a *APIServer) setupRoutes() {
 			{
 				proxyPortGroup.GET("", a.getProxyPorts)
 				proxyPortGroup.POST("", a.createProxyPort)
+				proxyPortGroup.POST("/bulk", a.createProxyPortsBulk)
 				proxyPortGroup.PUT("/:id", a.updateProxyPort)
 				proxyPortGroup.DELETE("/:id", a.deleteProxyPort)
+				proxyPortGroup.POST("/:id/test", a.testProxyPort)
 			}
 		}
 	}
@@ -1317,6 +1369,10 @@ func (a *APIServer) GetPrometheusMetrics() *monitor.PrometheusMetrics {
 // ACL (Access Control List) Handlers
 // Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8
 
+type updateACLEnabledRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
 // getBlacklist returns the list of all blacklisted players.
 // GET /api/acl/blacklist
 // Query params: server_id (optional) - filter by server ID
@@ -1370,9 +1426,14 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "请求体格式错误", "玩家名不能为空")
 		return
 	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
 
 	entry := &db.BlacklistEntry{
 		DisplayName: playerName,
+		Enabled:     enabled,
 		Reason:      req.Reason,
 		ServerID:    req.ServerID,
 		AddedAt:     time.Now(),
@@ -1388,7 +1449,51 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 	// Kick the player if they are currently online
 	kickedCount := 0
 	if a.proxyController != nil {
-		kickedCount = a.proxyController.KickPlayer(playerName, "已被封禁")
+		kickedCount = a.proxyController.KickPlayer(playerName, a.buildBlacklistKickMessage(playerName, req.ServerID, entry.Reason))
+	}
+
+	respondSuccess(c, map[string]interface{}{
+		"entry":        entry.ToDTO(),
+		"kicked_count": kickedCount,
+	})
+}
+
+func (a *APIServer) updateBlacklistEnabled(c *gin.Context) {
+	if a.aclManager == nil {
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
+		return
+	}
+
+	name := c.Param("name")
+	if name == "" {
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
+		return
+	}
+
+	var req updateACLEnabledRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "请求体格式错误", err.Error())
+		return
+	}
+	if req.Enabled == nil {
+		respondError(c, http.StatusBadRequest, "请求体格式错误", "enabled 字段不能为空")
+		return
+	}
+
+	serverID := c.Query("server_id")
+	entry, err := a.aclManager.UpdateBlacklistEntryEnabled(name, serverID, *req.Enabled)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(c, http.StatusNotFound, "未找到记录", "未找到指定名称的黑名单记录")
+			return
+		}
+		respondError(c, http.StatusInternalServerError, "更新黑名单开关失败", err.Error())
+		return
+	}
+
+	kickedCount := 0
+	if entry != nil && entry.Enabled && a.proxyController != nil {
+		kickedCount = a.proxyController.KickPlayer(entry.DisplayName, a.buildBlacklistKickMessage(entry.DisplayName, serverID, entry.Reason))
 	}
 
 	respondSuccess(c, map[string]interface{}{
@@ -1480,9 +1585,14 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "请求体格式错误", "玩家名不能为空")
 		return
 	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
 
 	entry := &db.WhitelistEntry{
 		DisplayName: playerName,
+		Enabled:     enabled,
 		ServerID:    req.ServerID,
 		AddedAt:     time.Now(),
 		AddedBy:     "", // Could be set from API key context if needed
@@ -1490,6 +1600,42 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 
 	if err := a.aclManager.AddToWhitelist(entry); err != nil {
 		respondError(c, http.StatusInternalServerError, "添加到白名单失败", err.Error())
+		return
+	}
+
+	respondSuccess(c, entry.ToDTO())
+}
+
+func (a *APIServer) updateWhitelistEnabled(c *gin.Context) {
+	if a.aclManager == nil {
+		respondError(c, http.StatusInternalServerError, "ACL 管理器未初始化", "")
+		return
+	}
+
+	name := c.Param("name")
+	if name == "" {
+		respondError(c, http.StatusBadRequest, "请求参数错误", "name 参数不能为空")
+		return
+	}
+
+	var req updateACLEnabledRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "请求体格式错误", err.Error())
+		return
+	}
+	if req.Enabled == nil {
+		respondError(c, http.StatusBadRequest, "请求体格式错误", "enabled 字段不能为空")
+		return
+	}
+
+	serverID := c.Query("server_id")
+	entry, err := a.aclManager.UpdateWhitelistEntryEnabled(name, serverID, *req.Enabled)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondError(c, http.StatusNotFound, "未找到记录", "未找到指定名称的白名单记录")
+			return
+		}
+		respondError(c, http.StatusInternalServerError, "更新白名单开关失败", err.Error())
 		return
 	}
 
@@ -1565,6 +1711,7 @@ func (a *APIServer) updateACLSettings(c *gin.Context) {
 
 	settings := &db.ACLSettings{
 		ServerID:         settingsDTO.ServerID,
+		BlacklistEnabled: settingsDTO.BlacklistEnabled,
 		WhitelistEnabled: settingsDTO.WhitelistEnabled,
 		DefaultMessage:   settingsDTO.DefaultMessage,
 		WhitelistMessage: settingsDTO.WhitelistMessage,

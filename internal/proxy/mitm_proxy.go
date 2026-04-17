@@ -197,7 +197,7 @@ func (p *MITMProxy) handleConnection(ctx context.Context, clientConn *minecraft.
 
 	// Check ACL access control (Requirements 5.1, 5.2, 5.3, 5.4)
 	if p.aclManager != nil {
-		allowed, reason := p.checkACLAccess(playerName, p.serverID, clientAddr)
+		allowed, reason := p.checkACLAccess(playerName, p.config.GetACLServerID(), clientAddr)
 		if !allowed {
 			// Send disconnect packet with denial reason (Requirement 5.2)
 			_ = clientConn.WritePacket(&packet.Disconnect{
@@ -307,11 +307,10 @@ func (p *MITMProxy) forwardPackets(ctx context.Context, src, dst *minecraft.Conn
 			}
 
 			// Update stats (approximate packet size) and keep session alive
-			sess.UpdateLastSeen()
 			if isClientToRemote {
-				sess.AddBytesUp(100) // Approximate
+				sess.AddBytesUpAndUpdateLastSeen(100) // Approximate
 			} else {
-				sess.AddBytesDown(100) // Approximate
+				sess.AddBytesDownAndUpdateLastSeen(100) // Approximate
 			}
 
 			// Log interesting packets

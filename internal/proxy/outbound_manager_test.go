@@ -268,6 +268,83 @@ func TestProperty1_OutboundStoragePreservesAllFields(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+func TestSelectOutboundWithFailoverForServerPrefersBestNodeOverClearlySlowerPinned(t *testing.T) {
+	manager := NewOutboundManager(nil)
+
+	fast := &config.ProxyOutbound{Name: "fast", Type: config.ProtocolShadowsocks, Server: "fast.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	slow := &config.ProxyOutbound{Name: "slow", Type: config.ProtocolShadowsocks, Server: "slow.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+
+	if err := manager.AddOutbound(fast); err != nil {
+		t.Fatalf("AddOutbound fast failed: %v", err)
+	}
+	if err := manager.AddOutbound(slow); err != nil {
+		t.Fatalf("AddOutbound slow failed: %v", err)
+	}
+
+	manager.SetServerSelectedNode("srv1", "slow")
+	manager.SetServerNodeLatency("srv1", "slow", config.LoadBalanceSortUDP, 100)
+	manager.SetServerNodeLatency("srv1", "fast", config.LoadBalanceSortUDP, 70)
+
+	selected, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil {
+		t.Fatalf("SelectOutboundWithFailoverForServer failed: %v", err)
+	}
+	if selected == nil || selected.Name != "fast" {
+		t.Fatalf("expected fast node, got %+v", selected)
+	}
+}
+
+func TestSelectOutboundWithFailoverForServerKeepsPinnedNodeWhenImprovementIsSmall(t *testing.T) {
+	manager := NewOutboundManager(nil)
+
+	best := &config.ProxyOutbound{Name: "best", Type: config.ProtocolShadowsocks, Server: "best.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	pinned := &config.ProxyOutbound{Name: "pinned", Type: config.ProtocolShadowsocks, Server: "pinned.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+
+	if err := manager.AddOutbound(best); err != nil {
+		t.Fatalf("AddOutbound best failed: %v", err)
+	}
+	if err := manager.AddOutbound(pinned); err != nil {
+		t.Fatalf("AddOutbound pinned failed: %v", err)
+	}
+
+	manager.SetServerSelectedNode("srv1", "pinned")
+	manager.SetServerNodeLatency("srv1", "pinned", config.LoadBalanceSortUDP, 100)
+	manager.SetServerNodeLatency("srv1", "best", config.LoadBalanceSortUDP, 95)
+
+	selected, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil {
+		t.Fatalf("SelectOutboundWithFailoverForServer failed: %v", err)
+	}
+	if selected == nil || selected.Name != "pinned" {
+		t.Fatalf("expected pinned node, got %+v", selected)
+	}
+}
+
+func TestSelectOutboundWithFailoverForServerIgnoresPinnedNodeOutsideSelector(t *testing.T) {
+	manager := NewOutboundManager(nil)
+
+	other := &config.ProxyOutbound{Name: "other", Type: config.ProtocolShadowsocks, Server: "other.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "other"}
+	groupNode := &config.ProxyOutbound{Name: "group-node", Type: config.ProtocolShadowsocks, Server: "group.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+
+	if err := manager.AddOutbound(other); err != nil {
+		t.Fatalf("AddOutbound other failed: %v", err)
+	}
+	if err := manager.AddOutbound(groupNode); err != nil {
+		t.Fatalf("AddOutbound group node failed: %v", err)
+	}
+
+	manager.SetServerSelectedNode("srv1", "other")
+	manager.SetServerNodeLatency("srv1", "group-node", config.LoadBalanceSortUDP, 80)
+
+	selected, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil {
+		t.Fatalf("SelectOutboundWithFailoverForServer failed: %v", err)
+	}
+	if selected == nil || selected.Name != "group-node" {
+		t.Fatalf("expected group-node, got %+v", selected)
+	}
+}
+
 // **Feature: singbox-outbound-proxy, Property 2: List contains all added outbounds**
 // **Validates: Requirements 1.3**
 //

@@ -48,6 +48,12 @@ type RakNetProxy struct {
 	activeConnsMu sync.RWMutex
 }
 
+func (p *RakNetProxy) hasActiveConnections() bool {
+	p.activeConnsMu.RLock()
+	defer p.activeConnsMu.RUnlock()
+	return len(p.activeConns) > 0
+}
+
 // NewRakNetProxy creates a new RakNet proxy for the specified server configuration.
 func NewRakNetProxy(
 	serverID string,
@@ -165,6 +171,9 @@ func (p *RakNetProxy) startPongRefresh(ctx context.Context) {
 			if p.closed.Load() {
 				return
 			}
+			if p.hasActiveConnections() {
+				continue
+			}
 			p.fetchRemotePongWithLatency()
 		}
 	}
@@ -270,9 +279,8 @@ func (p *RakNetProxy) GetCachedPong() []byte {
 // pingThroughProxy pings the target server through the proxy outbound.
 func (p *RakNetProxy) pingThroughProxy(targetAddr, proxyName string) ([]byte, time.Duration, error) {
 	// Create a proxy dialer for UDP
-	// Use a longer timeout (15s) for proxy connections since they have additional latency
-	// from QUIC handshake + proxy relay
-	proxyDialer := NewProxyDialer(p.outboundMgr, p.config, 15*time.Second)
+	// Use a shorter timeout to avoid long waits on unhealthy nodes during background refresh.
+	proxyDialer := NewProxyDialer(p.outboundMgr, p.config, 8*time.Second)
 
 	start := time.Now()
 
@@ -281,43 +289,17 @@ func (p *RakNetProxy) pingThroughProxy(targetAddr, proxyName string) ([]byte, ti
 		UpstreamDialer: proxyDialer,
 	}
 
-	// Ping through the proxy with a timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Create a channel for the ping result
-	type pingResult struct {
-		pong []byte
-		err  error
+	pong, err := dialer.Ping(targetAddr)
+	latency := time.Since(start)
+	if err != nil {
+		logger.Debug("RakNet pingThroughProxy failed: server=%s target=%s node=%s latency=%s err=%v",
+			p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, err)
+		return nil, latency, err
 	}
-	resultCh := make(chan pingResult, 1)
 
-	go func() {
-		pong, err := dialer.Ping(targetAddr)
-		select {
-		case resultCh <- pingResult{pong, err}:
-		default:
-			// Nobody listening, just return
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		latency := time.Since(start)
-		logger.Debug("RakNet pingThroughProxy timeout: server=%s target=%s node=%s latency=%s err=%v",
-			p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, ctx.Err())
-		return nil, latency, ctx.Err()
-	case result := <-resultCh:
-		latency := time.Since(start)
-		if result.err != nil {
-			logger.Debug("RakNet pingThroughProxy failed: server=%s target=%s node=%s latency=%s err=%v",
-				p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency, result.err)
-		} else {
-			logger.Debug("RakNet pingThroughProxy ok: server=%s target=%s node=%s latency=%s",
-				p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency)
-		}
-		return result.pong, latency, result.err
-	}
+	logger.Debug("RakNet pingThroughProxy ok: server=%s target=%s node=%s latency=%s",
+		p.serverID, targetAddr, proxyDialer.GetSelectedNode(), latency)
+	return pong, latency, nil
 }
 
 // embedLatencyInMOTD embeds the latency value into the MOTD string.
@@ -599,15 +581,14 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 			activityUpdateCounter = 0
 
 			// Update session stats and keep session alive
-			sess.UpdateLastSeen()
 			if gid != 0 {
 				gm.UpdateActivity(gid)
 			}
 			if isClientToRemote {
-				sess.AddBytesUp(int64(n))
+				sess.AddBytesUpAndUpdateLastSeen(int64(n))
 				p.tryExtractPlayerInfo(sess, data)
 			} else {
-				sess.AddBytesDown(int64(n))
+				sess.AddBytesDownAndUpdateLastSeen(int64(n))
 				p.tryExtractPlayerInfoFromServer(sess, data)
 
 				// 尝试解析远端 MCBE 断开/封禁原因
@@ -665,7 +646,7 @@ func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 			// 如果拒绝，则额外构造一个 MCBE Disconnect 包，把 ACL 返回的原因当作踢出文案发给客户端，
 			// 避免玩家只看到“断开与主机的连接”，无法知道是被封禁/未在白名单等原因。
 			if p.aclManager != nil {
-				allowed, reason := p.checkACLAccess(name, p.serverID, sess.ClientAddr)
+				allowed, reason := p.checkACLAccess(name, p.config.GetACLServerID(), sess.ClientAddr)
 				if !allowed {
 					if reason == "" {
 						reason = "你已被封禁"
@@ -920,9 +901,9 @@ func (p *RakNetProxy) parseDisconnectData(data []byte) string {
 
 // sendDisconnect 向客户端主动发送一个 MCBE Disconnect 数据包，携带远端服务端返回的封禁/踢出原因。
 // 注意：
-//   1. RakNet 模式下，MCBE 在登录完成后会开启加密通道，本方法只能在「未加密阶段的 Disconnect」
-//      或服务端在登录阶段下发的明文踢出包上生效。
-//   2. 即使客户端已经处于加密阶段，我们仍然尝试发送一次，失败会被捕获记录为调试日志，不影响现有连接关闭流程。
+//  1. RakNet 模式下，MCBE 在登录完成后会开启加密通道，本方法只能在「未加密阶段的 Disconnect」
+//     或服务端在登录阶段下发的明文踢出包上生效。
+//  2. 即使客户端已经处于加密阶段，我们仍然尝试发送一次，失败会被捕获记录为调试日志，不影响现有连接关闭流程。
 func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) error {
 	// 使用内部 protocol.Handler 构造一个标准 MCBE Disconnect 包（0xfe 包头 + 0x05 + 文本）。
 	// 这里直接构造明文游戏层数据并通过 RakNet 连接发送，由客户端自行解码显示。
