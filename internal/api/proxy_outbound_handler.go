@@ -31,13 +31,14 @@ import (
 // ProxyOutboundHandler handles REST API requests for proxy outbound management.
 // Requirements: 5.3
 type ProxyOutboundHandler struct {
-	configMgr        *config.ProxyOutboundConfigManager
-	subConfigMgr     *config.ProxySubscriptionConfigManager
-	serverConfigMgr  *config.ConfigManager
-	outboundMgr      proxy.OutboundManager
-	singboxFactory   singboxcore.Factory
-	subService       *subscription.Service
-	activityProvider proxyOutboundUsageActivityProvider
+	configMgr              *config.ProxyOutboundConfigManager
+	subConfigMgr           *config.ProxySubscriptionConfigManager
+	serverConfigMgr        *config.ConfigManager
+	outboundMgr            proxy.OutboundManager
+	singboxFactory         singboxcore.Factory
+	subService             *subscription.Service
+	activityProvider       proxyOutboundUsageActivityProvider
+	subscriptionUpdateHook func(string)
 }
 
 type proxyOutboundUsageActivityProvider interface {
@@ -64,6 +65,33 @@ func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundCo
 		singboxFactory:  factory,
 		subService:      subscription.NewServiceWithSingboxFactory(configMgr, outboundMgr, factory),
 	}
+}
+
+// SetUsageContext injects activity providers used by outbound/port usage views.
+func (h *ProxyOutboundHandler) SetUsageContext(_ *config.ProxyPortConfigManager, activityProvider proxyOutboundUsageActivityProvider) {
+	if h == nil {
+		return
+	}
+	h.activityProvider = activityProvider
+}
+
+// SetSubscriptionUpdateHook injects a callback invoked after successful subscription node updates.
+func (h *ProxyOutboundHandler) SetSubscriptionUpdateHook(hook func(string)) {
+	if h == nil {
+		return
+	}
+	h.subscriptionUpdateHook = hook
+}
+
+func (h *ProxyOutboundHandler) triggerSubscriptionUpdateHook(reason string) {
+	if h == nil || h.subscriptionUpdateHook == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "subscription update"
+	}
+	h.subscriptionUpdateHook(reason)
 }
 
 // ProxyOutboundDTO represents the API response for a proxy outbound.
@@ -566,6 +594,7 @@ func (h *ProxyOutboundHandler) DeleteProxySubscription(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request", "subscription id is required")
 		return
 	}
+	sub, _ := h.subConfigMgr.GetSubscription(id)
 	if _, ok := h.subConfigMgr.GetSubscription(id); !ok {
 		respondError(c, http.StatusNotFound, "Proxy subscription not found", "")
 		return
@@ -579,6 +608,11 @@ func (h *ProxyOutboundHandler) DeleteProxySubscription(c *gin.Context) {
 	if err := h.subConfigMgr.DeleteSubscription(id); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to delete proxy subscription", err.Error())
 		return
+	}
+	if sub != nil {
+		h.triggerSubscriptionUpdateHook("subscription deleted: " + sub.Name)
+	} else {
+		h.triggerSubscriptionUpdateHook("subscription deleted")
 	}
 	respondSuccessWithMsg(c, "订阅已删除", nil)
 }
@@ -629,6 +663,7 @@ func (h *ProxyOutboundHandler) UpdateProxySubscriptionNow(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "Failed to persist proxy subscription state", err.Error())
 		return
 	}
+	h.triggerSubscriptionUpdateHook("subscription update: " + sub.Name)
 	respondSuccess(c, map[string]interface{}{
 		"subscription": h.toSubscriptionDTO(sub),
 		"result":       result,
@@ -686,6 +721,9 @@ func (h *ProxyOutboundHandler) UpdateAllProxySubscriptions(c *gin.Context) {
 		sub.LastError = ""
 		_ = h.subConfigMgr.UpdateSubscription(sub.ID, sub)
 		items = append(items, itemResult{Subscription: h.toSubscriptionDTO(sub), Result: result})
+	}
+	if updated > 0 {
+		h.triggerSubscriptionUpdateHook("subscription update all")
 	}
 	respondSuccess(c, map[string]interface{}{
 		"updated": updated,

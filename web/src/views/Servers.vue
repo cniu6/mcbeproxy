@@ -2468,46 +2468,78 @@ const filteredProxyOutbounds = computed(() => {
   }
   
   // 搜索过滤
-  if (proxyFilter.value.search) {
-    const kw = proxyFilter.value.search.toLowerCase()
-    list = list.filter(o => 
-      o.name.toLowerCase().includes(kw) || 
-      o.server.toLowerCase().includes(kw) ||
-      (o.group && o.group.toLowerCase().includes(kw))
-    )
-  }
+ if (proxyFilter.value.search) {
+   const kw = proxyFilter.value.search.toLowerCase()
+   list = list.filter(o => 
+     o.name.toLowerCase().includes(kw) || 
+     o.server.toLowerCase().includes(kw) ||
+     (o.group && o.group.toLowerCase().includes(kw))
+   )
+ }
+ 
+ // 获取当前服务器已选中的节点
+ const server = servers.value.find(s => s.id === selectedServerId.value)
+ const currentProxy = server?.proxy_outbound || ''
+ let selectedNodes = []
+ if (currentProxy && !currentProxy.startsWith('@')) {
+   selectedNodes = currentProxy.includes(',') ? currentProxy.split(',') : [currentProxy]
+ }
+ const metric = quickLoadBalanceSort.value || 'udp'
+ 
+ // 排序：已选中的节点排在前面，然后按延迟、分组和名称排序
+ return list.sort((a, b) => {
+   const aSelected = selectedNodes.includes(a.name)
+   const bSelected = selectedNodes.includes(b.name)
+   if (aSelected && !bSelected) return -1
+   if (!aSelected && bSelected) return 1
+   const latencyCmp = compareLatencySort(a, b, metric, quickLatencySortOrder.value)
+   if (latencyCmp !== 0) return latencyCmp
+   if (!a.group && b.group) return -1
+   if (a.group && !b.group) return 1
+   if (a.group && b.group && a.group !== b.group) return a.group.localeCompare(b.group)
+   return a.name.localeCompare(b.name)
+ })
+})
+
+// 打开快速切换代理选择器
+const openProxySelector = async (serverId) => {
+  selectedServerId.value = serverId
+  proxySelectorLoading.value = true
+  showProxySelector.value = true
   
-  // 获取当前服务器已选中的节点
+  // 重置筛选和分页状态
+  proxyFilter.value = { group: '', protocol: '', udpOnly: false, search: '' }
+  quickLatencySortOrder.value = 'asc'
+  proxySelectorPagination.value.page = 1
+  
+  // 根据当前值初始化选择器状态
   const server = servers.value.find(s => s.id === selectedServerId.value)
   const currentProxy = server?.proxy_outbound || ''
-  
-  // 初始化负载均衡设置
   quickLoadBalance.value = server?.load_balance || ''
   quickLoadBalanceSort.value = server?.load_balance_sort || ''
   
-  // 根据代理类型选择视图
-  if (currentProxy.startsWith('@')) {
-    // 分组模式 - 显示分组视图
+  if (!currentProxy || currentProxy.startsWith('@')) {
     proxyViewMode.value = 'groups'
     quickCheckedKeys.value = []
-  } else if (currentProxy.includes(',')) {
-    // 多节点模式 - 显示列表视图并选中节点
-    proxyViewMode.value = 'list'
-    quickCheckedKeys.value = currentProxy.split(',')
-  } else if (currentProxy) {
-    // 单节点模式 - 显示列表视图
-    proxyViewMode.value = 'list'
-    quickCheckedKeys.value = [currentProxy]
   } else {
-    // 直连模式 - 显示分组视图
-    proxyViewMode.value = 'groups'
-    quickCheckedKeys.value = []
+    proxyViewMode.value = 'list'
+    quickCheckedKeys.value = currentProxy.includes(',') ? currentProxy.split(',') : [currentProxy]
   }
   
-  // 使用 setTimeout 确保弹窗先渲染，再加载数据
+  await nextTick()
   setTimeout(() => {
     refreshProxyList()
-  }, 50)
+  }, 0)
+}
+
+// 刷新快速切换代理列表
+const refreshProxyList = async () => {
+  proxySelectorLoading.value = true
+  try {
+    await Promise.all([loadProxyOutbounds(), fetchGroupStats()])
+  } finally {
+    proxySelectorLoading.value = false
+  }
 }
 
 // 判断当前选中的代理是否匹配

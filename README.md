@@ -751,11 +751,36 @@ API 使用请求头 `X-API-Key`。
 build.bat
 ```
 
+`build.bat` 会按以下顺序执行：
+
+- 清空 `build/` 目录
+- 在 `web/` 中自动安装前端依赖（首次构建时）
+- 执行 `npm run build`，并将前端产物直接输出到 `internal/api/dist/`
+- 使用 `-tags=with_utls -ldflags="-s -w"` 进行交叉编译
+- 默认生成以下目标文件：
+  - `build/mcpeserverproxy_windows_amd64.exe`
+  - `build/mcpeserverproxy_linux_amd64`
+
+构建前请确认本机已安装并可直接调用：
+
+- `go`
+- `npm`
+
 ### 手动构建
 
 ```bash
-cd web && npm install && npm run build
+cd web
+npm install
+npm run build
+
 go build -tags=with_utls -ldflags="-s -w" -o mcpeserverproxy.exe cmd/mcpeserverproxy/main.go
+```
+
+如果你需要手动执行与 `build.bat` 一致的交叉编译，可以参考：
+
+```bash
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_windows_amd64.exe cmd/mcpeserverproxy/main.go
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_linux_amd64 cmd/mcpeserverproxy/main.go
 ```
 
 ### 运行测试
