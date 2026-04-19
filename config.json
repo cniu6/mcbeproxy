@@ -14,5 +14,15 @@
   "auth_cache_minutes": 15,
   "proxy_ports_enabled": true,
   "passthrough_idle_timeout": 30,
-  "public_ping_timeout_seconds": 5
+  "public_ping_timeout_seconds": 5,
+  "server_auto_ping_interval_minutes_default": 20,
+  "server_auto_ping_top_candidates_default": 500,
+  "server_auto_ping_full_scan_mode_default": "daily",
+  "server_auto_ping_full_scan_time_default": "12:00",
+  "server_auto_ping_full_scan_interval_hours_default": 24,
+  "proxy_port_auto_ping_interval_minutes_default": 20,
+  "proxy_port_auto_ping_top_candidates_default": 500,
+  "proxy_port_auto_ping_full_scan_mode_default": "daily",
+  "proxy_port_auto_ping_full_scan_time_default": "12:00",
+  "proxy_port_auto_ping_full_scan_interval_hours_default": 24
 }

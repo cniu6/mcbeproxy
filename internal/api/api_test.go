@@ -29,21 +29,21 @@ type mockProxyController struct {
 	kickReturn     int
 }
 
-func (m *mockProxyController) StartServer(serverID string) error               { return nil }
-func (m *mockProxyController) StopServer(serverID string) error                { return nil }
-func (m *mockProxyController) ReloadServer(serverID string) error              { return nil }
-func (m *mockProxyController) IsServerRunning(serverID string) bool            { return false }
-func (m *mockProxyController) GetServerStatus(serverID string) string          { return "stopped" }
-func (m *mockProxyController) GetActiveSessionsForServer(serverID string) int  { return 0 }
-func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO  { return nil }
+func (m *mockProxyController) StartServer(serverID string) error              { return nil }
+func (m *mockProxyController) StopServer(serverID string) error               { return nil }
+func (m *mockProxyController) ReloadServer(serverID string) error             { return nil }
+func (m *mockProxyController) IsServerRunning(serverID string) bool           { return false }
+func (m *mockProxyController) GetServerStatus(serverID string) string         { return "stopped" }
+func (m *mockProxyController) GetActiveSessionsForServer(serverID string) int { return 0 }
+func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO { return nil }
 func (m *mockProxyController) KickPlayer(playerName string, reason string) int {
 	m.lastKickPlayer = playerName
 	m.lastKickReason = reason
 	m.kickCalls++
 	return m.kickReturn
 }
-func (m *mockProxyController) GetServerLatency(serverID string) (int64, bool)  { return 0, false }
-func (m *mockProxyController) ReloadProxyPorts() error                         { return nil }
+func (m *mockProxyController) GetServerLatency(serverID string) (int64, bool) { return 0, false }
+func (m *mockProxyController) ReloadProxyPorts() error                        { return nil }
 
 // setupTestAPI creates a test API server with a temporary database.
 func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {
@@ -127,6 +127,115 @@ func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {
 	}
 
 	return api, database, cleanup
+}
+
+func TestDebugRoutes_OpenWhenNoAPIKeysConfigured(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/debug/goroutines", nil)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDebugRoutes_RequireValidKeyWhenConfigured(t *testing.T) {
+	api, database, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	keyRepo := db.NewAPIKeyRepository(database, 100)
+	apiKey := &db.APIKey{Key: "debug-valid-key", Name: "debug", CreatedAt: time.Now(), IsAdmin: false}
+	if err := keyRepo.Create(apiKey); err != nil {
+		t.Fatalf("Create API key failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/debug/goroutines", nil)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/debug/goroutines", nil)
+	req.Header.Set("X-API-Key", apiKey.Key)
+	w = httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid key status code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAnyValidAPIKeyCanDeleteKeys(t *testing.T) {
+	api, database, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	keyRepo := db.NewAPIKeyRepository(database, 100)
+	primary := &db.APIKey{Key: "primary-key", Name: "primary", CreatedAt: time.Now(), IsAdmin: false}
+	secondary := &db.APIKey{Key: "secondary-key", Name: "secondary", CreatedAt: time.Now(), IsAdmin: false}
+	if err := keyRepo.Create(primary); err != nil {
+		t.Fatalf("Create primary API key failed: %v", err)
+	}
+	if err := keyRepo.Create(secondary); err != nil {
+		t.Fatalf("Create secondary API key failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/keys/secondary-key", nil)
+	req.Header.Set("X-API-Key", primary.Key)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+	keys, err := keyRepo.List()
+	if err != nil {
+		t.Fatalf("List API keys failed: %v", err)
+	}
+	if len(keys) != 1 || keys[0].Key != primary.Key {
+		t.Fatalf("unexpected remaining keys: %+v", keys)
+	}
+}
+
+func TestCreateAPIKeyAlwaysStoresAdmin(t *testing.T) {
+	api, database, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	body, err := json.Marshal(map[string]any{"name": "created", "is_admin": false})
+	if err != nil {
+		t.Fatalf("Marshal request failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/keys", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	var resp APIResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal response failed: %v", err)
+	}
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected response data type: %T", resp.Data)
+	}
+	if isAdmin, ok := data["is_admin"].(bool); !ok || !isAdmin {
+		t.Fatalf("expected response is_admin=true, got %+v", data["is_admin"])
+	}
+
+	keys, err := db.NewAPIKeyRepository(database, 100).List()
+	if err != nil {
+		t.Fatalf("List API keys failed: %v", err)
+	}
+	if len(keys) != 1 || !keys[0].IsAdmin {
+		t.Fatalf("expected stored API key to be admin, got %+v", keys)
+	}
 }
 
 func TestAddToBlacklist_UsesDetailedKickReason(t *testing.T) {

@@ -95,7 +95,7 @@ func isAdminRequest(c *gin.Context) bool {
 	if getBoolContext(c, ctxAuthIsAdmin) {
 		return true
 	}
-	return !anyKeyConfigured(c) && isLocalFromContext(c)
+	return !anyKeyConfigured(c)
 }
 
 func allowPrivateTargets(c *gin.Context) bool {

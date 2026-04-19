@@ -27,17 +27,23 @@ const (
 // API is already admin-authenticated and the value is stored in plaintext
 // JSON on disk anyway, round-tripping the value is strictly safer.
 type ProxyPortConfig struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name"`
-	ListenAddr      string   `json:"listen_addr"`
-	Type            string   `json:"type"` // http, socks5, socks4, mixed
-	Enabled         bool     `json:"enabled"`
-	Username        string   `json:"username"`
-	Password        string   `json:"password"`
-	ProxyOutbound   string   `json:"proxy_outbound"`    // Proxy outbound name or "@group" or "node1,node2"
-	LoadBalance     string   `json:"load_balance"`      // least-latency, round-robin, random, least-connections
-	LoadBalanceSort string   `json:"load_balance_sort"` // tcp, http, udp
-	AllowList       []string `json:"allow_list"`        // CIDR list
+	ID                            string   `json:"id"`
+	Name                          string   `json:"name"`
+	ListenAddr                    string   `json:"listen_addr"`
+	Type                          string   `json:"type"` // http, socks5, socks4, mixed
+	Enabled                       bool     `json:"enabled"`
+	Username                      string   `json:"username"`
+	Password                      string   `json:"password"`
+	ProxyOutbound                 string   `json:"proxy_outbound"`    // Proxy outbound name or "@group" or "node1,node2"
+	LoadBalance                   string   `json:"load_balance"`      // least-latency, round-robin, random, least-connections
+	LoadBalanceSort               string   `json:"load_balance_sort"` // tcp, http, udp
+	AutoPingEnabled               bool     `json:"auto_ping_enabled"`
+	AutoPingIntervalMinutes       int      `json:"auto_ping_interval_minutes"`
+	AutoPingTopCandidates         int      `json:"auto_ping_top_candidates"`
+	AutoPingFullScanMode          string   `json:"auto_ping_full_scan_mode,omitempty"`
+	AutoPingFullScanTime          string   `json:"auto_ping_full_scan_time,omitempty"`
+	AutoPingFullScanIntervalHours int      `json:"auto_ping_full_scan_interval_hours"`
+	AllowList                     []string `json:"allow_list"` // CIDR list
 }
 
 // Clone returns a deep copy of the config.
@@ -63,6 +69,22 @@ func (pc *ProxyPortConfig) ApplyDefaults() {
 	}
 	if pc.ID == "" && pc.Name != "" {
 		pc.ID = pc.Name
+	}
+	pc.AutoPingFullScanMode = normalizeAutoPingFullScanMode(pc.AutoPingFullScanMode)
+	if pc.AutoPingIntervalMinutes <= 0 {
+		pc.AutoPingIntervalMinutes = 10
+	}
+	if pc.AutoPingTopCandidates == 0 {
+		pc.AutoPingTopCandidates = defaultAutoPingTopCandidates
+	}
+	if pc.AutoPingTopCandidates < 0 {
+		pc.AutoPingTopCandidates = 0
+	}
+	if strings.TrimSpace(pc.AutoPingFullScanTime) == "" {
+		pc.AutoPingFullScanTime = defaultAutoPingFullScanTime
+	}
+	if pc.AutoPingFullScanIntervalHours <= 0 {
+		pc.AutoPingFullScanIntervalHours = defaultAutoPingFullScanIntervalHr
 	}
 }
 
@@ -96,6 +118,25 @@ func (pc *ProxyPortConfig) Validate() error {
 	case ProxyPortTypeHTTP, ProxyPortTypeSocks5, ProxyPortTypeSocks4, ProxyPortTypeMixed:
 	default:
 		return fmt.Errorf("invalid type: %s", pc.Type)
+	}
+	if pc.AutoPingIntervalMinutes < 1 {
+		return fmt.Errorf("auto_ping_interval_minutes must be >= 1, got %d", pc.AutoPingIntervalMinutes)
+	}
+	if pc.AutoPingTopCandidates < 0 {
+		return fmt.Errorf("auto_ping_top_candidates must be >= 0, got %d", pc.AutoPingTopCandidates)
+	}
+	switch normalizeAutoPingFullScanMode(pc.AutoPingFullScanMode) {
+	case AutoPingFullScanModeDisabled:
+	case AutoPingFullScanModeDaily:
+		if _, err := parseAutoPingClock(pc.GetAutoPingFullScanTime()); err != nil {
+			return err
+		}
+	case AutoPingFullScanModeInterval:
+		if pc.GetAutoPingFullScanIntervalHours() < 1 {
+			return fmt.Errorf("auto_ping_full_scan_interval_hours must be >= 1, got %d", pc.GetAutoPingFullScanIntervalHours())
+		}
+	default:
+		return fmt.Errorf("invalid auto_ping_full_scan_mode: %s", pc.AutoPingFullScanMode)
 	}
 	if err := validateCIDRList(pc.AllowList); err != nil {
 		return err
@@ -162,6 +203,40 @@ func (pc *ProxyPortConfig) GetLoadBalanceSort() string {
 		return LoadBalanceSortTCP
 	}
 	return pc.LoadBalanceSort
+}
+
+func (pc *ProxyPortConfig) GetAutoPingTopCandidates() int {
+	if pc == nil {
+		return defaultAutoPingTopCandidates
+	}
+	if pc.AutoPingTopCandidates < 0 {
+		return 0
+	}
+	if pc.AutoPingTopCandidates == 0 {
+		return defaultAutoPingTopCandidates
+	}
+	return pc.AutoPingTopCandidates
+}
+
+func (pc *ProxyPortConfig) GetAutoPingFullScanMode() string {
+	if pc == nil {
+		return AutoPingFullScanModeDisabled
+	}
+	return normalizeAutoPingFullScanMode(pc.AutoPingFullScanMode)
+}
+
+func (pc *ProxyPortConfig) GetAutoPingFullScanTime() string {
+	if pc == nil || strings.TrimSpace(pc.AutoPingFullScanTime) == "" {
+		return defaultAutoPingFullScanTime
+	}
+	return strings.TrimSpace(pc.AutoPingFullScanTime)
+}
+
+func (pc *ProxyPortConfig) GetAutoPingFullScanIntervalHours() int {
+	if pc == nil || pc.AutoPingFullScanIntervalHours <= 0 {
+		return defaultAutoPingFullScanIntervalHr
+	}
+	return pc.AutoPingFullScanIntervalHours
 }
 
 func validateCIDRList(list []string) error {

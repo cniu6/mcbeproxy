@@ -93,7 +93,7 @@ func (m *ProxyOutboundConfigManager) saveToFile() error {
 		return fmt.Errorf("failed to marshal proxy outbound config: %w", err)
 	}
 
-	if err := os.WriteFile(m.configPath, data, 0644); err != nil {
+	if err := atomicWriteFile(m.configPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write proxy outbound config file: %w", err)
 	}
 
@@ -322,7 +322,7 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 	// Ensure the config file exists before watching
 	if _, err := os.Stat(m.configPath); os.IsNotExist(err) {
 		// Create an empty config file
-		if err := os.WriteFile(m.configPath, []byte("[]"), 0644); err != nil {
+		if err := writeFileAtomically(m.configPath, []byte("[]"), 0644); err != nil {
 			watcher.Close()
 			return fmt.Errorf("failed to create config file: %w", err)
 		}

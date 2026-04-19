@@ -70,6 +70,59 @@ func TestParseSubscriptionContent_AnyTLSRealityLink(t *testing.T) {
 	}
 }
 
+func TestParseSubscriptionContent_TrojanSNIChangeDoesNotForceInsecure(t *testing.T) {
+	content := []byte("trojan://secret@example.org:443?sni=download-porter.hoyoverse.com&fp=chrome#trojan-sni\n")
+
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent returned error: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolTrojan || got.SNI != "download-porter.hoyoverse.com" || got.Fingerprint != "chrome" || got.Insecure {
+		t.Fatalf("unexpected trojan parse result: %+v", got)
+	}
+}
+
+func TestParseSubscriptionContent_VLESSRealityFingerprintLink(t *testing.T) {
+	content := []byte("vless://88262562-4037-4e18-8a7c-aad7da0d8d3d@us3.miyazono-kaori.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=download-porter.hoyoverse.com&fp=chrome&pbk=W69IUo4AnRh5R8kBqp5q88Ttaf8rB5ZeqbvQpS5krTY&sid=9f3d2bcc02a2&spx=%2F&type=tcp&headerType=none#vless-reality\n")
+
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent returned error: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolVLESS || !got.Reality || got.Fingerprint != "chrome" || got.RealityPublicKey == "" || got.RealityShortID != "9f3d2bcc02a2" {
+		t.Fatalf("unexpected vless reality parse result: %+v", got)
+	}
+}
+
+func TestParseSubscriptionContent_Hysteria2InsecureAndCertFingerprintAliases(t *testing.T) {
+	content := []byte(
+		"hysteria2://secret@kr1.example.com:443?sni=kr1.example.com&insecure=0&allowInsecure=0#hy2-safe\n" +
+			"hysteria2://secret@kr2.example.com:443?sni=kr2.example.com&allowInsecure=1&pinSHA256=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789#hy2-insecure\n",
+	)
+
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent returned error: %v", err)
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 parsed outbounds, got %d", len(parsed))
+	}
+	if got := parsed[0].Outbound; got.Type != config.ProtocolHysteria2 || got.Insecure || got.CertFingerprint != "" {
+		t.Fatalf("unexpected safe hysteria2 parse result: %+v", got)
+	}
+	if got := parsed[1].Outbound; got.Type != config.ProtocolHysteria2 || !got.Insecure || got.CertFingerprint != "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" {
+		t.Fatalf("unexpected insecure hysteria2 parse result: %+v", got)
+	}
+}
+
 func TestParseSubscriptionContent_ClashYAMLProxyAliases(t *testing.T) {
 	content := []byte("proxies:\n  - name: socks-node\n    type: socks\n    server: 127.0.0.1\n    port: 1080\n    username: user\n    password: pass\n  - name: https-node\n    type: https\n    server: 127.0.0.1\n    port: 8443\n    sni: proxy.example.com\n")
 
@@ -157,5 +210,24 @@ func TestParseSubscriptionContent_XHTTPClashYAML(t *testing.T) {
 	}
 	if got := parsed[0].Outbound; got.Network != "xhttp" || got.WSPath != "/split-http" || got.WSHost != "edge.example.net" || got.XHTTPMode != "packet-up" {
 		t.Fatalf("unexpected clash xhttp parse result: %+v", got)
+	}
+}
+
+func TestParseSubscriptionUserInfoHeader(t *testing.T) {
+	upload, download, total, expireAt := parseSubscriptionUserInfoHeader("upload=1024; download=2048; total=8192; expire=1735689600")
+	if upload != 1024 {
+		t.Fatalf("expected upload=1024, got %d", upload)
+	}
+	if download != 2048 {
+		t.Fatalf("expected download=2048, got %d", download)
+	}
+	if total != 8192 {
+		t.Fatalf("expected total=8192, got %d", total)
+	}
+	if expireAt.IsZero() {
+		t.Fatal("expected expireAt to be parsed")
+	}
+	if got := expireAt.Unix(); got != 1735689600 {
+		t.Fatalf("expected expireAt unix=1735689600, got %d", got)
 	}
 }

@@ -75,7 +75,9 @@ const (
 	// to release TLS connections and other resources
 	OutboundIdleTimeout = 5 * time.Minute
 
-	serverNodeLatencyCacheTTL = 30 * time.Minute
+	serverNodeLatencyCacheTTL         = 30 * time.Minute
+	serverNodeLatencyHistoryRetention = 24 * time.Hour
+	serverNodeLatencyHistoryLimit     = 288
 )
 
 // HealthStatus represents the health status of a proxy outbound.
@@ -199,6 +201,10 @@ type OutboundManager interface {
 	// Returns (0,false) if missing or expired.
 	GetServerNodeLatency(serverID, nodeName, sortBy string) (int64, bool)
 
+	// GetServerNodeLatencyHistory returns cached latency history for a specific server and node.
+	// Returns nil if missing or expired.
+	GetServerNodeLatencyHistory(serverID, nodeName, sortBy string) []ServerNodeLatencySample
+
 	// SelectOutboundWithFailoverForServer selects a healthy proxy outbound with per-server latency preference.
 	// If serverID is empty, it behaves like SelectOutboundWithFailover.
 	SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error)
@@ -238,8 +244,15 @@ type outboundManagerImpl struct {
 	cleanupCancel       context.CancelFunc
 	serverNodeLatencyMu sync.RWMutex
 	serverNodeLatency   map[serverNodeLatencyKey]serverNodeLatencyValue
+	serverNodeHistory   map[serverNodeLatencyKey]*serverNodeLatencyHistory
 	serverSelectedMu    sync.RWMutex
 	serverSelectedNode  map[string]string // serverID -> pinned node name
+}
+
+type ServerNodeLatencySample struct {
+	Timestamp int64 `json:"timestamp"`
+	LatencyMs int64 `json:"latency_ms"`
+	OK        bool  `json:"ok"`
 }
 
 type serverNodeLatencyKey struct {
@@ -252,6 +265,61 @@ type serverNodeLatencyValue struct {
 	latencyMs  int64
 	updatedAt  time.Time
 	updatedAtN int64
+}
+
+type serverNodeLatencyHistory struct {
+	start   int
+	count   int
+	samples [serverNodeLatencyHistoryLimit]ServerNodeLatencySample
+}
+
+func (h *serverNodeLatencyHistory) append(sample ServerNodeLatencySample) {
+	if h == nil {
+		return
+	}
+	if h.count < len(h.samples) {
+		index := (h.start + h.count) % len(h.samples)
+		h.samples[index] = sample
+		h.count++
+		return
+	}
+	h.samples[h.start] = sample
+	h.start = (h.start + 1) % len(h.samples)
+}
+
+func (h *serverNodeLatencyHistory) filtered(now time.Time) []ServerNodeLatencySample {
+	if h == nil || h.count == 0 {
+		return nil
+	}
+	cutoff := now.Add(-serverNodeLatencyHistoryRetention).UnixMilli()
+	result := make([]ServerNodeLatencySample, 0, h.count)
+	for i := 0; i < h.count; i++ {
+		index := (h.start + i) % len(h.samples)
+		sample := h.samples[index]
+		if sample.Timestamp < cutoff {
+			continue
+		}
+		result = append(result, sample)
+	}
+	return result
+}
+
+func (h *serverNodeLatencyHistory) compact(now time.Time) bool {
+	if h == nil || h.count == 0 {
+		return true
+	}
+	filtered := h.filtered(now)
+	if len(filtered) == 0 {
+		h.start = 0
+		h.count = 0
+		return true
+	}
+	h.start = 0
+	h.count = len(filtered)
+	for i := range filtered {
+		h.samples[i] = filtered[i]
+	}
+	return false
 }
 
 // NewOutboundManager creates a new OutboundManager instance.
@@ -272,6 +340,7 @@ func NewOutboundManagerWithSingboxFactory(serverConfigUpdater ServerConfigUpdate
 		singboxFactory:      factory,
 		serverConfigUpdater: serverConfigUpdater,
 		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
+		serverNodeHistory:   make(map[serverNodeLatencyKey]*serverNodeLatencyHistory),
 		serverSelectedNode:  make(map[string]string),
 	}
 }
@@ -325,6 +394,12 @@ func (m *outboundManagerImpl) SetServerNodeLatency(serverID, nodeName, sortBy st
 
 	m.serverNodeLatencyMu.Lock()
 	m.serverNodeLatency[key] = serverNodeLatencyValue{latencyMs: latencyMs, updatedAt: now, updatedAtN: now.UnixNano()}
+	history := m.serverNodeHistory[key]
+	if history == nil {
+		history = &serverNodeLatencyHistory{}
+		m.serverNodeHistory[key] = history
+	}
+	history.append(ServerNodeLatencySample{Timestamp: now.UnixMilli(), LatencyMs: latencyMs, OK: latencyMs > 0})
 	m.serverNodeLatencyMu.Unlock()
 }
 
@@ -351,6 +426,45 @@ func (m *outboundManagerImpl) GetServerNodeLatency(serverID, nodeName, sortBy st
 		return 0, false
 	}
 	return v.latencyMs, true
+}
+
+func (m *outboundManagerImpl) GetServerNodeLatencyHistory(serverID, nodeName, sortBy string) []ServerNodeLatencySample {
+	serverID = strings.TrimSpace(serverID)
+	nodeName = strings.TrimSpace(nodeName)
+	if serverID == "" || nodeName == "" {
+		return nil
+	}
+	sortBy = normalizeSortBy(sortBy)
+
+	key := serverNodeLatencyKey{serverID: serverID, nodeName: nodeName, sortBy: sortBy}
+	now := time.Now()
+
+	m.serverNodeLatencyMu.Lock()
+	defer m.serverNodeLatencyMu.Unlock()
+
+	history := m.serverNodeHistory[key]
+	if history == nil {
+		return nil
+	}
+	samples := history.filtered(now)
+	if len(samples) == 0 {
+		delete(m.serverNodeHistory, key)
+		return nil
+	}
+	if history.compact(now) {
+		delete(m.serverNodeHistory, key)
+	}
+	return samples
+}
+
+func (m *outboundManagerImpl) cleanupExpiredServerNodeLatencyHistory(now time.Time) {
+	m.serverNodeLatencyMu.Lock()
+	defer m.serverNodeLatencyMu.Unlock()
+	for key, history := range m.serverNodeHistory {
+		if history == nil || history.compact(now) {
+			delete(m.serverNodeHistory, key)
+		}
+	}
 }
 
 func (m *outboundManagerImpl) GetServerSelectedNode(serverID string) (string, bool) {
@@ -1040,7 +1154,7 @@ func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) erro
 	// Requirements: 4.1
 	c.SetHealthy(true)
 	c.SetLastError("")
-
+	c.SetLastCheck(time.Now())
 	return nil
 }
 
@@ -1459,6 +1573,7 @@ func (m *outboundManagerImpl) cleanupIdleOutbounds() {
 				}
 			}
 			m.mu.Unlock()
+			m.cleanupExpiredServerNodeLatencyHistory(now)
 		}
 	}
 }

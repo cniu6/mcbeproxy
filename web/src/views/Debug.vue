@@ -596,18 +596,34 @@ const getStateSummaryType = (state) => {
   return 'default'
 }
 
+const stopAutoRefresh = () => {
+  if (refreshInterval.value) {
+    clearTimeout(refreshInterval.value)
+    refreshInterval.value = null
+  }
+}
+
+const scheduleAutoRefresh = () => {
+  stopAutoRefresh()
+  if (!autoRefresh.value) return
+  refreshInterval.value = setTimeout(async () => {
+    refreshInterval.value = null
+    await loadStats()
+  }, 3000)
+}
+
 const toggleAutoRefresh = (value) => {
   if (value) {
-    refreshInterval.value = setInterval(loadStats, 3000)
+    scheduleAutoRefresh()
   } else {
-    if (refreshInterval.value) {
-      clearInterval(refreshInterval.value)
-      refreshInterval.value = null
-    }
+    stopAutoRefresh()
   }
 }
 
 const loadStats = async () => {
+  if (loading.value) {
+    return
+  }
   loading.value = true
   try {
     const res = await api('/api/debug/goroutines/stats')
@@ -622,6 +638,9 @@ const loadStats = async () => {
     message.error('加载失败: ' + e.message)
   } finally {
     loading.value = false
+    if (autoRefresh.value) {
+      scheduleAutoRefresh()
+    }
   }
 }
 
@@ -850,13 +869,9 @@ const downloadProfile = (type, seconds = 0) => {
 
 onMounted(() => {
   loadStats()
-  // 自动开启自动刷新
-  refreshInterval.value = setInterval(loadStats, 3000)
 })
 
 onUnmounted(() => {
-  if (refreshInterval.value) {
-    clearInterval(refreshInterval.value)
-  }
+  stopAutoRefresh()
 })
 </script>

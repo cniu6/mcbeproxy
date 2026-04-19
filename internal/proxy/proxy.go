@@ -3,10 +3,13 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,9 +36,43 @@ type Listener interface {
 const defaultAutoPingIntervalMinutes = 10
 const autoPingParallelism = 4
 const autoPingGlobalParallelism = 8
+const defaultAutoPingHTTPProbeURL = "https://1.1.1.1/cdn-cgi/trace"
+const defaultAutoPingTCPProbeTarget = "1.1.1.1:443"
+const defaultAutoPingUDPProbeTarget = "mco.cubecraft.net:19132"
+
+type autoPingRunResult struct {
+	key          string
+	didFullScan  bool
+	scannedNodes int
+}
+
+type topologyRefreshSummary struct {
+	servers        int
+	serverNodes    int
+	serverFull     int
+	proxyPorts     int
+	proxyPortNodes int
+	proxyPortFull  int
+}
 
 type connectedPacketWriter interface {
 	Write([]byte) (int, error)
+}
+
+func proxyPortSelectorID(portID string) string {
+	portID = strings.TrimSpace(portID)
+	if portID == "" {
+		return ""
+	}
+	return "proxy-port:" + portID
+}
+
+func serverAutoPingResultKey(serverID string) string {
+	return "server:" + strings.TrimSpace(serverID)
+}
+
+func proxyPortAutoPingResultKey(portID string) string {
+	return proxyPortSelectorID(portID)
 }
 
 func writePacketConn(conn net.PacketConn, payload []byte, addr net.Addr) (int, error) {
@@ -132,6 +169,12 @@ type ProxyServer struct {
 	wg                     sync.WaitGroup
 	running                bool
 	runningMu              sync.RWMutex
+	topologyRefreshMu      sync.RWMutex
+	topologyRefreshSeq     uint64
+	topologyRefreshReason  string
+	topologyRefreshSignal  chan struct{}
+	autoPingBootstrapMu   sync.Mutex
+	autoPingBootstrapPos  map[string]int
 }
 
 // NewProxyServer creates a new ProxyServer with all components initialized.
@@ -228,6 +271,8 @@ func NewProxyServer(
 		proxyPortConfigMgr:     proxyPortConfigMgr,
 		proxyPortManager:       proxyPortManager,
 		listeners:              make(map[string]Listener),
+		topologyRefreshSignal:  make(chan struct{}, 1),
+		autoPingBootstrapPos:   make(map[string]int),
 	}, nil
 }
 
@@ -445,6 +490,7 @@ func (p *ProxyServer) Start() error {
 
 	// Start auto ping scheduler (per-server, per-node latency cache)
 	p.startAutoPingScheduler()
+	p.startTopologyRefreshWorker()
 
 	// Start proxy ports (local HTTP/SOCKS) if enabled
 	if p.proxyPortManager != nil {
@@ -476,9 +522,14 @@ func (p *ProxyServer) startAutoPingScheduler() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
-		lastRun := make(map[string]time.Time)
-		lastSwitch := make(map[string]time.Time)
-		observedSelectedNode := make(map[string]string)
+		serverLastRun := make(map[string]time.Time)
+		serverLastFullScan := make(map[string]time.Time)
+		serverLastSwitch := make(map[string]time.Time)
+		observedServerNode := make(map[string]string)
+		portLastRun := make(map[string]time.Time)
+		portLastFullScan := make(map[string]time.Time)
+		portLastSwitch := make(map[string]time.Time)
+		observedPortNode := make(map[string]string)
 
 		for {
 			select {
@@ -487,11 +538,9 @@ func (p *ProxyServer) startAutoPingScheduler() {
 			case <-ticker.C:
 			}
 
-			servers := p.configMgr.GetAllServers()
 			now := time.Now()
 			var dueServers []*config.ServerConfig
-
-			for _, serverCfg := range servers {
+			for _, serverCfg := range p.configMgr.GetAllServers() {
 				if serverCfg == nil {
 					continue
 				}
@@ -503,40 +552,263 @@ func (p *ProxyServer) startAutoPingScheduler() {
 					intervalMin = defaultAutoPingIntervalMinutes
 				}
 
-				if t, ok := lastRun[serverCfg.ID]; ok {
+				if t, ok := serverLastRun[serverCfg.ID]; ok {
 					if now.Sub(t) < time.Duration(intervalMin)*time.Minute {
 						continue
 					}
 				}
-
 				dueServers = append(dueServers, serverCfg)
 			}
 
-			if len(dueServers) == 0 {
+			var duePorts []*config.ProxyPortConfig
+			if p.proxyPortConfigMgr != nil {
+				for _, portCfg := range p.proxyPortConfigMgr.GetAllPorts() {
+					if portCfg == nil {
+						continue
+					}
+					if !portCfg.Enabled || !portCfg.AutoPingEnabled {
+						continue
+					}
+					if portCfg.IsDirectConnection() {
+						continue
+					}
+					intervalMin := portCfg.AutoPingIntervalMinutes
+					if intervalMin <= 0 {
+						intervalMin = defaultAutoPingIntervalMinutes
+					}
+					if t, ok := portLastRun[portCfg.ID]; ok {
+						if now.Sub(t) < time.Duration(intervalMin)*time.Minute {
+							continue
+						}
+					}
+					duePorts = append(duePorts, portCfg)
+				}
+			}
+
+			if len(dueServers) == 0 && len(duePorts) == 0 {
 				continue
 			}
 
 			pingBudget := make(chan struct{}, autoPingGlobalParallelism)
+			results := make(chan autoPingRunResult, len(dueServers)+len(duePorts))
 			var pingWG sync.WaitGroup
 			for _, serverCfg := range dueServers {
 				pingWG.Add(1)
 				go func(serverCfg *config.ServerConfig) {
 					defer pingWG.Done()
-					p.pingAllNodesForServer(serverCfg, pingBudget)
+					fullScanDue, _ := shouldRunScheduledFullScan(serverCfg, now, serverLastFullScan[serverCfg.ID])
+					results <- p.pingAllNodesForServer(serverCfg, pingBudget, fullScanDue)
 				}(serverCfg)
 			}
+			for _, portCfg := range duePorts {
+				pingWG.Add(1)
+				go func(portCfg *config.ProxyPortConfig) {
+					defer pingWG.Done()
+					fullScanDue, _ := shouldRunScheduledFullScanForProxyPort(portCfg, now, portLastFullScan[portCfg.ID])
+					results <- p.pingAllNodesForProxyPort(portCfg, pingBudget, fullScanDue)
+				}(portCfg)
+			}
 			pingWG.Wait()
+			close(results)
 			completedAt := time.Now()
+			for result := range results {
+				if result.key == "" || !result.didFullScan {
+					continue
+				}
+				if strings.HasPrefix(result.key, "server:") {
+					serverLastFullScan[strings.TrimPrefix(result.key, "server:")] = completedAt
+					continue
+				}
+				if strings.HasPrefix(result.key, "proxy-port:") {
+					portLastFullScan[strings.TrimPrefix(result.key, "proxy-port:")] = completedAt
+				}
+			}
 			for _, serverCfg := range dueServers {
-				lastRun[serverCfg.ID] = completedAt
-				p.maybeAutoSwitchServerNode(serverCfg, completedAt, lastSwitch, observedSelectedNode)
+				serverLastRun[serverCfg.ID] = completedAt
+				p.maybeAutoSwitchServerNode(serverCfg, completedAt, serverLastSwitch, observedServerNode)
+			}
+			for _, portCfg := range duePorts {
+				portLastRun[portCfg.ID] = completedAt
+				p.maybeAutoSwitchProxyPortNode(portCfg, completedAt, portLastSwitch, observedPortNode)
 			}
 		}
 	}()
 }
 
+func (p *ProxyServer) startTopologyRefreshWorker() {
+	if p.ctx == nil {
+		return
+	}
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		gm := monitor.GetGoroutineManager()
+		gid := gm.TrackBackground("topology-refresh", "proxy-server", "Topology refresh worker", p.cancel)
+		defer gm.Untrack(gid)
+
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		var lastProcessed uint64
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+			case <-p.topologyRefreshSignal:
+			}
+
+			seq, reason := p.latestTopologyRefreshRequest()
+			if seq == 0 || seq == lastProcessed {
+				continue
+			}
+
+			activeSessions := p.GetActiveSessionCount()
+			activeProxyPorts := p.GetActiveProxyPortConnectionCount()
+			if activeSessions > 0 || activeProxyPorts > 0 {
+				logger.Info("Deferred topology refresh #%d: %s (active_sessions=%d, active_proxy_ports=%d)", seq, reason, activeSessions, activeProxyPorts)
+				continue
+			}
+
+			logger.Info("Running topology refresh #%d: %s", seq, reason)
+			summary := p.runAutoLatencyRefresh(true)
+			lastProcessed = seq
+			logger.Info(
+				"Completed topology refresh #%d: %s (servers=%d, server_nodes=%d, server_full=%d, proxy_ports=%d, proxy_port_nodes=%d, proxy_port_full=%d)",
+				seq,
+				reason,
+				summary.servers,
+				summary.serverNodes,
+				summary.serverFull,
+				summary.proxyPorts,
+				summary.proxyPortNodes,
+				summary.proxyPortFull,
+			)
+		}
+	}()
+}
+
+func (p *ProxyServer) TriggerAutoLatencyRefresh(reason string) {
+	if p == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "subscription update"
+	}
+
+	p.topologyRefreshMu.Lock()
+	p.topologyRefreshSeq++
+	seq := p.topologyRefreshSeq
+	p.topologyRefreshReason = reason
+	p.topologyRefreshMu.Unlock()
+
+	logger.Info("Queued topology refresh #%d: %s", seq, reason)
+
+	if p.topologyRefreshSignal != nil {
+		select {
+		case p.topologyRefreshSignal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (p *ProxyServer) latestTopologyRefreshRequest() (uint64, string) {
+	if p == nil {
+		return 0, ""
+	}
+	p.topologyRefreshMu.RLock()
+	defer p.topologyRefreshMu.RUnlock()
+	return p.topologyRefreshSeq, p.topologyRefreshReason
+}
+
+func (p *ProxyServer) runAutoLatencyRefresh(forceFullScan bool) topologyRefreshSummary {
+	summary := topologyRefreshSummary{}
+	if p == nil || p.outboundMgr == nil || p.configMgr == nil {
+		return summary
+	}
+
+	pingBudget := make(chan struct{}, autoPingGlobalParallelism)
+	results := make(chan autoPingRunResult)
+	var pingWG sync.WaitGroup
+
+	for _, serverCfg := range p.configMgr.GetAllServers() {
+		if serverCfg == nil || !serverCfg.AutoPingEnabled {
+			continue
+		}
+		summary.servers++
+		pingWG.Add(1)
+		go func(serverCfg *config.ServerConfig) {
+			defer pingWG.Done()
+			results <- p.pingAllNodesForServer(serverCfg, pingBudget, forceFullScan)
+		}(serverCfg)
+	}
+
+	if p.proxyPortConfigMgr != nil {
+		for _, portCfg := range p.proxyPortConfigMgr.GetAllPorts() {
+			if portCfg == nil || !portCfg.Enabled || !portCfg.AutoPingEnabled || portCfg.IsDirectConnection() {
+				continue
+			}
+			summary.proxyPorts++
+			pingWG.Add(1)
+			go func(portCfg *config.ProxyPortConfig) {
+				defer pingWG.Done()
+				results <- p.pingAllNodesForProxyPort(portCfg, pingBudget, forceFullScan)
+			}(portCfg)
+		}
+	}
+
+	go func() {
+		pingWG.Wait()
+		close(results)
+	}()
+
+	now := time.Now()
+	serverLastSwitch := make(map[string]time.Time)
+	observedServerNode := make(map[string]string)
+	portLastSwitch := make(map[string]time.Time)
+	observedPortNode := make(map[string]string)
+
+	for result := range results {
+		switch {
+		case strings.HasPrefix(result.key, "server:"):
+			summary.serverNodes += result.scannedNodes
+			if result.didFullScan {
+				summary.serverFull++
+			}
+		case strings.HasPrefix(result.key, "proxy-port:"):
+			summary.proxyPortNodes += result.scannedNodes
+			if result.didFullScan {
+				summary.proxyPortFull++
+			}
+		}
+	}
+
+	for _, serverCfg := range p.configMgr.GetAllServers() {
+		if serverCfg == nil || !serverCfg.AutoPingEnabled {
+			continue
+		}
+		p.maybeAutoSwitchServerNode(serverCfg, now, serverLastSwitch, observedServerNode)
+	}
+	if p.proxyPortConfigMgr != nil {
+		for _, portCfg := range p.proxyPortConfigMgr.GetAllPorts() {
+			if portCfg == nil || !portCfg.Enabled || !portCfg.AutoPingEnabled || portCfg.IsDirectConnection() {
+				continue
+			}
+			p.maybeAutoSwitchProxyPortNode(portCfg, now, portLastSwitch, observedPortNode)
+		}
+	}
+
+	return summary
+}
+
 func (p *ProxyServer) maybeAutoSwitchServerNode(serverCfg *config.ServerConfig, now time.Time, lastSwitch map[string]time.Time, observedSelectedNode map[string]string) {
 	if serverCfg == nil || p.outboundMgr == nil {
+		return
+	}
+	if serverCfg.GetLoadBalance() != config.LoadBalanceLeastLatency {
 		return
 	}
 
@@ -579,6 +851,54 @@ func (p *ProxyServer) maybeAutoSwitchServerNode(serverCfg *config.ServerConfig, 
 	logger.Info("Auto-switch server %s node: %s -> %s (0 active sessions, current=%dms, best=%dms)", serverCfg.ID, currentNode, bestNode, currentLatency, bestLatency)
 }
 
+func (p *ProxyServer) maybeAutoSwitchProxyPortNode(portCfg *config.ProxyPortConfig, now time.Time, lastSwitch map[string]time.Time, observedSelectedNode map[string]string) {
+	if portCfg == nil || p.outboundMgr == nil {
+		return
+	}
+	if portCfg.GetLoadBalance() != config.LoadBalanceLeastLatency {
+		return
+	}
+
+	selectorID := proxyPortSelectorID(portCfg.ID)
+	proxyOutbound := strings.TrimSpace(portCfg.ProxyOutbound)
+	sortBy := portCfg.GetLoadBalanceSort()
+	bestNode, bestLatency := p.outboundMgr.GetBestNodeForServer(selectorID, proxyOutbound, sortBy)
+	if bestNode == "" {
+		return
+	}
+
+	currentNode, _ := p.outboundMgr.GetServerSelectedNode(selectorID)
+	if observedSelectedNode[portCfg.ID] != currentNode {
+		observedSelectedNode[portCfg.ID] = currentNode
+		if currentNode == "" {
+			delete(lastSwitch, portCfg.ID)
+		} else {
+			lastSwitch[portCfg.ID] = now
+		}
+	}
+	if currentNode == bestNode {
+		return
+	}
+
+	activeConnections := p.GetActiveConnectionsForProxyPort(portCfg.ID)
+	if activeConnections != 0 {
+		logger.Debug("Auto-switch deferred for proxy port %s: %s -> %s (%d active connections)", portCfg.ID, currentNode, bestNode, activeConnections)
+		return
+	}
+
+	currentLatency, currentLatencyOK := p.outboundMgr.GetServerNodeLatency(selectorID, currentNode, sortBy)
+	if shouldSwitch, reason := shouldAutoSwitchNode(currentNode, currentLatency, currentLatencyOK, bestLatency, lastSwitch[portCfg.ID], now); !shouldSwitch {
+		logger.Debug("Auto-switch skipped for proxy port %s: %s (current=%s, best=%s, current_latency=%dms, best_latency=%dms)",
+			portCfg.ID, reason, currentNode, bestNode, currentLatency, bestLatency)
+		return
+	}
+
+	p.outboundMgr.SetServerSelectedNode(selectorID, bestNode)
+	observedSelectedNode[portCfg.ID] = bestNode
+	lastSwitch[portCfg.ID] = now
+	logger.Info("Auto-switch proxy port %s node: %s -> %s (0 active connections, current=%dms, best=%dms)", portCfg.ID, currentNode, bestNode, currentLatency, bestLatency)
+}
+
 func shouldAutoSwitchNode(currentNode string, currentLatency int64, currentLatencyOK bool, bestLatency int64, lastSwitchAt time.Time, now time.Time) (bool, string) {
 	if bestLatency <= 0 {
 		return false, "best node has no latency sample"
@@ -604,24 +924,26 @@ func shouldAutoSwitchNode(currentNode string, currentLatency int64, currentLaten
 	return true, ""
 }
 
-func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, globalSem chan struct{}) {
+func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, globalSem chan struct{}, scheduledFullScan bool) autoPingRunResult {
+	result := autoPingRunResult{}
 	if serverCfg == nil || p.outboundMgr == nil {
-		return
+		return result
 	}
+	result.key = serverAutoPingResultKey(serverCfg.ID)
 
 	proxyOutbound := strings.TrimSpace(serverCfg.GetProxyOutbound())
 	if proxyOutbound == "" || proxyOutbound == "direct" {
-		return
+		return result
 	}
 	if p.GetActiveSessionsForServer(serverCfg.ID) > 0 {
-		return
+		return result
 	}
 
 	targetAddr := serverCfg.GetTargetAddr()
 	destAddr, _, err := buildUDPDestinationAddr(context.Background(), targetAddr, true)
 	if err != nil {
 		logger.Debug("auto ping resolve target failed: server=%s target=%s err=%v", serverCfg.ID, targetAddr, err)
-		return
+		return result
 	}
 
 	sortBy := serverCfg.GetLoadBalanceSort()
@@ -630,27 +952,43 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, glob
 	}
 
 	nodeNames := p.getServerNodeNames(serverCfg)
+	nodeNames = dedupeNodeNames(nodeNames)
 	if len(nodeNames) == 0 {
-		return
+		return result
 	}
+	fullScan := scheduledFullScan
+	scanTargets := nodeNames
+	if !fullScan {
+		var fallbackFullScan bool
+		scanTargets, fallbackFullScan = p.selectAutoPingTargets(serverCfg, nodeNames, sortBy)
+		if fallbackFullScan {
+			fullScan = true
+			scanTargets = nodeNames
+		}
+	}
+	if len(scanTargets) == 0 {
+		return result
+	}
+	result.didFullScan = fullScan
+	result.scannedNodes = len(scanTargets)
 
 	parallelism := autoPingParallelism
 	if parallelism <= 0 {
 		parallelism = 1
 	}
-	if len(nodeNames) < parallelism {
-		parallelism = len(nodeNames)
+	if len(scanTargets) < parallelism {
+		parallelism = len(scanTargets)
 	}
 	if parallelism <= 0 {
-		return
+		return result
 	}
 
 	sem := make(chan struct{}, parallelism)
 	var wg sync.WaitGroup
-	for _, nodeName := range nodeNames {
+	for _, nodeName := range scanTargets {
 		if !acquireAutoPingSlot(p.ctx, sem, globalSem) {
 			wg.Wait()
-			return
+			return result
 		}
 
 		wg.Add(1)
@@ -658,7 +996,7 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, glob
 			defer wg.Done()
 			defer releaseAutoPingSlot(sem, globalSem)
 
-			latencyMs := p.pingServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr)
+			latencyMs := p.probeServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr, sortBy)
 			if latencyMs > 0 {
 				p.outboundMgr.SetServerNodeLatency(serverCfg.ID, nodeName, sortBy, latencyMs)
 			} else {
@@ -667,6 +1005,159 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, glob
 		}(nodeName)
 	}
 	wg.Wait()
+	if fullScan {
+		logger.Debug("auto ping full scan complete: server=%s sort=%s nodes=%d", serverCfg.ID, sortBy, len(scanTargets))
+	} else {
+		logger.Debug("auto ping partial scan complete: server=%s sort=%s nodes=%d", serverCfg.ID, sortBy, len(scanTargets))
+	}
+	return result
+}
+
+func shouldRunScheduledFullScanForProxyPort(portCfg *config.ProxyPortConfig, now, lastFullScan time.Time) (bool, string) {
+	if portCfg == nil {
+		return false, ""
+	}
+	switch portCfg.GetAutoPingFullScanMode() {
+	case config.AutoPingFullScanModeDisabled:
+		return false, ""
+	case config.AutoPingFullScanModeDaily:
+		clock, err := configTimeOnly(portCfg.GetAutoPingFullScanTime())
+		if err != nil {
+			return false, ""
+		}
+		scheduledAt := time.Date(now.Year(), now.Month(), now.Day(), clock.Hour(), clock.Minute(), 0, 0, now.Location())
+		if now.Before(scheduledAt) {
+			return false, ""
+		}
+		if !lastFullScan.IsZero() && !lastFullScan.Before(scheduledAt) {
+			return false, ""
+		}
+		return true, "daily"
+	case config.AutoPingFullScanModeInterval:
+		interval := time.Duration(portCfg.GetAutoPingFullScanIntervalHours()) * time.Hour
+		if interval <= 0 || lastFullScan.IsZero() || now.Sub(lastFullScan) < interval {
+			return false, ""
+		}
+		return true, "interval"
+	default:
+		return false, ""
+	}
+}
+
+func (p *ProxyServer) pingAllNodesForProxyPort(portCfg *config.ProxyPortConfig, globalSem chan struct{}, scheduledFullScan bool) autoPingRunResult {
+	result := autoPingRunResult{}
+	if portCfg == nil || p.outboundMgr == nil {
+		return result
+	}
+	result.key = proxyPortAutoPingResultKey(portCfg.ID)
+
+	if !portCfg.Enabled || portCfg.IsDirectConnection() {
+		return result
+	}
+	if p.GetActiveConnectionsForProxyPort(portCfg.ID) > 0 {
+		return result
+	}
+
+	sortBy := portCfg.GetLoadBalanceSort()
+	if sortBy == "" {
+		sortBy = config.LoadBalanceSortTCP
+	}
+
+	targetAddr := defaultAutoPingTCPProbeTarget
+	var destAddr net.Addr
+	if sortBy == config.LoadBalanceSortUDP {
+		targetAddr = defaultAutoPingUDPProbeTarget
+		udpDestAddr, _, err := buildUDPDestinationAddr(context.Background(), targetAddr, true)
+		if err != nil {
+			logger.Debug("auto ping resolve proxy port target failed: port=%s target=%s err=%v", portCfg.ID, targetAddr, err)
+			return result
+		}
+		destAddr = udpDestAddr
+	}
+
+	nodeNames := dedupeNodeNames(p.getProxyPortNodeNames(portCfg))
+	if len(nodeNames) == 0 {
+		return result
+	}
+
+	selectorID := proxyPortSelectorID(portCfg.ID)
+	fullScan := scheduledFullScan
+	scanTargets := nodeNames
+	if !fullScan {
+		var fallbackFullScan bool
+		scanTargets, fallbackFullScan = p.selectAutoPingTargetsForSelector(selectorID, portCfg.GetAutoPingTopCandidates(), nodeNames, sortBy)
+		if fallbackFullScan {
+			fullScan = true
+			scanTargets = nodeNames
+		}
+	}
+	if len(scanTargets) == 0 {
+		return result
+	}
+	result.didFullScan = fullScan
+	result.scannedNodes = len(scanTargets)
+
+	parallelism := autoPingParallelism
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	if len(scanTargets) < parallelism {
+		parallelism = len(scanTargets)
+	}
+	if parallelism <= 0 {
+		return result
+	}
+
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	for _, nodeName := range scanTargets {
+		if !acquireAutoPingSlot(p.ctx, sem, globalSem) {
+			wg.Wait()
+			return result
+		}
+
+		wg.Add(1)
+		go func(nodeName string) {
+			defer wg.Done()
+			defer releaseAutoPingSlot(sem, globalSem)
+
+			latencyMs := p.probeProxyPortThroughNode(selectorID, nodeName, targetAddr, destAddr, sortBy)
+			if latencyMs > 0 {
+				p.outboundMgr.SetServerNodeLatency(selectorID, nodeName, sortBy, latencyMs)
+			} else {
+				p.outboundMgr.SetServerNodeLatency(selectorID, nodeName, sortBy, 0)
+			}
+		}(nodeName)
+	}
+	wg.Wait()
+	if fullScan {
+		logger.Debug("auto ping full scan complete: proxy_port=%s sort=%s nodes=%d", portCfg.ID, sortBy, len(scanTargets))
+	} else {
+		logger.Debug("auto ping partial scan complete: proxy_port=%s sort=%s nodes=%d", portCfg.ID, sortBy, len(scanTargets))
+	}
+	return result
+}
+
+func (p *ProxyServer) probeProxyPortThroughNode(selectorID, nodeName, targetAddr string, destAddr net.Addr, sortBy string) int64 {
+	switch sortBy {
+	case config.LoadBalanceSortTCP:
+		if nodeName == DirectNodeName {
+			return p.probeTCPDirect(selectorID, targetAddr)
+		}
+		return p.probeTCPThroughNode(selectorID, nodeName, targetAddr)
+	case config.LoadBalanceSortHTTP:
+		if nodeName == DirectNodeName {
+			return p.probeHTTPDirect(selectorID)
+		}
+		return p.probeHTTPThroughNode(selectorID, nodeName)
+	case config.LoadBalanceSortUDP:
+		fallthrough
+	default:
+		if nodeName == DirectNodeName {
+			return p.pingServerDirect(selectorID, targetAddr)
+		}
+		return p.pingServerThroughNode(selectorID, nodeName, targetAddr, destAddr)
+	}
 }
 
 func acquireAutoPingSlot(ctx context.Context, localSem chan struct{}, globalSem chan struct{}) bool {
@@ -735,6 +1226,261 @@ func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []strin
 	return []string{proxyOutbound}
 }
 
+func (p *ProxyServer) getProxyPortNodeNames(portCfg *config.ProxyPortConfig) []string {
+	if portCfg == nil || p.outboundMgr == nil {
+		return nil
+	}
+	proxyOutbound := strings.TrimSpace(portCfg.ProxyOutbound)
+	if proxyOutbound == "" || proxyOutbound == "direct" {
+		return nil
+	}
+
+	if portCfg.IsGroupSelection() {
+		groupName := portCfg.GetGroupName()
+		nodes := p.outboundMgr.GetOutboundsByGroup(groupName)
+		out := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			out = append(out, n.Name)
+		}
+		return out
+	}
+
+	if portCfg.IsMultiNodeSelection() {
+		ns := portCfg.GetNodeList()
+		out := make([]string, 0, len(ns))
+		for _, n := range ns {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+
+	return []string{proxyOutbound}
+}
+
+func shouldRunScheduledFullScan(serverCfg *config.ServerConfig, now, lastFullScan time.Time) (bool, string) {
+	if serverCfg == nil {
+		return false, ""
+	}
+	switch serverCfg.GetAutoPingFullScanMode() {
+	case config.AutoPingFullScanModeDisabled:
+		return false, ""
+	case config.AutoPingFullScanModeDaily:
+		clock, err := configTimeOnly(serverCfg.GetAutoPingFullScanTime())
+		if err != nil {
+			return false, ""
+		}
+		scheduledAt := time.Date(now.Year(), now.Month(), now.Day(), clock.Hour(), clock.Minute(), 0, 0, now.Location())
+		if now.Before(scheduledAt) {
+			return false, ""
+		}
+		if !lastFullScan.IsZero() && !lastFullScan.Before(scheduledAt) {
+			return false, ""
+		}
+		return true, "daily"
+	case config.AutoPingFullScanModeInterval:
+		interval := time.Duration(serverCfg.GetAutoPingFullScanIntervalHours()) * time.Hour
+		if interval <= 0 || lastFullScan.IsZero() || now.Sub(lastFullScan) < interval {
+			return false, ""
+		}
+		return true, "interval"
+	default:
+		return false, ""
+	}
+}
+
+func configTimeOnly(value string) (time.Time, error) {
+	return time.Parse("15:04", strings.TrimSpace(value))
+}
+
+func (p *ProxyServer) selectAutoPingTargets(serverCfg *config.ServerConfig, nodeNames []string, sortBy string) ([]string, bool) {
+	if serverCfg == nil {
+		return dedupeNodeNames(nodeNames), false
+	}
+	return p.selectAutoPingTargetsForSelector(serverCfg.ID, serverCfg.GetAutoPingTopCandidates(), nodeNames, sortBy)
+}
+
+func (p *ProxyServer) selectAutoPingTargetsForSelector(selectorID string, topCandidates int, nodeNames []string, sortBy string) ([]string, bool) {
+	if len(nodeNames) <= 1 {
+		return dedupeNodeNames(nodeNames), false
+	}
+
+	currentNode, _ := p.outboundMgr.GetServerSelectedNode(selectorID)
+	selected := make([]string, 0, len(nodeNames))
+	selectedSet := make(map[string]struct{}, len(nodeNames))
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, exists := selectedSet[name]; exists {
+			return
+		}
+		selectedSet[name] = struct{}{}
+		selected = append(selected, name)
+	}
+
+	nodeSet := make(map[string]struct{}, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+		nodeSet[nodeName] = struct{}{}
+	}
+	if _, exists := nodeSet[currentNode]; exists {
+		add(currentNode)
+	}
+
+	type rankedCandidate struct {
+		name      string
+		latencyMs int64
+	}
+	ranked := make([]rankedCandidate, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" || nodeName == currentNode {
+			continue
+		}
+		if latencyMs, ok := p.lookupAutoPingLatency(selectorID, nodeName, sortBy); ok && latencyMs > 0 {
+			ranked = append(ranked, rankedCandidate{name: nodeName, latencyMs: latencyMs})
+		}
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].latencyMs == ranked[j].latencyMs {
+			return ranked[i].name < ranked[j].name
+		}
+		return ranked[i].latencyMs < ranked[j].latencyMs
+	})
+
+	if topCandidates < 1 {
+		topCandidates = 1
+	}
+	limit := topCandidates
+	if currentNode != "" {
+		if _, exists := nodeSet[currentNode]; exists {
+			limit++
+		}
+	}
+	for _, candidate := range ranked {
+		if len(selected) >= limit {
+			break
+		}
+		add(candidate.name)
+	}
+
+	if len(selected) == 0 {
+		return p.nextAutoPingBootstrapTargets(selectorID, topCandidates, nodeNames), false
+	}
+	return selected, false
+}
+
+func (p *ProxyServer) nextAutoPingBootstrapTargets(selectorID string, topCandidates int, nodeNames []string) []string {
+	nodeNames = dedupeNodeNames(nodeNames)
+	if len(nodeNames) == 0 {
+		return nil
+	}
+	if topCandidates < 1 {
+		topCandidates = 1
+	}
+	if topCandidates >= len(nodeNames) {
+		return nodeNames
+	}
+
+	p.autoPingBootstrapMu.Lock()
+	defer p.autoPingBootstrapMu.Unlock()
+
+	if p.autoPingBootstrapPos == nil {
+		p.autoPingBootstrapPos = make(map[string]int)
+	}
+	start := p.autoPingBootstrapPos[selectorID]
+	if start < 0 || start >= len(nodeNames) {
+		start = 0
+	}
+
+	selected := make([]string, 0, topCandidates)
+	for i := 0; i < topCandidates && i < len(nodeNames); i++ {
+		selected = append(selected, nodeNames[(start+i)%len(nodeNames)])
+	}
+	p.autoPingBootstrapPos[selectorID] = (start + len(selected)) % len(nodeNames)
+	return selected
+}
+
+func dedupeNodeNames(nodeNames []string) []string {
+	seen := make(map[string]struct{}, len(nodeNames))
+	result := make([]string, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+		if _, exists := seen[nodeName]; exists {
+			continue
+		}
+		seen[nodeName] = struct{}{}
+		result = append(result, nodeName)
+	}
+	return result
+}
+
+func (p *ProxyServer) lookupAutoPingLatency(selectorID, nodeName, sortBy string) (int64, bool) {
+	if p.outboundMgr != nil {
+		if latencyMs, ok := p.outboundMgr.GetServerNodeLatency(selectorID, nodeName, sortBy); ok && latencyMs > 0 {
+			return latencyMs, true
+		}
+	}
+	if nodeName == DirectNodeName || p.proxyOutboundConfigMgr == nil {
+		return 0, false
+	}
+	outbound, exists := p.proxyOutboundConfigMgr.GetOutbound(nodeName)
+	if !exists || outbound == nil {
+		return 0, false
+	}
+	switch sortBy {
+	case config.LoadBalanceSortTCP:
+		if outbound.TCPLatencyMs > 0 {
+			return outbound.TCPLatencyMs, true
+		}
+	case config.LoadBalanceSortHTTP:
+		if outbound.HTTPLatencyMs > 0 {
+			return outbound.HTTPLatencyMs, true
+		}
+	default:
+		if outbound.UDPLatencyMs > 0 {
+			return outbound.UDPLatencyMs, true
+		}
+	}
+	return 0, false
+}
+
+func (p *ProxyServer) probeServerThroughNode(serverID, nodeName, targetAddr string, destAddr net.Addr, sortBy string) int64 {
+	switch sortBy {
+	case config.LoadBalanceSortTCP:
+		if nodeName == DirectNodeName {
+			return p.probeTCPDirect(serverID, targetAddr)
+		}
+		return p.probeTCPThroughNode(serverID, nodeName, targetAddr)
+	case config.LoadBalanceSortHTTP:
+		if nodeName == DirectNodeName {
+			return p.probeHTTPDirect(serverID)
+		}
+		return p.probeHTTPThroughNode(serverID, nodeName)
+	case config.LoadBalanceSortUDP:
+		fallthrough
+	default:
+		if nodeName == DirectNodeName {
+			return p.pingServerDirect(serverID, targetAddr)
+		}
+		return p.pingServerThroughNode(serverID, nodeName, targetAddr, destAddr)
+	}
+}
+
 func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr string, destAddr net.Addr) int64 {
 	if p.outboundMgr == nil {
 		return -1
@@ -743,7 +1489,15 @@ func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr strin
 	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
 	defer cancel()
 
-	conn, err := p.outboundMgr.DialPacketConn(ctx, nodeName, targetAddr)
+	var (
+		conn net.PacketConn
+		err  error
+	)
+	if noRetryDialer, ok := p.outboundMgr.(outboundPacketConnNoRetryDialer); ok {
+		conn, err = noRetryDialer.DialPacketConnNoRetry(ctx, nodeName, targetAddr)
+	} else {
+		conn, err = p.outboundMgr.DialPacketConn(ctx, nodeName, targetAddr)
+	}
 	if err != nil {
 		logger.Debug("auto ping dial failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
 		return -1
@@ -775,6 +1529,179 @@ func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr strin
 		return -1
 	}
 
+	return latencyMs
+}
+
+func (p *ProxyServer) pingServerDirect(serverID, targetAddr string) int64 {
+	ctx := context.Background()
+	if p != nil && p.ctx != nil {
+		ctx = p.ctx
+	}
+	udpAddr, err := resolveUDPAddrWithContext(ctx, targetAddr)
+	if err != nil || udpAddr == nil {
+		logger.Debug("auto ping direct resolve failed: server=%s target=%s err=%v", serverID, targetAddr, err)
+		return -1
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		logger.Debug("auto ping direct dial failed: server=%s target=%s err=%v", serverID, targetAddr, err)
+		return -1
+	}
+	defer conn.Close()
+
+	pingPacket := buildRakNetPingPacket()
+	startTime := time.Now()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(pingPacket); err != nil {
+		logger.Debug("auto ping direct write failed: server=%s target=%s err=%v", serverID, targetAddr, err)
+		return -1
+	}
+
+	bufPtr := GetSmallBuffer()
+	buf := *bufPtr
+	defer PutSmallBuffer(bufPtr)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := conn.ReadFrom(buf)
+	latencyMs := time.Since(startTime).Milliseconds()
+	if err != nil {
+		logger.Debug("auto ping direct read failed: server=%s target=%s err=%v", serverID, targetAddr, err)
+		return -1
+	}
+	if n <= 0 || buf[0] != 0x1c {
+		logger.Debug("auto ping direct invalid pong: server=%s target=%s", serverID, targetAddr)
+		return -1
+	}
+	return latencyMs
+}
+
+func (p *ProxyServer) probeTCPThroughNode(serverID, nodeName, targetAddr string) int64 {
+	if p == nil || p.outboundMgr == nil {
+		return -1
+	}
+	cfg, exists := p.outboundMgr.GetOutbound(nodeName)
+	if !exists || cfg == nil {
+		logger.Debug("auto ping tcp probe failed: server=%s node=%s target=%s err=proxy outbound not found", serverID, nodeName, targetAddr)
+		return -1
+	}
+	ctx := context.Background()
+	if p.ctx != nil {
+		ctx = p.ctx
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	dialer, err := NewSingboxCoreFactory().CreateDialer(probeCtx, cfg)
+	if err != nil {
+		logger.Debug("auto ping tcp dialer create failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
+		return -1
+	}
+	defer dialer.Close()
+
+	startTime := time.Now()
+	conn, err := dialer.DialContext(probeCtx, "tcp", targetAddr)
+	latencyMs := time.Since(startTime).Milliseconds()
+	if err != nil {
+		logger.Debug("auto ping tcp dial failed: server=%s node=%s target=%s err=%v", serverID, nodeName, targetAddr, err)
+		return -1
+	}
+	_ = conn.Close()
+	return latencyMs
+}
+
+func (p *ProxyServer) probeTCPDirect(serverID, targetAddr string) int64 {
+	ctx := context.Background()
+	if p != nil && p.ctx != nil {
+		ctx = p.ctx
+	}
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	startTime := time.Now()
+	conn, err := dialer.DialContext(probeCtx, "tcp", targetAddr)
+	latencyMs := time.Since(startTime).Milliseconds()
+	if err != nil {
+		logger.Debug("auto ping direct tcp dial failed: server=%s target=%s err=%v", serverID, targetAddr, err)
+		return -1
+	}
+	_ = conn.Close()
+	return latencyMs
+}
+
+func (p *ProxyServer) probeHTTPThroughNode(serverID, nodeName string) int64 {
+	if p == nil || p.outboundMgr == nil {
+		return -1
+	}
+	cfg, exists := p.outboundMgr.GetOutbound(nodeName)
+	if !exists || cfg == nil {
+		logger.Debug("auto ping http probe failed: server=%s node=%s err=proxy outbound not found", serverID, nodeName)
+		return -1
+	}
+	ctx := context.Background()
+	if p.ctx != nil {
+		ctx = p.ctx
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	dialer, err := NewSingboxCoreFactory().CreateDialer(probeCtx, cfg)
+	if err != nil {
+		logger.Debug("auto ping http dialer create failed: server=%s node=%s err=%v", serverID, nodeName, err)
+		return -1
+	}
+	defer dialer.Close()
+	return doHTTPProbe(probeCtx, serverID, "node="+nodeName, func(transport *http.Transport) {
+		transport.DialContext = dialer.DialContext
+	})
+}
+
+func (p *ProxyServer) probeHTTPDirect(serverID string) int64 {
+	ctx := context.Background()
+	if p != nil && p.ctx != nil {
+		ctx = p.ctx
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	return doHTTPProbe(probeCtx, serverID, "node=direct", nil)
+}
+
+func doHTTPProbe(ctx context.Context, serverID, label string, customizeTransport func(*http.Transport)) int64 {
+	transport := &http.Transport{
+		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          0,
+		MaxIdleConnsPerHost:   1,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+	}
+	if customizeTransport != nil {
+		customizeTransport(transport)
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   12 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, defaultAutoPingHTTPProbeURL, nil)
+	if err != nil {
+		logger.Debug("auto ping http request create failed: server=%s %s err=%v", serverID, label, err)
+		return -1
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (MCPE Proxy AutoPing)")
+	req.Header.Set("Accept", "*/*")
+
+	startTime := time.Now()
+	resp, err := client.Do(req)
+	latencyMs := time.Since(startTime).Milliseconds()
+	if err != nil {
+		logger.Debug("auto ping http failed: server=%s %s url=%s err=%v", serverID, label, defaultAutoPingHTTPProbeURL, err)
+		return -1
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		logger.Debug("auto ping http non-success: server=%s %s status=%d", serverID, label, resp.StatusCode)
+		return -1
+	}
 	return latencyMs
 }
 
@@ -1435,11 +2362,31 @@ func (p *ProxyServer) GetPlayerRepository() *db.PlayerRepository {
 
 // GetActiveSessionCount returns the number of active sessions.
 func (p *ProxyServer) GetActiveSessionCount() int {
+	if p == nil || p.sessionMgr == nil {
+		return 0
+	}
 	return p.sessionMgr.Count()
+}
+
+func (p *ProxyServer) GetActiveProxyPortConnectionCount() int {
+	if p == nil || p.proxyPortManager == nil {
+		return 0
+	}
+	return p.proxyPortManager.GetActiveConnectionCount()
+}
+
+func (p *ProxyServer) GetActiveConnectionsForProxyPort(portID string) int {
+	if p == nil || p.proxyPortManager == nil {
+		return 0
+	}
+	return p.proxyPortManager.GetActiveConnectionCountForPort(portID)
 }
 
 // GetActiveSessionsForServer returns the number of active sessions for a specific server.
 func (p *ProxyServer) GetActiveSessionsForServer(serverID string) int {
+	if p == nil || p.sessionMgr == nil {
+		return 0
+	}
 	sessions := p.sessionMgr.GetAllSessions()
 	count := 0
 	for _, sess := range sessions {

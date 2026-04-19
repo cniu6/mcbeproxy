@@ -91,7 +91,7 @@ func (m *ProxyPortConfigManager) saveToFile() error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal proxy port config: %w", err)
 	}
-	if err := os.WriteFile(m.configPath, data, 0644); err != nil {
+	if err := atomicWriteFile(m.configPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write proxy port config file: %w", err)
 	}
 	return nil
@@ -264,7 +264,7 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 	m.watcherMu.Unlock()
 
 	if _, err := os.Stat(m.configPath); os.IsNotExist(err) {
-		if err := os.WriteFile(m.configPath, []byte("[]"), 0644); err != nil {
+		if err := atomicWriteFile(m.configPath, []byte("[]"), 0644); err != nil {
 			watcher.Close()
 			return fmt.Errorf("failed to create config file: %w", err)
 		}

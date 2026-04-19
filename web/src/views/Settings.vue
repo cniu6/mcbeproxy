@@ -125,6 +125,73 @@
       </n-form>
     </n-card>
 
+    <n-card title="新建默认值" style="margin-bottom: 24px">
+      <n-alert type="info" style="margin-bottom: 16px">
+        这里控制“新建代理服务器 / 新建代理端口”时自动带出的默认测速参数。不会强制覆盖你已经创建好的现有配置。
+      </n-alert>
+      <n-form :model="config" label-placement="left" label-width="180">
+        <n-grid :cols="2" :x-gap="24">
+          <n-gi :span="2">
+            <n-divider style="margin-top: 0">新建代理服务器默认值</n-divider>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="服务器 Ping 间隔 (分钟)">
+              <n-input-number v-model:value="config.server_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="服务器 Top N 候选">
+              <n-input-number v-model:value="config.server_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="服务器全量扫描模式">
+              <n-select v-model:value="config.server_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
+            </n-form-item>
+          </n-gi>
+          <n-gi v-if="config.server_auto_ping_full_scan_mode_default === 'daily'">
+            <n-form-item label="服务器扫描时间">
+              <n-input v-model:value="config.server_auto_ping_full_scan_time_default" placeholder="04:00" />
+            </n-form-item>
+          </n-gi>
+          <n-gi v-else-if="config.server_auto_ping_full_scan_mode_default === 'interval'">
+            <n-form-item label="服务器扫描间隔 (小时)">
+              <n-input-number v-model:value="config.server_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+
+          <n-gi :span="2">
+            <n-divider>新建代理端口默认值</n-divider>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="端口 Ping 间隔 (分钟)">
+              <n-input-number v-model:value="config.proxy_port_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="端口 Top N 候选">
+              <n-input-number v-model:value="config.proxy_port_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="端口全量扫描模式">
+              <n-select v-model:value="config.proxy_port_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
+            </n-form-item>
+          </n-gi>
+          <n-gi v-if="config.proxy_port_auto_ping_full_scan_mode_default === 'daily'">
+            <n-form-item label="端口扫描时间">
+              <n-input v-model:value="config.proxy_port_auto_ping_full_scan_time_default" placeholder="04:00" />
+            </n-form-item>
+          </n-gi>
+          <n-gi v-else-if="config.proxy_port_auto_ping_full_scan_mode_default === 'interval'">
+            <n-form-item label="端口扫描间隔 (小时)">
+              <n-input-number v-model:value="config.proxy_port_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+      </n-form>
+    </n-card>
+
     <!-- 日志配置 -->
     <n-card title="日志配置" style="margin-bottom: 24px">
       <n-form :model="config" label-placement="left" label-width="150">
@@ -247,6 +314,12 @@ const aclSettings = reactive({
 })
 const savingACL = ref(false)
 
+const autoPingFullScanModeOptions = [
+  { label: '关闭', value: '' },
+  { label: '每天定时', value: 'daily' },
+  { label: '固定间隔', value: 'interval' }
+]
+
 const config = reactive({
   api_port: 8080,
   api_entry_path: '/mcpe-admin',
@@ -256,6 +329,16 @@ const config = reactive({
   max_access_log_records: 100,
   passthrough_idle_timeout: 30,
   public_ping_timeout_seconds: 5,
+  server_auto_ping_interval_minutes_default: 10,
+  server_auto_ping_top_candidates_default: 10,
+  server_auto_ping_full_scan_mode_default: '',
+  server_auto_ping_full_scan_time_default: '04:00',
+  server_auto_ping_full_scan_interval_hours_default: 24,
+  proxy_port_auto_ping_interval_minutes_default: 10,
+  proxy_port_auto_ping_top_candidates_default: 10,
+  proxy_port_auto_ping_full_scan_mode_default: '',
+  proxy_port_auto_ping_full_scan_time_default: '04:00',
+  proxy_port_auto_ping_full_scan_interval_hours_default: 24,
   log_dir: 'logs',
   log_retention_days: 7,
   log_max_size_mb: 100,
@@ -320,6 +403,14 @@ const saveACL = async () => {
 }
 
 const saveConfigAndRestart = async () => {
+  if (config.server_auto_ping_full_scan_mode_default === 'daily' && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(String(config.server_auto_ping_full_scan_time_default || '').trim())) {
+    message.error('服务器默认扫描时间格式应为 HH:mm')
+    return
+  }
+  if (config.proxy_port_auto_ping_full_scan_mode_default === 'daily' && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(String(config.proxy_port_auto_ping_full_scan_time_default || '').trim())) {
+    message.error('端口默认扫描时间格式应为 HH:mm')
+    return
+  }
   const res = await api('/api/config', 'PUT', { ...config, restart: true })
   if (res.success) {
     message.success('配置已保存，服务正在重启...')

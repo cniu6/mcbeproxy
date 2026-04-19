@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,7 @@ import (
 type mockOutboundManager struct {
 	outbounds map[string]*config.ProxyOutbound
 	latency   map[string]int64
+	history   map[string][]proxy.ServerNodeLatencySample
 	selected  map[string]string
 }
 
@@ -29,6 +31,7 @@ func newMockOutboundManager() *mockOutboundManager {
 	return &mockOutboundManager{
 		outbounds: make(map[string]*config.ProxyOutbound),
 		latency:   make(map[string]int64),
+		history:   make(map[string][]proxy.ServerNodeLatencySample),
 		selected:  make(map[string]string),
 	}
 }
@@ -149,12 +152,25 @@ func (m *mockOutboundManager) SelectOutboundWithFailover(groupOrName, strategy, 
 func (m *mockOutboundManager) SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64) {
 	key := serverID + "|" + nodeName + "|" + sortBy
 	m.latency[key] = latencyMs
+	m.history[key] = append(m.history[key], proxy.ServerNodeLatencySample{
+		Timestamp: time.Now().UnixMilli(),
+		LatencyMs: latencyMs,
+		OK:        latencyMs > 0,
+	})
 }
 
 func (m *mockOutboundManager) GetServerNodeLatency(serverID, nodeName, sortBy string) (int64, bool) {
 	key := serverID + "|" + nodeName + "|" + sortBy
 	v, ok := m.latency[key]
 	return v, ok
+}
+
+func (m *mockOutboundManager) GetServerNodeLatencyHistory(serverID, nodeName, sortBy string) []proxy.ServerNodeLatencySample {
+	key := serverID + "|" + nodeName + "|" + sortBy
+	items := m.history[key]
+	result := make([]proxy.ServerNodeLatencySample, len(items))
+	copy(result, items)
+	return result
 }
 
 func (m *mockOutboundManager) SelectOutboundWithFailoverForServer(serverID, groupOrName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
@@ -193,7 +209,6 @@ func (m *mockOutboundManager) GetBestNodeForServer(serverID, groupOrName, sortBy
 	return bestName, bestLatency
 }
 
-// setupTestProxyOutboundHandler creates a test handler with mock dependencies.
 func setupTestProxyOutboundHandler() (*ProxyOutboundHandler, *config.ProxyOutboundConfigManager, *mockOutboundManager) {
 	// Create config manager
 	configMgr := config.NewProxyOutboundConfigManager("test_proxy_outbounds.json")
@@ -213,7 +228,6 @@ func setupTestHandler() (*ProxyOutboundHandler, *mockOutboundManager) {
 	return h, m
 }
 
-// setupTestRouter creates a test router with the handler registered.
 func setupTestRouter(handler *ProxyOutboundHandler) *gin.Engine {
 	router := gin.New()
 	router.GET("/api/proxy-outbounds/groups", handler.ListGroups)
@@ -222,8 +236,101 @@ func setupTestRouter(handler *ProxyOutboundHandler) *gin.Engine {
 	return router
 }
 
-// TestListGroups_Success tests successful group list response.
-// Requirements: 8.1, 8.4
+func TestGetServerNodeLatencyHistory_Success(t *testing.T) {
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(t.TempDir(), "proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(filepath.Join(t.TempDir(), "proxy_subscriptions.json"))
+	serverConfigMgr, err := config.NewConfigManager(filepath.Join(t.TempDir(), "servers.json"))
+	if err != nil {
+		t.Fatalf("NewConfigManager failed: %v", err)
+	}
+	outboundMgr := newMockOutboundManager()
+	handler := NewProxyOutboundHandler(configMgr, subConfigMgr, serverConfigMgr, outboundMgr)
+
+	node1 := &config.ProxyOutbound{Name: "node-a", Type: config.ProtocolShadowsocks, Server: "a.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	node2 := &config.ProxyOutbound{Name: "node-b", Type: config.ProtocolShadowsocks, Server: "b.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	if err := configMgr.AddOutbound(node1); err != nil {
+		t.Fatalf("AddOutbound node-a failed: %v", err)
+	}
+	if err := configMgr.AddOutbound(node2); err != nil {
+		t.Fatalf("AddOutbound node-b failed: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(node1); err != nil {
+		t.Fatalf("mock AddOutbound node-a failed: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(node2); err != nil {
+		t.Fatalf("mock AddOutbound node-b failed: %v", err)
+	}
+
+	serverCfg := &config.ServerConfig{
+		ID:              "srv1",
+		Name:            "Server 1",
+		Target:          "example.com",
+		Port:            19132,
+		ListenAddr:      "0.0.0.0:19132",
+		Protocol:        "raknet",
+		Enabled:         true,
+		ProxyOutbound:   "node-a,node-b",
+		LoadBalanceSort: config.LoadBalanceSortUDP,
+	}
+	if err := serverConfigMgr.AddServer(serverCfg); err != nil {
+		t.Fatalf("AddServer failed: %v", err)
+	}
+
+	outboundMgr.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 81)
+	outboundMgr.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 77)
+	outboundMgr.SetServerNodeLatency("srv1", "node-b", config.LoadBalanceSortUDP, 0)
+
+	router := gin.New()
+	router.GET("/api/servers/:id/node-latency-history", handler.GetServerNodeLatencyHistory)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/servers/srv1/node-latency-history?sort_by=udp", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response APIResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("Expected success=true, got false: %v", response.Msg)
+	}
+
+	data, ok := response.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected object response, got %T", response.Data)
+	}
+	if data["server_id"] != "srv1" {
+		t.Fatalf("Expected server_id=srv1, got %v", data["server_id"])
+	}
+	nodes, ok := data["nodes"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected nodes array, got %T", data["nodes"])
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("Expected 2 nodes, got %d", len(nodes))
+	}
+
+	nodeMap := make(map[string]map[string]interface{}, len(nodes))
+	for _, item := range nodes {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			t.Fatalf("Expected node entry object, got %T", item)
+		}
+		name, _ := entry["name"].(string)
+		nodeMap[name] = entry
+	}
+	if len(nodeMap["node-a"]["samples"].([]interface{})) != 2 {
+		t.Fatalf("Expected node-a to have 2 samples, got %#v", nodeMap["node-a"]["samples"])
+	}
+	if len(nodeMap["node-b"]["samples"].([]interface{})) != 1 {
+		t.Fatalf("Expected node-b to have 1 sample, got %#v", nodeMap["node-b"]["samples"])
+	}
+}
+
 func TestListGroups_Success(t *testing.T) {
 	handler, mockMgr := setupTestHandler()
 
@@ -540,7 +647,7 @@ func TestBatchProxyTestBudgetsIncreaseWithWorkers(t *testing.T) {
 	}
 }
 
-func TestParseImportContent_FiltersMetadataLikeNodeNames(t *testing.T) {
+func TestParseImportContent_KeepsMetadataLikeNodeNames(t *testing.T) {
 	handler, _ := setupTestHandler()
 	router := setupTestRouter(handler)
 
@@ -574,22 +681,29 @@ func TestParseImportContent_FiltersMetadataLikeNodeNames(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected object response, got %T", response.Data)
 	}
-	if got := int(data["count"].(float64)); got != 1 {
-		t.Fatalf("Expected count=1, got %d", got)
+	if got := int(data["count"].(float64)); got != 2 {
+		t.Fatalf("Expected count=2, got %d", got)
 	}
-	if got := int(data["filtered"].(float64)); got != 1 {
-		t.Fatalf("Expected filtered=1, got %d", got)
+	if got := int(data["filtered"].(float64)); got != 0 {
+		t.Fatalf("Expected filtered=0, got %d", got)
 	}
 	items, ok := data["items"].([]interface{})
-	if !ok || len(items) != 1 {
-		t.Fatalf("Expected one parsed item, got %#v", data["items"])
+	if !ok || len(items) != 2 {
+		t.Fatalf("Expected two parsed items, got %#v", data["items"])
 	}
 	item, ok := items[0].(map[string]interface{})
 	if !ok {
 		t.Fatalf("Expected parsed item object, got %T", items[0])
 	}
+	if item["name"] != "剩余流量：1GB" {
+		t.Fatalf("Expected first node name 剩余流量：1GB, got %v", item["name"])
+	}
+	item, ok = items[1].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected parsed item object, got %T", items[1])
+	}
 	if item["name"] != "vmess-node" {
-		t.Fatalf("Expected surviving node name vmess-node, got %v", item["name"])
+		t.Fatalf("Expected second node name vmess-node, got %v", item["name"])
 	}
 }
 

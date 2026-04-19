@@ -172,7 +172,7 @@
           :data="sortedOutbounds"
           :bordered="false"
           size="small"
-          :scroll-x="1560"
+          :scroll-x="1980"
           :row-key="rowKey"
           :row-props="proxyTableRowProps"
           v-model:checked-row-keys="checkedRowKeys"
@@ -1003,6 +1003,63 @@ const formatLastActive = (value) => {
   return `最近活跃 ${formatTime(value)}`
 }
 
+const renderUsageLatencyTag = (label, available, latency, good, medium) => {
+  if (!available) return null
+  const type = latency < good ? 'success' : latency < medium ? 'warning' : 'error'
+  return h(NTag, { type, size: 'tiny', bordered: false }, () => `${label} ${latency}ms`)
+}
+
+const getUsageRefKindLabel = (kind) => {
+  if (kind === 'proxy_port') return '端口'
+  return '服务器'
+}
+
+const getUsageNodeDisplayName = (nodeName) => {
+  if (!nodeName) return ''
+  return nodeName === 'direct' ? '直连' : nodeName
+}
+
+const renderUsageRefs = (row) => {
+  const refs = Array.isArray(row.usage_refs) ? row.usage_refs : []
+  if (refs.length === 0) {
+    return h('div', { class: 'table-secondary-text' }, '未被代理服务器或代理端口引用')
+  }
+
+  const visibleRefs = refs.slice(0, 3)
+  const currentCount = refs.filter(ref => ref.is_current).length
+
+  return h(NSpace, { vertical: true, size: 6 }, () => [
+    h(NSpace, { size: 4, wrap: true }, () => [
+      h(NTag, { type: 'info', size: 'small', bordered: false }, () => `引用 ${refs.length}`),
+      currentCount > 0 ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => `当前 ${currentCount}`) : null
+    ]),
+    ...visibleRefs.map(ref => h('div', { class: 'usage-ref-card' }, [
+      h(NSpace, { size: 4, wrap: true }, () => [
+        h(NTag, { type: ref.kind === 'proxy_port' ? 'warning' : 'info', size: 'small', bordered: false }, () => `${getUsageRefKindLabel(ref.kind)} ${ref.name}`),
+        h(NTag, { type: (ref.active_connections || 0) > 0 ? 'success' : 'default', size: 'small', bordered: false }, () => `连接 ${ref.active_connections || 0}`),
+        ref.is_current
+          ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => '当前使用')
+          : h(NTag, { size: 'small', bordered: false }, () => '候选中')
+      ]),
+      ref.has_node
+        ? h(NSpace, { size: 4, wrap: true }, () => [
+            h('span', { class: 'usage-ref-label' }, '最终服务器'),
+            h(NTag, { type: ref.is_current ? 'success' : 'warning', size: 'small', round: true, bordered: false }, () => getUsageNodeDisplayName(ref.current_node)),
+            renderUsageLatencyTag('TCP', ref.has_tcp, ref.tcp_ms, 200, 500),
+            renderUsageLatencyTag('UDP', ref.has_udp, ref.udp_ms, 200, 500),
+            renderUsageLatencyTag('HTTP', ref.has_http, ref.http_ms, 300, 800),
+            !ref.has_tcp && !ref.has_udp && !ref.has_http
+              ? h(NTag, { size: 'tiny', bordered: false }, () => '未测试')
+              : null
+          ])
+        : h('div', { class: 'table-secondary-text' }, '最终服务器 尚未选择')
+    ])),
+    refs.length > visibleRefs.length
+      ? h('div', { class: 'table-secondary-text' }, `还有 ${refs.length - visibleRefs.length} 个引用未展开`)
+      : null
+  ])
+}
+
 const columns = computed(() => [
   { type: 'selection', fixed: 'left' },
   {
@@ -1067,6 +1124,12 @@ const columns = computed(() => [
       h('div', { class: 'table-secondary-text' }, `↑ ${formatBytes(row.bytes_up || 0)} / ↓ ${formatBytes(row.bytes_down || 0)}`),
       h('div', { class: 'table-secondary-text' }, formatLastActive(row.last_active))
     ])
+  },
+  {
+    title: '当前使用',
+    key: 'usage_refs',
+    width: 420,
+    render: (row) => renderUsageRefs(row)
   },
   {
     title: '状态',
@@ -1410,7 +1473,6 @@ const handleBatchTestSelect = (key) => {
 
 const handleQuickBatchTestSelect = (key) => {
   const names = filteredOutbounds.value
-    .filter(item => !isMetadataLikeNodeName(item.name))
     .map(item => item.name)
   if (names.length === 0) {
     message.warning('当前筛选结果没有可测试节点')
@@ -1681,7 +1743,7 @@ const subProxyGroup = ref(null)
 const subProxyGroupOptions = computed(() => {
   const groups = new Set()
   outbounds.value.forEach(o => {
-    if (o.group && o.enabled && !isMetadataLikeNodeName(o.name)) groups.add(o.group)
+    if (o.group && o.enabled) groups.add(o.group)
   })
   return Array.from(groups).sort().map(g => ({ label: g, value: g }))
 })
@@ -1739,11 +1801,11 @@ const subProxyTest = async (name, type) => {
 }
 
 const filteredSubProxyList = computed(() => {
-  let list = outbounds.value.filter(o => o.enabled && !isMetadataLikeNodeName(o.name))
-  if (subProxyGroup.value) {
-    list = list.filter(o => o.group === subProxyGroup.value)
-  }
-  const q = subProxySearch.value.trim().toLowerCase()
+  let list = outbounds.value.filter(o => o.enabled)
+   if (subProxyGroup.value) {
+     list = list.filter(o => o.group === subProxyGroup.value)
+   }
+   const q = subProxySearch.value.trim().toLowerCase()
   if (q) {
     list = list.filter(o => o.name.toLowerCase().includes(q) || (o.group || '').toLowerCase().includes(q) || (o.server || '').toLowerCase().includes(q))
   }
@@ -1794,7 +1856,8 @@ const fetchSubscription = async () => {
     
     const lines = importText.value.split('\n').filter(l => l.trim())
     const proxyInfo = res.data.proxy_used ? ` (通过 ${res.data.proxy_used})` : ' (直连)'
-    message.success(`订阅获取成功${proxyInfo}，共 ${lines.length} 行`)
+    const summary = formatSubscriptionFetchSummary(res.data)
+    message.success(`订阅获取成功${proxyInfo}，共 ${lines.length} 行${summary ? `，${summary}` : ''}`)
   } catch (e) {
     message.error('获取订阅失败: ' + e.message)
   }
@@ -1809,6 +1872,24 @@ const decodeBase64UTF8 = (base64) => {
     bytes[i] = binaryStr.charCodeAt(i)
   }
   return new TextDecoder('utf-8').decode(bytes)
+}
+
+const formatSubscriptionFetchSummary = (data) => {
+  if (!data) return ''
+  const upload = Number(data.last_subscription_upload_bytes || 0)
+  const download = Number(data.last_subscription_download_bytes || 0)
+  const total = Number(data.last_subscription_total_bytes || 0)
+  const used = Math.max(upload + download, 0)
+  const parts = []
+  if (total > 0) {
+    parts.push(`已用 ${formatBytes(used)} / 总 ${formatBytes(total)}`)
+  } else if (used > 0) {
+    parts.push(`已用 ${formatBytes(used)}`)
+  }
+  if (data.last_subscription_expire_at) {
+    parts.push(`到期 ${formatTime(data.last_subscription_expire_at)}`)
+  }
+  return parts.join('，')
 }
 
 const parseBoolQueryValue = (value) => {
@@ -2360,6 +2441,7 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
+  padding-bottom: 6px;
 }
 .node-name {
   font-weight: 600;
@@ -2380,6 +2462,20 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 .table-error-text {
   font-size: 11px;
   color: #ef4444;
+  line-height: 1.35;
+}
+.usage-ref-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  background: var(--n-color-embedded);
+}
+.usage-ref-label {
+  font-size: 11px;
+  color: var(--n-text-color-3);
   line-height: 1.35;
 }
 .metric-label {

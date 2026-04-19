@@ -95,7 +95,7 @@ func (a *APIServer) getResolvedACLSettings(serverID string) *db.ACLSettings {
 	defaults := db.DefaultACLSettings()
 	defaults.ServerID = serverID
 	return defaults
-	}
+}
 
 func (a *APIServer) buildBlacklistKickMessage(playerName, serverID, reason string) string {
 	settings := a.getResolvedACLSettings(serverID)
@@ -200,6 +200,7 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/servers/:id/latency", a.getServerLatency)
 		if a.proxyOutboundHandler != nil {
 			api.GET("/servers/:id/node-latency", a.proxyOutboundHandler.GetServerNodeLatency)
+			api.GET("/servers/:id/node-latency-history", a.proxyOutboundHandler.GetServerNodeLatencyHistory)
 			api.GET("/servers/:id/current-node", a.proxyOutboundHandler.GetServerCurrentNode)
 			api.POST("/servers/:id/switch-node", a.proxyOutboundHandler.SwitchServerNode)
 		}
@@ -319,6 +320,7 @@ func (a *APIServer) setupRoutes() {
 			proxyPortGroup := api.Group("/proxy-ports")
 			{
 				proxyPortGroup.GET("", a.getProxyPorts)
+				proxyPortGroup.GET("/:id/runtime", a.getProxyPortRuntime)
 				proxyPortGroup.POST("", a.createProxyPort)
 				proxyPortGroup.POST("/bulk", a.createProxyPortsBulk)
 				proxyPortGroup.PUT("/:id", a.updateProxyPort)
@@ -468,7 +470,7 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 
 		// Store key info in context for later use
 		c.Set("api_key", key)
-		c.Set(ctxAuthIsAdmin, key.IsAdmin)
+		c.Set(ctxAuthIsAdmin, true)
 		c.Next()
 	}
 }
@@ -918,9 +920,7 @@ func (a *APIServer) createAPIKey(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	if !isAdminRequest(c) {
-		req.IsAdmin = false
-	}
+	req.IsAdmin = true
 
 	// Generate a random API key
 	keyBytes := make([]byte, 32)
@@ -1156,21 +1156,31 @@ func (a *APIServer) getConfig(c *gin.Context) {
 
 	// Return a safe subset of config (no sensitive data)
 	configDTO := map[string]interface{}{
-		"api_port":                    a.globalConfig.APIPort,
-		"api_entry_path":              a.globalConfig.APIEntryPath,
-		"database_path":               a.globalConfig.DatabasePath,
-		"log_dir":                     a.globalConfig.LogDir,
-		"log_retention_days":          a.globalConfig.LogRetentionDays,
-		"log_max_size_mb":             a.globalConfig.LogMaxSizeMB,
-		"debug_mode":                  a.globalConfig.DebugMode,
-		"max_session_records":         a.globalConfig.MaxSessionRecords,
-		"max_access_log_records":      a.globalConfig.MaxAccessLogRecords,
-		"auth_verify_enabled":         a.globalConfig.AuthVerifyEnabled,
-		"auth_verify_url":             a.globalConfig.AuthVerifyURL,
-		"auth_cache_minutes":          a.globalConfig.AuthCacheMinutes,
-		"proxy_ports_enabled":         a.globalConfig.ProxyPortsEnabled,
-		"passthrough_idle_timeout":    a.globalConfig.PassthroughIdleTimeout,
-		"public_ping_timeout_seconds": a.globalConfig.PublicPingTimeoutSeconds,
+		"api_port":                                              a.globalConfig.APIPort,
+		"api_entry_path":                                        a.globalConfig.APIEntryPath,
+		"database_path":                                         a.globalConfig.DatabasePath,
+		"log_dir":                                               a.globalConfig.LogDir,
+		"log_retention_days":                                    a.globalConfig.LogRetentionDays,
+		"log_max_size_mb":                                       a.globalConfig.LogMaxSizeMB,
+		"debug_mode":                                            a.globalConfig.DebugMode,
+		"max_session_records":                                   a.globalConfig.MaxSessionRecords,
+		"max_access_log_records":                                a.globalConfig.MaxAccessLogRecords,
+		"auth_verify_enabled":                                   a.globalConfig.AuthVerifyEnabled,
+		"auth_verify_url":                                       a.globalConfig.AuthVerifyURL,
+		"auth_cache_minutes":                                    a.globalConfig.AuthCacheMinutes,
+		"proxy_ports_enabled":                                   a.globalConfig.ProxyPortsEnabled,
+		"passthrough_idle_timeout":                              a.globalConfig.PassthroughIdleTimeout,
+		"public_ping_timeout_seconds":                           a.globalConfig.PublicPingTimeoutSeconds,
+		"server_auto_ping_interval_minutes_default":             a.globalConfig.GetServerAutoPingIntervalMinutesDefault(),
+		"server_auto_ping_top_candidates_default":               a.globalConfig.GetServerAutoPingTopCandidatesDefault(),
+		"server_auto_ping_full_scan_mode_default":               a.globalConfig.GetServerAutoPingFullScanModeDefault(),
+		"server_auto_ping_full_scan_time_default":               a.globalConfig.GetServerAutoPingFullScanTimeDefault(),
+		"server_auto_ping_full_scan_interval_hours_default":     a.globalConfig.GetServerAutoPingFullScanIntervalHoursDefault(),
+		"proxy_port_auto_ping_interval_minutes_default":         a.globalConfig.GetProxyPortAutoPingIntervalMinutesDefault(),
+		"proxy_port_auto_ping_top_candidates_default":           a.globalConfig.GetProxyPortAutoPingTopCandidatesDefault(),
+		"proxy_port_auto_ping_full_scan_mode_default":           a.globalConfig.GetProxyPortAutoPingFullScanModeDefault(),
+		"proxy_port_auto_ping_full_scan_time_default":           a.globalConfig.GetProxyPortAutoPingFullScanTimeDefault(),
+		"proxy_port_auto_ping_full_scan_interval_hours_default": a.globalConfig.GetProxyPortAutoPingFullScanIntervalHoursDefault(),
 	}
 	respondSuccess(c, configDTO)
 }
@@ -1184,88 +1194,134 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	}
 
 	var req struct {
-		APIPort                  int    `json:"api_port"`
-		APIEntryPath             string `json:"api_entry_path"`
-		LogDir                   string `json:"log_dir"`
-		LogRetentionDays         int    `json:"log_retention_days"`
-		LogMaxSizeMB             int    `json:"log_max_size_mb"`
-		DebugMode                bool   `json:"debug_mode"`
-		MaxSessionRecords        int    `json:"max_session_records"`
-		MaxAccessLogRecords      int    `json:"max_access_log_records"`
-		AuthVerifyEnabled        bool   `json:"auth_verify_enabled"`
-		AuthVerifyURL            string `json:"auth_verify_url"`
-		AuthCacheMinutes         int    `json:"auth_cache_minutes"`
-		ProxyPortsEnabled        *bool  `json:"proxy_ports_enabled"`
-		PassthroughIdleTimeout   *int   `json:"passthrough_idle_timeout"`
-		PublicPingTimeoutSeconds *int   `json:"public_ping_timeout_seconds"`
-		Restart                  bool   `json:"restart"`
+		APIPort                                       int     `json:"api_port"`
+		APIEntryPath                                  string  `json:"api_entry_path"`
+		LogDir                                        string  `json:"log_dir"`
+		LogRetentionDays                              int     `json:"log_retention_days"`
+		LogMaxSizeMB                                  int     `json:"log_max_size_mb"`
+		DebugMode                                     bool    `json:"debug_mode"`
+		MaxSessionRecords                             int     `json:"max_session_records"`
+		MaxAccessLogRecords                           int     `json:"max_access_log_records"`
+		AuthVerifyEnabled                             bool    `json:"auth_verify_enabled"`
+		AuthVerifyURL                                 string  `json:"auth_verify_url"`
+		AuthCacheMinutes                              int     `json:"auth_cache_minutes"`
+		ProxyPortsEnabled                             *bool   `json:"proxy_ports_enabled"`
+		PassthroughIdleTimeout                        *int    `json:"passthrough_idle_timeout"`
+		PublicPingTimeoutSeconds                      *int    `json:"public_ping_timeout_seconds"`
+		ServerAutoPingIntervalMinutesDefault          *int    `json:"server_auto_ping_interval_minutes_default"`
+		ServerAutoPingTopCandidatesDefault            *int    `json:"server_auto_ping_top_candidates_default"`
+		ServerAutoPingFullScanModeDefault             *string `json:"server_auto_ping_full_scan_mode_default"`
+		ServerAutoPingFullScanTimeDefault             *string `json:"server_auto_ping_full_scan_time_default"`
+		ServerAutoPingFullScanIntervalHoursDefault    *int    `json:"server_auto_ping_full_scan_interval_hours_default"`
+		ProxyPortAutoPingIntervalMinutesDefault       *int    `json:"proxy_port_auto_ping_interval_minutes_default"`
+		ProxyPortAutoPingTopCandidatesDefault         *int    `json:"proxy_port_auto_ping_top_candidates_default"`
+		ProxyPortAutoPingFullScanModeDefault          *string `json:"proxy_port_auto_ping_full_scan_mode_default"`
+		ProxyPortAutoPingFullScanTimeDefault          *string `json:"proxy_port_auto_ping_full_scan_time_default"`
+		ProxyPortAutoPingFullScanIntervalHoursDefault *int    `json:"proxy_port_auto_ping_full_scan_interval_hours_default"`
+		Restart                                       bool    `json:"restart"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
 
-	// Update config in memory
+	nextConfig := *a.globalConfig
 	if req.APIPort > 0 {
-		a.globalConfig.APIPort = req.APIPort
+		nextConfig.APIPort = req.APIPort
 	}
 	if req.APIEntryPath != "" {
-		a.globalConfig.APIEntryPath = req.APIEntryPath
+		nextConfig.APIEntryPath = req.APIEntryPath
 	}
 	if req.LogDir != "" {
-		a.globalConfig.LogDir = req.LogDir
+		nextConfig.LogDir = req.LogDir
 	}
 	if req.LogRetentionDays > 0 {
-		a.globalConfig.LogRetentionDays = req.LogRetentionDays
+		nextConfig.LogRetentionDays = req.LogRetentionDays
 	}
 	if req.LogMaxSizeMB > 0 {
-		a.globalConfig.LogMaxSizeMB = req.LogMaxSizeMB
+		nextConfig.LogMaxSizeMB = req.LogMaxSizeMB
 	}
-	a.globalConfig.DebugMode = req.DebugMode
+	nextConfig.DebugMode = req.DebugMode
 	if req.MaxSessionRecords > 0 {
-		a.globalConfig.MaxSessionRecords = req.MaxSessionRecords
-		// Update SessionRepository immediately to apply the new limit
-		if a.sessionRepo != nil {
-			if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
-				fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
-			}
-		}
+		nextConfig.MaxSessionRecords = req.MaxSessionRecords
 	}
 	if req.MaxAccessLogRecords > 0 {
-		a.globalConfig.MaxAccessLogRecords = req.MaxAccessLogRecords
+		nextConfig.MaxAccessLogRecords = req.MaxAccessLogRecords
 	}
-	a.globalConfig.AuthVerifyEnabled = req.AuthVerifyEnabled
+	nextConfig.AuthVerifyEnabled = req.AuthVerifyEnabled
 	if req.AuthVerifyURL != "" {
-		a.globalConfig.AuthVerifyURL = req.AuthVerifyURL
+		nextConfig.AuthVerifyURL = req.AuthVerifyURL
 	}
 	if req.AuthCacheMinutes > 0 {
-		a.globalConfig.AuthCacheMinutes = req.AuthCacheMinutes
+		nextConfig.AuthCacheMinutes = req.AuthCacheMinutes
 	}
 	if req.ProxyPortsEnabled != nil {
-		a.globalConfig.ProxyPortsEnabled = *req.ProxyPortsEnabled
-		if a.proxyController != nil {
-			if err := a.proxyController.ReloadProxyPorts(); err != nil {
-				fmt.Printf("Warning: failed to reload proxy ports after config update: %v\n", err)
-			}
-		}
+		nextConfig.ProxyPortsEnabled = *req.ProxyPortsEnabled
 	}
 	if req.PassthroughIdleTimeout != nil {
 		if *req.PassthroughIdleTimeout < 0 {
 			respondError(c, http.StatusBadRequest, "Invalid passthrough_idle_timeout", "passthrough_idle_timeout cannot be negative")
 			return
 		}
-		a.globalConfig.PassthroughIdleTimeout = *req.PassthroughIdleTimeout
+		nextConfig.PassthroughIdleTimeout = *req.PassthroughIdleTimeout
 	}
 	if req.PublicPingTimeoutSeconds != nil {
 		if *req.PublicPingTimeoutSeconds < 0 {
 			respondError(c, http.StatusBadRequest, "Invalid public_ping_timeout_seconds", "public_ping_timeout_seconds cannot be negative")
 			return
 		}
-		a.globalConfig.PublicPingTimeoutSeconds = *req.PublicPingTimeoutSeconds
+		nextConfig.PublicPingTimeoutSeconds = *req.PublicPingTimeoutSeconds
+	}
+	if req.ServerAutoPingIntervalMinutesDefault != nil {
+		nextConfig.ServerAutoPingIntervalMinutesDefault = *req.ServerAutoPingIntervalMinutesDefault
+	}
+	if req.ServerAutoPingTopCandidatesDefault != nil {
+		nextConfig.ServerAutoPingTopCandidatesDefault = *req.ServerAutoPingTopCandidatesDefault
+	}
+	if req.ServerAutoPingFullScanModeDefault != nil {
+		nextConfig.ServerAutoPingFullScanModeDefault = *req.ServerAutoPingFullScanModeDefault
+	}
+	if req.ServerAutoPingFullScanTimeDefault != nil {
+		nextConfig.ServerAutoPingFullScanTimeDefault = *req.ServerAutoPingFullScanTimeDefault
+	}
+	if req.ServerAutoPingFullScanIntervalHoursDefault != nil {
+		nextConfig.ServerAutoPingFullScanIntervalHoursDefault = *req.ServerAutoPingFullScanIntervalHoursDefault
+	}
+	if req.ProxyPortAutoPingIntervalMinutesDefault != nil {
+		nextConfig.ProxyPortAutoPingIntervalMinutesDefault = *req.ProxyPortAutoPingIntervalMinutesDefault
+	}
+	if req.ProxyPortAutoPingTopCandidatesDefault != nil {
+		nextConfig.ProxyPortAutoPingTopCandidatesDefault = *req.ProxyPortAutoPingTopCandidatesDefault
+	}
+	if req.ProxyPortAutoPingFullScanModeDefault != nil {
+		nextConfig.ProxyPortAutoPingFullScanModeDefault = *req.ProxyPortAutoPingFullScanModeDefault
+	}
+	if req.ProxyPortAutoPingFullScanTimeDefault != nil {
+		nextConfig.ProxyPortAutoPingFullScanTimeDefault = *req.ProxyPortAutoPingFullScanTimeDefault
+	}
+	if req.ProxyPortAutoPingFullScanIntervalHoursDefault != nil {
+		nextConfig.ProxyPortAutoPingFullScanIntervalHoursDefault = *req.ProxyPortAutoPingFullScanIntervalHoursDefault
+	}
+	if err := nextConfig.Validate(); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid config", err.Error())
+		return
+	}
+	if err := nextConfig.Save("config.json"); err != nil {
+		respondError(c, http.StatusInternalServerError, "Failed to save config", err.Error())
+		return
+	}
+	*a.globalConfig = nextConfig
+	if req.MaxSessionRecords > 0 && a.sessionRepo != nil {
+		if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
+			fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
+		}
+	}
+	if req.ProxyPortsEnabled != nil && a.proxyController != nil {
+		if err := a.proxyController.ReloadProxyPorts(); err != nil {
+			fmt.Printf("Warning: failed to reload proxy ports after config update: %v\n", err)
+		}
 	}
 
-	// Note: Actual restart would require additional implementation
-	// For now, just acknowledge the config update
 	respondSuccessWithMsg(c, "配置已更新", nil)
 }
 

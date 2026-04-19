@@ -82,7 +82,7 @@ func (m *ProxySubscriptionConfigManager) saveToFile() error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal proxy subscription config: %w", err)
 	}
-	if err := os.WriteFile(m.configPath, data, 0644); err != nil {
+	if err := atomicWriteFile(m.configPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write proxy subscription config file: %w", err)
 	}
 	return nil

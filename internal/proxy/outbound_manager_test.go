@@ -345,6 +345,47 @@ func TestSelectOutboundWithFailoverForServerIgnoresPinnedNodeOutsideSelector(t *
 	}
 }
 
+func TestServerNodeLatencyHistoryPreservesOrderAndFailureSamples(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 91)
+	manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 0)
+	manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 73)
+
+	samples := manager.GetServerNodeLatencyHistory("srv1", "node-a", config.LoadBalanceSortUDP)
+	if len(samples) != 3 {
+		t.Fatalf("expected 3 samples, got %d", len(samples))
+	}
+	if samples[0].LatencyMs != 91 || !samples[0].OK {
+		t.Fatalf("unexpected first sample: %+v", samples[0])
+	}
+	if samples[1].LatencyMs != 0 || samples[1].OK {
+		t.Fatalf("unexpected second sample: %+v", samples[1])
+	}
+	if samples[2].LatencyMs != 73 || !samples[2].OK {
+		t.Fatalf("unexpected third sample: %+v", samples[2])
+	}
+}
+
+func TestServerNodeLatencyHistoryKeepsMostRecentSamples(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	for i := 0; i < serverNodeLatencyHistoryLimit+12; i++ {
+		manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, int64(i+1))
+	}
+
+	samples := manager.GetServerNodeLatencyHistory("srv1", "node-a", config.LoadBalanceSortUDP)
+	if len(samples) != serverNodeLatencyHistoryLimit {
+		t.Fatalf("expected %d samples, got %d", serverNodeLatencyHistoryLimit, len(samples))
+	}
+	expectedFirst := int64(13)
+	if samples[0].LatencyMs != expectedFirst {
+		t.Fatalf("expected first retained sample latency %d, got %d", expectedFirst, samples[0].LatencyMs)
+	}
+	expectedLast := int64(serverNodeLatencyHistoryLimit + 12)
+	if samples[len(samples)-1].LatencyMs != expectedLast {
+		t.Fatalf("expected last retained sample latency %d, got %d", expectedLast, samples[len(samples)-1].LatencyMs)
+	}
+}
+
 // **Feature: singbox-outbound-proxy, Property 2: List contains all added outbounds**
 // **Validates: Requirements 1.3**
 //

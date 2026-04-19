@@ -79,7 +79,7 @@
           :row-props="portTableRowProps"
           :pagination="portTablePagination"
           :max-height="720"
-          :scroll-x="1500"
+          :scroll-x="1860"
           :loading="loading"
         />
         <div v-if="newPortDraft" class="port-new-draft">
@@ -93,8 +93,10 @@
             :proxy-type-options="proxyTypeOptions"
             :load-balance-options="loadBalanceOptions"
             :load-balance-sort-options="loadBalanceSortOptions"
+            :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
             :needs-load-balance="needsLoadBalance"
             :get-proxy-outbound-display="getProxyOutboundDisplay"
+            :show-runtime-info="false"
             @open-proxy-selector="openFormProxySelector(newPortDraft)"
             @clear-proxy="clearProxySelection(newPortDraft)"
           />
@@ -404,7 +406,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, nextTick, h } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, h } from 'vue'
 import { useMessage, NTag, NButton, NSpace } from 'naive-ui'
 import { api } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
@@ -449,7 +451,20 @@ const customHttpUrl = ref('')
 const batchMcbeAddress = ref('mco.cubecraft.net:19132')
 
 const globalConfig = reactive({
-  proxy_ports_enabled: true
+  proxy_ports_enabled: true,
+  proxy_port_auto_ping_interval_minutes_default: 10,
+  proxy_port_auto_ping_top_candidates_default: 10,
+  proxy_port_auto_ping_full_scan_mode_default: '',
+  proxy_port_auto_ping_full_scan_time_default: '04:00',
+  proxy_port_auto_ping_full_scan_interval_hours_default: 24
+})
+
+const getProxyPortAutoPingDefaults = () => ({
+  interval_minutes: globalConfig.proxy_port_auto_ping_interval_minutes_default || 10,
+  top_candidates: globalConfig.proxy_port_auto_ping_top_candidates_default || 10,
+  full_scan_mode: globalConfig.proxy_port_auto_ping_full_scan_mode_default || '',
+  full_scan_time: globalConfig.proxy_port_auto_ping_full_scan_time_default || '04:00',
+  full_scan_interval_hours: globalConfig.proxy_port_auto_ping_full_scan_interval_hours_default || 24
 })
 
 const createBulkFormDefaults = () => ({
@@ -582,6 +597,12 @@ const loadBalanceSortOptions = [
   { label: 'UDP', value: 'udp' }
 ]
 
+const autoPingFullScanModeOptions = [
+  { label: '关闭', value: '' },
+  { label: '每天定时', value: 'daily' },
+  { label: '固定间隔', value: 'interval' }
+]
+
 const proxyProtocolOptions = [
   { label: 'Shadowsocks', value: 'shadowsocks' },
   { label: 'VMess', value: 'vmess' },
@@ -622,6 +643,54 @@ const applyLoadBalanceDefaults = (port) => {
   }
 }
 
+const applyAutoPingDefaults = (port) => {
+  const defaults = getProxyPortAutoPingDefaults()
+  if (needsLoadBalance(port.proxy_outbound)) {
+    if (typeof port.auto_ping_enabled !== 'boolean') port.auto_ping_enabled = true
+    if (!port.auto_ping_interval_minutes || port.auto_ping_interval_minutes < 1) port.auto_ping_interval_minutes = defaults.interval_minutes
+    if (!port.auto_ping_top_candidates || port.auto_ping_top_candidates < 1) port.auto_ping_top_candidates = defaults.top_candidates
+    if (port.auto_ping_full_scan_mode === undefined || port.auto_ping_full_scan_mode === null) port.auto_ping_full_scan_mode = defaults.full_scan_mode
+    if (!port.auto_ping_full_scan_time) port.auto_ping_full_scan_time = defaults.full_scan_time
+    if (!port.auto_ping_full_scan_interval_hours || port.auto_ping_full_scan_interval_hours < 1) {
+      port.auto_ping_full_scan_interval_hours = defaults.full_scan_interval_hours
+    }
+  } else {
+    port.auto_ping_enabled = false
+    if (!port.auto_ping_interval_minutes || port.auto_ping_interval_minutes < 1) port.auto_ping_interval_minutes = defaults.interval_minutes
+    if (!port.auto_ping_top_candidates || port.auto_ping_top_candidates < 1) port.auto_ping_top_candidates = defaults.top_candidates
+    if (port.auto_ping_full_scan_mode === undefined || port.auto_ping_full_scan_mode === null) port.auto_ping_full_scan_mode = defaults.full_scan_mode
+    if (!port.auto_ping_full_scan_time) port.auto_ping_full_scan_time = defaults.full_scan_time
+    if (!port.auto_ping_full_scan_interval_hours || port.auto_ping_full_scan_interval_hours < 1) {
+      port.auto_ping_full_scan_interval_hours = defaults.full_scan_interval_hours
+    }
+  }
+}
+
+const portRuntimeFieldDefaults = {
+  active_connections: 0,
+  current_node: '',
+  has_node: false,
+  tcp_ms: 0,
+  udp_ms: 0,
+  http_ms: 0,
+  has_tcp: false,
+  has_udp: false,
+  has_http: false
+}
+
+const applyPortRuntimeSnapshot = (port, snapshot = {}) => {
+  if (!port) return
+  port.active_connections = snapshot.active_connections || 0
+  port.current_node = snapshot.current_node || ''
+  port.has_node = !!snapshot.has_node
+  port.tcp_ms = snapshot.tcp_ms || 0
+  port.udp_ms = snapshot.udp_ms || 0
+  port.http_ms = snapshot.http_ms || 0
+  port.has_tcp = !!snapshot.has_tcp
+  port.has_udp = !!snapshot.has_udp
+  port.has_http = !!snapshot.has_http
+}
+
 const normalizePort = (port) => {
   const normalized = {
     id: port.id,
@@ -634,9 +703,18 @@ const normalizePort = (port) => {
     proxy_outbound: port.proxy_outbound || '',
     load_balance: port.load_balance || '',
     load_balance_sort: port.load_balance_sort || '',
-    allow_list: Array.isArray(port.allow_list) && port.allow_list.length > 0 ? [...port.allow_list] : ['0.0.0.0/0']
+    auto_ping_enabled: typeof port.auto_ping_enabled === 'boolean' ? port.auto_ping_enabled : undefined,
+    auto_ping_interval_minutes: port.auto_ping_interval_minutes,
+    auto_ping_top_candidates: port.auto_ping_top_candidates,
+    auto_ping_full_scan_mode: port.auto_ping_full_scan_mode,
+    auto_ping_full_scan_time: port.auto_ping_full_scan_time,
+    auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours,
+    allow_list: Array.isArray(port.allow_list) && port.allow_list.length > 0 ? [...port.allow_list] : ['0.0.0.0/0'],
+    ...portRuntimeFieldDefaults
   }
   applyLoadBalanceDefaults(normalized)
+  applyAutoPingDefaults(normalized)
+  applyPortRuntimeSnapshot(normalized, port)
   return normalized
 }
 
@@ -738,6 +816,7 @@ const bulkUsesSharedLoadBalance = computed(() => {
 })
 
 const bulkPreviewState = computed(() => {
+  const autoPingDefaults = getProxyPortAutoPingDefaults()
   const { ports: portNumbers, error } = parsePortExpression(bulkForm.port_expression)
   if (error) {
     return { rows: [], error }
@@ -778,6 +857,12 @@ const bulkPreviewState = computed(() => {
       proxy_outbound: proxyOutbound,
       load_balance: loadBalance,
       load_balance_sort: loadBalanceSort,
+      auto_ping_enabled: needsLoadBalance(proxyOutbound),
+      auto_ping_interval_minutes: autoPingDefaults.interval_minutes,
+      auto_ping_top_candidates: autoPingDefaults.top_candidates,
+      auto_ping_full_scan_mode: autoPingDefaults.full_scan_mode,
+      auto_ping_full_scan_time: autoPingDefaults.full_scan_time,
+      auto_ping_full_scan_interval_hours: autoPingDefaults.full_scan_interval_hours,
       allow_list: [...allowList],
       _port_number: portNumber
     }
@@ -826,6 +911,11 @@ const loadConfig = async () => {
   const res = await api('/api/config')
   if (res.success) {
     globalConfig.proxy_ports_enabled = !!res.data.proxy_ports_enabled
+    globalConfig.proxy_port_auto_ping_interval_minutes_default = res.data.proxy_port_auto_ping_interval_minutes_default || 10
+    globalConfig.proxy_port_auto_ping_top_candidates_default = res.data.proxy_port_auto_ping_top_candidates_default || 10
+    globalConfig.proxy_port_auto_ping_full_scan_mode_default = res.data.proxy_port_auto_ping_full_scan_mode_default || ''
+    globalConfig.proxy_port_auto_ping_full_scan_time_default = res.data.proxy_port_auto_ping_full_scan_time_default || '04:00'
+    globalConfig.proxy_port_auto_ping_full_scan_interval_hours_default = res.data.proxy_port_auto_ping_full_scan_interval_hours_default || 24
   }
 }
 
@@ -836,6 +926,38 @@ const loadPorts = async () => {
     return
   }
   ports.value = (res.data || []).map(normalizePort)
+}
+
+const refreshPortRuntime = async (port) => {
+  if (!port || !port.id || port._new) return
+  port._runtimeRefreshing = true
+  try {
+    const res = await api(`/api/proxy-ports/${encodeURIComponent(port.id)}/runtime`)
+    if (res.success && res.data) {
+      applyPortRuntimeSnapshot(port, res.data)
+    }
+  } finally {
+    port._runtimeRefreshing = false
+  }
+}
+
+let expandedPortRuntimeTimer = null
+
+const stopExpandedPortRuntimePolling = () => {
+  if (expandedPortRuntimeTimer) {
+    clearTimeout(expandedPortRuntimeTimer)
+    expandedPortRuntimeTimer = null
+  }
+}
+
+const scheduleExpandedPortRuntimePolling = () => {
+  stopExpandedPortRuntimePolling()
+  if (expandedPortIds.value.length === 0) return
+  expandedPortRuntimeTimer = setTimeout(async () => {
+    const expandedPorts = ports.value.filter(port => expandedPortIds.value.includes(port.id) && !port._new)
+    await Promise.all(expandedPorts.map(port => refreshPortRuntime(port)))
+    scheduleExpandedPortRuntimePolling()
+  }, 3000)
 }
 
 const loadProxyOutbounds = async () => {
@@ -863,6 +985,7 @@ const addPort = () => {
     message.info('已有未保存的新增草稿, 先处理完再新增')
     return
   }
+  const autoPingDefaults = getProxyPortAutoPingDefaults()
   newPortDraft.value = normalizePort({
     id: `proxy-${Date.now()}`,
     name: '新代理端口',
@@ -870,6 +993,12 @@ const addPort = () => {
     type: 'socks5',
     enabled: true,
     proxy_outbound: '',
+    auto_ping_enabled: false,
+    auto_ping_interval_minutes: autoPingDefaults.interval_minutes,
+    auto_ping_top_candidates: autoPingDefaults.top_candidates,
+    auto_ping_full_scan_mode: autoPingDefaults.full_scan_mode,
+    auto_ping_full_scan_time: autoPingDefaults.full_scan_time,
+    auto_ping_full_scan_interval_hours: autoPingDefaults.full_scan_interval_hours,
     allow_list: ['0.0.0.0/0']
   })
   newPortDraft.value._new = true
@@ -886,6 +1015,7 @@ const openEditPort = (port) => {
     ]
   } else {
     expandedPortIds.value = [...expandedPortIds.value, port.id]
+    refreshPortRuntime(port)
   }
 }
 
@@ -955,6 +1085,45 @@ const renderAllowListCell = (row) => {
     head + more)
 }
 
+const getPortRuntimeNodeDisplay = (nodeName) => {
+  if (!nodeName) return ''
+  return nodeName === 'direct' ? '直连' : nodeName
+}
+
+const getRuntimeTagType = (latency, good, medium) => {
+  if (!latency || latency <= 0) return 'default'
+  if (latency < good) return 'success'
+  if (latency < medium) return 'warning'
+  return 'error'
+}
+
+const renderPortLatencyTag = (label, available, latency, good, medium) => {
+  if (!available) return null
+  return h(NTag, { size: 'tiny', type: getRuntimeTagType(latency, good, medium), bordered: false }, () => `${label} ${latency}ms`)
+}
+
+const renderPortRuntimeCell = (row) => {
+  const hasNode = !!row.has_node || row.current_node === 'direct'
+  return h('div', { style: 'display: flex; flex-direction: column; gap: 4px' }, [
+    h(NSpace, { size: 4, wrap: true }, () => [
+      h(NTag, { size: 'small', type: (row.active_connections || 0) > 0 ? 'success' : 'default', bordered: false }, () => `连接 ${row.active_connections || 0}`),
+      hasNode
+        ? h(NTag, { size: 'small', type: row.current_node === 'direct' ? 'default' : 'success', round: true, bordered: false }, () => getPortRuntimeNodeDisplay(row.current_node))
+        : h(NTag, { size: 'small', bordered: false }, () => '未选择')
+    ]),
+    hasNode
+      ? h(NSpace, { size: 4, wrap: true }, () => [
+          renderPortLatencyTag('TCP', row.has_tcp, row.tcp_ms, 200, 500),
+          renderPortLatencyTag('UDP', row.has_udp, row.udp_ms, 200, 500),
+          renderPortLatencyTag('HTTP', row.has_http, row.http_ms, 300, 800),
+          !row.has_tcp && !row.has_udp && !row.has_http
+            ? h(NTag, { size: 'tiny', bordered: false }, () => '未测试')
+            : null
+        ])
+      : h('span', { class: 'port-runtime-subtext' }, needsLoadBalance(row.proxy_outbound) ? '等待选出最终节点' : '当前未使用代理节点')
+  ])
+}
+
 const portTableColumns = computed(() => [
   { type: 'selection', width: 36, fixed: 'left' },
   {
@@ -968,10 +1137,15 @@ const portTableColumns = computed(() => [
         proxyTypeOptions,
         loadBalanceOptions,
         loadBalanceSortOptions,
+        autoPingFullScanModeOptions,
         needsLoadBalance,
         getProxyOutboundDisplay,
+        showRuntimeInfo: !row._new,
+        canRefreshRuntime: !row._new,
+        runtimeRefreshing: !!row._runtimeRefreshing,
         onOpenProxySelector: () => openFormProxySelector(row),
-        onClearProxy: () => clearProxySelection(row)
+        onClearProxy: () => clearProxySelection(row),
+        onRefreshRuntime: () => refreshPortRuntime(row)
       }),
       h(NSpace, { justify: 'end', style: 'margin-top: 8px' }, () => [
         h(NButton, {
@@ -1031,6 +1205,12 @@ const portTableColumns = computed(() => [
           : null
       ])
     }
+  },
+  {
+    title: '当前使用',
+    key: 'runtime',
+    minWidth: 280,
+    render: renderPortRuntimeCell
   },
   {
     title: '白名单',
@@ -1137,6 +1317,7 @@ const confirmDeletePort = (port) => {
 
 const buildPortPayload = (port) => {
   applyLoadBalanceDefaults(port)
+  applyAutoPingDefaults(port)
   return {
     id: port.id,
     name: port.name,
@@ -1148,6 +1329,12 @@ const buildPortPayload = (port) => {
     proxy_outbound: port.proxy_outbound,
     load_balance: port.load_balance || '',
     load_balance_sort: port.load_balance_sort || '',
+    auto_ping_enabled: !!port.auto_ping_enabled,
+    auto_ping_interval_minutes: port.auto_ping_interval_minutes || 10,
+    auto_ping_top_candidates: port.auto_ping_top_candidates || 10,
+    auto_ping_full_scan_mode: port.auto_ping_full_scan_mode || '',
+    auto_ping_full_scan_time: port.auto_ping_full_scan_time || '04:00',
+    auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours || 24,
     allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean)
   }
 }
@@ -1385,20 +1572,7 @@ const saveGlobal = async () => {
 const savePort = async (port) => {
   port._saving = true
   try {
-    applyLoadBalanceDefaults(port)
-    const payload = {
-      id: port.id,
-      name: port.name,
-      listen_addr: port.listen_addr,
-      type: port.type,
-      enabled: port.enabled,
-      username: port.username,
-      password: port.password,
-      proxy_outbound: port.proxy_outbound,
-      load_balance: port.load_balance || '',
-      load_balance_sort: port.load_balance_sort || '',
-      allow_list: (port.allow_list || []).map(v => v.trim()).filter(Boolean)
-    }
+    const payload = buildPortPayload(port)
 
     const res = port._new
       ? await api('/api/proxy-ports', 'POST', payload)
@@ -1446,6 +1620,7 @@ const clearProxySelection = (port) => {
   port.proxy_outbound = ''
   port.load_balance = ''
   port.load_balance_sort = ''
+  applyAutoPingDefaults(port)
 }
 
 const clearBulkProxySelection = () => {
@@ -1523,6 +1698,7 @@ const confirmFormProxySelection = () => {
     }
   }
   applyLoadBalanceDefaults(port)
+  applyAutoPingDefaults(port)
   if (port === bulkForm && !bulkCanRotateNodes.value) {
     bulkForm.assignment_mode = 'shared'
   }
@@ -1534,19 +1710,7 @@ const createBulkPorts = async () => {
 
   bulkSaving.value = true
   try {
-    const payload = bulkPreviewRows.value.map(row => ({
-      id: row.id,
-      name: row.name,
-      listen_addr: row.listen_addr,
-      type: row.type,
-      enabled: row.enabled,
-      username: row.username,
-      password: row.password,
-      proxy_outbound: row.proxy_outbound,
-      load_balance: row.load_balance,
-      load_balance_sort: row.load_balance_sort,
-      allow_list: row.allow_list
-    }))
+    const payload = bulkPreviewRows.value.map(row => buildPortPayload({ ...row }))
 
     const res = await api('/api/proxy-ports/bulk', 'POST', { ports: payload })
     if (res.success) {
@@ -1845,8 +2009,16 @@ const formatLatency = (latency) => {
   return `${latency}ms`
 }
 
+watch(expandedPortIds, () => {
+  scheduleExpandedPortRuntimePolling()
+}, { deep: true })
+
 onMounted(() => {
   loadAll()
+})
+
+onBeforeUnmount(() => {
+  stopExpandedPortRuntimePolling()
 })
 </script>
 
@@ -1995,6 +2167,12 @@ onMounted(() => {
 
 .status-dot.status-off {
   background-color: #9ca3af;
+}
+
+.port-runtime-subtext {
+  font-size: 11px;
+  color: var(--n-text-color-3);
+  line-height: 1.35;
 }
 
 .port-new-draft {

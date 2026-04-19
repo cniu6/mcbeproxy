@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -107,6 +108,34 @@ func (m *ProxyPortManager) stopListeners(wait bool, closeDialers bool) {
 	}
 }
 
+func (m *ProxyPortManager) GetActiveConnectionCount() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	total := 0
+	for _, listener := range m.listeners {
+		total += listener.ActiveConnections()
+	}
+	return total
+}
+
+func (m *ProxyPortManager) GetActiveConnectionCountForPort(id string) int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	listener, ok := m.listeners[id]
+	if !ok || listener == nil {
+		return 0
+	}
+	return listener.ActiveConnections()
+}
+
 type proxyPortDialerPool struct {
 	mu      sync.Mutex
 	factory singboxcore.Factory
@@ -158,6 +187,7 @@ type proxyPortListener struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	allowList   []*net.IPNet
+	activeConns atomic.Int64
 }
 
 func newProxyPortListener(cfg *config.ProxyPortConfig, outboundMgr OutboundManager, dialerPool *proxyPortDialerPool) *proxyPortListener {
@@ -166,6 +196,13 @@ func newProxyPortListener(cfg *config.ProxyPortConfig, outboundMgr OutboundManag
 		outboundMgr: outboundMgr,
 		dialerPool:  dialerPool,
 	}
+}
+
+func (l *proxyPortListener) ActiveConnections() int {
+	if l == nil {
+		return 0
+	}
+	return int(l.activeConns.Load())
 }
 
 func (l *proxyPortListener) Start() error {
@@ -225,6 +262,8 @@ func (l *proxyPortListener) acceptLoop() {
 		l.wg.Add(1)
 		go func(c net.Conn) {
 			defer l.wg.Done()
+			l.activeConns.Add(1)
+			defer l.activeConns.Add(-1)
 			l.handleConn(c)
 		}(conn)
 	}
@@ -605,7 +644,7 @@ func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (n
 	attempts := proxySelectionAttemptLimit(l.cfg, l.outboundMgr)
 
 	for i := 0; i < attempts; i++ {
-		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer("", l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
+		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
 		if err != nil {
 			return nil, "", err
 		}

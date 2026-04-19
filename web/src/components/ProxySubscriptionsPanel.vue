@@ -87,7 +87,7 @@
         :checked-row-keys="checkedSubscriptionIds"
         @update:checked-row-keys="onCheckedKeysChange"
         :bordered="false"
-        :scroll-x="1180"
+        :scroll-x="1680"
         :pagination="false"
         :loading="loading"
       />
@@ -166,6 +166,35 @@
             <n-input v-model:value="form.user_agent" placeholder="默认 Mozilla/5.0" />
           </n-form-item>
         </n-gi>
+        <n-gi>
+          <n-form-item label="自动更新">
+            <n-switch v-model:value="form.auto_update_enabled" />
+          </n-form-item>
+        </n-gi>
+        <n-gi v-if="form.auto_update_enabled">
+          <n-form-item label="调度方式">
+            <n-select
+              v-model:value="form.auto_update_mode"
+              :options="autoUpdateModeOptions"
+              :clearable="false"
+            />
+          </n-form-item>
+        </n-gi>
+        <n-gi v-if="form.auto_update_enabled && form.auto_update_mode === 'daily'">
+          <n-form-item label="每日时间">
+            <n-input v-model:value="form.auto_update_time" placeholder="04:00" />
+          </n-form-item>
+        </n-gi>
+        <n-gi v-if="form.auto_update_enabled && form.auto_update_mode === 'interval'">
+          <n-form-item label="间隔天数">
+            <n-input-number v-model:value="form.auto_update_interval_days" :min="1" style="width: 100%" />
+          </n-form-item>
+        </n-gi>
+        <n-gi v-if="form.auto_update_enabled" :span="2">
+          <n-alert type="info" :show-icon="false">
+            仅在无人连接时自动执行。如果到点还有玩家在线，会顺延到连接清空后再补更新。
+          </n-alert>
+        </n-gi>
       </n-grid>
     </n-form>
     <template #footer>
@@ -183,7 +212,7 @@
 <script setup>
 import { computed, h, onMounted, ref } from 'vue'
 import { NButton, NPopconfirm, NTag, NSpace, NText, useMessage } from 'naive-ui'
-import { api } from '../api'
+import { api, formatBytes } from '../api'
 
 const props = defineProps({
   outbounds: { type: Array, default: () => [] }
@@ -251,11 +280,19 @@ const createDefaultForm = () => ({
   enabled: true,
   group: '',
   proxy_name: null,
-  user_agent: 'Mozilla/5.0'
+  user_agent: 'Mozilla/5.0',
+  auto_update_enabled: true,
+  auto_update_mode: 'daily',
+  auto_update_time: '04:00',
+  auto_update_interval_days: 1
 })
 
 const form = ref(createDefaultForm())
 const updateProxySelection = ref('__saved__')
+const autoUpdateModeOptions = [
+  { label: '每日定时', value: 'daily' },
+  { label: '每隔一段时间(天)', value: 'interval' }
+]
 
 const proxyOptions = computed(() => {
   const options = [{ label: '直连 (不使用代理)', value: null }]
@@ -320,6 +357,58 @@ const summarizeUpdateResult = (row) => {
   return `+${row.last_added || 0} / ~${row.last_updated || 0} / -${row.last_removed || 0}`
 }
 
+const getSubscriptionUsedBytes = (row) => {
+  return Math.max(0, Number(row?.last_subscription_upload_bytes || 0) + Number(row?.last_subscription_download_bytes || 0))
+}
+
+const getSubscriptionRemainingBytes = (row) => {
+  const total = Number(row?.last_subscription_total_bytes || 0)
+  if (total <= 0) return null
+  return Math.max(total - getSubscriptionUsedBytes(row), 0)
+}
+
+const formatSubscriptionTrafficPrimary = (row) => {
+  const total = Number(row?.last_subscription_total_bytes || 0)
+  const used = getSubscriptionUsedBytes(row)
+  if (total > 0) {
+    return `已用 ${formatBytes(used)} / 总 ${formatBytes(total)}`
+  }
+  if (used > 0) {
+    return `已用 ${formatBytes(used)}`
+  }
+  return '-'
+}
+
+const formatSubscriptionTrafficSecondary = (row) => {
+  const upload = Number(row?.last_subscription_upload_bytes || 0)
+  const download = Number(row?.last_subscription_download_bytes || 0)
+  const remaining = getSubscriptionRemainingBytes(row)
+  const parts = []
+  if (upload > 0 || download > 0) {
+    parts.push(`↑${formatBytes(upload)} / ↓${formatBytes(download)}`)
+  }
+  if (remaining !== null) {
+    parts.push(`剩余 ${formatBytes(remaining)}`)
+  }
+  return parts.join(' / ') || '-'
+}
+
+const hasSubscriptionTrafficInfo = (row) => {
+  return Number(row?.last_subscription_total_bytes || 0) > 0 ||
+    Number(row?.last_subscription_upload_bytes || 0) > 0 ||
+    Number(row?.last_subscription_download_bytes || 0) > 0
+}
+
+const getExpireTagType = (value) => {
+  if (!value) return 'default'
+  const expireAt = new Date(value).getTime()
+  if (Number.isNaN(expireAt)) return 'default'
+  const diff = expireAt - Date.now()
+  if (diff <= 0) return 'error'
+  if (diff <= 3 * 24 * 60 * 60 * 1000) return 'warning'
+  return 'success'
+}
+
 const loadSubscriptions = async () => {
   loading.value = true
   try {
@@ -348,7 +437,11 @@ const openEditModal = (row) => {
     enabled: row.enabled !== false,
     group: row.group || '',
     proxy_name: row.proxy_name || null,
-    user_agent: row.user_agent || 'Mozilla/5.0'
+    user_agent: row.user_agent || 'Mozilla/5.0',
+    auto_update_enabled: row.auto_update_enabled !== false,
+    auto_update_mode: row.auto_update_mode || 'daily',
+    auto_update_time: row.auto_update_time || '04:00',
+    auto_update_interval_days: row.auto_update_interval_days || 1
   }
   showEditModal.value = true
 }
@@ -360,13 +453,21 @@ const saveSubscription = async () => {
   }
   saving.value = true
   try {
+    if (form.value.auto_update_enabled && form.value.auto_update_mode === 'daily' && !isValidAutoUpdateTime(form.value.auto_update_time)) {
+      message.warning('每日时间格式应为 HH:mm，例如 04:00')
+      return false
+    }
     const payload = {
       name: form.value.name.trim(),
       url: form.value.url.trim(),
       enabled: !!form.value.enabled,
       group: form.value.group?.trim() || '',
       proxy_name: form.value.proxy_name || '',
-      user_agent: form.value.user_agent?.trim() || 'Mozilla/5.0'
+      user_agent: form.value.user_agent?.trim() || 'Mozilla/5.0',
+      auto_update_enabled: !!form.value.auto_update_enabled,
+      auto_update_mode: form.value.auto_update_mode || 'daily',
+      auto_update_time: (form.value.auto_update_time || '04:00').trim(),
+      auto_update_interval_days: Math.max(1, Number(form.value.auto_update_interval_days) || 1)
     }
     const res = editingId.value
       ? await api(`/api/proxy-subscriptions/${editingId.value}`, 'PUT', payload)
@@ -532,6 +633,18 @@ const emitRefresh = async () => {
   emit('refresh')
 }
 
+const isValidAutoUpdateTime = (value) => /^([01]\d|2[0-3]):([0-5]\d)$/.test(String(value || '').trim())
+
+const formatAutoUpdatePlan = (row) => {
+  if (row?.auto_update_enabled === false) {
+    return '已关闭'
+  }
+  if (row?.auto_update_mode === 'interval') {
+    return `每 ${row?.auto_update_interval_days || 1} 天`
+  }
+  return `每日 ${row?.auto_update_time || '04:00'}`
+}
+
 const subscriptionColumns = [
   // Row selection checkbox column. Combined with the `rowKey` binding on
   // the table above, this lets users cherry-pick which subscriptions to
@@ -570,6 +683,15 @@ const subscriptionColumns = [
     ])
   },
   {
+    title: '自动更新',
+    key: 'auto_update',
+    width: 170,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h(NTag, { type: row.auto_update_enabled === false ? 'default' : 'success', size: 'small', bordered: false }, () => row.auto_update_enabled === false ? '已关闭' : '已开启'),
+      h(NText, { depth: 3, style: 'font-size: 12px' }, () => `${formatAutoUpdatePlan(row)} / 无人连接时执行`)
+    ])
+  },
+  {
     title: '节点数',
     key: 'last_node_count',
     width: 90,
@@ -580,6 +702,31 @@ const subscriptionColumns = [
     key: 'last_change',
     width: 140,
     render: (row) => summarizeUpdateResult(row)
+  },
+  {
+    title: '流量',
+    key: 'last_subscription_total_bytes',
+    width: 230,
+    render: (row) => {
+      if (!hasSubscriptionTrafficInfo(row)) {
+        return h(NText, { depth: 3 }, () => '-')
+      }
+      return h(NSpace, { vertical: true, size: 2 }, () => [
+        h(NText, { strong: true }, () => formatSubscriptionTrafficPrimary(row)),
+        h(NText, { depth: 3, style: 'font-size: 12px' }, () => formatSubscriptionTrafficSecondary(row))
+      ])
+    }
+  },
+  {
+    title: '到期时间',
+    key: 'last_subscription_expire_at',
+    width: 180,
+    render: (row) => {
+      if (!row.last_subscription_expire_at) {
+        return h(NText, { depth: 3 }, () => '-')
+      }
+      return h(NTag, { type: getExpireTagType(row.last_subscription_expire_at), size: 'small', bordered: false }, () => formatDateTime(row.last_subscription_expire_at))
+    }
   },
   {
     title: '最近更新',

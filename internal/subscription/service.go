@@ -30,12 +30,25 @@ type ParsedOutbound struct {
 }
 
 type UpdateResult struct {
-	NodeCount    int    `json:"node_count"`
-	AddedCount   int    `json:"added_count"`
-	UpdatedCount int    `json:"updated_count"`
-	RemovedCount int    `json:"removed_count"`
-	ProxyUsed    string `json:"proxy_used,omitempty"`
-	ContentSize  int    `json:"content_size"`
+	NodeCount                 int        `json:"node_count"`
+	AddedCount                int        `json:"added_count"`
+	UpdatedCount              int        `json:"updated_count"`
+	RemovedCount              int        `json:"removed_count"`
+	ProxyUsed                 string     `json:"proxy_used,omitempty"`
+	ContentSize               int        `json:"content_size"`
+	SubscriptionUploadBytes   int64      `json:"subscription_upload_bytes,omitempty"`
+	SubscriptionDownloadBytes int64      `json:"subscription_download_bytes,omitempty"`
+	SubscriptionTotalBytes    int64      `json:"subscription_total_bytes,omitempty"`
+	SubscriptionExpireAt      *time.Time `json:"subscription_expire_at,omitempty"`
+}
+
+type FetchResult struct {
+	Content                   []byte
+	ProxyUsed                 string
+	SubscriptionUploadBytes   int64
+	SubscriptionDownloadBytes int64
+	SubscriptionTotalBytes    int64
+	SubscriptionExpireAt      time.Time
 }
 
 type Service struct {
@@ -59,9 +72,9 @@ func NewServiceWithSingboxFactory(configMgr *config.ProxyOutboundConfigManager, 
 	return &Service{configMgr: configMgr, outboundMgr: outboundMgr, singboxFactory: factory}
 }
 
-func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscription) ([]byte, string, error) {
+func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscription) (*FetchResult, error) {
 	if sub == nil {
-		return nil, "", fmt.Errorf("proxy subscription is nil")
+		return nil, fmt.Errorf("proxy subscription is nil")
 	}
 	var httpClient *http.Client
 	var dialerToClose singboxcore.Dialer
@@ -69,14 +82,14 @@ func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscriptio
 	if proxyName != "" && proxyName != "direct" && s.outboundMgr != nil {
 		cfg, exists := s.outboundMgr.GetOutbound(proxyName)
 		if !exists || cfg == nil {
-			return nil, "", fmt.Errorf("proxy outbound not found: %s", proxyName)
+			return nil, fmt.Errorf("proxy outbound not found: %s", proxyName)
 		}
 		if !cfg.Enabled {
-			return nil, "", fmt.Errorf("proxy outbound is disabled: %s", proxyName)
+			return nil, fmt.Errorf("proxy outbound is disabled: %s", proxyName)
 		}
 		dialer, err := s.singboxFactory.CreateDialer(ctx, cfg)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to create proxy dialer: %w", err)
+			return nil, fmt.Errorf("failed to create proxy dialer: %w", err)
 		}
 		dialerToClose = dialer
 		httpClient = &http.Client{
@@ -103,33 +116,45 @@ func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscriptio
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid subscription url: %w", err)
+		return nil, fmt.Errorf("invalid subscription url: %w", err)
 	}
-	request.Header.Set("User-Agent", strings.TrimSpace(sub.UserAgent))
+	userAgent := strings.TrimSpace(sub.UserAgent)
+	if userAgent == "" {
+		userAgent = "Mozilla/5.0"
+	}
+	request.Header.Set("User-Agent", userAgent)
 	response, err := httpClient.Do(request)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to fetch subscription: %w", err)
+		return nil, fmt.Errorf("failed to fetch subscription: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("subscription server returned HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("subscription server returned HTTP %d", response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 10*1024*1024))
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to read subscription content: %w", err)
+		return nil, fmt.Errorf("failed to read subscription content: %w", err)
 	}
-	return body, proxyName, nil
+	uploadBytes, downloadBytes, totalBytes, expireAt := parseSubscriptionUserInfoHeader(response.Header.Get("Subscription-Userinfo"))
+	return &FetchResult{
+		Content:                   body,
+		ProxyUsed:                 proxyName,
+		SubscriptionUploadBytes:   uploadBytes,
+		SubscriptionDownloadBytes: downloadBytes,
+		SubscriptionTotalBytes:    totalBytes,
+		SubscriptionExpireAt:      expireAt,
+	}, nil
 }
 
 func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubscription) (*UpdateResult, error) {
 	if sub == nil {
 		return nil, fmt.Errorf("proxy subscription is nil")
 	}
-	content, proxyUsed, err := s.FetchContent(ctx, sub)
+	fetchResult, err := s.FetchContent(ctx, sub)
 	if err != nil {
 		return nil, err
 	}
-	parsed, err := ParseSubscriptionContent(content)
+	parsed, err := ParseSubscriptionContent(fetchResult.Content)
 	if err != nil {
 		return nil, err
 	}
@@ -155,22 +180,6 @@ func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubsc
 		effectiveGroup = strings.TrimSpace(sub.Name)
 	}
 
-	// Two-pass name assignment:
-	//
-	//   Pass 1 — existing nodes keep their previously-assigned names so
-	//            server/node-group configs that reference them stay stable.
-	//   Pass 2 — brand-new nodes get fresh unique names via
-	//            uniqueOutboundName, which at this point sees every
-	//            preserved name in usedNames and can never collide.
-	//
-	// The previous single-pass loop ordered by parsed order, so a NEW node
-	// whose BaseName happened to match an existing node's previous name
-	// could grab that name first (nothing in usedNames yet). The existing
-	// node would then reuse `previous.Name` and hit `ReplaceSubscriptionOutbounds`'
-	// duplicate-name guard, failing the entire subscription update and
-	// discarding all N parsed nodes. This is why real-world subscriptions
-	// that changed a node's server keep failing with messages like
-	// `duplicate proxy outbound name 🇹🇼台湾家宽|高速03`.
 	seenSource := make(map[string]struct{}, len(parsed))
 	type preparedNode struct {
 		node     *config.ProxyOutbound
@@ -206,15 +215,10 @@ func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubsc
 	addedCount := 0
 	updatedCount := 0
 
-	// Pass 1: preserve stable names for existing nodes.
 	for _, pn := range existingNodes {
 		previous := existingBySource[pn.node.SubscriptionNodeID]
 		preservedName := previous.Name
 		if _, taken := usedNames[preservedName]; taken {
-			// Defensive: a prior duplicate (e.g. legacy data, or manual
-			// config edit) means two existing nodes want the same name.
-			// Fall back to a fresh unique name so the update still
-			// succeeds instead of aborting the whole subscription.
 			preservedName = uniqueOutboundName(pn.baseName, sub.Name, usedNames)
 			logger.Warn("Subscription %q: existing node %q had a name collision, renaming to %q", sub.Name, previous.Name, preservedName)
 		}
@@ -231,8 +235,6 @@ func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubsc
 		next = append(next, pn.node)
 	}
 
-	// Pass 2: assign fresh names to new nodes; usedNames now includes
-	// every preserved name from pass 1 so there cannot be a collision.
 	for _, pn := range newNodes {
 		pn.node.Name = uniqueOutboundName(pn.baseName, sub.Name, usedNames)
 		addedCount++
@@ -254,13 +256,23 @@ func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubsc
 		return nil, err
 	}
 
+	var subscriptionExpireAt *time.Time
+	if !fetchResult.SubscriptionExpireAt.IsZero() {
+		expireAt := fetchResult.SubscriptionExpireAt
+		subscriptionExpireAt = &expireAt
+	}
+
 	return &UpdateResult{
-		NodeCount:    len(next),
-		AddedCount:   addedCount,
-		UpdatedCount: updatedCount,
-		RemovedCount: removedCount,
-		ProxyUsed:    proxyUsed,
-		ContentSize:  len(content),
+		NodeCount:                 len(next),
+		AddedCount:                addedCount,
+		UpdatedCount:              updatedCount,
+		RemovedCount:              removedCount,
+		ProxyUsed:                 fetchResult.ProxyUsed,
+		ContentSize:               len(fetchResult.Content),
+		SubscriptionUploadBytes:   fetchResult.SubscriptionUploadBytes,
+		SubscriptionDownloadBytes: fetchResult.SubscriptionDownloadBytes,
+		SubscriptionTotalBytes:    fetchResult.SubscriptionTotalBytes,
+		SubscriptionExpireAt:      subscriptionExpireAt,
 	}, nil
 }
 
@@ -318,6 +330,56 @@ func (s *Service) syncRuntime(previous []*config.ProxyOutbound, next []*config.P
 		}
 	}
 	return nil
+}
+
+func parseSubscriptionUserInfoHeader(value string) (int64, int64, int64, time.Time) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, 0, 0, time.Time{}
+	}
+
+	var uploadBytes int64
+	var downloadBytes int64
+	var totalBytes int64
+	var expireSeconds int64
+
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ';' || r == '&' || r == '\n' || r == '\r'
+	})
+
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		key, rawValue, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		parsedValue, err := strconv.ParseInt(strings.Trim(strings.TrimSpace(rawValue), `"'`), 10, 64)
+		if err != nil || parsedValue < 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "upload":
+			uploadBytes = parsedValue
+		case "download":
+			downloadBytes = parsedValue
+		case "total":
+			totalBytes = parsedValue
+		case "expire", "expires", "expiration":
+			expireSeconds = parsedValue
+		}
+	}
+
+	if expireSeconds > 1_000_000_000_000 {
+		expireSeconds /= 1000
+	}
+	if expireSeconds <= 0 {
+		return uploadBytes, downloadBytes, totalBytes, time.Time{}
+	}
+
+	return uploadBytes, downloadBytes, totalBytes, time.Unix(expireSeconds, 0).UTC()
 }
 
 func ParseSubscriptionContent(content []byte) ([]ParsedOutbound, error) {
@@ -649,10 +711,10 @@ func parseVmess(link string) (ParsedOutbound, bool) {
 		Security:    firstNonEmpty(getString(item, "scy"), "auto"),
 		TLS:         tlsEnabled,
 		SNI:         getString(item, "sni"),
-		Fingerprint: getString(item, "fp"),
+		Fingerprint: firstNonEmpty(getString(item, "fp"), getString(item, "fingerprint"), getString(item, "client-fingerprint"), getString(item, "client_fingerprint")),
 		Enabled:     true,
 	}
-	if allow := getBoolAlt(item, "allowInsecure", "allow_insecure", "insecure"); allow {
+	if allow := getBoolAlt(item, "allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify"); allow {
 		outbound.Insecure = true
 	}
 	if strings.ToLower(getString(item, "net")) == "ws" {
@@ -764,10 +826,10 @@ func parseTrojan(link string) (ParsedOutbound, bool) {
 		TLS:         security != "none",
 		SNI:         firstNonEmpty(parts.Query.Get("sni"), parts.Query.Get("peer"), server),
 		ALPN:        parts.Query.Get("alpn"),
-		Fingerprint: firstNonEmpty(parts.Query.Get("fp"), parts.Query.Get("fingerprint"), parts.Query.Get("client-fingerprint")),
+		Fingerprint: queryFingerprint(parts.Query),
 		Enabled:     true,
 	}
-	outbound.Insecure = getBoolString(parts.Query.Get("allowInsecure")) || getBoolString(parts.Query.Get("insecure")) || getBoolString(parts.Query.Get("skip-cert-verify")) || (outbound.SNI != "" && outbound.SNI != server)
+	outbound.Insecure = queryAllowInsecure(parts.Query)
 	switch strings.ToLower(parts.Query.Get("type")) {
 	case "ws":
 		outbound.Network = "ws"
@@ -815,22 +877,18 @@ func parseSOCKS5(link string) (ParsedOutbound, bool) {
 	password = firstNonEmpty(password, queryFirst(query, "password", "pass"))
 	tlsEnabled := getBoolString(queryFirst(query, "tls", "secure")) || strings.EqualFold(queryFirst(query, "security"), "tls")
 	outbound := &config.ProxyOutbound{
-		Name:     fallbackName(decodeURLFragment(parsed.Fragment), server, port),
-		Type:     config.ProtocolSOCKS5,
-		Server:   server,
-		Port:     port,
-		Username: username,
-		Password: password,
-		TLS:      tlsEnabled,
-		SNI:      queryFirst(query, "sni", "peer"),
-		ALPN:     queryFirst(query, "alpn"),
-		Fingerprint: firstNonEmpty(
-			queryFirst(query, "fp"),
-			queryFirst(query, "fingerprint"),
-			queryFirst(query, "client-fingerprint"),
-		),
-		Insecure: getBoolString(queryFirst(query, "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify")),
-		Enabled:  true,
+		Name:        fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Type:        config.ProtocolSOCKS5,
+		Server:      server,
+		Port:        port,
+		Username:    username,
+		Password:    password,
+		TLS:         tlsEnabled,
+		SNI:         queryFirst(query, "sni", "peer"),
+		ALPN:        queryFirst(query, "alpn"),
+		Fingerprint: queryFingerprint(query),
+		Insecure:    queryAllowInsecure(query),
+		Enabled:     true,
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -866,22 +924,18 @@ func parseHTTP(link string) (ParsedOutbound, bool) {
 		tlsEnabled = getBoolString(rawTLS)
 	}
 	outbound := &config.ProxyOutbound{
-		Name:     fallbackName(decodeURLFragment(parsed.Fragment), server, port),
-		Type:     config.ProtocolHTTP,
-		Server:   server,
-		Port:     port,
-		Username: username,
-		Password: password,
-		TLS:      tlsEnabled,
-		SNI:      queryFirst(query, "sni", "peer"),
-		ALPN:     queryFirst(query, "alpn"),
-		Fingerprint: firstNonEmpty(
-			queryFirst(query, "fp"),
-			queryFirst(query, "fingerprint"),
-			queryFirst(query, "client-fingerprint"),
-		),
-		Insecure: getBoolString(queryFirst(query, "allowInsecure", "insecure", "skip-cert-verify", "skip_cert_verify")),
-		Enabled:  true,
+		Name:        fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Type:        config.ProtocolHTTP,
+		Server:      server,
+		Port:        port,
+		Username:    username,
+		Password:    password,
+		TLS:         tlsEnabled,
+		SNI:         queryFirst(query, "sni", "peer"),
+		ALPN:        queryFirst(query, "alpn"),
+		Fingerprint: queryFingerprint(query),
+		Insecure:    queryAllowInsecure(query),
+		Enabled:     true,
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -922,13 +976,13 @@ func parseAnyTLS(link string) (ParsedOutbound, bool) {
 		TLS:                      true,
 		SNI:                      firstNonEmpty(parsed.Query().Get("sni"), server),
 		ALPN:                     parsed.Query().Get("alpn"),
-		Fingerprint:              parsed.Query().Get("fp"),
+		Fingerprint:              queryFingerprint(parsed.Query()),
 		IdleSessionCheckInterval: idleSessionCheckInterval,
 		IdleSessionTimeout:       idleSessionTimeout,
 		MinIdleSession:           minIdleSession,
 		Enabled:                  true,
 	}
-	outbound.Insecure = getBoolString(parsed.Query().Get("allowInsecure")) || getBoolString(parsed.Query().Get("insecure"))
+	outbound.Insecure = queryAllowInsecure(parsed.Query())
 	if isReality {
 		outbound.Reality = true
 		outbound.Insecure = true
@@ -964,10 +1018,10 @@ func parseVLESS(link string) (ParsedOutbound, bool) {
 		TLS:         isTLS,
 		SNI:         firstNonEmpty(parts.Query.Get("sni"), server),
 		ALPN:        parts.Query.Get("alpn"),
-		Fingerprint: parts.Query.Get("fp"),
+		Fingerprint: queryFingerprint(parts.Query),
 		Enabled:     true,
 	}
-	outbound.Insecure = getBoolString(parts.Query.Get("allowInsecure")) || getBoolString(parts.Query.Get("insecure"))
+	outbound.Insecure = queryAllowInsecure(parts.Query)
 	if isReality {
 		outbound.Reality = true
 		outbound.Insecure = true
@@ -1010,19 +1064,21 @@ func parseHysteria2(link string) (ParsedOutbound, bool) {
 		return ParsedOutbound{}, false
 	}
 	outbound := &config.ProxyOutbound{
-		Name:         fallbackName(decodeURLFragment(parsed.Fragment), server, port),
-		Type:         config.ProtocolHysteria2,
-		Server:       server,
-		Port:         port,
-		Password:     decodePercent(parsed.User.Username()),
-		Obfs:         parsed.Query().Get("obfs"),
-		ObfsPassword: parsed.Query().Get("obfs-password"),
-		PortHopping:  firstNonEmpty(parsed.Query().Get("mport"), parsed.Query().Get("ports")),
-		TLS:          true,
-		SNI:          firstNonEmpty(parsed.Query().Get("sni"), server),
-		Enabled:      true,
+		Name:            fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Type:            config.ProtocolHysteria2,
+		Server:          server,
+		Port:            port,
+		Password:        decodePercent(parsed.User.Username()),
+		Obfs:            parsed.Query().Get("obfs"),
+		ObfsPassword:    parsed.Query().Get("obfs-password"),
+		PortHopping:     firstNonEmpty(parsed.Query().Get("mport"), parsed.Query().Get("ports")),
+		ALPN:            parsed.Query().Get("alpn"),
+		CertFingerprint: queryFirst(parsed.Query(), "pinSHA256", "pin_sha256", "cert-fingerprint", "cert_fingerprint", "certFingerprint"),
+		TLS:             true,
+		SNI:             firstNonEmpty(parsed.Query().Get("sni"), server),
+		Enabled:         true,
 	}
-	outbound.Insecure = getBoolString(parsed.Query().Get("insecure"))
+	outbound.Insecure = queryAllowInsecure(parsed.Query())
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
 	}
@@ -1208,6 +1264,19 @@ func queryFirst(values url.Values, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func queryAllowInsecure(values url.Values) bool {
+	return getBoolString(queryFirst(values, "allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify"))
+}
+
+func queryFingerprint(values url.Values) string {
+	return firstNonEmpty(
+		queryFirst(values, "fp"),
+		queryFirst(values, "fingerprint"),
+		queryFirst(values, "client-fingerprint"),
+		queryFirst(values, "client_fingerprint"),
+	)
 }
 
 func isPlainProxyURLPath(value string) bool {

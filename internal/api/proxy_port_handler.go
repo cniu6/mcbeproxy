@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/proxy"
 )
 
 type bulkCreateProxyPortsRequest struct {
@@ -42,6 +43,24 @@ type testProxyPortResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type proxyPortRuntimeDTO struct {
+	PortID            string `json:"port_id"`
+	ActiveConnections int    `json:"active_connections"`
+	CurrentNode       string `json:"current_node,omitempty"`
+	HasNode           bool   `json:"has_node"`
+	TCPMs             int64  `json:"tcp_ms,omitempty"`
+	UDPMs             int64  `json:"udp_ms,omitempty"`
+	HTTPMs            int64  `json:"http_ms,omitempty"`
+	HasTCP            bool   `json:"has_tcp,omitempty"`
+	HasUDP            bool   `json:"has_udp,omitempty"`
+	HasHTTP           bool   `json:"has_http,omitempty"`
+}
+
+type proxyPortListDTO struct {
+	*config.ProxyPortConfig
+	proxyPortRuntimeDTO
+}
+
 // defaultProxyPortTestURL is used when the caller doesn't supply one.
 // google.com/generate_204 is a well-known captive-portal test endpoint:
 // fast, returns HTTP 204 on success, low payload, censored region safe as a reachability signal.
@@ -56,7 +75,70 @@ func (a *APIServer) getProxyPorts(c *gin.Context) {
 		return
 	}
 	ports := a.proxyPortConfigMgr.GetAllPorts()
-	respondSuccess(c, ports)
+	dtos := make([]proxyPortListDTO, 0, len(ports))
+	for _, port := range ports {
+		if port == nil {
+			continue
+		}
+		clone := port.Clone()
+		dtos = append(dtos, proxyPortListDTO{
+			ProxyPortConfig:     clone,
+			proxyPortRuntimeDTO: a.buildProxyPortRuntimeSnapshot(clone),
+		})
+	}
+	respondSuccess(c, dtos)
+}
+
+func (a *APIServer) getProxyPortRuntime(c *gin.Context) {
+	if a.proxyPortConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
+		return
+	}
+
+	portID := strings.TrimSpace(c.Param("id"))
+	if portID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "id parameter is required")
+		return
+	}
+
+	port, exists := a.proxyPortConfigMgr.GetPort(portID)
+	if !exists || port == nil {
+		respondError(c, http.StatusNotFound, "Proxy port not found", "no proxy port with id "+portID)
+		return
+	}
+
+	respondSuccess(c, a.buildProxyPortRuntimeSnapshot(port))
+}
+
+func (a *APIServer) buildProxyPortRuntimeSnapshot(port *config.ProxyPortConfig) proxyPortRuntimeDTO {
+	dto := proxyPortRuntimeDTO{}
+	if port == nil {
+		return dto
+	}
+
+	dto.PortID = port.ID
+	if a.proxyOutboundHandler != nil {
+		ref := a.proxyOutboundHandler.buildProxyPortUsageRef(port)
+		dto.ActiveConnections = ref.ActiveConnections
+		dto.CurrentNode = ref.CurrentNode
+		dto.HasNode = ref.HasNode
+		dto.TCPMs = ref.TCPMs
+		dto.UDPMs = ref.UDPMs
+		dto.HTTPMs = ref.HTTPMs
+		dto.HasTCP = ref.HasTCP
+		dto.HasUDP = ref.HasUDP
+		dto.HasHTTP = ref.HasHTTP
+	}
+
+	if port.IsDirectConnection() {
+		dto.CurrentNode = proxy.DirectNodeName
+		dto.HasNode = true
+		dto.HasTCP = false
+		dto.HasUDP = false
+		dto.HasHTTP = false
+	}
+
+	return dto
 }
 
 func (a *APIServer) createProxyPort(c *gin.Context) {

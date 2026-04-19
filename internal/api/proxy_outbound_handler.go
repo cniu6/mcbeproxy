@@ -31,12 +31,18 @@ import (
 // ProxyOutboundHandler handles REST API requests for proxy outbound management.
 // Requirements: 5.3
 type ProxyOutboundHandler struct {
-	configMgr       *config.ProxyOutboundConfigManager
-	subConfigMgr    *config.ProxySubscriptionConfigManager
-	serverConfigMgr *config.ConfigManager
-	outboundMgr     proxy.OutboundManager
-	singboxFactory  singboxcore.Factory
-	subService      *subscription.Service
+	configMgr        *config.ProxyOutboundConfigManager
+	subConfigMgr     *config.ProxySubscriptionConfigManager
+	serverConfigMgr  *config.ConfigManager
+	outboundMgr      proxy.OutboundManager
+	singboxFactory   singboxcore.Factory
+	subService       *subscription.Service
+	activityProvider proxyOutboundUsageActivityProvider
+}
+
+type proxyOutboundUsageActivityProvider interface {
+	GetActiveSessionsForServer(serverID string) int
+	GetActiveConnectionsForProxyPort(portID string) int
 }
 
 var metadataLikeImportNamePattern = regexp.MustCompile(`(?i)^(剩余流量|套餐到期|到期时间|过期时间|流量重置|订阅信息|订阅更新时间|更新时间|使用说明|官网|公告|客服|telegram|tg|email|邮箱)\s*[：:]`)
@@ -277,7 +283,8 @@ type TestResult struct {
 
 // NameRequest represents a request with just a name field.
 type NameRequest struct {
-	Name string `json:"name" binding:"required"`
+	Name     string `json:"name" binding:"required"`
+	ServerID string `json:"server_id,omitempty"`
 }
 
 type BatchProxyTestRequest struct {
@@ -355,6 +362,11 @@ type ProxySubscriptionDTO struct {
 	LastUpdated   int    `json:"last_updated,omitempty"`
 	LastRemoved   int    `json:"last_removed,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
+}
+
+type ServerNodeLatencyHistoryItem struct {
+	Name    string                          `json:"name"`
+	Samples []proxy.ServerNodeLatencySample `json:"samples"`
 }
 
 type ProxySubscriptionRequest struct {
@@ -732,7 +744,7 @@ func isMetadataLikeImportName(name string) bool {
 func filterImportableParsedOutbounds(parsed []subscription.ParsedOutbound) []*config.ProxyOutbound {
 	items := make([]*config.ProxyOutbound, 0, len(parsed))
 	for _, item := range parsed {
-		if item.Outbound == nil || isMetadataLikeImportName(item.Outbound.Name) {
+		if item.Outbound == nil {
 			continue
 		}
 		items = append(items, item.Outbound.Clone())
@@ -861,7 +873,7 @@ func (h *ProxyOutboundHandler) TestProxyOutbound(c *gin.Context) {
 		return
 	}
 
-	h.doTestOutbound(c, name)
+	h.doTestOutbound(c, name, "")
 }
 
 // TestProxyOutboundByBody tests the connection to a proxy outbound using name from request body.
@@ -874,7 +886,7 @@ func (h *ProxyOutboundHandler) TestProxyOutboundByBody(c *gin.Context) {
 		return
 	}
 
-	h.doTestOutbound(c, req.Name)
+	h.doTestOutbound(c, req.Name, strings.TrimSpace(req.ServerID))
 }
 
 func (h *ProxyOutboundHandler) executeTCPTest(ctx context.Context, name string) TestResult {
@@ -901,7 +913,10 @@ func (h *ProxyOutboundHandler) executeTCPTest(ctx context.Context, name string) 
 }
 
 // doTestOutbound performs the actual test logic
-func (h *ProxyOutboundHandler) doTestOutbound(c *gin.Context, name string) {
+func (h *ProxyOutboundHandler) doTestOutbound(c *gin.Context, name, serverID string) {
+	name = strings.TrimSpace(name)
+	serverID = strings.TrimSpace(serverID)
+
 	// Check if outbound exists
 	_, exists := h.configMgr.GetOutbound(name)
 	if !exists {
@@ -918,6 +933,13 @@ func (h *ProxyOutboundHandler) doTestOutbound(c *gin.Context, name string) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 	result := h.executeTCPTest(ctx, name)
+	if serverID != "" && h.outboundMgr != nil {
+		if result.Success {
+			h.outboundMgr.SetServerNodeLatency(serverID, name, config.LoadBalanceSortTCP, result.LatencyMs)
+		} else {
+			h.outboundMgr.SetServerNodeLatency(serverID, name, config.LoadBalanceSortTCP, 0)
+		}
+	}
 	respondSuccess(c, result)
 }
 
@@ -1386,6 +1408,9 @@ func (h *ProxyOutboundHandler) executeBatchHTTPTest(ctx context.Context, name st
 			h.updateOutboundRuntime(name, func(outbound *config.ProxyOutbound) {
 				outbound.SetHTTPLatencyMs(0)
 			})
+			if strings.TrimSpace(req.ServerID) != "" && h.outboundMgr != nil {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, name, config.LoadBalanceSortHTTP, 0)
+			}
 			return item
 		}
 		defer dialer.Close()
@@ -1452,6 +1477,13 @@ func (h *ProxyOutboundHandler) executeBatchHTTPTest(ctx context.Context, name st
 		item.Error = firstHTTPFailure(httpTests, customResult)
 		if strings.TrimSpace(item.Error) == "" {
 			item.Error = "http test failed"
+		}
+	}
+	if strings.TrimSpace(req.ServerID) != "" && h.outboundMgr != nil {
+		if bestLatency >= 0 {
+			h.outboundMgr.SetServerNodeLatency(req.ServerID, name, config.LoadBalanceSortHTTP, bestLatency)
+		} else {
+			h.outboundMgr.SetServerNodeLatency(req.ServerID, name, config.LoadBalanceSortHTTP, 0)
 		}
 	}
 	h.updateOutboundRuntime(name, func(outbound *config.ProxyOutbound) {
@@ -1772,6 +1804,7 @@ type SpeedTestResult struct {
 // DetailedTestRequest represents a request for detailed proxy testing.
 type DetailedTestRequest struct {
 	Name         string             `json:"name" binding:"required"`
+	ServerID     string             `json:"server_id,omitempty"`
 	IncludePing  *bool              `json:"include_ping,omitempty"`
 	IncludeUDP   *bool              `json:"include_udp,omitempty"`
 	UDPAddress   string             `json:"udp_address,omitempty"`
@@ -1904,6 +1937,9 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("Failed to create proxy dialer: %v", err)
+			if req.ServerID != "" && h.outboundMgr != nil {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortHTTP, 0)
+			}
 			respondSuccess(c, result)
 			return
 		}
@@ -2004,6 +2040,13 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 		}
 		if result.CustomHTTP != nil && result.CustomHTTP.Success && (bestLatency < 0 || result.CustomHTTP.LatencyMs < bestLatency) {
 			bestLatency = result.CustomHTTP.LatencyMs
+		}
+		if req.ServerID != "" && h.outboundMgr != nil {
+			if bestLatency >= 0 {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortHTTP, bestLatency)
+			} else {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortHTTP, 0)
+			}
 		}
 		h.updateOutboundRuntime(req.Name, func(outbound *config.ProxyOutbound) {
 			if bestLatency >= 0 {
@@ -2822,6 +2865,43 @@ type ServerNodeLatencyItem struct {
 	OK        bool   `json:"ok"`
 }
 
+func (h *ProxyOutboundHandler) listServerCandidateNodes(serverCfg *config.ServerConfig) []string {
+	if h == nil || h.configMgr == nil || serverCfg == nil {
+		return nil
+	}
+	proxyOutbound := strings.TrimSpace(serverCfg.ProxyOutbound)
+	if proxyOutbound == "" || proxyOutbound == proxy.DirectNodeName {
+		return nil
+	}
+	candidateNodes := make([]string, 0)
+	if serverCfg.IsGroupSelection() {
+		groupName := serverCfg.GetGroupName()
+		outbounds := h.configMgr.GetByGroup(groupName)
+		for _, o := range outbounds {
+			if o != nil && o.Enabled {
+				candidateNodes = append(candidateNodes, o.Name)
+			}
+		}
+	} else if serverCfg.IsMultiNodeSelection() {
+		for _, name := range serverCfg.GetNodeList() {
+			if name == "" {
+				continue
+			}
+			o, exists := h.configMgr.GetOutbound(name)
+			if !exists || o == nil || !o.Enabled {
+				continue
+			}
+			candidateNodes = append(candidateNodes, name)
+		}
+	} else {
+		o, exists := h.configMgr.GetOutbound(proxyOutbound)
+		if exists && o != nil && o.Enabled {
+			candidateNodes = append(candidateNodes, proxyOutbound)
+		}
+	}
+	return candidateNodes
+}
+
 // GetServerNodeLatency returns per-server per-node cached latency for the server's selected nodes.
 // GET /api/servers/:id/node-latency?sort_by=udp
 func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
@@ -2855,8 +2935,8 @@ func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
 		order = "asc"
 	}
 
-	proxyOutbound := strings.TrimSpace(serverCfg.ProxyOutbound)
-	if proxyOutbound == "" || proxyOutbound == "direct" {
+	candidateNodes := h.listServerCandidateNodes(serverCfg)
+	if len(candidateNodes) == 0 {
 		respondSuccess(c, map[string]interface{}{
 			"server_id": serverID,
 			"sort_by":   sortBy,
@@ -2864,34 +2944,6 @@ func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
 			"nodes":     []ServerNodeLatencyItem{},
 		})
 		return
-	}
-
-	candidateNodes := make([]string, 0)
-	if serverCfg.IsGroupSelection() {
-		groupName := serverCfg.GetGroupName()
-		outbounds := h.configMgr.GetByGroup(groupName)
-		for _, o := range outbounds {
-			if o == nil || !o.Enabled {
-				continue
-			}
-			candidateNodes = append(candidateNodes, o.Name)
-		}
-	} else if serverCfg.IsMultiNodeSelection() {
-		for _, name := range serverCfg.GetNodeList() {
-			if name == "" {
-				continue
-			}
-			o, exists := h.configMgr.GetOutbound(name)
-			if !exists || o == nil || !o.Enabled {
-				continue
-			}
-			candidateNodes = append(candidateNodes, name)
-		}
-	} else {
-		o, exists := h.configMgr.GetOutbound(proxyOutbound)
-		if exists && o != nil && o.Enabled {
-			candidateNodes = append(candidateNodes, proxyOutbound)
-		}
 	}
 
 	items := make([]ServerNodeLatencyItem, 0, len(candidateNodes))
@@ -2918,6 +2970,49 @@ func (h *ProxyOutboundHandler) GetServerNodeLatency(c *gin.Context) {
 		"server_id": serverID,
 		"sort_by":   sortBy,
 		"order":     order,
+		"nodes":     items,
+	})
+}
+
+func (h *ProxyOutboundHandler) GetServerNodeLatencyHistory(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	if h.serverConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Server config manager not initialized", "")
+		return
+	}
+
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+
+	sortBy := strings.TrimSpace(c.Query("sort_by"))
+	if sortBy == "" {
+		sortBy = serverCfg.GetLoadBalanceSort()
+	}
+
+	candidateNodes := h.listServerCandidateNodes(serverCfg)
+	items := make([]ServerNodeLatencyHistoryItem, 0, len(candidateNodes))
+	for _, nodeName := range candidateNodes {
+		items = append(items, ServerNodeLatencyHistoryItem{
+			Name:    nodeName,
+			Samples: h.outboundMgr.GetServerNodeLatencyHistory(serverID, nodeName, sortBy),
+		})
+	}
+
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"sort_by":   sortBy,
 		"nodes":     items,
 	})
 }
@@ -3065,6 +3160,66 @@ func (h *ProxyOutboundHandler) SwitchServerNode(c *gin.Context) {
 		"latency_ms": bestLatency,
 		"sort_by":    sortBy,
 	})
+}
+
+type proxyPortUsageRef struct {
+	ActiveConnections int
+	CurrentNode       string
+	HasNode           bool
+	TCPMs             int64
+	UDPMs             int64
+	HTTPMs            int64
+	HasTCP            bool
+	HasUDP            bool
+	HasHTTP           bool
+}
+
+func proxyPortSelectorIDForAPI(portID string) string {
+	portID = strings.TrimSpace(portID)
+	if portID == "" {
+		return ""
+	}
+	return "proxy-port:" + portID
+}
+
+func (h *ProxyOutboundHandler) buildProxyPortUsageRef(port *config.ProxyPortConfig) proxyPortUsageRef {
+	ref := proxyPortUsageRef{}
+	if port == nil {
+		return ref
+	}
+	if h.activityProvider != nil {
+		ref.ActiveConnections = h.activityProvider.GetActiveConnectionsForProxyPort(port.ID)
+	}
+	if h.outboundMgr == nil {
+		return ref
+	}
+	selectorID := proxyPortSelectorIDForAPI(port.ID)
+	nodeName, hasNode := h.outboundMgr.GetServerSelectedNode(selectorID)
+	ref.CurrentNode = nodeName
+	ref.HasNode = hasNode
+	if !hasNode {
+		return ref
+	}
+	ref.TCPMs, ref.HasTCP = h.outboundMgr.GetServerNodeLatency(selectorID, nodeName, config.LoadBalanceSortTCP)
+	ref.UDPMs, ref.HasUDP = h.outboundMgr.GetServerNodeLatency(selectorID, nodeName, config.LoadBalanceSortUDP)
+	ref.HTTPMs, ref.HasHTTP = h.outboundMgr.GetServerNodeLatency(selectorID, nodeName, config.LoadBalanceSortHTTP)
+	if (!ref.HasTCP || !ref.HasUDP || !ref.HasHTTP) && h.configMgr != nil {
+		if outbound, exists := h.configMgr.GetOutbound(nodeName); exists && outbound != nil {
+			if !ref.HasTCP && outbound.TCPLatencyMs > 0 {
+				ref.TCPMs = outbound.TCPLatencyMs
+				ref.HasTCP = true
+			}
+			if !ref.HasUDP && outbound.UDPLatencyMs > 0 {
+				ref.UDPMs = outbound.UDPLatencyMs
+				ref.HasUDP = true
+			}
+			if !ref.HasHTTP && outbound.HTTPLatencyMs > 0 {
+				ref.HTTPMs = outbound.HTTPLatencyMs
+				ref.HasHTTP = true
+			}
+		}
+	}
+	return ref
 }
 
 // FetchSubscription fetches a subscription URL, optionally through a proxy outbound.

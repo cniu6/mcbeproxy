@@ -17,6 +17,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/proxy"
+	"mcpeserverproxy/internal/subscription"
 )
 
 var (
@@ -159,6 +160,22 @@ func main() {
 		configMgr,
 		proxyServer.GetOutboundManager(),
 	)
+	proxyOutboundHandler.SetUsageContext(proxyServer.GetProxyPortConfigManager(), proxyServer)
+	proxyOutboundHandler.SetSubscriptionUpdateHook(proxyServer.TriggerAutoLatencyRefresh)
+	subscriptionScheduler := subscription.NewScheduler(
+		proxySubscriptionMgr,
+		subscription.NewService(proxyServer.GetProxyOutboundConfigManager(), proxyServer.GetOutboundManager()),
+		func() int {
+			return proxyServer.GetActiveSessionCount() + proxyServer.GetActiveProxyPortConnectionCount()
+		},
+	)
+	subscriptionScheduler.SetAfterUpdateHook(func(sub *config.ProxySubscription, result *subscription.UpdateResult) {
+		reason := "subscription auto update"
+		if sub != nil && sub.Name != "" {
+			reason = "subscription auto update: " + sub.Name
+		}
+		proxyServer.TriggerAutoLatencyRefresh(reason)
+	})
 
 	// Create API server
 	apiServer := api.NewAPIServer(
@@ -194,6 +211,7 @@ func main() {
 	// Wait for shutdown signal
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	subscriptionScheduler.Start(ctx)
 
 	<-ctx.Done()
 	logger.Info("Shutdown signal received, stopping services...")

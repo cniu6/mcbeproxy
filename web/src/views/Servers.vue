@@ -63,8 +63,8 @@
           </n-gi>
           <n-gi :span="2" v-if="isGroupOrMultiNode">
             <n-alert type="info" style="margin-bottom: 12px">
-              开启自动Ping后，系统会定时测试「代理节点」中对应的节点延迟，并在当前服务器连接人数为 0 时自动切换到最优节点。
-              如有活跃连接则推迟切换（避免断线）。你也可以手动一键切换。
+              开启自动Ping后，系统会按低流量模式定时测试「代理节点」中的延迟，并在当前服务器连接人数为 0 时自动切换到最优节点。
+              平时只测当前节点和 Top N 候选；必要时或到你设定的全量扫描时间，才会扩展到全量节点。
             </n-alert>
             <n-form-item label="负载策略" label-placement="left" label-width="100">
               <n-select v-model:value="form.load_balance" :options="loadBalanceOptions" placeholder="选择负载策略" />
@@ -88,6 +88,42 @@
                     style="width: 100%"
                   >
                     <template #suffix>分钟</template>
+                  </n-input-number>
+                </n-form-item>
+              </n-gi>
+            </n-grid>
+            <n-grid :cols="2" :x-gap="16" style="margin-top: 12px">
+              <n-gi>
+                <n-form-item label="Top N候选" label-placement="left" label-width="100">
+                  <n-input-number
+                    v-model:value="form.auto_ping_top_candidates"
+                    :min="1"
+                    style="width: 100%"
+                  />
+                  <template #feedback>每轮额外测试的候选节点数，不含当前节点。</template>
+                </n-form-item>
+              </n-gi>
+              <n-gi>
+                <n-form-item label="全量扫描" label-placement="left" label-width="100">
+                  <n-select v-model:value="form.auto_ping_full_scan_mode" :options="autoPingFullScanModeOptions" placeholder="关闭" />
+                </n-form-item>
+              </n-gi>
+            </n-grid>
+            <n-grid v-if="form.auto_ping_full_scan_mode" :cols="2" :x-gap="16" style="margin-top: 12px">
+              <n-gi v-if="form.auto_ping_full_scan_mode === 'daily'">
+                <n-form-item label="扫描时间" label-placement="left" label-width="100">
+                  <n-input v-model:value="form.auto_ping_full_scan_time" placeholder="04:00" />
+                  <template #feedback>格式 HH:mm，例如 04:00。</template>
+                </n-form-item>
+              </n-gi>
+              <n-gi v-if="form.auto_ping_full_scan_mode === 'interval'">
+                <n-form-item label="扫描间隔" label-placement="left" label-width="100">
+                  <n-input-number
+                    v-model:value="form.auto_ping_full_scan_interval_hours"
+                    :min="1"
+                    style="width: 100%"
+                  >
+                    <template #suffix>小时</template>
                   </n-input-number>
                 </n-form-item>
               </n-gi>
@@ -879,7 +915,7 @@
             :columns="bestNodeColumnsWithActions"
             :data="filteredBestNodeList"
             :max-height="450"
-            :scroll-x="1100"
+            :scroll-x="1280"
             :row-class-name="bestNodeRowClassName"
             :row-key="row => row.name"
             :row-props="bestNodeSelectRowProps"
@@ -900,82 +936,8 @@
   </div>
 </template>
 
-<style scoped>
-/* 高亮最优节点 */
-:deep(.best-node-row) {
-  background-color: rgba(24, 160, 88, 0.1) !important;
-  font-weight: 600;
-}
-
-:deep(.best-node-row:hover) {
-  background-color: rgba(24, 160, 88, 0.15) !important;
-}
-
-.toolbar-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.compact-stack {
-  gap: 10px;
-}
-
-.toolbar-panel {
-  border: 1px solid var(--n-border-color);
-  border-radius: 10px;
-  padding: 12px 14px;
-  background: var(--n-color-embedded);
-}
-
-.selector-panel {
-  margin-bottom: 12px;
-}
-
-.toolbar-panel-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--n-text-color-2);
-  margin-bottom: 10px;
-}
-
-.toolbar-panel-split {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.toolbar-label {
-  font-size: 12px;
-  color: var(--n-text-color-3);
-  white-space: nowrap;
-}
-
-.toolbar-input-wide {
-  width: 260px;
-}
-
-.toolbar-input-medium {
-  width: 220px;
-}
-
-.toolbar-input-search {
-  width: 190px;
-}
-
-@media (max-width: 900px) {
-  .toolbar-input-wide,
-  .toolbar-input-medium,
-  .toolbar-input-search {
-    width: 100%;
-  }
-}
-</style>
-
 <script setup>
-import { ref, computed, onMounted, h, nextTick, watch } from 'vue'
+import { ref, reactive, computed, onMounted, h, nextTick, watch } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
 import { api, apiStream } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
@@ -1014,7 +976,14 @@ const proxyModeOptions = [
   { label: 'RakNet', value: 'raknet' }
 ]
 const proxyOutboundOptions = ref([{ label: '直连 (不使用代理)', value: '' }])
-const defaultForm = {
+const globalAutoPingDefaults = reactive({
+  interval_minutes: 10,
+  top_candidates: 10,
+  full_scan_mode: '',
+  full_scan_time: '04:00',
+  full_scan_interval_hours: 24
+})
+const baseDefaultForm = {
   id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true,
   disabled_message: '§c服务器维护中§r\n§7请稍后再试',
   custom_motd: '', // 留空则从远程服务器获取
@@ -1022,8 +991,21 @@ const defaultForm = {
   udp_socket_buffer_size: 0,
   load_balance: 'least-latency', load_balance_sort: 'udp',
   auto_ping_enabled: true,
-  auto_ping_interval_minutes: 10 // 负载均衡Ping间隔（分钟）
+  auto_ping_interval_minutes: 10, // 负载均衡Ping间隔（分钟）
+  auto_ping_top_candidates: 10,
+  auto_ping_full_scan_mode: '',
+  auto_ping_full_scan_time: '04:00',
+  auto_ping_full_scan_interval_hours: 24
 }
+
+const makeDefaultForm = () => ({
+  ...baseDefaultForm,
+  auto_ping_interval_minutes: globalAutoPingDefaults.interval_minutes,
+  auto_ping_top_candidates: globalAutoPingDefaults.top_candidates,
+  auto_ping_full_scan_mode: globalAutoPingDefaults.full_scan_mode,
+  auto_ping_full_scan_time: globalAutoPingDefaults.full_scan_time,
+  auto_ping_full_scan_interval_hours: globalAutoPingDefaults.full_scan_interval_hours
+})
 
 // Load balance strategy options
 const loadBalanceOptions = [
@@ -1039,6 +1021,12 @@ const loadBalanceSortOptions = [
   { label: 'UDP延迟 (MCBE默认)', value: 'udp' },
   { label: 'TCP延迟', value: 'tcp' },
   { label: 'HTTP延迟', value: 'http' }
+]
+
+const autoPingFullScanModeOptions = [
+  { label: '关闭', value: '' },
+  { label: '每日定时全量扫描', value: 'daily' },
+  { label: '按间隔全量扫描', value: 'interval' }
 ]
 
 const latencySortOrderOptions = [
@@ -1097,7 +1085,7 @@ const generateDefaultMOTD = (name, port) => {
   const serverUID = Math.floor(Math.random() * 9000000000000000) + 1000000000000000
   return `MCPE;§a${name || '代理服务器'};712;1.21.50;0;100;${serverUID};${name || '代理服务器'};Survival;1;${port || 19132};${port || 19132};0;`
 }
-const form = ref({ ...defaultForm })
+const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
 
 // 存储代理出站详情用于显示类型标签
@@ -1131,6 +1119,16 @@ const loadProxyOutbounds = async () => {
     // 存储详情用于显示标签
     outboundsRes.data.forEach(o => { proxyOutboundDetails.value[o.name] = o })
   }
+}
+
+const loadGlobalDefaults = async () => {
+  const res = await api('/api/config')
+  if (!res.success || !res.data) return
+  globalAutoPingDefaults.interval_minutes = res.data.server_auto_ping_interval_minutes_default || 10
+  globalAutoPingDefaults.top_candidates = res.data.server_auto_ping_top_candidates_default || 10
+  globalAutoPingDefaults.full_scan_mode = res.data.server_auto_ping_full_scan_mode_default || ''
+  globalAutoPingDefaults.full_scan_time = res.data.server_auto_ping_full_scan_time_default || '04:00'
+  globalAutoPingDefaults.full_scan_interval_hours = res.data.server_auto_ping_full_scan_interval_hours_default || 24
 }
 
 // 跳转到代理出口页面（highlight参数让目标页面将该节点排在第一位）
@@ -1318,6 +1316,9 @@ const bestNodeBatchTesting = ref(false) // 批量测试状态
 const bestNodeBatchProgress = ref({ current: 0, total: 0, success: 0, failed: 0 })
 const serverNodeLatencySortBy = ref('')
 const serverNodeLatencyMap = ref({})
+const bestNodeHistoryLoading = ref(false)
+const bestNodeHistorySortBy = ref('')
+const bestNodeLatencyHistoryMap = ref({})
 // In-flight guards to prevent duplicate concurrent requests (e.g. watcher
 // fires while an earlier fetch is still pending). Each request bumps the
 // token and checks it again after the fetch resolves so that only the
@@ -1326,6 +1327,7 @@ const serverNodeLatencyMap = ref({})
 // firing) and the extra `/api/servers/:id/node-latency` burst when the
 // load_balance_sort dropdown changes rapidly.
 let serverNodeLatencyFetchToken = 0
+let bestNodeHistoryFetchToken = 0
 let editServerLiveSessionsFetchToken = 0
 const bestNodePagination = ref({
   page: 1,
@@ -1430,6 +1432,7 @@ const bestNodeColumns = [
     if (r.udp_available === false) return h(NTag, { type: 'error', size: 'small' }, () => '✗')
     return '-'
   }},
+  { title: '历史趋势', key: 'latency_history', width: 150, render: r => renderBestNodeHistoryCell(r) },
   { title: '是否最优', key: 'is_best', width: 80, render: r => h(NTag, { type: r._isBest ? 'success' : 'default', size: 'small' }, () => r._isBest ? '✓ 最优' : '-') }
 ]
 
@@ -1464,6 +1467,160 @@ const formatLiveSessionBytes = (bytes) => {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
   return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+const resolveBestNodeHistoryMetric = () => bestNodeSortMetric.value || form.value?.load_balance_sort || serverNodeLatencySortBy.value || 'udp'
+
+const getBestNodeHistoryMetricLabel = (metric) => {
+  if (metric === 'tcp') return 'TCP'
+  if (metric === 'http') return 'HTTP'
+  return 'UDP'
+}
+
+const clearBestNodeHistory = () => {
+  bestNodeHistorySortBy.value = ''
+  bestNodeLatencyHistoryMap.value = {}
+}
+
+const getBestNodeHistorySamples = (name, metric = resolveBestNodeHistoryMetric()) => {
+  if (bestNodeHistorySortBy.value !== metric) return []
+  const samples = bestNodeLatencyHistoryMap.value?.[name]
+  return Array.isArray(samples) ? samples : []
+}
+
+const getBestNodeHistoryColor = (metric, latency, ok = true) => {
+  if (!ok || !latency || latency <= 0) return '#8c8c8c'
+  const [goodThreshold, warnThreshold] = metric === 'http' ? [500, 1500] : [200, 500]
+  if (latency < goodThreshold) return '#18a058'
+  if (latency < warnThreshold) return '#f0a020'
+  return '#d03050'
+}
+
+const formatBestNodeHistoryTime = (timestamp) => {
+  const value = Number(timestamp || 0)
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+const buildBestNodeSparklineModel = (samples, width = 96, height = 28) => {
+  const latestSample = samples[samples.length - 1] || null
+  const okValues = samples
+    .filter(sample => sample?.ok && sample.latency_ms > 0)
+    .map(sample => Number(sample.latency_ms))
+  const failureCount = samples.reduce((count, sample) => count + (sample?.ok && sample.latency_ms > 0 ? 0 : 1), 0)
+  if (!okValues.length) {
+    return { segments: [], latestPoint: null, latestSample, min: 0, max: 0, okCount: 0, failureCount }
+  }
+  const min = Math.min(...okValues)
+  const max = Math.max(...okValues)
+  const range = Math.max(max - min, 1)
+  const step = samples.length > 1 ? width / (samples.length - 1) : 0
+  const segments = []
+  let current = []
+  let latestPoint = null
+  for (let i = 0; i < samples.length; i += 1) {
+    const sample = samples[i]
+    const x = samples.length === 1 ? width / 2 : i * step
+    if (!(sample?.ok && sample.latency_ms > 0)) {
+      if (current.length) {
+        segments.push(current)
+        current = []
+      }
+      continue
+    }
+    const y = height - 2 - ((Number(sample.latency_ms) - min) / range) * (height - 4)
+    const point = { x, y, latencyMs: Number(sample.latency_ms) }
+    current.push(point)
+    latestPoint = point
+  }
+  if (current.length) {
+    segments.push(current)
+  }
+  return { segments, latestPoint, latestSample, min, max, okCount: okValues.length, failureCount }
+}
+
+const renderBestNodeHistoryCell = (row) => {
+  const metric = resolveBestNodeHistoryMetric()
+  const samples = getBestNodeHistorySamples(row.name, metric)
+  if (!samples.length) {
+    if (bestNodeHistoryLoading.value) {
+      return h('div', { style: 'font-size: 12px; color: var(--n-text-color-disabled);' }, '加载中')
+    }
+    return h('div', { style: 'font-size: 12px; color: var(--n-text-color-disabled);' }, '暂无')
+  }
+  const model = buildBestNodeSparklineModel(samples)
+  const latestSample = model.latestSample
+  const latestLabel = latestSample?.ok && latestSample.latency_ms > 0 ? `${latestSample.latency_ms}ms` : '失败'
+  const strokeColor = getBestNodeHistoryColor(metric, model.latestPoint?.latencyMs || latestSample?.latency_ms || 0, latestSample?.ok !== false)
+  const tooltipChildren = [
+    h('div', { style: 'font-weight: 600; margin-bottom: 4px;' }, `${getBestNodeHistoryMetricLabel(metric)} 历史`),
+    h('div', null, `样本: ${samples.length}`),
+    h('div', null, `成功: ${model.okCount} / 失败: ${model.failureCount}`),
+    h('div', null, `最近: ${latestLabel}`),
+    model.okCount > 0 ? h('div', null, `最佳: ${model.min}ms / 最差: ${model.max}ms`) : null,
+    latestSample ? h('div', { style: 'margin-top: 4px; color: var(--n-text-color-3);' }, `更新时间: ${formatBestNodeHistoryTime(latestSample.timestamp)}`) : null
+  ].filter(Boolean)
+
+  return h(NTooltip, null, {
+    trigger: () => h('div', { style: 'display: flex; align-items: center; gap: 6px; min-width: 0;' }, [
+      h('svg', { width: 96, height: 28, viewBox: '0 0 96 28', style: 'display: block; flex-shrink: 0;' }, [
+        h('polyline', { points: '0,26 96,26', fill: 'none', stroke: 'var(--n-border-color)', 'stroke-width': '1', 'stroke-dasharray': '3 3' }),
+        ...model.segments.map(segment => h('polyline', {
+          points: segment.map(point => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '),
+          fill: 'none',
+          stroke: strokeColor,
+          'stroke-width': '2',
+          'stroke-linecap': 'round',
+          'stroke-linejoin': 'round'
+        })),
+        model.latestPoint ? h('circle', { cx: model.latestPoint.x, cy: model.latestPoint.y, r: '2.5', fill: strokeColor }) : null,
+        latestSample && latestSample.ok === false ? h('line', { x1: '88', y1: '6', x2: '94', y2: '12', stroke: '#d03050', 'stroke-width': '1.5', 'stroke-linecap': 'round' }) : null,
+        latestSample && latestSample.ok === false ? h('line', { x1: '94', y1: '6', x2: '88', y2: '12', stroke: '#d03050', 'stroke-width': '1.5', 'stroke-linecap': 'round' }) : null
+      ]),
+      h('div', { style: 'font-size: 12px; line-height: 1.2; min-width: 0;' }, [
+        h('div', { style: `font-weight: 600; color: ${latestSample?.ok === false ? '#d03050' : 'inherit'};` }, latestLabel),
+        h('div', { style: 'color: var(--n-text-color-3); white-space: nowrap;' }, `${samples.length} 点`)
+      ])
+    ]),
+    default: () => h('div', { style: 'font-size: 12px; line-height: 1.5;' }, tooltipChildren)
+  })
+}
+
+const refreshBestNodeHistory = async (sortBy = resolveBestNodeHistoryMetric()) => {
+  const serverId = form.value?.id
+  if (!serverId || !showBestNodeModal.value) {
+    bestNodeHistoryLoading.value = false
+    clearBestNodeHistory()
+    return
+  }
+  const token = ++bestNodeHistoryFetchToken
+  bestNodeHistoryLoading.value = true
+  try {
+    const res = await api(`/api/servers/${serverId}/node-latency-history?sort_by=${sortBy}`)
+    if (token !== bestNodeHistoryFetchToken) return
+    if (!showBestNodeModal.value || form.value?.id !== serverId) return
+    if (!res?.success || !res.data) {
+      clearBestNodeHistory()
+      return
+    }
+    const historyMap = {}
+    ;(res.data.nodes || []).forEach(node => {
+      if (node?.name) {
+        historyMap[node.name] = Array.isArray(node.samples) ? node.samples : []
+      }
+    })
+    bestNodeHistorySortBy.value = sortBy
+    bestNodeLatencyHistoryMap.value = historyMap
+  } catch {
+    if (token !== bestNodeHistoryFetchToken) return
+    clearBestNodeHistory()
+  } finally {
+    if (token === bestNodeHistoryFetchToken) {
+      bestNodeHistoryLoading.value = false
+    }
+  }
 }
 
 // Sync the active session counter back onto the cached server row and the
@@ -1656,16 +1813,16 @@ const { rowProps: bestNodeSelectRowProps } = useDragSelect(bestNodeCheckedKeys, 
 
 const buildHttpTestRequest = (name) => {
   if (customHttpUrl.value) {
-    return { name, include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
+    return { name, server_id: form.value?.id || '', include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
   }
-  return { name, include_ping: false, targets: [batchHttpTarget.value] }
+  return { name, server_id: form.value?.id || '', include_ping: false, targets: [batchHttpTarget.value] }
 }
 
 const buildBatchHttpTestRequest = () => {
   if (customHttpUrl.value) {
-    return { include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
+    return { server_id: form.value?.id || '', include_ping: false, custom_http: { url: customHttpUrl.value, method: 'GET' } }
   }
-  return { include_ping: false, targets: [batchHttpTarget.value] }
+  return { server_id: form.value?.id || '', include_ping: false, targets: [batchHttpTarget.value] }
 }
 
 // 更新代理出站数据
@@ -1816,7 +1973,7 @@ const testSingleProxy = async (name, type) => {
   }
 }
 
-// 表单分组选项（包含未分组）
+// 表单代理选择器相关
 const formGroupOptions = computed(() => {
   const options = []
   // 添加未分组选项（如果存在未分组节点）
@@ -1840,7 +1997,8 @@ const formGroupOptions = computed(() => {
 // 表单过滤后的代理列表
 const formFilteredProxyOutbounds = computed(() => {
   let list = [...allProxyOutbounds.value]
-  // 分组筛选（支持未分组）
+  
+  // 按分组过滤（支持未分组）
   if (formProxyFilter.value.group) {
     if (formProxyFilter.value.group === '_ungrouped') {
       list = list.filter(o => !o.group)
@@ -1848,20 +2006,36 @@ const formFilteredProxyOutbounds = computed(() => {
       list = list.filter(o => o.group === formProxyFilter.value.group)
     }
   }
+  
+  // 按协议过滤
   if (formProxyFilter.value.protocol) {
     list = list.filter(o => o.type === formProxyFilter.value.protocol)
   }
+  
+  // 只显示支持UDP的
   if (formProxyFilter.value.udpOnly) {
     list = list.filter(o => o.udp_available !== false)
   }
+  
+  // 搜索过滤
   if (formProxyFilter.value.search) {
     const kw = formProxyFilter.value.search.toLowerCase()
-    list = list.filter(o => o.name.toLowerCase().includes(kw) || o.server.toLowerCase().includes(kw))
+    list = list.filter(o => 
+      o.name.toLowerCase().includes(kw) || 
+      o.server.toLowerCase().includes(kw)
+    )
   }
-  // 排序：已选中的节点排在前面，然后按名称排序
-  // 排序：已选中的节点排在前面
-  const selectedNodes = formSelectedNodes.value || []
+  
+  // 获取当前服务器已选中的节点
+  const server = servers.value.find(s => s.id === selectedServerId.value)
+  const currentProxy = server?.proxy_outbound || ''
+  let selectedNodes = []
+  if (currentProxy && !currentProxy.startsWith('@')) {
+    selectedNodes = currentProxy.includes(',') ? currentProxy.split(',') : [currentProxy]
+  }
   const metric = formLoadBalanceSort.value || 'udp'
+  
+  // 排序：已选中的节点排在前面，然后按分组和名称排序
   return list.sort((a, b) => {
     const aSelected = selectedNodes.includes(a.name)
     const bSelected = selectedNodes.includes(b.name)
@@ -1869,6 +2043,10 @@ const formFilteredProxyOutbounds = computed(() => {
     if (!aSelected && bSelected) return 1
     const latencyCmp = compareLatencySort(a, b, metric, formLatencySortOrder.value)
     if (latencyCmp !== 0) return latencyCmp
+    // 未选中的按分组和名称排序
+    if (!a.group && b.group) return -1
+    if (a.group && !b.group) return 1
+    if (a.group && b.group && a.group !== b.group) return a.group.localeCompare(b.group)
     return a.name.localeCompare(b.name)
   })
 })
@@ -2251,11 +2429,17 @@ const proxyGroups = computed(() => {
   const options = []
   // 添加未分组选项
   if (hasUngrouped) {
-    options.push({ label: '未分组', value: '_ungrouped' })
+    options.push({
+      label: '未分组',
+      value: '_ungrouped'
+    })
   }
   // 添加有名称的分组
   Array.from(groups).sort().forEach(g => {
-    options.push({ label: g, value: g })
+    options.push({
+      label: g,
+      value: g
+    })
   })
   return options
 })
@@ -2295,82 +2479,6 @@ const filteredProxyOutbounds = computed(() => {
   
   // 获取当前服务器已选中的节点
   const server = servers.value.find(s => s.id === selectedServerId.value)
-  const currentProxy = server?.proxy_outbound || ''
-  let selectedNodes = []
-  if (currentProxy && !currentProxy.startsWith('@')) {
-    selectedNodes = currentProxy.includes(',') ? currentProxy.split(',') : [currentProxy]
-  }
-  const metric = quickLoadBalanceSort.value || 'udp'
-  
-  // 排序：已选中的节点排在前面，然后按分组和名称排序
-  return list.sort((a, b) => {
-    const aSelected = selectedNodes.includes(a.name)
-    const bSelected = selectedNodes.includes(b.name)
-    if (aSelected && !bSelected) return -1
-    if (!aSelected && bSelected) return 1
-    const latencyCmp = compareLatencySort(a, b, metric, quickLatencySortOrder.value)
-    if (latencyCmp !== 0) return latencyCmp
-    // 未选中的按分组和名称排序
-    if (!a.group && b.group) return -1
-    if (a.group && !b.group) return 1
-    if (a.group && b.group && a.group !== b.group) return a.group.localeCompare(b.group)
-    return a.name.localeCompare(b.name)
-  })
-})
-
-// 刷新代理列表
-const refreshProxyList = async () => {
-  proxySelectorLoading.value = true
-  try {
-    // 并行获取代理列表和分组统计
-    const [outboundsRes, groupsRes] = await Promise.all([
-      api('/api/proxy-outbounds'),
-      api('/api/proxy-outbounds/groups')
-    ])
-    
-    if (outboundsRes.success && outboundsRes.data) {
-      // Build group options (with @ prefix)
-      const groupOptions = []
-      if (groupsRes.success && groupsRes.data) {
-        groupsRes.data.forEach(g => {
-          if (g.name) { // Skip ungrouped
-            groupOptions.push({ 
-              label: `@${g.name} (${g.healthy_count}/${g.total_count}节点)`, 
-              value: '@' + g.name 
-            })
-          }
-        })
-      }
-      
-      proxyOutboundOptions.value = [
-        { label: '直连 (不使用代理)', value: '' },
-        ...groupOptions,
-        ...outboundsRes.data.filter(o => o.enabled).map(o => ({ label: `${o.name} (${o.type})`, value: o.name }))
-      ]
-      outboundsRes.data.forEach(o => { proxyOutboundDetails.value[o.name] = o })
-    }
-    
-    if (groupsRes.success && groupsRes.data) {
-      groupStats.value = groupsRes.data
-    }
-  } finally {
-    proxySelectorLoading.value = false
-  }
-}
-
-// 打开代理选择器（先弹窗再加载）
-const openProxySelector = (serverId) => {
-  selectedServerId.value = serverId
-  proxySelectorLoading.value = true
-  showProxySelector.value = true
-  
-  // 重置筛选和分页状态
-  proxyFilter.value = { group: '', protocol: '', udpOnly: false, search: '' }
-  quickLatencySortOrder.value = 'asc'
-  proxySelectorPagination.value.page = 1
-  
-  // 根据当前服务器的代理设置初始化视图
-  const server = servers.value.find(s => s.id === serverId)
   const currentProxy = server?.proxy_outbound || ''
   
   // 初始化负载均衡设置
@@ -2646,7 +2754,7 @@ const generateSingleNodeShareLink = () => {
       if (node.network === 'xhttp' && node.xhttp_mode) params.set('mode', node.xhttp_mode)
       if (node.grpc_service_name) params.set('serviceName', node.grpc_service_name)
       if (node.grpc_authority) params.set('authority', node.grpc_authority)
-      if (node.reality_public_key) params.set('pbk', node.reality_public_key)
+      if (node.reality) params.set('pbk', node.reality_public_key)
       if (node.reality_short_id) params.set('sid', node.reality_short_id)
       if (node.fingerprint) params.set('fp', node.fingerprint)
       link = `vless://${node.uuid}@${node.server}:${node.port}?${params.toString()}#${encodeURIComponent(node.name)}`
@@ -2846,7 +2954,7 @@ const columns = [
     title: '代理节点', 
     key: 'proxy_outbound', 
     width: 250, 
-    render: r => h(NSpace, { size: 'small', align: 'center' }, () => [
+    render: r => h(NSpace, { size: 'small' }, () => [
       h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, getProxyTypeTags(r.proxy_outbound, r.id)),
       h(NButton, { size: 'tiny', quaternary: true, onClick: () => openProxySelector(r.id) }, () => '切换')
     ])
@@ -2867,14 +2975,14 @@ const columns = [
 ]
 
 const load = async () => { const res = await api('/api/servers'); if (res.success) servers.value = res.data || [] }
-const openAddModal = () => { editingId.value = null; form.value = { ...defaultForm }; showEditModal.value = true; refreshBatchMcbeAddress() }
+const openAddModal = () => { editingId.value = null; form.value = makeDefaultForm(); showEditModal.value = true; refreshBatchMcbeAddress() }
 // Note: refreshServerNodeLatency/refreshBatchMcbeAddress are intentionally
 // NOT called here. The watchers at the bottom of <script setup> react to
 // showEditModal/form.id/load_balance_sort changes and call them exactly
 // once per open, which avoids the "double burst" of /api/servers/:id/
 // node-latency and /api/sessions that the user saw. We still invoke
 // fetchCurrentNode() eagerly because there is no reactive watcher for it.
-const openEditModal = (s) => { editingId.value = s.id; form.value = { ...defaultForm, ...s }; showEditModal.value = true; fetchCurrentNode() }
+const openEditModal = (s) => { editingId.value = s.id; form.value = { ...makeDefaultForm(), ...s }; showEditModal.value = true; fetchCurrentNode() }
 
 const refreshBatchMcbeAddress = () => {
   const target = form.value?.target
@@ -2897,6 +3005,19 @@ watch(
   () => [showEditModal.value, form.value?.id, form.value?.proxy_outbound, form.value?.load_balance_sort],
   () => {
     if (showEditModal.value) refreshServerNodeLatency()
+  }
+)
+
+watch(
+  [showBestNodeModal, bestNodeSortMetric, () => form.value?.id],
+  ([visible, metric, serverId]) => {
+    if (!visible || !serverId) {
+      bestNodeHistoryFetchToken += 1
+      bestNodeHistoryLoading.value = false
+      clearBestNodeHistory()
+      return
+    }
+    refreshBestNodeHistory(metric || form.value?.load_balance_sort || 'udp')
   }
 )
 
@@ -2961,6 +3082,16 @@ const saveServer = async () => {
     }
     if (!form.value.auto_ping_interval_minutes || form.value.auto_ping_interval_minutes < 1) {
       form.value.auto_ping_interval_minutes = 10
+    }
+    if (!form.value.auto_ping_top_candidates || form.value.auto_ping_top_candidates < 1) {
+      form.value.auto_ping_top_candidates = 10
+    }
+    if (form.value.auto_ping_full_scan_mode === 'daily' && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(String(form.value.auto_ping_full_scan_time || '').trim())) {
+      message.warning('全量扫描时间格式应为 HH:mm，例如 04:00')
+      return
+    }
+    if (form.value.auto_ping_full_scan_mode === 'interval' && (!form.value.auto_ping_full_scan_interval_hours || form.value.auto_ping_full_scan_interval_hours < 1)) {
+      form.value.auto_ping_full_scan_interval_hours = 24
     }
   }
 
@@ -3046,7 +3177,7 @@ const testBestNode = async (name, type) => {
   try {
     let res
     if (type === 'tcp') {
-      res = await api('/api/proxy-outbounds/test', 'POST', { name })
+      res = await api('/api/proxy-outbounds/test', 'POST', { name, server_id: form.value?.id || '' })
       if (res?.success && res.data?.success) {
         updateBestNodeData(name, { latency_ms: res.data.latency_ms, healthy: true })
         if (form.value?.id) {
@@ -3085,6 +3216,9 @@ const testBestNode = async (name, type) => {
         updateBestNodeData(name, { udp_available: false })
         message.error(`${name} UDP测试失败`)
       }
+    }
+    if (form.value?.id) {
+      await refreshBestNodeHistory(resolveBestNodeHistoryMetric())
     }
   } catch (e) {
     message.error(`测试失败: ${e.message}`)
@@ -3182,6 +3316,7 @@ const batchTestBestNodes = async (testType) => {
     // 测试完成后强制刷新表格并重新计算最优节点
     bestNodeRawData.value = [...bestNodeRawData.value]
     recalculateBestNode()
+    await refreshBestNodeHistory(resolveBestNodeHistoryMetric())
   } catch (error) {
     bestNodeProgress.value.status = 'error'
     message.error(`测试失败: ${error.message}`)
@@ -3219,6 +3354,7 @@ const handleBestNodeBatchTest = async (key) => {
   // 测试完成后强制刷新表格并重新计算最优节点
   bestNodeRawData.value = [...bestNodeRawData.value]
   recalculateBestNode()
+  await refreshBestNodeHistory(resolveBestNodeHistoryMetric())
 }
 
 // 获取当前选择的节点和延迟信息（用于表单显示）
@@ -3334,7 +3470,7 @@ const importServers = async () => {
   } catch (e) { message.error('JSON 格式错误: ' + e.message) }
 }
 
-onMounted(() => { load(); loadProxyOutbounds() })
+onMounted(() => { load(); loadProxyOutbounds(); loadGlobalDefaults() })
 </script>
 
 <style scoped>

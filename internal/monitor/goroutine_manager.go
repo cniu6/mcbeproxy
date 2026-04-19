@@ -238,18 +238,27 @@ func (gm *GoroutineManager) Cancel(id int64) bool {
 
 // GetStats returns comprehensive goroutine statistics.
 func (gm *GoroutineManager) GetStats(includeStacks bool) *GoroutineStats {
-	gm.mu.RLock()
-	defer gm.mu.RUnlock()
-
 	now := time.Now()
+	gm.mu.RLock()
+	tracked := make([]trackedGoroutine, 0, len(gm.goroutines))
+	for _, g := range gm.goroutines {
+		tracked = append(tracked, trackedGoroutine{
+			info:         g.info,
+			lastActive:   g.lastActive,
+			isBackground: g.isBackground,
+		})
+	}
+	gm.mu.RUnlock()
+
 	stats := &GoroutineStats{
 		TotalCount:   runtime.NumGoroutine(),
-		TrackedCount: len(gm.goroutines),
+		TrackedCount: len(tracked),
 		ByComponent:  make(map[string]int),
 		ByState:      make(map[string]int),
 	}
 
-	for _, g := range gm.goroutines {
+	for i := range tracked {
+		g := &tracked[i]
 		stats.ByComponent[g.info.Component]++
 		stats.ByState[g.info.State]++
 

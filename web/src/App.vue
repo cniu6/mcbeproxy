@@ -94,7 +94,7 @@ const menuOptions = [
   { label: '服务状态展示', key: 'service-status', icon: renderIcon(ServerOutline) },
   { label: '代理服务器', key: 'servers', icon: renderIcon(ServerOutline) },
   { label: '代理节点', key: 'proxy-outbounds', icon: renderIcon(GitNetworkOutline) },
-  { label: 'Proxy Ports', key: 'proxy-ports', icon: renderIcon(SwapHorizontalOutline) },
+  { label: '代理端口', key: 'proxy-ports', icon: renderIcon(SwapHorizontalOutline) },
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
   { label: '黑名单', key: 'blacklist', icon: renderIcon(BanOutline) },
   { label: '白名单', key: 'whitelist', icon: renderIcon(CheckmarkCircleOutline) },

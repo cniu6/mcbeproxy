@@ -33,6 +33,17 @@ const (
 	LoadBalanceSortHTTP = "http"
 )
 
+const (
+	AutoPingFullScanModeDisabled = ""
+	AutoPingFullScanModeDaily    = "daily"
+	AutoPingFullScanModeInterval = "interval"
+
+	defaultAutoPingIntervalMinutes    = 10
+	defaultAutoPingTopCandidates      = 10
+	defaultAutoPingFullScanTime       = "04:00"
+	defaultAutoPingFullScanIntervalHr = 24
+)
+
 // ServerConfig represents a proxy target server configuration.
 type ServerConfig struct {
 	ID                  string            `json:"id"`
@@ -62,10 +73,14 @@ type ServerConfig struct {
 	LoadBalanceSort     string            `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
 	ProtocolVersion     int               `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
 	// Load balancing ping interval
-	AutoPingEnabled         bool `json:"auto_ping_enabled"`
-	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval in minutes
-	resolvedIP              string
-	lastResolved            time.Time
+	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
+	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"`         // Per-server ping interval in minutes
+	AutoPingTopCandidates         int    `json:"auto_ping_top_candidates"`           // Additional low-traffic candidates besides current node
+	AutoPingFullScanMode          string `json:"auto_ping_full_scan_mode,omitempty"` // "", daily, interval
+	AutoPingFullScanTime          string `json:"auto_ping_full_scan_time,omitempty"` // HH:MM for daily full scan
+	AutoPingFullScanIntervalHours int    `json:"auto_ping_full_scan_interval_hours"` // Full-scan interval in hours when mode=interval
+	resolvedIP                    string
+	lastResolved                  time.Time
 }
 
 const (
@@ -207,6 +222,22 @@ func (sc *ServerConfig) Validate() error {
 	if sc.UDPSocketBufferSize < -1 {
 		return fmt.Errorf("udp_socket_buffer_size must be >= -1, got %d", sc.UDPSocketBufferSize)
 	}
+	if sc.AutoPingTopCandidates < 0 {
+		return fmt.Errorf("auto_ping_top_candidates must be >= 0, got %d", sc.AutoPingTopCandidates)
+	}
+	switch normalizeAutoPingFullScanMode(sc.AutoPingFullScanMode) {
+	case AutoPingFullScanModeDisabled:
+	case AutoPingFullScanModeDaily:
+		if _, err := parseAutoPingClock(sc.GetAutoPingFullScanTime()); err != nil {
+			return err
+		}
+	case AutoPingFullScanModeInterval:
+		if sc.GetAutoPingFullScanIntervalHours() < 1 {
+			return fmt.Errorf("auto_ping_full_scan_interval_hours must be >= 1, got %d", sc.AutoPingFullScanIntervalHours)
+		}
+	default:
+		return fmt.Errorf("invalid auto_ping_full_scan_mode: %s", sc.AutoPingFullScanMode)
+	}
 	if !isValidRawUDPKickStrategy(sc.RawUDPKickStrategy) {
 		return fmt.Errorf("invalid raw_udp_kick_strategy: %s", sc.RawUDPKickStrategy)
 	}
@@ -291,42 +322,50 @@ type ServerConfigDTO struct {
 	Status              string               `json:"status"`            // running, stopped
 	ActiveSessions      int                  `json:"active_sessions"`
 	// Load balancing ping interval
-	AutoPingEnabled         bool `json:"auto_ping_enabled"`
-	AutoPingIntervalMinutes int  `json:"auto_ping_interval_minutes"` // Per-server ping interval
+	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
+	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval
+	AutoPingTopCandidates         int    `json:"auto_ping_top_candidates"`
+	AutoPingFullScanMode          string `json:"auto_ping_full_scan_mode,omitempty"`
+	AutoPingFullScanTime          string `json:"auto_ping_full_scan_time,omitempty"`
+	AutoPingFullScanIntervalHours int    `json:"auto_ping_full_scan_interval_hours"`
 }
 
 // ToDTO converts the server config to a DTO for API responses.
 func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO {
 	return ServerConfigDTO{
-		ID:                      sc.ID,
-		Name:                    sc.Name,
-		Target:                  sc.Target,
-		Port:                    sc.Port,
-		ListenAddr:              sc.ListenAddr,
-		Protocol:                sc.Protocol,
-		Enabled:                 sc.Enabled,
-		Disabled:                sc.Disabled,
-		UDPSpeeder:              sc.UDPSpeeder.ToDTO(),
-		SendRealIP:              sc.SendRealIP,
-		ResolveInterval:         sc.ResolveInterval,
-		IdleTimeout:             sc.IdleTimeout,
-		BufferSize:              sc.BufferSize,
-		UDPSocketBufferSize:     sc.UDPSocketBufferSize,
-		DisabledMessage:         sc.DisabledMessage,
-		CustomMOTD:              sc.CustomMOTD,
-		ProxyMode:               sc.ProxyMode,
-		ACLServerID:             sc.GetACLServerID(),
-		RawUDPKickStrategy:      sc.GetRawUDPKickStrategy(),
-		XboxAuthEnabled:         sc.XboxAuthEnabled,
-		XboxTokenPath:           sc.XboxTokenPath,
-		ProxyOutbound:           sc.ProxyOutbound,
-		ShowRealLatency:         sc.ShowRealLatency,
-		LoadBalance:             sc.LoadBalance,
-		LoadBalanceSort:         sc.LoadBalanceSort,
-		Status:                  status,
-		ActiveSessions:          activeSessions,
-		AutoPingEnabled:         sc.AutoPingEnabled,
-		AutoPingIntervalMinutes: sc.AutoPingIntervalMinutes,
+		ID:                            sc.ID,
+		Name:                          sc.Name,
+		Target:                        sc.Target,
+		Port:                          sc.Port,
+		ListenAddr:                    sc.ListenAddr,
+		Protocol:                      sc.Protocol,
+		Enabled:                       sc.Enabled,
+		Disabled:                      sc.Disabled,
+		UDPSpeeder:                    sc.UDPSpeeder.ToDTO(),
+		SendRealIP:                    sc.SendRealIP,
+		ResolveInterval:               sc.ResolveInterval,
+		IdleTimeout:                   sc.IdleTimeout,
+		BufferSize:                    sc.BufferSize,
+		UDPSocketBufferSize:           sc.UDPSocketBufferSize,
+		DisabledMessage:               sc.DisabledMessage,
+		CustomMOTD:                    sc.CustomMOTD,
+		ProxyMode:                     sc.ProxyMode,
+		ACLServerID:                   sc.GetACLServerID(),
+		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
+		XboxAuthEnabled:               sc.XboxAuthEnabled,
+		XboxTokenPath:                 sc.XboxTokenPath,
+		ProxyOutbound:                 sc.ProxyOutbound,
+		ShowRealLatency:               sc.ShowRealLatency,
+		LoadBalance:                   sc.LoadBalance,
+		LoadBalanceSort:               sc.LoadBalanceSort,
+		Status:                        status,
+		ActiveSessions:                activeSessions,
+		AutoPingEnabled:               sc.AutoPingEnabled,
+		AutoPingIntervalMinutes:       sc.AutoPingIntervalMinutes,
+		AutoPingTopCandidates:         sc.GetAutoPingTopCandidates(),
+		AutoPingFullScanMode:          sc.GetAutoPingFullScanMode(),
+		AutoPingFullScanTime:          sc.GetAutoPingFullScanTime(),
+		AutoPingFullScanIntervalHours: sc.GetAutoPingFullScanIntervalHours(),
 	}
 }
 
@@ -469,6 +508,61 @@ func (sc *ServerConfig) GetLoadBalanceSort() string {
 		return LoadBalanceSortUDP
 	}
 	return sc.LoadBalanceSort
+}
+
+func (sc *ServerConfig) GetAutoPingTopCandidates() int {
+	if sc == nil {
+		return defaultAutoPingTopCandidates
+	}
+	if sc.AutoPingTopCandidates < 0 {
+		return 0
+	}
+	if sc.AutoPingTopCandidates == 0 {
+		return defaultAutoPingTopCandidates
+	}
+	return sc.AutoPingTopCandidates
+}
+
+func (sc *ServerConfig) GetAutoPingFullScanMode() string {
+	if sc == nil {
+		return AutoPingFullScanModeDisabled
+	}
+	return normalizeAutoPingFullScanMode(sc.AutoPingFullScanMode)
+}
+
+func (sc *ServerConfig) GetAutoPingFullScanTime() string {
+	if sc == nil || strings.TrimSpace(sc.AutoPingFullScanTime) == "" {
+		return defaultAutoPingFullScanTime
+	}
+	return strings.TrimSpace(sc.AutoPingFullScanTime)
+}
+
+func (sc *ServerConfig) GetAutoPingFullScanIntervalHours() int {
+	if sc == nil || sc.AutoPingFullScanIntervalHours <= 0 {
+		return defaultAutoPingFullScanIntervalHr
+	}
+	return sc.AutoPingFullScanIntervalHours
+}
+
+func normalizeAutoPingFullScanMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case AutoPingFullScanModeDisabled:
+		return AutoPingFullScanModeDisabled
+	case AutoPingFullScanModeDaily:
+		return AutoPingFullScanModeDaily
+	case AutoPingFullScanModeInterval:
+		return AutoPingFullScanModeInterval
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func parseAutoPingClock(value string) (time.Time, error) {
+	parsed, err := time.Parse("15:04", strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid auto_ping_full_scan_time %q: expected HH:MM", value)
+	}
+	return parsed, nil
 }
 
 // DNSResolver handles DNS resolution for server targets.
@@ -806,7 +900,7 @@ func (cm *ConfigManager) saveToFile() error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(cm.configPath, data, 0644); err != nil {
+	if err := atomicWriteFile(cm.configPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -884,26 +978,48 @@ type GlobalConfig struct {
 	// PublicPingTimeoutSeconds controls per-server ping timeout for /api/public/status.
 	// 0 disables the timeout (wait indefinitely).
 	PublicPingTimeoutSeconds int `json:"public_ping_timeout_seconds"`
+	// Defaults for new server auto ping forms in the frontend.
+	ServerAutoPingIntervalMinutesDefault       int    `json:"server_auto_ping_interval_minutes_default"`
+	ServerAutoPingTopCandidatesDefault         int    `json:"server_auto_ping_top_candidates_default"`
+	ServerAutoPingFullScanModeDefault          string `json:"server_auto_ping_full_scan_mode_default"`
+	ServerAutoPingFullScanTimeDefault          string `json:"server_auto_ping_full_scan_time_default"`
+	ServerAutoPingFullScanIntervalHoursDefault int    `json:"server_auto_ping_full_scan_interval_hours_default"`
+	// Defaults for new proxy-port auto ping forms in the frontend.
+	ProxyPortAutoPingIntervalMinutesDefault       int    `json:"proxy_port_auto_ping_interval_minutes_default"`
+	ProxyPortAutoPingTopCandidatesDefault         int    `json:"proxy_port_auto_ping_top_candidates_default"`
+	ProxyPortAutoPingFullScanModeDefault          string `json:"proxy_port_auto_ping_full_scan_mode_default"`
+	ProxyPortAutoPingFullScanTimeDefault          string `json:"proxy_port_auto_ping_full_scan_time_default"`
+	ProxyPortAutoPingFullScanIntervalHoursDefault int    `json:"proxy_port_auto_ping_full_scan_interval_hours_default"`
 }
 
 // DefaultGlobalConfig returns a GlobalConfig with default values.
 func DefaultGlobalConfig() *GlobalConfig {
 	return &GlobalConfig{
-		MaxSessionRecords:        100,
-		MaxAccessLogRecords:      100,
-		APIPort:                  8080,
-		APIKey:                   "",
-		APIEntryPath:             "/mcpe-admin",
-		DatabasePath:             "data.db",
-		LogDir:                   "logs",
-		LogRetentionDays:         7,
-		LogMaxSizeMB:             100,
-		AuthVerifyEnabled:        false,
-		AuthVerifyURL:            "",
-		AuthCacheMinutes:         15,
-		ProxyPortsEnabled:        true,
-		PassthroughIdleTimeout:   30,
-		PublicPingTimeoutSeconds: 5,
+		MaxSessionRecords:                    100,
+		MaxAccessLogRecords:                  100,
+		APIPort:                              8080,
+		APIKey:                               "",
+		APIEntryPath:                         "/mcpe-admin",
+		DatabasePath:                         "data.db",
+		LogDir:                               "logs",
+		LogRetentionDays:                     7,
+		LogMaxSizeMB:                         100,
+		AuthVerifyEnabled:                    false,
+		AuthVerifyURL:                        "",
+		AuthCacheMinutes:                     15,
+		ProxyPortsEnabled:                    true,
+		PassthroughIdleTimeout:               30,
+		PublicPingTimeoutSeconds:             5,
+		ServerAutoPingIntervalMinutesDefault: defaultAutoPingIntervalMinutes,
+		ServerAutoPingTopCandidatesDefault:   defaultAutoPingTopCandidates,
+		ServerAutoPingFullScanModeDefault:    AutoPingFullScanModeDisabled,
+		ServerAutoPingFullScanTimeDefault:    defaultAutoPingFullScanTime,
+		ServerAutoPingFullScanIntervalHoursDefault:    defaultAutoPingFullScanIntervalHr,
+		ProxyPortAutoPingIntervalMinutesDefault:       defaultAutoPingIntervalMinutes,
+		ProxyPortAutoPingTopCandidatesDefault:         defaultAutoPingTopCandidates,
+		ProxyPortAutoPingFullScanModeDefault:          AutoPingFullScanModeDisabled,
+		ProxyPortAutoPingFullScanTimeDefault:          defaultAutoPingFullScanTime,
+		ProxyPortAutoPingFullScanIntervalHoursDefault: defaultAutoPingFullScanIntervalHr,
 	}
 }
 
@@ -943,6 +1059,32 @@ func LoadGlobalConfig(path string) (*GlobalConfig, error) {
 	if config.AuthCacheMinutes <= 0 {
 		config.AuthCacheMinutes = 15
 	}
+	if config.ServerAutoPingIntervalMinutesDefault <= 0 {
+		config.ServerAutoPingIntervalMinutesDefault = defaultAutoPingIntervalMinutes
+	}
+	if config.ServerAutoPingTopCandidatesDefault <= 0 {
+		config.ServerAutoPingTopCandidatesDefault = defaultAutoPingTopCandidates
+	}
+	config.ServerAutoPingFullScanModeDefault = normalizeAutoPingFullScanMode(config.ServerAutoPingFullScanModeDefault)
+	if strings.TrimSpace(config.ServerAutoPingFullScanTimeDefault) == "" {
+		config.ServerAutoPingFullScanTimeDefault = defaultAutoPingFullScanTime
+	}
+	if config.ServerAutoPingFullScanIntervalHoursDefault <= 0 {
+		config.ServerAutoPingFullScanIntervalHoursDefault = defaultAutoPingFullScanIntervalHr
+	}
+	if config.ProxyPortAutoPingIntervalMinutesDefault <= 0 {
+		config.ProxyPortAutoPingIntervalMinutesDefault = defaultAutoPingIntervalMinutes
+	}
+	if config.ProxyPortAutoPingTopCandidatesDefault <= 0 {
+		config.ProxyPortAutoPingTopCandidatesDefault = defaultAutoPingTopCandidates
+	}
+	config.ProxyPortAutoPingFullScanModeDefault = normalizeAutoPingFullScanMode(config.ProxyPortAutoPingFullScanModeDefault)
+	if strings.TrimSpace(config.ProxyPortAutoPingFullScanTimeDefault) == "" {
+		config.ProxyPortAutoPingFullScanTimeDefault = defaultAutoPingFullScanTime
+	}
+	if config.ProxyPortAutoPingFullScanIntervalHoursDefault <= 0 {
+		config.ProxyPortAutoPingFullScanIntervalHoursDefault = defaultAutoPingFullScanIntervalHr
+	}
 
 	return config, nil
 }
@@ -954,7 +1096,7 @@ func (gc *GlobalConfig) Save(path string) error {
 		return fmt.Errorf("failed to marshal global config: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := atomicWriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write global config: %w", err)
 	}
 
@@ -978,7 +1120,115 @@ func (gc *GlobalConfig) Validate() error {
 	if gc.PublicPingTimeoutSeconds < 0 {
 		return errors.New("public_ping_timeout_seconds cannot be negative")
 	}
+	if gc.GetServerAutoPingIntervalMinutesDefault() < 1 {
+		return errors.New("server_auto_ping_interval_minutes_default must be >= 1")
+	}
+	if gc.GetServerAutoPingTopCandidatesDefault() < 0 {
+		return errors.New("server_auto_ping_top_candidates_default must be >= 0")
+	}
+	switch gc.GetServerAutoPingFullScanModeDefault() {
+	case AutoPingFullScanModeDisabled:
+	case AutoPingFullScanModeDaily:
+		if _, err := parseAutoPingClock(gc.GetServerAutoPingFullScanTimeDefault()); err != nil {
+			return err
+		}
+	case AutoPingFullScanModeInterval:
+		if gc.GetServerAutoPingFullScanIntervalHoursDefault() < 1 {
+			return errors.New("server_auto_ping_full_scan_interval_hours_default must be >= 1")
+		}
+	default:
+		return fmt.Errorf("invalid server_auto_ping_full_scan_mode_default: %s", gc.ServerAutoPingFullScanModeDefault)
+	}
+	if gc.GetProxyPortAutoPingIntervalMinutesDefault() < 1 {
+		return errors.New("proxy_port_auto_ping_interval_minutes_default must be >= 1")
+	}
+	if gc.GetProxyPortAutoPingTopCandidatesDefault() < 0 {
+		return errors.New("proxy_port_auto_ping_top_candidates_default must be >= 0")
+	}
+	switch gc.GetProxyPortAutoPingFullScanModeDefault() {
+	case AutoPingFullScanModeDisabled:
+	case AutoPingFullScanModeDaily:
+		if _, err := parseAutoPingClock(gc.GetProxyPortAutoPingFullScanTimeDefault()); err != nil {
+			return err
+		}
+	case AutoPingFullScanModeInterval:
+		if gc.GetProxyPortAutoPingFullScanIntervalHoursDefault() < 1 {
+			return errors.New("proxy_port_auto_ping_full_scan_interval_hours_default must be >= 1")
+		}
+	default:
+		return fmt.Errorf("invalid proxy_port_auto_ping_full_scan_mode_default: %s", gc.ProxyPortAutoPingFullScanModeDefault)
+	}
 	return nil
+}
+
+func (gc *GlobalConfig) GetServerAutoPingIntervalMinutesDefault() int {
+	if gc == nil || gc.ServerAutoPingIntervalMinutesDefault <= 0 {
+		return defaultAutoPingIntervalMinutes
+	}
+	return gc.ServerAutoPingIntervalMinutesDefault
+}
+
+func (gc *GlobalConfig) GetServerAutoPingTopCandidatesDefault() int {
+	if gc == nil || gc.ServerAutoPingTopCandidatesDefault <= 0 {
+		return defaultAutoPingTopCandidates
+	}
+	return gc.ServerAutoPingTopCandidatesDefault
+}
+
+func (gc *GlobalConfig) GetServerAutoPingFullScanModeDefault() string {
+	if gc == nil {
+		return AutoPingFullScanModeDisabled
+	}
+	return normalizeAutoPingFullScanMode(gc.ServerAutoPingFullScanModeDefault)
+}
+
+func (gc *GlobalConfig) GetServerAutoPingFullScanTimeDefault() string {
+	if gc == nil || strings.TrimSpace(gc.ServerAutoPingFullScanTimeDefault) == "" {
+		return defaultAutoPingFullScanTime
+	}
+	return strings.TrimSpace(gc.ServerAutoPingFullScanTimeDefault)
+}
+
+func (gc *GlobalConfig) GetServerAutoPingFullScanIntervalHoursDefault() int {
+	if gc == nil || gc.ServerAutoPingFullScanIntervalHoursDefault <= 0 {
+		return defaultAutoPingFullScanIntervalHr
+	}
+	return gc.ServerAutoPingFullScanIntervalHoursDefault
+}
+
+func (gc *GlobalConfig) GetProxyPortAutoPingIntervalMinutesDefault() int {
+	if gc == nil || gc.ProxyPortAutoPingIntervalMinutesDefault <= 0 {
+		return defaultAutoPingIntervalMinutes
+	}
+	return gc.ProxyPortAutoPingIntervalMinutesDefault
+}
+
+func (gc *GlobalConfig) GetProxyPortAutoPingTopCandidatesDefault() int {
+	if gc == nil || gc.ProxyPortAutoPingTopCandidatesDefault <= 0 {
+		return defaultAutoPingTopCandidates
+	}
+	return gc.ProxyPortAutoPingTopCandidatesDefault
+}
+
+func (gc *GlobalConfig) GetProxyPortAutoPingFullScanModeDefault() string {
+	if gc == nil {
+		return AutoPingFullScanModeDisabled
+	}
+	return normalizeAutoPingFullScanMode(gc.ProxyPortAutoPingFullScanModeDefault)
+}
+
+func (gc *GlobalConfig) GetProxyPortAutoPingFullScanTimeDefault() string {
+	if gc == nil || strings.TrimSpace(gc.ProxyPortAutoPingFullScanTimeDefault) == "" {
+		return defaultAutoPingFullScanTime
+	}
+	return strings.TrimSpace(gc.ProxyPortAutoPingFullScanTimeDefault)
+}
+
+func (gc *GlobalConfig) GetProxyPortAutoPingFullScanIntervalHoursDefault() int {
+	if gc == nil || gc.ProxyPortAutoPingFullScanIntervalHoursDefault <= 0 {
+		return defaultAutoPingFullScanIntervalHr
+	}
+	return gc.ProxyPortAutoPingFullScanIntervalHoursDefault
 }
 
 // Watch starts watching the configuration file for changes.
@@ -999,7 +1249,7 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 			cm.closeWatcher()
 			return fmt.Errorf("failed to create config dir: %w", err)
 		}
-		if err := os.WriteFile(cm.configPath, []byte("[]"), 0644); err != nil {
+		if err := writeFileAtomically(cm.configPath, []byte("[]"), 0644); err != nil {
 			cm.closeWatcher()
 			return fmt.Errorf("failed to create config file: %w", err)
 		}

@@ -5,6 +5,8 @@
     "listen_addr": "0.0.0.0:1080",
     "type": "mixed",
     "enabled": true,
+    "username": "111",
+    "password": "111",
     "proxy_outbound": "HK-1,剩余流量：199.82 GB,HK-2",
     "load_balance": "least-latency",
     "load_balance_sort": "tcp",
