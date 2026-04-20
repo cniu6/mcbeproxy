@@ -15,8 +15,12 @@ set "WEB_DIR=web"
 set "DIST_DIR=internal\api\dist"
 set "MAIN_FILE=cmd\mcpeserverproxy\main.go"
 set "RELEASE_VERSION="
-for /f "delims=" %%I in ('git describe --tags --always --dirty 2^>nul') do set "RELEASE_VERSION=%%I"
+for /f "delims=" %%I in ('git describe --tags --always 2^>nul') do set "RELEASE_VERSION=%%I"
 if not defined RELEASE_VERSION set "RELEASE_VERSION=dev"
+git diff --quiet --ignore-submodules=dirty --no-ext-diff --exit-code -- 2>nul
+if errorlevel 1 set "RELEASE_VERSION=%RELEASE_VERSION%-dirty"
+git diff --cached --quiet --ignore-submodules=dirty --no-ext-diff --exit-code -- 2>nul
+if errorlevel 1 set "RELEASE_VERSION=%RELEASE_VERSION%-dirty"
 set "BUILD_TIME="
 for /f "usebackq delims=" %%I in (`powershell -NoLogo -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'"`) do set "BUILD_TIME=%%I"
 if not defined BUILD_TIME set "BUILD_TIME=unknown"
