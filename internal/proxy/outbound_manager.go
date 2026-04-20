@@ -76,8 +76,9 @@ const (
 	OutboundIdleTimeout = 5 * time.Minute
 
 	serverNodeLatencyCacheTTL         = 30 * time.Minute
-	serverNodeLatencyHistoryRetention = 24 * time.Hour
-	serverNodeLatencyHistoryLimit     = 288
+	serverNodeLatencyHistoryRetention = 5 * 24 * time.Hour
+	serverNodeLatencyHistoryLimit     = 1000
+	serverNodeLatencyHistoryMinGap    = 10 * time.Minute
 )
 
 // HealthStatus represents the health status of a proxy outbound.
@@ -142,6 +143,8 @@ type OutboundManager interface {
 	// Returns nil if the outbound doesn't exist.
 	// Requirements: 4.3
 	GetHealthStatus(name string) *HealthStatus
+	SetOutboundLatency(name, sortBy string, latencyMs int64)
+	GetOutboundLatencyHistory(name, sortBy string) []OutboundLatencySample
 
 	// DialPacketConn creates a UDP PacketConn through the specified outbound.
 	// Returns ErrOutboundNotFound if the outbound doesn't exist.
@@ -231,9 +234,14 @@ type ServerConfigUpdater interface {
 	UpdateServerProxyOutbound(serverID string, proxyOutbound string) error
 }
 
+type serverConfigGetter interface {
+	GetServer(serverID string) (*config.ServerConfig, bool)
+}
+
 // outboundManagerImpl is the in-memory implementation of OutboundManager.
 type outboundManagerImpl struct {
 	mu                  sync.RWMutex
+	globalConfig        *config.GlobalConfig
 	outbounds           map[string]*config.ProxyOutbound
 	singboxOutbounds    map[string]singboxcore.UDPOutbound
 	singboxLastUsed     map[string]time.Time // Track last usage time for idle cleanup
@@ -245,6 +253,8 @@ type outboundManagerImpl struct {
 	serverNodeLatencyMu sync.RWMutex
 	serverNodeLatency   map[serverNodeLatencyKey]serverNodeLatencyValue
 	serverNodeHistory   map[serverNodeLatencyKey]*serverNodeLatencyHistory
+	outboundLatencyMu   sync.RWMutex
+	outboundHistory     map[outboundLatencyKey]*outboundLatencyHistory
 	serverSelectedMu    sync.RWMutex
 	serverSelectedNode  map[string]string // serverID -> pinned node name
 }
@@ -268,34 +278,36 @@ type serverNodeLatencyValue struct {
 }
 
 type serverNodeLatencyHistory struct {
-	start   int
-	count   int
-	samples [serverNodeLatencyHistoryLimit]ServerNodeLatencySample
+	samples []ServerNodeLatencySample
 }
 
-func (h *serverNodeLatencyHistory) append(sample ServerNodeLatencySample) {
+func (h *serverNodeLatencyHistory) append(sample ServerNodeLatencySample, retention time.Duration, minIntervalMs int64, storageLimit int) {
 	if h == nil {
 		return
 	}
-	if h.count < len(h.samples) {
-		index := (h.start + h.count) % len(h.samples)
-		h.samples[index] = sample
-		h.count++
-		return
+	cutoff := time.UnixMilli(sample.Timestamp).Add(-retention).UnixMilli()
+	filtered := h.filtered(cutoff)
+	if len(filtered) > 0 && minIntervalMs > 0 {
+		lastIndex := len(filtered) - 1
+		if sample.Timestamp-filtered[lastIndex].Timestamp < minIntervalMs {
+			filtered[lastIndex] = sample
+			h.samples = filtered
+			return
+		}
 	}
-	h.samples[h.start] = sample
-	h.start = (h.start + 1) % len(h.samples)
+	filtered = append(filtered, sample)
+	if storageLimit > 0 && len(filtered) > storageLimit {
+		filtered = filtered[len(filtered)-storageLimit:]
+	}
+	h.samples = filtered
 }
 
-func (h *serverNodeLatencyHistory) filtered(now time.Time) []ServerNodeLatencySample {
-	if h == nil || h.count == 0 {
+func (h *serverNodeLatencyHistory) filtered(cutoff int64) []ServerNodeLatencySample {
+	if h == nil || len(h.samples) == 0 {
 		return nil
 	}
-	cutoff := now.Add(-serverNodeLatencyHistoryRetention).UnixMilli()
-	result := make([]ServerNodeLatencySample, 0, h.count)
-	for i := 0; i < h.count; i++ {
-		index := (h.start + i) % len(h.samples)
-		sample := h.samples[index]
+	result := make([]ServerNodeLatencySample, 0, len(h.samples))
+	for _, sample := range h.samples {
 		if sample.Timestamp < cutoff {
 			continue
 		}
@@ -304,36 +316,40 @@ func (h *serverNodeLatencyHistory) filtered(now time.Time) []ServerNodeLatencySa
 	return result
 }
 
-func (h *serverNodeLatencyHistory) compact(now time.Time) bool {
-	if h == nil || h.count == 0 {
+func (h *serverNodeLatencyHistory) compact(cutoff int64) bool {
+	if h == nil || len(h.samples) == 0 {
 		return true
 	}
-	filtered := h.filtered(now)
+	filtered := h.filtered(cutoff)
 	if len(filtered) == 0 {
-		h.start = 0
-		h.count = 0
+		h.samples = nil
 		return true
 	}
-	h.start = 0
-	h.count = len(filtered)
-	for i := range filtered {
-		h.samples[i] = filtered[i]
-	}
+	h.samples = filtered
 	return false
 }
 
 // NewOutboundManager creates a new OutboundManager instance.
 // The serverConfigUpdater parameter is optional and used for cascade updates on delete.
 func NewOutboundManager(serverConfigUpdater ServerConfigUpdater) OutboundManager {
-	return NewOutboundManagerWithSingboxFactory(serverConfigUpdater, nil)
+	return NewOutboundManagerWithConfig(serverConfigUpdater, nil)
+}
+
+func NewOutboundManagerWithConfig(serverConfigUpdater ServerConfigUpdater, globalConfig *config.GlobalConfig) OutboundManager {
+	return NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater, globalConfig, nil)
 }
 
 // NewOutboundManagerWithSingboxFactory creates an OutboundManager with an injectable sing-box factory.
 func NewOutboundManagerWithSingboxFactory(serverConfigUpdater ServerConfigUpdater, factory singboxcore.Factory) OutboundManager {
+	return NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater, nil, factory)
+}
+
+func NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater ServerConfigUpdater, globalConfig *config.GlobalConfig, factory singboxcore.Factory) OutboundManager {
 	if factory == nil {
 		factory = NewSingboxCoreFactory()
 	}
 	return &outboundManagerImpl{
+		globalConfig:        globalConfig,
 		outbounds:           make(map[string]*config.ProxyOutbound),
 		singboxOutbounds:    make(map[string]singboxcore.UDPOutbound),
 		singboxLastUsed:     make(map[string]time.Time),
@@ -341,8 +357,68 @@ func NewOutboundManagerWithSingboxFactory(serverConfigUpdater ServerConfigUpdate
 		serverConfigUpdater: serverConfigUpdater,
 		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
 		serverNodeHistory:   make(map[serverNodeLatencyKey]*serverNodeLatencyHistory),
+		outboundHistory:     make(map[outboundLatencyKey]*outboundLatencyHistory),
 		serverSelectedNode:  make(map[string]string),
 	}
+}
+
+func (m *outboundManagerImpl) latencyHistoryRetention() time.Duration {
+	if m == nil || m.globalConfig == nil {
+		return serverNodeLatencyHistoryRetention
+	}
+	return time.Duration(m.globalConfig.GetLatencyHistoryRetentionDays()) * 24 * time.Hour
+}
+
+func (m *outboundManagerImpl) latencyHistoryStorageLimit() int {
+	if m == nil || m.globalConfig == nil {
+		return serverNodeLatencyHistoryLimit
+	}
+	return m.globalConfig.GetLatencyHistoryStorageLimit()
+}
+
+func (m *outboundManagerImpl) latencyHistoryMinIntervalMs() int64 {
+	if m == nil || m.globalConfig == nil {
+		return 0
+	}
+	return int64(time.Duration(m.globalConfig.GetLatencyHistoryMinIntervalMinutes()) * time.Minute / time.Millisecond)
+}
+
+func coalesceLatencyHistoryMinIntervalMs(defaultMinGapMs, overrideMs int64) int64 {
+	if overrideMs <= 0 {
+		return defaultMinGapMs
+	}
+	if defaultMinGapMs <= 0 || overrideMs < defaultMinGapMs {
+		return overrideMs
+	}
+	return defaultMinGapMs
+}
+
+func (m *outboundManagerImpl) serverLatencyHistoryMinIntervalMs(serverID string) int64 {
+	baseMinIntervalMs := m.latencyHistoryMinIntervalMs()
+	if m == nil || m.serverConfigUpdater == nil {
+		return baseMinIntervalMs
+	}
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" || strings.HasPrefix(serverID, "proxy-port:") {
+		return baseMinIntervalMs
+	}
+	getter, ok := m.serverConfigUpdater.(serverConfigGetter)
+	if !ok {
+		return baseMinIntervalMs
+	}
+	serverCfg, exists := getter.GetServer(serverID)
+	if !exists || serverCfg == nil || !serverCfg.AutoPingEnabled {
+		return baseMinIntervalMs
+	}
+	intervalMinutes := serverCfg.AutoPingIntervalMinutes
+	if intervalMinutes <= 0 && m.globalConfig != nil {
+		intervalMinutes = m.globalConfig.GetServerAutoPingIntervalMinutesDefault()
+	}
+	if intervalMinutes <= 0 {
+		return baseMinIntervalMs
+	}
+	overrideMs := int64(time.Duration(intervalMinutes) * time.Minute / time.Millisecond)
+	return coalesceLatencyHistoryMinIntervalMs(baseMinIntervalMs, overrideMs)
 }
 
 func normalizeSortBy(sortBy string) string {
@@ -382,24 +458,33 @@ func outboundSupportsSort(outbound *config.ProxyOutbound, sortBy string) bool {
 }
 
 func (m *outboundManagerImpl) SetServerNodeLatency(serverID, nodeName, sortBy string, latencyMs int64) {
+	m.setServerNodeLatencyAt(serverID, nodeName, sortBy, latencyMs, time.Now())
+}
+
+func (m *outboundManagerImpl) setServerNodeLatencyAt(serverID, nodeName, sortBy string, latencyMs int64, recordedAt time.Time) {
 	serverID = strings.TrimSpace(serverID)
 	nodeName = strings.TrimSpace(nodeName)
 	if serverID == "" || nodeName == "" {
 		return
 	}
 	sortBy = normalizeSortBy(sortBy)
+	if recordedAt.IsZero() {
+		recordedAt = time.Now()
+	}
 
 	key := serverNodeLatencyKey{serverID: serverID, nodeName: nodeName, sortBy: sortBy}
-	now := time.Now()
+	retention := m.latencyHistoryRetention()
+	minIntervalMs := m.serverLatencyHistoryMinIntervalMs(serverID)
+	storageLimit := m.latencyHistoryStorageLimit()
 
 	m.serverNodeLatencyMu.Lock()
-	m.serverNodeLatency[key] = serverNodeLatencyValue{latencyMs: latencyMs, updatedAt: now, updatedAtN: now.UnixNano()}
+	m.serverNodeLatency[key] = serverNodeLatencyValue{latencyMs: latencyMs, updatedAt: recordedAt, updatedAtN: recordedAt.UnixNano()}
 	history := m.serverNodeHistory[key]
 	if history == nil {
 		history = &serverNodeLatencyHistory{}
 		m.serverNodeHistory[key] = history
 	}
-	history.append(ServerNodeLatencySample{Timestamp: now.UnixMilli(), LatencyMs: latencyMs, OK: latencyMs > 0})
+	history.append(ServerNodeLatencySample{Timestamp: recordedAt.UnixMilli(), LatencyMs: latencyMs, OK: latencyMs > 0}, retention, minIntervalMs, storageLimit)
 	m.serverNodeLatencyMu.Unlock()
 }
 
@@ -437,7 +522,7 @@ func (m *outboundManagerImpl) GetServerNodeLatencyHistory(serverID, nodeName, so
 	sortBy = normalizeSortBy(sortBy)
 
 	key := serverNodeLatencyKey{serverID: serverID, nodeName: nodeName, sortBy: sortBy}
-	now := time.Now()
+	cutoff := time.Now().Add(-m.latencyHistoryRetention()).UnixMilli()
 
 	m.serverNodeLatencyMu.Lock()
 	defer m.serverNodeLatencyMu.Unlock()
@@ -446,22 +531,23 @@ func (m *outboundManagerImpl) GetServerNodeLatencyHistory(serverID, nodeName, so
 	if history == nil {
 		return nil
 	}
-	samples := history.filtered(now)
+	samples := history.filtered(cutoff)
 	if len(samples) == 0 {
 		delete(m.serverNodeHistory, key)
 		return nil
 	}
-	if history.compact(now) {
+	if history.compact(cutoff) {
 		delete(m.serverNodeHistory, key)
 	}
 	return samples
 }
 
 func (m *outboundManagerImpl) cleanupExpiredServerNodeLatencyHistory(now time.Time) {
+	cutoff := now.Add(-m.latencyHistoryRetention()).UnixMilli()
 	m.serverNodeLatencyMu.Lock()
 	defer m.serverNodeLatencyMu.Unlock()
 	for key, history := range m.serverNodeHistory {
-		if history == nil || history.compact(now) {
+		if history == nil || history.compact(cutoff) {
 			delete(m.serverNodeHistory, key)
 		}
 	}
@@ -496,7 +582,7 @@ func (m *outboundManagerImpl) SetServerSelectedNode(serverID, nodeName string) {
 }
 
 func (m *outboundManagerImpl) isSelectableOutboundLocked(outbound *config.ProxyOutbound) bool {
-	if outbound == nil || !outbound.Enabled {
+	if outbound == nil || !outbound.Enabled || outbound.IsAutoSelectBlocked() {
 		return false
 	}
 	lastCheck := outbound.GetLastCheck()
@@ -649,7 +735,7 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 		}
 		if !excluded {
 			m.mu.RLock()
-			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled && outboundSupportsSort(o, sortBy) && selectorIncludesOutbound(groupOrName, o) {
+			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled && !o.IsAutoSelectBlocked() && outboundSupportsSort(o, sortBy) && selectorIncludesOutbound(groupOrName, o) {
 				lastCheck := o.GetLastCheck()
 				hasError := o.GetLastError() != ""
 				isHealthy := o.GetHealthy()
@@ -734,21 +820,7 @@ func (m *outboundManagerImpl) selectFromNodeListForServer(serverID, nodeListStr,
 		if !outboundSupportsSort(outbound, sortBy) {
 			continue
 		}
-
-		// Skip disabled nodes
-		if !outbound.Enabled {
-			continue
-		}
-
-		// Skip unhealthy nodes only if they have been tested and failed recently
-		// Allow retry after 30 seconds to recover from transient issues
-		lastCheck := outbound.GetLastCheck()
-		isNeverTested := lastCheck.IsZero()
-		hasError := outbound.GetLastError() != ""
-		isHealthy := outbound.GetHealthy()
-		timeSinceLastCheck := time.Since(lastCheck)
-
-		if !isHealthy && !isNeverTested && hasError && timeSinceLastCheck < 30*time.Second {
+		if !m.isSelectableOutboundLocked(outbound) {
 			continue
 		}
 
@@ -804,16 +876,7 @@ func (m *outboundManagerImpl) selectFromGroupForServer(serverID, groupName, stra
 			if !outboundSupportsSort(outbound, sortBy) {
 				continue
 			}
-			if !outbound.Enabled {
-				continue
-			}
-
-			lastCheck := outbound.GetLastCheck()
-			hasError := outbound.GetLastError() != ""
-			isHealthy := outbound.GetHealthy()
-			timeSinceLastCheck := time.Since(lastCheck)
-
-			if !isHealthy && hasError && !lastCheck.IsZero() && timeSinceLastCheck < 30*time.Second {
+			if !m.isSelectableOutboundLocked(outbound) {
 				continue
 			}
 
@@ -1574,6 +1637,7 @@ func (m *outboundManagerImpl) cleanupIdleOutbounds() {
 			}
 			m.mu.Unlock()
 			m.cleanupExpiredServerNodeLatencyHistory(now)
+			m.cleanupExpiredOutboundLatencyHistory(now)
 		}
 	}
 }
@@ -1900,26 +1964,7 @@ func (m *outboundManagerImpl) selectFromNodeList(nodeListStr, strategy, sortBy s
 			notFoundNodes = append(notFoundNodes, nodeName)
 			continue
 		}
-
-		// Skip disabled nodes
-		if !outbound.Enabled {
-			continue
-		}
-
-		// Skip unhealthy nodes only if they have been tested and failed recently
-		// Allow retry after 30 seconds to recover from transient issues
-		lastCheck := outbound.GetLastCheck()
-		isNeverTested := lastCheck.IsZero()
-		hasError := outbound.GetLastError() != ""
-		isHealthy := outbound.GetHealthy()
-		timeSinceLastCheck := time.Since(lastCheck)
-
-		// Allow node if:
-		// - healthy
-		// - never tested
-		// - no error recorded
-		// - unhealthy but last check was more than 30 seconds ago (allow retry)
-		if !isHealthy && !isNeverTested && hasError && timeSinceLastCheck < 30*time.Second {
+		if !m.isSelectableOutboundLocked(outbound) {
 			continue
 		}
 
@@ -1972,21 +2017,7 @@ func (m *outboundManagerImpl) selectFromGroup(groupName, strategy, sortBy string
 			if !outboundSupportsSort(outbound, sortBy) {
 				continue
 			}
-
-			// Skip disabled nodes
-			if !outbound.Enabled {
-				continue
-			}
-
-			// Skip unhealthy nodes only if they failed recently
-			// Allow retry after 30 seconds to recover from transient issues
-			// Requirements: 3.4 - exclude unhealthy nodes from selection
-			lastCheck := outbound.GetLastCheck()
-			hasError := outbound.GetLastError() != ""
-			isHealthy := outbound.GetHealthy()
-			timeSinceLastCheck := time.Since(lastCheck)
-
-			if !isHealthy && hasError && !lastCheck.IsZero() && timeSinceLastCheck < 30*time.Second {
+			if !m.isSelectableOutboundLocked(outbound) {
 				continue
 			}
 

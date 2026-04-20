@@ -19,10 +19,34 @@
         <n-button v-if="batchTesting" type="info" :loading="true" secondary>
           测试中 {{ batchTestProgress.current }}/{{ batchTestProgress.total }}
         </n-button>
+        <n-button v-if="checkedRowKeys.length > 0 && !batchTesting" type="error" secondary @click="openBatchAutoSelectBlockModal()">
+          批量封禁 ({{ checkedRowKeys.length }})
+        </n-button>
+        <n-popconfirm v-if="checkedRowKeys.length > 0 && !batchTesting" @positive-click="clearAutoSelectBlock(checkedRowKeys)">
+          <template #trigger><n-button type="success" secondary>批量解封 ({{ checkedRowKeys.length }})</n-button></template>
+          确定解除选中的 {{ checkedRowKeys.length }} 个节点自动选择封禁吗？
+        </n-popconfirm>
         <n-popconfirm v-if="checkedRowKeys.length > 0 && !batchTesting" @positive-click="batchDelete">
           <template #trigger><n-button type="error" secondary>批量删除 ({{ checkedRowKeys.length }})</n-button></template>
           确定删除选中的 {{ checkedRowKeys.length }} 个节点吗？
         </n-popconfirm>
+        <n-popover trigger="click" placement="bottom-end">
+          <template #trigger>
+            <n-button secondary>显示字段 ({{ proxyTableVisibleColumnKeys.length }}/{{ proxyTableColumnOptions.length }})</n-button>
+          </template>
+          <n-space vertical size="small" style="width: 220px">
+            <div style="font-size: 12px; color: var(--n-text-color-3);">节点、操作固定显示，其余列可按需勾选。</div>
+            <n-checkbox-group v-model:value="proxyTableVisibleColumnKeys">
+              <n-space vertical size="small">
+                <n-checkbox v-for="option in proxyTableColumnOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </n-checkbox>
+              </n-space>
+            </n-checkbox-group>
+            <n-button text type="primary" style="align-self: flex-start" @click="resetProxyTableVisibleColumns">恢复默认</n-button>
+          </n-space>
+        </n-popover>
+        <n-button secondary @click="openLatencyOverviewModal">延迟历史总表</n-button>
         <n-button secondary @click="showSubscriptionsModal = true">订阅管理</n-button>
         <n-button secondary @click="openImportModal">导入节点</n-button>
         <n-button type="primary" @click="openAddModal">添加代理节点</n-button>
@@ -172,7 +196,7 @@
           :data="sortedOutbounds"
           :bordered="false"
           size="small"
-          :scroll-x="1980"
+          :scroll-x="proxyTableScrollX"
           :row-key="rowKey"
           :row-props="proxyTableRowProps"
           v-model:checked-row-keys="checkedRowKeys"
@@ -183,6 +207,150 @@
         />
       </div>
     </n-card>
+
+    <n-modal v-model:show="showLatencyOverviewModal" preset="card" title="代理节点延迟历史总表" style="width: 1460px; max-width: 97vw">
+      <n-space vertical :size="12">
+        <n-alert type="info">
+          总表固定展示最近 1 小时三类延迟小图，点击任意小图即可展开查看完整历史、时间范围和下方滑块缩放。
+        </n-alert>
+        <n-alert v-if="proxyHistoryOverviewError" type="warning">{{ proxyHistoryOverviewError }}</n-alert>
+        <n-data-table
+          :columns="latencyOverviewColumns"
+          :data="sortedOutbounds"
+          :bordered="false"
+          size="small"
+          :loading="proxyHistoryOverviewLoading"
+          :max-height="640"
+          :scroll-x="1320"
+        />
+      </n-space>
+    </n-modal>
+
+    <n-modal v-model:show="showLatencyHistoryModal" preset="card" :title="proxyHistoryModalTitle" style="width: 1180px; max-width: 96vw">
+      <n-space vertical :size="12">
+        <n-alert type="info">
+          上方控制后端请求时间范围；下方滑块会在已加载的时间段内继续滚动 / 缩放查看。
+        </n-alert>
+        <div class="proxy-history-toolbar">
+          <n-space align="center" wrap>
+            <n-select v-model:value="proxyHistoryRangeKey" :options="proxyHistoryRangeOptions" style="width: 140px" size="small" />
+            <n-date-picker
+              v-if="proxyHistoryRangeKey === 'custom'"
+              v-model:value="proxyHistoryCustomRange"
+              type="datetimerange"
+              size="small"
+              clearable
+              style="width: 320px"
+            />
+            <n-tag v-if="proxyHistoryWindowLabel" type="info" size="small">请求窗口：{{ proxyHistoryWindowLabel }}</n-tag>
+            <n-tag v-if="proxyHistoryVisibleWindowLabel" type="success" size="small">当前视窗：{{ proxyHistoryVisibleWindowLabel }}</n-tag>
+            <n-button size="small" tertiary @click="resetProxyHistoryViewport">重置视窗</n-button>
+            <n-button size="small" @click="refreshProxyLatencyHistoryDetail" :loading="proxyHistoryDetailLoading">刷新</n-button>
+          </n-space>
+        </div>
+        <n-alert v-if="proxyHistoryDetailError" type="warning">{{ proxyHistoryDetailError }}</n-alert>
+        <div class="proxy-history-summary-grid">
+          <n-card size="small">
+            <div class="proxy-history-summary-title">当前视窗</div>
+            <div class="proxy-history-summary-value">{{ proxyHistoryVisibleSummary.total }}</div>
+            <div class="proxy-history-summary-sub">{{ proxyHistoryVisibleSummary.range }}</div>
+          </n-card>
+          <n-card size="small" v-for="metric in proxyHistoryMetricOrder" :key="`summary-${metric}`">
+            <div class="proxy-history-summary-title">{{ proxyHistoryMetricLabels[metric] }}</div>
+            <div class="proxy-history-summary-value">{{ proxyHistorySummaryByMetric[metric].minAvgMax }}</div>
+            <div class="proxy-history-summary-sub">{{ proxyHistorySummaryByMetric[metric].ok }} / {{ proxyHistorySummaryByMetric[metric].samples }} 成功</div>
+          </n-card>
+        </div>
+        <n-card v-if="selectedProxyHistoryOutbound" size="small">
+          <template #header>节点详细信息</template>
+          <n-descriptions :column="3" bordered size="small">
+            <n-descriptions-item label="节点">{{ selectedProxyHistoryOutbound.name }}</n-descriptions-item>
+            <n-descriptions-item label="协议">{{ String(selectedProxyHistoryOutbound.type || '-').toUpperCase() }}</n-descriptions-item>
+            <n-descriptions-item label="分组">{{ selectedProxyHistoryOutbound.group || '-' }}</n-descriptions-item>
+            <n-descriptions-item label="服务器">{{ selectedProxyHistoryOutbound.server }}:{{ selectedProxyHistoryOutbound.port }}</n-descriptions-item>
+            <n-descriptions-item label="状态">
+              <n-space size="4" wrap>
+                <n-tag :type="selectedProxyHistoryOutbound.enabled ? 'success' : 'default'" size="small" bordered="false">
+                  {{ selectedProxyHistoryOutbound.enabled ? '启用中' : '已禁用' }}
+                </n-tag>
+                <n-tag :type="!selectedProxyHistoryOutbound.last_check ? 'default' : (selectedProxyHistoryOutbound.healthy ? 'success' : 'error')" size="small" bordered="false">
+                  {{ !selectedProxyHistoryOutbound.last_check ? '未检测' : (selectedProxyHistoryOutbound.healthy ? '健康' : '异常') }}
+                </n-tag>
+              </n-space>
+            </n-descriptions-item>
+            <n-descriptions-item label="最后检测">{{ selectedProxyHistoryOutbound.last_check ? formatHistoryDateTime(selectedProxyHistoryOutbound.last_check, true) : '-' }}</n-descriptions-item>
+            <n-descriptions-item label="当前质量" :span="3">
+              <n-space size="6" wrap>
+                <n-tag size="small" bordered="false">TCP {{ selectedProxyHistoryOutbound.latency_ms > 0 ? `${selectedProxyHistoryOutbound.latency_ms}ms` : '-' }}</n-tag>
+                <n-tag size="small" bordered="false">HTTP {{ selectedProxyHistoryOutbound.http_latency_ms > 0 ? `${selectedProxyHistoryOutbound.http_latency_ms}ms` : '-' }}</n-tag>
+                <n-tag size="small" bordered="false">UDP {{ selectedProxyHistoryOutbound.udp_available === true ? (selectedProxyHistoryOutbound.udp_latency_ms > 0 ? `${selectedProxyHistoryOutbound.udp_latency_ms}ms` : '可用') : (selectedProxyHistoryOutbound.udp_available === false ? '失败' : '-') }}</n-tag>
+              </n-space>
+            </n-descriptions-item>
+            <n-descriptions-item label="运行态">{{ selectedProxyHistoryOutbound.conn_count || 0 }} 连接 / 活跃 {{ formatDuration(selectedProxyHistoryOutbound.active_duration_seconds) }}</n-descriptions-item>
+            <n-descriptions-item label="流量">↑ {{ formatBytes(selectedProxyHistoryOutbound.bytes_up || 0) }} / ↓ {{ formatBytes(selectedProxyHistoryOutbound.bytes_down || 0) }}</n-descriptions-item>
+            <n-descriptions-item label="最近活跃">{{ selectedProxyHistoryOutbound.last_active ? formatHistoryDateTime(selectedProxyHistoryOutbound.last_active, true) : '-' }}</n-descriptions-item>
+            <n-descriptions-item v-if="selectedProxyHistoryOutbound.last_error" label="最近错误" :span="3">{{ selectedProxyHistoryOutbound.last_error }}</n-descriptions-item>
+          </n-descriptions>
+        </n-card>
+        <n-empty v-if="!proxyHistoryHasAnySamples && !proxyHistoryDetailLoading" description="暂无历史数据" />
+        <div v-else class="proxy-history-chart-grid">
+          <n-card size="small" v-for="metric in proxyHistoryMetricOrder" :key="`chart-${metric}`">
+            <template #header>{{ proxyHistoryMetricLabels[metric] }} 历史</template>
+            <div class="proxy-history-large-chart">
+              <LatencySparkline
+                :samples="proxyHistoryVisibleMetrics[metric]"
+                :label="`${selectedProxyHistoryOutbound?.name || '-'} · ${proxyHistoryMetricLabels[metric]} 历史`"
+                :loading="proxyHistoryDetailLoading"
+                :width="860"
+                :height="240"
+                :max-samples="latencyHistoryRenderLimit"
+                :show-label="false"
+              />
+            </div>
+          </n-card>
+        </div>
+        <div v-if="proxyHistoryRequestWindow" class="proxy-history-slider-card">
+          <div class="proxy-history-slider-header">
+            <span>时间滑块缩放</span>
+            <span>{{ proxyHistoryVisibleWindowLabel || '全部' }}</span>
+          </div>
+          <n-slider v-model:value="proxyHistoryViewportPercent" range :min="0" :max="100" :step="1" />
+        </div>
+        <div class="proxy-history-detail-grid">
+          <n-card size="small" v-for="metric in proxyHistoryMetricOrder" :key="`detail-${metric}`">
+            <template #header>{{ proxyHistoryMetricLabels[metric] }} 详细内容</template>
+            <n-descriptions :column="2" bordered size="small">
+              <n-descriptions-item label="最新状态">
+                <n-tag :type="proxyHistoryMetricDetails[metric].latestType" size="small" bordered="false">
+                  {{ proxyHistoryMetricDetails[metric].latestStatus }}
+                </n-tag>
+              </n-descriptions-item>
+              <n-descriptions-item label="最新延迟">{{ proxyHistoryMetricDetails[metric].latestLatency }}</n-descriptions-item>
+              <n-descriptions-item label="最新时间">{{ proxyHistoryMetricDetails[metric].latestTime }}</n-descriptions-item>
+              <n-descriptions-item label="成功率">{{ proxyHistoryMetricDetails[metric].successRate }}</n-descriptions-item>
+              <n-descriptions-item label="最后成功">{{ proxyHistoryMetricDetails[metric].lastSuccessTime }}</n-descriptions-item>
+              <n-descriptions-item label="最后失败">{{ proxyHistoryMetricDetails[metric].lastFailureTime }}</n-descriptions-item>
+            </n-descriptions>
+            <div class="proxy-history-event-list">
+              <div class="proxy-history-summary-title">最近 {{ proxyHistoryMetricDetails[metric].recent.length }} 条记录</div>
+              <n-empty v-if="proxyHistoryMetricDetails[metric].recent.length === 0" size="small" description="暂无明细" />
+              <div v-else>
+                <div v-for="item in proxyHistoryMetricDetails[metric].recent" :key="item.key" class="proxy-history-event-item">
+                  <div class="proxy-history-event-header">
+                    <span>{{ item.time }}</span>
+                    <n-tag :type="item.type" size="tiny" bordered="false">{{ item.status }}</n-tag>
+                  </div>
+                  <div class="proxy-history-event-sub">
+                    <span>{{ item.latency }}</span>
+                    <span v-if="item.source">{{ item.source }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </n-card>
+        </div>
+      </n-space>
+    </n-modal>
 
     <!-- 编辑 Modal -->
     <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" style="width: 700px">
@@ -279,6 +447,40 @@
         </n-grid>
       </n-form>
       <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveOutbound">保存</n-button></n-space></template>
+    </n-modal>
+
+    <n-modal v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
+      <n-space vertical>
+        <n-alert type="warning">封禁后该节点不会再被负载均衡和自动候选池选中，但你手动指定单节点时仍可使用。</n-alert>
+        <n-form :model="autoSelectBlockForm" label-placement="left" label-width="96">
+          <n-form-item :label="autoSelectBlockTargetNames.length > 1 ? '节点数量' : '节点'">
+            <n-input v-if="autoSelectBlockTargetNames.length <= 1" :value="autoSelectBlockForm.name" readonly />
+            <n-input v-else :value="`已选择 ${autoSelectBlockTargetNames.length} 个节点`" readonly />
+          </n-form-item>
+          <n-alert v-if="autoSelectBlockTargetNames.length > 1" type="info">
+            {{ autoSelectBlockTargetSummary }}
+          </n-alert>
+          <n-form-item label="原因">
+            <n-input v-model:value="autoSelectBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
+          </n-form-item>
+          <n-space size="6" wrap>
+            <n-button v-for="reason in autoSelectBlockReasonOptions" :key="reason" size="small" secondary @click="autoSelectBlockForm.reason = reason">{{ reason }}</n-button>
+          </n-space>
+          <n-form-item label="时长" style="margin-top: 8px">
+            <n-select v-model:value="autoSelectBlockForm.duration" :options="autoSelectBlockDurationOptions" />
+          </n-form-item>
+          <n-form-item v-if="autoSelectBlockForm.duration === 'custom'" label="到期时间">
+            <n-date-picker v-model:value="autoSelectBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
+          </n-form-item>
+          <n-alert v-if="autoSelectBlockPreviewText" type="info">{{ autoSelectBlockPreviewText }}</n-alert>
+        </n-form>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showAutoSelectBlockModal = false">取消</n-button>
+          <n-button type="error" :loading="savingAutoSelectBlock" @click="submitAutoSelectBlock">{{ autoSelectBlockTargetNames.length > 1 ? '确认批量封禁' : '确认封禁' }}</n-button>
+        </n-space>
+      </template>
     </n-modal>
 
     <!-- 导入 Modal -->
@@ -558,9 +760,10 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, h, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, h, watch, nextTick } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
+import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
 import { useDragSelect } from '../composables/useDragSelect'
 
@@ -574,10 +777,12 @@ const outbounds = ref([])
 const loading = ref(false)
 const highlightName = ref('')
 const showEditModal = ref(false)
+const showAutoSelectBlockModal = ref(false)
 const showImportModal = ref(false)
 const showTestOptionsModal = ref(false)
 const showTestResultModal = ref(false)
 const editingName = ref(null)
+const savingAutoSelectBlock = ref(false)
 const testingName = ref(null)
 const testResultData = ref(null)
 const testLoading = ref('正在测试...')
@@ -591,6 +796,80 @@ const pagination = ref({
   showQuickJumper: true,
   prefix: ({ itemCount }) => `共 ${itemCount} 条`
 })
+
+const showLatencyOverviewModal = ref(false)
+const showLatencyHistoryModal = ref(false)
+const proxyHistoryOverviewLoading = ref(false)
+const proxyHistoryOverviewError = ref('')
+const proxyHistoryOverviewMap = ref({})
+const selectedProxyHistoryOutbound = ref(null)
+const proxyHistoryRangeKey = ref('24h')
+const proxyHistoryCustomRange = ref(null)
+const proxyHistoryDetailLoading = ref(false)
+const proxyHistoryDetailError = ref('')
+const proxyHistoryDetailMetrics = ref({ tcp: [], http: [], udp: [] })
+const proxyHistoryViewportPercent = ref([0, 100])
+let proxyHistoryOverviewFetchToken = 0
+let proxyHistoryDetailFetchToken = 0
+let managedDataRefreshTimer = null
+let refreshManagedDataPromise = null
+const proxyHistoryMetricOrder = ['tcp', 'http', 'udp']
+const proxyHistoryMetricLabels = { tcp: 'TCP', http: 'HTTP', udp: 'UDP' }
+const proxyHistoryRangeOptions = [
+  { label: '最近 1 小时', value: '1h' },
+  { label: '最近 6 小时', value: '6h' },
+  { label: '最近 24 小时', value: '24h' },
+  { label: '自定义', value: 'custom' }
+]
+
+const proxyTableColumnStorageKey = 'proxy-outbounds.main-table.visible-columns'
+const proxyTableColumnOptions = [
+  { label: '协议', value: 'type', width: 210 },
+  { label: '质量', value: 'quality', width: 250 },
+  { label: '历史趋势', value: 'history', width: 330 },
+  { label: '运行态', value: 'runtime', width: 260 },
+  { label: '当前使用', value: 'usage_refs', width: 420 },
+  { label: '状态', value: 'status', width: 210 }
+]
+const proxyTableDefaultVisibleColumnKeys = proxyTableColumnOptions.map(option => option.value)
+const normalizeProxyTableVisibleColumnKeys = (keys) => {
+  return Array.from(new Set((Array.isArray(keys) ? keys : []).filter(key => proxyTableDefaultVisibleColumnKeys.includes(key))))
+}
+const readProxyTableVisibleColumnKeys = () => {
+  if (typeof window === 'undefined') return [...proxyTableDefaultVisibleColumnKeys]
+  try {
+    const raw = window.localStorage.getItem(proxyTableColumnStorageKey)
+    if (!raw) return [...proxyTableDefaultVisibleColumnKeys]
+    return normalizeProxyTableVisibleColumnKeys(JSON.parse(raw))
+  } catch {
+    return [...proxyTableDefaultVisibleColumnKeys]
+  }
+}
+const proxyTableVisibleColumnKeys = ref(readProxyTableVisibleColumnKeys())
+const visibleProxyTableColumnSet = computed(() => new Set(normalizeProxyTableVisibleColumnKeys(proxyTableVisibleColumnKeys.value)))
+const isProxyTableColumnVisible = (key) => visibleProxyTableColumnSet.value.has(key)
+const proxyTableScrollX = computed(() => {
+  const total = 48 + 280 + 210 + proxyTableColumnOptions.reduce((sum, option) => {
+    return sum + (isProxyTableColumnVisible(option.value) ? option.width : 0)
+  }, 0)
+  return Math.max(total + 80, 980)
+})
+const resetProxyTableVisibleColumns = () => {
+  proxyTableVisibleColumnKeys.value = [...proxyTableDefaultVisibleColumnKeys]
+}
+
+watch(proxyTableVisibleColumnKeys, (keys) => {
+  const normalized = normalizeProxyTableVisibleColumnKeys(keys)
+  const changed = normalized.length !== keys.length || normalized.some((key, index) => key !== keys[index])
+  if (changed) {
+    proxyTableVisibleColumnKeys.value = normalized
+    return
+  }
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(proxyTableColumnStorageKey, JSON.stringify(normalized))
+  } catch {}
+}, { deep: true })
 
 // 拖选功能实例
 const { rowProps: proxyTableRowProps } = useDragSelect(checkedRowKeys, 'name')
@@ -616,6 +895,34 @@ const qualitySortOrderOptions = [
   { label: '从小到大', value: 'asc' },
   { label: '从大到小', value: 'desc' }
 ]
+
+const autoSelectBlockReasonOptions = ['被封禁IP', '报VPN', '不稳定', '延迟高', '频繁失败']
+const autoSelectBlockDurationOptions = [
+  { label: '12 小时', value: '12h' },
+  { label: '1 天', value: '1d' },
+  { label: '5 天', value: '5d' },
+  { label: '15 天', value: '15d' },
+  { label: '30 天', value: '30d' },
+  { label: '永久', value: 'permanent' },
+  { label: '自定义', value: 'custom' }
+]
+const autoSelectBlockDurationMs = {
+  '12h': 12 * 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+  '5d': 5 * 24 * 60 * 60 * 1000,
+  '15d': 15 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000
+}
+const autoSelectBlockForm = reactive({
+  name: '',
+  reason: '',
+  duration: '1d',
+  customExpiresAt: null
+})
+const autoSelectBlockTargetNames = ref([])
+const latencyHistoryMinIntervalMinutes = ref(10)
+const latencyHistoryRenderLimit = ref(100)
+const latencyHistoryStorageLimit = ref(1000)
 
 // 分组统计数据
 const groupStatsData = ref([])
@@ -706,7 +1013,8 @@ const statusFilterOptions = [
   { label: '已启用', value: 'enabled' },
   { label: '已禁用', value: 'disabled' },
   { label: '健康', value: 'healthy' },
-  { label: '不健康', value: 'unhealthy' }
+  { label: '不健康', value: 'unhealthy' },
+  { label: '已封禁', value: 'blocked' }
 ]
 
 const getQualitySortValue = (row, metric) => {
@@ -759,6 +1067,9 @@ const filteredOutbounds = computed(() => {
       case 'unhealthy':
         result = result.filter(o => !o.healthy)
         break
+	    case 'blocked':
+	      result = result.filter(o => o.auto_select_blocked)
+	      break
     }
   }
 
@@ -773,7 +1084,8 @@ const filteredOutbounds = computed(() => {
       o.name.toLowerCase().includes(kw) || 
       o.server.toLowerCase().includes(kw) ||
       (o.group && o.group.toLowerCase().includes(kw)) ||
-      (o.subscription_name && o.subscription_name.toLowerCase().includes(kw))
+      (o.subscription_name && o.subscription_name.toLowerCase().includes(kw)) ||
+      (o.auto_select_block_reason && o.auto_select_block_reason.toLowerCase().includes(kw))
     )
   }
   
@@ -963,9 +1275,44 @@ const defaultForm = {
   flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '',
   idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
   reality: false, reality_public_key: '', reality_short_id: '',
-  network: '', ws_path: '', ws_host: '', xhttp_mode: '', grpc_service_name: '', grpc_authority: ''
+  network: '', ws_path: '', ws_host: '', xhttp_mode: '', grpc_service_name: '', grpc_authority: '',
+  auto_select_blocked: false, auto_select_block_reason: '', auto_select_block_expires_at: null
 }
 const form = ref({ ...defaultForm })
+
+const resolveAutoSelectBlockExpiresAt = () => {
+  if (autoSelectBlockForm.duration === 'permanent') return null
+  if (autoSelectBlockForm.duration === 'custom') {
+    if (!autoSelectBlockForm.customExpiresAt) return undefined
+    return new Date(autoSelectBlockForm.customExpiresAt).toISOString()
+  }
+  const durationMs = autoSelectBlockDurationMs[autoSelectBlockForm.duration]
+  if (!durationMs) return undefined
+  return new Date(Date.now() + durationMs).toISOString()
+}
+
+const autoSelectBlockPreviewText = computed(() => {
+  const expiresAt = resolveAutoSelectBlockExpiresAt()
+  if (expiresAt === undefined) return ''
+  if (expiresAt === null) return '将永久跳过自动选择，直到你手动解封。'
+  return `将自动封禁至 ${formatTime(expiresAt)}`
+})
+
+const autoSelectBlockModalTitle = computed(() => autoSelectBlockTargetNames.value.length > 1 ? '批量封禁自动选择' : '封禁自动选择')
+
+const autoSelectBlockTargetSummary = computed(() => {
+  const names = autoSelectBlockTargetNames.value.filter(Boolean)
+  if (names.length <= 1) return names[0] || ''
+  const preview = names.slice(0, 6).join('、')
+  return names.length > 6 ? `${preview} 等 ${names.length} 个节点` : preview
+})
+
+const formatAutoSelectBlockSummary = (row) => {
+  if (!row?.auto_select_blocked) return ''
+  const untilText = row.auto_select_block_expires_at ? `至 ${formatTime(row.auto_select_block_expires_at)}` : '永久'
+  const reason = (row.auto_select_block_reason || '').trim()
+  return reason ? `${untilText} · ${reason}` : untilText
+}
 
 const renderLatencyTag = (latency, good, medium) => {
   if (!latency || latency <= 0) {
@@ -1001,6 +1348,375 @@ const renderStatusTag = (row) => {
 const formatLastActive = (value) => {
   if (!value) return '最近活跃 -'
   return `最近活跃 ${formatTime(value)}`
+}
+
+const renderProxyHistorySparkline = (row, metric, width = 160, clickable = false) => {
+  const samples = getProxyOverviewHistorySamples(row.name, metric)
+  const fallbackLatency = metric === 'tcp'
+    ? row.latency_ms
+    : metric === 'http'
+      ? row.http_latency_ms
+      : row.udp_available === true
+        ? row.udp_latency_ms
+        : 0
+  return h(LatencySparkline, {
+    samples,
+    loading: proxyHistoryOverviewLoading.value,
+    label: `${row.name} · ${proxyHistoryMetricLabels[metric]} 历史`,
+    emptyText: '暂无',
+    width,
+    height: 30,
+    showLabel: false,
+    clickable,
+    onClick: clickable ? () => openProxyLatencyHistoryModal(row) : undefined,
+    maxSamples: Math.max(Number(latencyHistoryRenderLimit.value) || 100, 1)
+  })
+}
+
+const renderProxyHistoryStack = (row, width = 160) => {
+  const open = (event) => {
+    event?.stopPropagation?.()
+    openProxyLatencyHistoryModal(row)
+  }
+  const onKeydown = (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      event.stopPropagation()
+      openProxyLatencyHistoryModal(row)
+    }
+  }
+  return h('div', {
+    class: 'proxy-history-cell-card',
+    role: 'button',
+    tabindex: 0,
+    onClick: open,
+    onKeydown
+  }, [
+    h(NSpace, { vertical: true, size: 6 }, () => proxyHistoryMetricOrder.map(metric => h('div', { class: 'proxy-history-cell-row' }, [
+      h('span', { class: 'proxy-history-cell-label' }, proxyHistoryMetricLabels[metric]),
+      renderProxyHistorySparkline(row, metric, width, true)
+    ])))
+  ])
+}
+
+const isSuccessfulLatencySample = (sample) => {
+  if (!sample || sample.stopped) return false
+  const latency = Number(sample.latency_ms || 0)
+  if (typeof sample.ok === 'boolean') return sample.ok && latency > 0
+  if (typeof sample.online === 'boolean') return sample.online && latency > 0
+  return latency > 0
+}
+
+const formatHistoryDateTime = (timestamp, includeSeconds = false) => {
+  const value = Number(timestamp || 0)
+  if (!Number.isFinite(value) || value <= 0) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  const yyyy = date.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  const hh = String(date.getHours()).padStart(2, '0')
+  const mi = String(date.getMinutes()).padStart(2, '0')
+  const ss = String(date.getSeconds()).padStart(2, '0')
+  return includeSeconds ? `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}` : `${yyyy}-${mm}-${dd} ${hh}:${mi}`
+}
+
+const getQuickProxyHistoryWindow = (key) => {
+  const now = Date.now()
+  if (key === '1h') return [now - 60 * 60 * 1000, now]
+  if (key === '24h') return [now - 24 * 60 * 60 * 1000, now]
+  return [now - 6 * 60 * 60 * 1000, now]
+}
+
+const normalizeProxyHistoryWindow = (range) => {
+  if (!Array.isArray(range) || range.length !== 2) return null
+  const start = Number(range[0])
+  const end = Number(range[1])
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end <= 0) return null
+  return start <= end ? [start, end] : [end, start]
+}
+
+const getProxyHistoryRequestWindow = () => {
+  if (proxyHistoryRangeKey.value === 'custom') {
+    return normalizeProxyHistoryWindow(proxyHistoryCustomRange.value)
+  }
+  return getQuickProxyHistoryWindow(proxyHistoryRangeKey.value)
+}
+
+const getProxyHistoryLimit = () => {
+  const range = getProxyHistoryRequestWindow()
+  const minIntervalMinutes = Math.max(Number(latencyHistoryMinIntervalMinutes.value) || 10, 1)
+  const storageLimit = Math.max(Number(latencyHistoryStorageLimit.value) || 1000, 1)
+  const renderLimit = Math.max(Number(latencyHistoryRenderLimit.value) || 100, 1)
+  if (!range) {
+    return Math.min(storageLimit, renderLimit)
+  }
+  const estimated = Math.ceil(Math.max(range[1] - range[0], 0) / (minIntervalMinutes * 60 * 1000)) + 1
+  return Math.min(storageLimit, Math.max(estimated, renderLimit))
+}
+
+const normalizeProxyHistoryMetrics = (metrics) => ({
+  tcp: Array.isArray(metrics?.tcp) ? metrics.tcp : [],
+  http: Array.isArray(metrics?.http) ? metrics.http : [],
+  udp: Array.isArray(metrics?.udp) ? metrics.udp : []
+})
+
+const getProxyOverviewHistorySamples = (name, metric) => {
+  return normalizeProxyHistoryMetrics(proxyHistoryOverviewMap.value?.[name])[metric] || []
+}
+
+const proxyHistoryRequestWindow = computed(() => getProxyHistoryRequestWindow())
+const proxyHistoryWindowLabel = computed(() => {
+  const range = proxyHistoryRequestWindow.value
+  if (!range) return ''
+  return `${formatHistoryDateTime(range[0])} - ${formatHistoryDateTime(range[1])}`
+})
+
+const proxyHistoryVisibleWindow = computed(() => {
+  const range = proxyHistoryRequestWindow.value
+  if (!range) return null
+  const [fromMs, toMs] = range
+  const span = Math.max(toMs - fromMs, 1)
+  const raw = Array.isArray(proxyHistoryViewportPercent.value) ? proxyHistoryViewportPercent.value : [0, 100]
+  const startPercent = Math.min(Math.max(Number(raw[0]) || 0, 0), 100)
+  const endPercent = Math.min(Math.max(Number(raw[1]) || 100, 0), 100)
+  const normalized = startPercent <= endPercent ? [startPercent, endPercent] : [endPercent, startPercent]
+  const start = fromMs + span * (normalized[0] / 100)
+  const end = fromMs + span * (normalized[1] / 100)
+  return [Math.round(start), Math.round(end)]
+})
+
+const proxyHistoryVisibleWindowLabel = computed(() => {
+  const range = proxyHistoryVisibleWindow.value
+  if (!range) return ''
+  return `${formatHistoryDateTime(range[0])} - ${formatHistoryDateTime(range[1])}`
+})
+
+const proxyHistoryVisibleMetrics = computed(() => {
+  const metrics = normalizeProxyHistoryMetrics(proxyHistoryDetailMetrics.value)
+  const range = proxyHistoryVisibleWindow.value
+  if (!range) return metrics
+  const [start, end] = range
+  const filterSamples = (samples) => samples.filter(sample => {
+    const ts = Number(sample?.timestamp || 0)
+    return ts >= start && ts <= end
+  })
+  return {
+    tcp: filterSamples(metrics.tcp),
+    http: filterSamples(metrics.http),
+    udp: filterSamples(metrics.udp)
+  }
+})
+
+const formatHistoryLatencyLabel = (value) => {
+  const latency = Number(value || 0)
+  if (!Number.isFinite(latency) || latency <= 0) return '-'
+  return `${Math.round(latency)} ms`
+}
+
+const getProxyHistorySampleTag = (sample) => {
+  if (!sample) return { type: 'default', label: '-' }
+  if (sample.stopped) return { type: 'default', label: '已停止' }
+  const latency = Number(sample.latency_ms || 0)
+  if (typeof sample.ok === 'boolean') {
+    return sample.ok && latency > 0
+      ? { type: 'success', label: '成功' }
+      : { type: 'error', label: '失败' }
+  }
+  if (typeof sample.online === 'boolean') {
+    if (!sample.online) return { type: 'error', label: '离线' }
+    return latency > 0
+      ? { type: 'success', label: '在线' }
+      : { type: 'warning', label: '在线' }
+  }
+  return latency > 0 ? { type: 'success', label: '成功' } : { type: 'default', label: '-' }
+}
+
+const findLastProxyHistorySample = (samples, predicate) => {
+  for (let index = samples.length - 1; index >= 0; index -= 1) {
+    const sample = samples[index]
+    if (predicate(sample)) return sample
+  }
+  return null
+}
+
+const proxyHistoryMetricDetails = computed(() => {
+  const metrics = proxyHistoryVisibleMetrics.value
+  const result = {}
+  proxyHistoryMetricOrder.forEach((metric) => {
+    const samples = Array.isArray(metrics[metric]) ? metrics[metric] : []
+    const latest = samples[samples.length - 1] || null
+    const latestTag = getProxyHistorySampleTag(latest)
+    const successCount = samples.filter(isSuccessfulLatencySample).length
+    const lastSuccess = findLastProxyHistorySample(samples, isSuccessfulLatencySample)
+    const lastFailure = findLastProxyHistorySample(samples, sample => !!sample && !isSuccessfulLatencySample(sample))
+    result[metric] = {
+      latestType: latestTag.type,
+      latestStatus: latestTag.label,
+      latestLatency: formatHistoryLatencyLabel(latest?.latency_ms),
+      latestTime: formatHistoryDateTime(latest?.timestamp, true),
+      successRate: samples.length ? `${Math.round((successCount / samples.length) * 100)}% (${successCount}/${samples.length})` : '-',
+      lastSuccessTime: formatHistoryDateTime(lastSuccess?.timestamp, true),
+      lastFailureTime: formatHistoryDateTime(lastFailure?.timestamp, true),
+      recent: samples.slice(-6).reverse().map((sample, index) => {
+        const tag = getProxyHistorySampleTag(sample)
+        return {
+          key: `${metric}-${sample?.timestamp || 0}-${index}`,
+          time: formatHistoryDateTime(sample?.timestamp, true),
+          type: tag.type,
+          status: tag.label,
+          latency: formatHistoryLatencyLabel(sample?.latency_ms),
+          source: typeof sample?.source === 'string' ? sample.source.trim() : ''
+        }
+      })
+    }
+  })
+  return result
+})
+
+const proxyHistorySummaryByMetric = computed(() => {
+  const visibleMetrics = proxyHistoryVisibleMetrics.value
+  const result = {}
+  proxyHistoryMetricOrder.forEach((metric) => {
+    const samples = Array.isArray(visibleMetrics[metric]) ? visibleMetrics[metric] : []
+    const okSamples = samples.filter(isSuccessfulLatencySample)
+    const values = okSamples.map(sample => Number(sample.latency_ms || 0)).filter(value => Number.isFinite(value) && value > 0)
+    result[metric] = {
+      samples: samples.length,
+      ok: okSamples.length,
+      failed: Math.max(samples.length - okSamples.length, 0),
+      minAvgMax: values.length
+        ? `${Math.min(...values)} / ${Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)} / ${Math.max(...values)} ms`
+        : '-'
+    }
+  })
+  return result
+})
+
+const proxyHistoryVisibleSummary = computed(() => {
+  const metrics = proxyHistoryVisibleMetrics.value
+  const total = proxyHistoryMetricOrder.reduce((sum, metric) => sum + (metrics[metric]?.length || 0), 0)
+  return {
+    total: `${total} 点`,
+    range: proxyHistoryVisibleWindowLabel.value || '-'
+  }
+})
+
+const proxyHistoryHasAnySamples = computed(() => {
+  const metrics = proxyHistoryVisibleMetrics.value
+  return proxyHistoryMetricOrder.some(metric => (metrics[metric]?.length || 0) > 0)
+})
+
+const proxyHistoryModalTitle = computed(() => {
+  const name = selectedProxyHistoryOutbound.value?.name
+  return name ? `${name} · 完整延迟历史` : '代理节点延迟历史'
+})
+
+const resetProxyHistoryViewport = () => {
+  proxyHistoryViewportPercent.value = [0, 100]
+}
+
+const openLatencyOverviewModal = async () => {
+  showLatencyOverviewModal.value = true
+  await refreshProxyLatencyOverview()
+}
+
+const refreshProxyLatencyOverview = async () => {
+  const now = Date.now()
+  const overviewLimit = Math.min(
+    Math.max(Number(latencyHistoryStorageLimit.value) || 1000, 1),
+    Math.max(Number(latencyHistoryRenderLimit.value) || 100, 1)
+  )
+  const params = new URLSearchParams({
+    from: String(now - 60 * 60 * 1000),
+    to: String(now),
+    limit: String(overviewLimit)
+  })
+  const token = ++proxyHistoryOverviewFetchToken
+  proxyHistoryOverviewLoading.value = true
+  proxyHistoryOverviewError.value = ''
+  try {
+    const res = await api(`/api/proxy-outbounds/latency-overview?${params.toString()}`)
+    if (token !== proxyHistoryOverviewFetchToken) return
+    if (!res?.success || !res?.data) {
+      proxyHistoryOverviewMap.value = {}
+      proxyHistoryOverviewError.value = res?.error || res?.msg || '代理历史数据加载失败'
+      return
+    }
+    proxyHistoryOverviewMap.value = res.data.latency_history || {}
+  } catch (error) {
+    if (token !== proxyHistoryOverviewFetchToken) return
+    proxyHistoryOverviewMap.value = {}
+    proxyHistoryOverviewError.value = error?.message || '代理历史数据加载失败'
+  } finally {
+    if (token === proxyHistoryOverviewFetchToken) {
+      proxyHistoryOverviewLoading.value = false
+    }
+  }
+}
+
+const refreshProxyHistoryViews = async () => {
+  await refreshProxyLatencyOverview()
+  if (showLatencyHistoryModal.value && selectedProxyHistoryOutbound.value?.name) {
+    await refreshProxyLatencyHistoryDetail()
+  }
+}
+
+const openProxyLatencyHistoryModal = async (row) => {
+  const nextName = row?.name ? String(row.name) : ''
+  if (!nextName) return
+  selectedProxyHistoryOutbound.value = { ...row }
+  proxyHistoryDetailError.value = ''
+  resetProxyHistoryViewport()
+  if (showLatencyOverviewModal.value) {
+    showLatencyOverviewModal.value = false
+  }
+  showLatencyHistoryModal.value = true
+  await nextTick()
+  await refreshProxyLatencyHistoryDetail()
+}
+
+const refreshProxyLatencyHistoryDetail = async () => {
+  const name = selectedProxyHistoryOutbound.value?.name
+  if (!showLatencyHistoryModal.value || !name) {
+    proxyHistoryDetailMetrics.value = { tcp: [], http: [], udp: [] }
+    proxyHistoryDetailError.value = ''
+    return
+  }
+  const windowRange = getProxyHistoryRequestWindow()
+  if (!windowRange) {
+    proxyHistoryDetailMetrics.value = { tcp: [], http: [], udp: [] }
+    proxyHistoryDetailError.value = '请选择完整的开始和结束时间。'
+    return
+  }
+  const [fromMs, toMs] = windowRange
+  const params = new URLSearchParams({
+    from: String(fromMs),
+    to: String(toMs),
+    limit: String(getProxyHistoryLimit())
+  })
+  const token = ++proxyHistoryDetailFetchToken
+  proxyHistoryDetailLoading.value = true
+  proxyHistoryDetailError.value = ''
+  try {
+    const res = await api(`/api/proxy-outbounds/${encodeURIComponent(name)}/latency-history?${params.toString()}`)
+    if (token !== proxyHistoryDetailFetchToken) return
+    if (!showLatencyHistoryModal.value || selectedProxyHistoryOutbound.value?.name !== name) return
+    if (!res?.success || !res?.data) {
+      proxyHistoryDetailMetrics.value = { tcp: [], http: [], udp: [] }
+      proxyHistoryDetailError.value = res?.error || res?.msg || '代理历史数据加载失败'
+      return
+    }
+    proxyHistoryDetailMetrics.value = normalizeProxyHistoryMetrics(res.data.metrics)
+  } catch (error) {
+    if (token !== proxyHistoryDetailFetchToken) return
+    proxyHistoryDetailMetrics.value = { tcp: [], http: [], udp: [] }
+    proxyHistoryDetailError.value = error?.message || '代理历史数据加载失败'
+  } finally {
+    if (token === proxyHistoryDetailFetchToken) {
+      proxyHistoryDetailLoading.value = false
+    }
+  }
 }
 
 const renderUsageLatencyTag = (label, available, latency, good, medium) => {
@@ -1060,100 +1776,189 @@ const renderUsageRefs = (row) => {
   ])
 }
 
-const columns = computed(() => [
-  { type: 'selection', fixed: 'left' },
-  {
-    title: '节点',
-    key: 'name',
-    width: 280,
-    fixed: 'left',
-    sorter: (a, b) => a.name.localeCompare(b.name),
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-      h('div', { class: row.name === highlightName.value ? 'node-name node-name-highlight' : 'node-name' }, row.name),
-      h('div', { class: 'table-secondary-text' }, `${row.server}:${row.port}`),
-      h(NSpace, { size: 4, wrap: true }, () => [
-        row.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => row.group) : null,
-        row.subscription_name ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => `订阅: ${row.subscription_name}`) : null
+const columns = computed(() => {
+  const columnList = [
+    { type: 'selection', fixed: 'left' },
+    {
+      title: '节点',
+      key: 'name',
+      width: 280,
+      fixed: 'left',
+      sorter: (a, b) => a.name.localeCompare(b.name),
+      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+        h('div', { class: row.name === highlightName.value ? 'node-name node-name-highlight' : 'node-name' }, row.name),
+        h('div', { class: 'table-secondary-text' }, `${row.server}:${row.port}`),
+        h(NSpace, { size: 4, wrap: true }, () => [
+          row.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => row.group) : null,
+          row.subscription_name ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => `订阅: ${row.subscription_name}`) : null,
+          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null
+        ])
       ])
-    ])
-  },
-  {
-    title: '协议',
-    key: 'type',
-    width: 210,
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-      h(NSpace, { size: 4, wrap: true }, () => [
-        h(NTag, { type: 'info', size: 'small' }, () => row.type.toUpperCase()),
-        row.reality ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => 'Reality') : null,
-        row.flow === 'xtls-rprx-vision' ? h(NTag, { type: 'primary', size: 'small', bordered: false }, () => 'Vision') : null,
-        row.network === 'ws' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'WS') : null,
-        row.network === 'httpupgrade' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'HTTPU') : null,
-        row.network === 'xhttp' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'XHTTP') : null,
-        row.network === 'grpc' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'gRPC') : null,
-        row.port_hopping ? h(NTag, { size: 'small', bordered: false }, () => 'Hop') : null,
-        row.tls ? h(NTag, { type: row.insecure ? 'warning' : 'success', size: 'small', bordered: false }, () => row.insecure ? 'TLS*' : 'TLS') : null
-      ]),
-      h('div', { class: 'table-secondary-text' }, row.sni ? `SNI ${row.sni}` : (row.alpn ? `ALPN ${row.alpn}` : '-'))
-    ])
-  },
-  {
-    title: '质量',
-    key: 'quality',
-    width: 250,
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-      h(NSpace, { size: 6, wrap: true }, () => [
-        h('span', { class: 'metric-label' }, 'TCP'),
-        renderLatencyTag(row.latency_ms, 200, 500),
-        h('span', { class: 'metric-label' }, 'HTTP'),
-        renderLatencyTag(row.http_latency_ms, 500, 1500),
-        h('span', { class: 'metric-label' }, 'UDP'),
-        renderUdpTag(row)
-      ]),
-      h('div', { class: 'table-secondary-text' }, row.last_check ? `最后检测 ${formatTime(row.last_check)}` : '尚未进行连通性检测')
-    ])
-  },
-  {
-    title: '运行态',
-    key: 'runtime',
-    width: 260,
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-      h(NSpace, { size: 4, wrap: true }, () => [
-        h(NTag, { type: (row.conn_count || 0) > 0 ? 'success' : 'default', size: 'small', bordered: false }, () => `连接 ${row.conn_count || 0}`),
-        h(NTag, { size: 'small', bordered: false }, () => `活跃 ${formatDuration(row.active_duration_seconds)}`)
-      ]),
-      h('div', { class: 'table-secondary-text' }, `↑ ${formatBytes(row.bytes_up || 0)} / ↓ ${formatBytes(row.bytes_down || 0)}`),
-      h('div', { class: 'table-secondary-text' }, formatLastActive(row.last_active))
-    ])
-  },
-  {
-    title: '当前使用',
-    key: 'usage_refs',
-    width: 420,
-    render: (row) => renderUsageRefs(row)
-  },
-  {
-    title: '状态',
-    key: 'status',
-    width: 210,
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-      h(NSpace, { size: 4, wrap: true }, () => [
-        h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启用中' : '已禁用'),
-        renderStatusTag(row)
-      ]),
-      h('div', { class: row.last_error ? 'table-error-text' : 'table-secondary-text', title: row.last_error || '' }, row.last_error || '无最近错误')
-    ])
-  },
-  {
+    }
+  ]
+
+  if (isProxyTableColumnVisible('type')) {
+    columnList.push({
+      title: '协议',
+      key: 'type',
+      width: 210,
+      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+        h(NSpace, { size: 4, wrap: true }, () => [
+          h(NTag, { type: 'info', size: 'small' }, () => row.type.toUpperCase()),
+          row.reality ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => 'Reality') : null,
+          row.flow === 'xtls-rprx-vision' ? h(NTag, { type: 'primary', size: 'small', bordered: false }, () => 'Vision') : null,
+          row.network === 'ws' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'WS') : null,
+          row.network === 'httpupgrade' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'HTTPU') : null,
+          row.network === 'xhttp' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'XHTTP') : null,
+          row.network === 'grpc' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'gRPC') : null,
+          row.port_hopping ? h(NTag, { size: 'small', bordered: false }, () => 'Hop') : null,
+          row.tls ? h(NTag, { type: row.insecure ? 'warning' : 'success', size: 'small', bordered: false }, () => row.insecure ? 'TLS*' : 'TLS') : null
+        ]),
+        h('div', { class: 'table-secondary-text' }, row.sni ? `SNI ${row.sni}` : (row.alpn ? `ALPN ${row.alpn}` : '-'))
+      ])
+    })
+  }
+
+  if (isProxyTableColumnVisible('quality')) {
+    columnList.push({
+      title: '质量',
+      key: 'quality',
+      width: 250,
+      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+        h(NSpace, { size: 6, wrap: true }, () => [
+          h('span', { class: 'metric-label' }, 'TCP'),
+          renderLatencyTag(row.latency_ms, 200, 500),
+          h('span', { class: 'metric-label' }, 'HTTP'),
+          renderLatencyTag(row.http_latency_ms, 500, 1500),
+          h('span', { class: 'metric-label' }, 'UDP'),
+          renderUdpTag(row)
+        ]),
+        h('div', { class: 'table-secondary-text' }, row.last_check ? `最后检测 ${formatTime(row.last_check)}` : '尚未进行连通性检测')
+      ])
+    })
+  }
+
+  if (isProxyTableColumnVisible('history')) {
+    columnList.push({
+      title: '历史趋势',
+      key: 'history',
+      width: 330,
+      render: (row) => renderProxyHistoryStack(row, 150)
+    })
+  }
+
+  if (isProxyTableColumnVisible('runtime')) {
+    columnList.push({
+      title: '运行态',
+      key: 'runtime',
+      width: 260,
+      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+        h(NSpace, { size: 4, wrap: true }, () => [
+          h(NTag, { type: (row.conn_count || 0) > 0 ? 'success' : 'default', size: 'small', bordered: false }, () => `连接 ${row.conn_count || 0}`),
+          h(NTag, { size: 'small', bordered: false }, () => `活跃 ${formatDuration(row.active_duration_seconds)}`)
+        ]),
+        h('div', { class: 'table-secondary-text' }, `↑ ${formatBytes(row.bytes_up || 0)} / ↓ ${formatBytes(row.bytes_down || 0)}`),
+        h('div', { class: 'table-secondary-text' }, formatLastActive(row.last_active))
+      ])
+    })
+  }
+
+  if (isProxyTableColumnVisible('usage_refs')) {
+    columnList.push({
+      title: '当前使用',
+      key: 'usage_refs',
+      width: 420,
+      render: (row) => renderUsageRefs(row)
+    })
+  }
+
+  if (isProxyTableColumnVisible('status')) {
+    columnList.push({
+      title: '状态',
+      key: 'status',
+      width: 260,
+      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+        h(NSpace, { size: 4, wrap: true }, () => [
+          h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启用中' : '已禁用'),
+          renderStatusTag(row),
+          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null
+        ]),
+        row.auto_select_blocked ? h('div', { class: 'table-error-text', title: formatAutoSelectBlockSummary(row) }, formatAutoSelectBlockSummary(row)) : null,
+        h('div', { class: row.last_error ? 'table-error-text' : 'table-secondary-text', title: row.last_error || '' }, row.last_error || '无最近错误')
+      ])
+    })
+  }
+
+  columnList.push({
     title: '操作',
     key: 'actions',
-    width: 210,
+    width: 290,
     fixed: 'right',
     render: (row) => h(NSpace, { size: 6, wrap: true }, () => [
       h(NButton, { size: 'small', type: 'primary', ghost: true, onClick: () => openTestOptions(row.name) }, () => '测试'),
       h(NButton, { size: 'small', type: 'warning', ghost: true, onClick: () => testMCBE(row.name) }, () => 'UDP'),
       h(NButton, { size: 'small', onClick: () => openEditModal(row) }, () => '编辑'),
+      row.auto_select_blocked
+        ? h(NPopconfirm, { onPositiveClick: () => clearAutoSelectBlock(row.name) }, {
+            trigger: () => h(NButton, { size: 'small', type: 'success', ghost: true }, () => '解封'),
+            default: () => '确定解除该节点的自动选择封禁吗？'
+          })
+        : h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => openAutoSelectBlockModal(row) }, () => '封禁'),
       h(NPopconfirm, { onPositiveClick: () => deleteOutbound(row.name) }, { trigger: () => h(NButton, { size: 'small', type: 'error', ghost: true }, () => '删除'), default: () => '确定删除该节点吗？' })
     ])
+  })
+
+  return columnList
+})
+
+const latencyOverviewColumns = computed(() => [
+  {
+    title: '节点',
+    key: 'name',
+    width: 220,
+    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+      h('div', { class: 'node-name' }, row.name),
+      h('div', { class: 'table-secondary-text' }, `${String(row.type || '-').toUpperCase()}${row.group ? ` / ${row.group}` : ''}`)
+    ])
+  },
+  {
+    title: '状态',
+    key: 'enabled',
+    width: 150,
+    render: (row) => h(NSpace, { size: 4, wrap: true }, () => [
+      h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启用中' : '已禁用'),
+      renderStatusTag(row)
+    ])
+  },
+  {
+    title: 'TCP',
+    key: 'latency_ms',
+    width: 90,
+    render: (row) => renderLatencyTag(row.latency_ms, 200, 500)
+  },
+  {
+    title: 'HTTP',
+    key: 'http_latency_ms',
+    width: 90,
+    render: (row) => renderLatencyTag(row.http_latency_ms, 500, 1500)
+  },
+  {
+    title: 'UDP',
+    key: 'udp_latency_ms',
+    width: 90,
+    render: (row) => renderUdpTag(row)
+  },
+  {
+    title: '最近 1 小时趋势',
+    key: 'history',
+    width: 620,
+    render: (row) => renderProxyHistoryStack(row, 190)
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 120,
+    render: (row) => h(NButton, { size: 'small', type: 'primary', ghost: true, onClick: () => openProxyLatencyHistoryModal(row) }, () => '查看大图')
   }
 ])
 
@@ -1222,6 +2027,12 @@ const load = async () => {
     const res = await api('/api/proxy-outbounds')
     if (res.success) {
       outbounds.value = res.data || []
+      if (selectedProxyHistoryOutbound.value?.name) {
+        const latest = outbounds.value.find(item => item?.name === selectedProxyHistoryOutbound.value?.name)
+        if (latest) {
+          selectedProxyHistoryOutbound.value = { ...latest }
+        }
+      }
     } else {
       message.error(res.msg || '加载代理节点失败')
     }
@@ -1231,7 +2042,20 @@ const load = async () => {
 }
 
 const refreshManagedData = async () => {
-  await Promise.all([load(), fetchGroupStats()])
+  if (refreshManagedDataPromise) {
+    return refreshManagedDataPromise
+  }
+  refreshManagedDataPromise = (async () => {
+    try {
+      await Promise.all([load(), fetchGroupStats(), refreshProxyLatencyOverview()])
+      if (showLatencyHistoryModal.value && selectedProxyHistoryOutbound.value?.name) {
+        await refreshProxyLatencyHistoryDetail()
+      }
+    } finally {
+      refreshManagedDataPromise = null
+    }
+  })()
+  return refreshManagedDataPromise
 }
 
 const focusSubscriptionNodes = (subscriptionName) => {
@@ -1257,6 +2081,93 @@ const openAddModal = () => {
   editingName.value = null
   form.value = { ...defaultForm }
   showEditModal.value = true
+}
+
+const openAutoSelectBlockModal = (row) => {
+	autoSelectBlockTargetNames.value = row?.name ? [row.name] : []
+	autoSelectBlockForm.name = row?.name || ''
+	autoSelectBlockForm.reason = row?.auto_select_block_reason || ''
+	if (row?.auto_select_blocked && row?.auto_select_block_expires_at) {
+		autoSelectBlockForm.duration = 'custom'
+		autoSelectBlockForm.customExpiresAt = new Date(row.auto_select_block_expires_at).getTime()
+	} else if (row?.auto_select_blocked) {
+		autoSelectBlockForm.duration = 'permanent'
+		autoSelectBlockForm.customExpiresAt = null
+	} else {
+		autoSelectBlockForm.duration = '1d'
+		autoSelectBlockForm.customExpiresAt = null
+	}
+	showAutoSelectBlockModal.value = true
+}
+
+const openBatchAutoSelectBlockModal = (names = checkedRowKeys.value) => {
+	const uniqueNames = Array.from(new Set((Array.isArray(names) ? names : []).map(name => String(name || '').trim()).filter(Boolean)))
+	if (uniqueNames.length === 0) {
+		message.warning('请先选择要封禁的节点')
+		return
+	}
+	autoSelectBlockTargetNames.value = uniqueNames
+	autoSelectBlockForm.name = uniqueNames.length === 1 ? uniqueNames[0] : ''
+	autoSelectBlockForm.reason = ''
+	autoSelectBlockForm.duration = '1d'
+	autoSelectBlockForm.customExpiresAt = null
+	showAutoSelectBlockModal.value = true
+}
+
+const submitAutoSelectBlock = async () => {
+	const names = autoSelectBlockTargetNames.value.filter(Boolean)
+	if (names.length === 0) {
+		message.warning('缺少节点名称')
+		return
+	}
+	const expiresAt = resolveAutoSelectBlockExpiresAt()
+	if (expiresAt === undefined) {
+		message.warning('请选择有效的到期时间')
+		return
+	}
+	savingAutoSelectBlock.value = true
+	try {
+		const payload = names.length === 1
+			? { name: names[0], reason: (autoSelectBlockForm.reason || '').trim() }
+			: { names, reason: (autoSelectBlockForm.reason || '').trim() }
+		if (expiresAt) payload.expires_at = expiresAt
+		const res = await api(names.length === 1 ? '/api/proxy-outbounds/block-auto-select' : '/api/proxy-outbounds/block-auto-select/batch', 'POST', payload)
+		if (res.success) {
+			message.success(names.length === 1 ? '已封禁自动选择' : `已批量封禁 ${names.length} 个节点`)
+			showAutoSelectBlockModal.value = false
+			autoSelectBlockTargetNames.value = []
+			await refreshManagedData()
+		} else {
+			message.error(res.msg || res.error || '封禁失败')
+		}
+	} finally {
+		savingAutoSelectBlock.value = false
+	}
+}
+
+const clearAutoSelectBlock = async (name) => {
+	const names = Array.isArray(name)
+		? Array.from(new Set(name.map(item => String(item || '').trim()).filter(Boolean)))
+		: [String(name || '').trim()].filter(Boolean)
+	if (names.length === 0) {
+		message.warning('缺少节点名称')
+		return
+	}
+	const res = await api(names.length === 1 ? '/api/proxy-outbounds/unblock-auto-select' : '/api/proxy-outbounds/unblock-auto-select/batch', 'POST', names.length === 1 ? { name: names[0] } : { names })
+	if (res.success) {
+		message.success(names.length === 1 ? '已解除自动选择封禁' : `已批量解除 ${names.length} 个节点自动选择封禁`)
+		await refreshManagedData()
+	} else {
+		message.error(res.msg || res.error || '解封失败')
+	}
+}
+
+const loadHistoryConfig = async () => {
+	const res = await api('/api/config')
+	if (!res?.success || !res?.data) return
+	latencyHistoryMinIntervalMinutes.value = Math.max(Number(res.data.latency_history_min_interval_minutes) || 10, 1)
+	latencyHistoryRenderLimit.value = Math.max(Number(res.data.latency_history_render_limit) || 100, 1)
+	latencyHistoryStorageLimit.value = Math.max(Number(res.data.latency_history_storage_limit) || 1000, 1)
 }
 
 const openEditModal = (o) => {
@@ -1305,7 +2216,7 @@ const saveOutbound = async () => {
   if (res.success) {
     message.success(editingName.value ? '已更新' : '已创建')
     showEditModal.value = false
-    load()
+    await refreshManagedData()
   } else {
     message.error(res.msg || '操作失败')
   }
@@ -1399,7 +2310,7 @@ const deleteOutbound = async (name) => {
   if (res.success) {
     message.success('已删除')
     await syncServersAfterDelete([name])
-    load()
+    await refreshManagedData()
   } else {
     message.error(res.msg || '删除失败')
   }
@@ -1422,7 +2333,7 @@ const batchDelete = async () => {
   }
   message.success(`删除完成: ${success} 成功, ${failed} 失败`)
   checkedRowKeys.value = []
-  load()
+  await refreshManagedData()
 }
 
 // 批量测试选项
@@ -1537,6 +2448,7 @@ const startBatchTest = async () => {
     await runBatchTestType(names, 'http')
     // UDP 测试
     await runBatchTestType(names, 'udp')
+    await refreshProxyHistoryViews()
     
     batchTesting.value = false
     message.success(`一键测试完成: ${batchTestProgress.value.success} 成功, ${batchTestProgress.value.failed} 失败`)
@@ -1547,6 +2459,7 @@ const startBatchTest = async () => {
   message.info(`开始 ${type.toUpperCase()} 测试 ${names.length} 个节点...`)
   
   await runBatchTestType(names, type)
+  await refreshProxyHistoryViews()
   
   batchTesting.value = false
   message.success(`${type.toUpperCase()} 测试完成: ${batchTestProgress.value.success} 成功, ${batchTestProgress.value.failed} 失败`)
@@ -1639,6 +2552,7 @@ const testMCBE = async (name) => {
     mcbeTestResult.value = { success: false, error: res.msg || '测试失败' }
     updateOutboundData(name, { udp_available: false, udp_latency_ms: 0 })
   }
+  await refreshProxyHistoryViews()
 }
 
 // 打开测试选项弹窗
@@ -1726,6 +2640,7 @@ const runDetailedTest = async () => {
     if (Object.keys(updates).length > 0) {
       updateOutboundData(name, updates)
     }
+    await refreshProxyHistoryViews()
   } else {
     testResultData.value = { success: false, error: res.msg || '测试失败', http_tests: [] }
   }
@@ -1793,10 +2708,11 @@ const subProxyTest = async (name, type) => {
     } else {
       res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: 'mco.cubecraft.net:19132' })
       if (res.success) {
-        updateOutboundData(name, { udp_available: res.data?.available, udp_latency_ms: res.data?.latency_ms || 0 })
-        message.success(`${name} UDP: ${res.data?.available ? (res.data?.latency_ms ? res.data.latency_ms + 'ms' : '可用') : '不可用'}`)
+        updateOutboundData(name, { udp_available: !!res.data?.success, udp_latency_ms: res.data?.latency_ms || 0 })
+        message.success(`${name} UDP: ${res.data?.success ? (res.data?.latency_ms ? res.data.latency_ms + 'ms' : '可用') : '不可用'}`)
       } else { message.error(res.msg || '测试失败') }
     }
+    await refreshProxyHistoryViews()
   } catch (e) { message.error('测试出错: ' + e.message) }
 }
 
@@ -2372,15 +3288,32 @@ const importNodes = async () => {
   }
 
   if (success > 0) {
-    await load()
+    await refreshManagedData()
   }
   if (success > 0 && failed === 0) {
     showImportModal.value = false
   }
 }
 
+watch(showLatencyHistoryModal, (show) => {
+  if (!show) {
+    proxyHistoryDetailMetrics.value = { tcp: [], http: [], udp: [] }
+    proxyHistoryDetailError.value = ''
+  }
+})
+
+watch([proxyHistoryRangeKey, proxyHistoryCustomRange], () => {
+  if (!showLatencyHistoryModal.value) return
+  resetProxyHistoryViewport()
+  refreshProxyLatencyHistoryDetail()
+})
+
 onMounted(async () => {
-  await Promise.all([load(), fetchGroupStats()])
+	await loadHistoryConfig()
+  await refreshManagedData()
+  managedDataRefreshTimer = setInterval(() => {
+    refreshManagedData()
+  }, 30000)
   // 优先使用 initialHighlight，否则使用 initialSearch
   const highlightTarget = props.initialHighlight || props.initialSearch
   if (highlightTarget) {
@@ -2391,6 +3324,13 @@ onMounted(async () => {
     highlightName.value = highlightTarget
     // 5秒后取消高亮（但保持排序）
     setTimeout(() => { highlightName.value = '' }, 5000)
+  }
+})
+
+onBeforeUnmount(() => {
+  if (managedDataRefreshTimer) {
+    clearInterval(managedDataRefreshTimer)
+    managedDataRefreshTimer = null
   }
 })
 
@@ -2505,10 +3445,137 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
   max-width: 100%;
   height: auto;
 }
+.proxy-history-cell-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.proxy-history-cell-card {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  outline: none;
+}
+.proxy-history-cell-card:hover {
+  background: rgba(32, 128, 240, 0.06);
+  border-color: rgba(32, 128, 240, 0.16);
+}
+.proxy-history-cell-card:focus-visible {
+  box-shadow: 0 0 0 2px rgba(32, 128, 240, 0.24);
+}
+.proxy-history-cell-label {
+  width: 34px;
+  font-size: 11px;
+  color: var(--n-text-color-3);
+  flex-shrink: 0;
+}
+.proxy-history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.proxy-history-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.proxy-history-summary-title {
+  font-size: 12px;
+  color: var(--n-text-color-3);
+  margin-bottom: 8px;
+}
+.proxy-history-summary-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--n-text-color-1);
+  line-height: 1.3;
+}
+.proxy-history-summary-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--n-text-color-3);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.proxy-history-chart-grid {
+  display: grid;
+  gap: 12px;
+}
+.proxy-history-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+.proxy-history-large-chart {
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.proxy-history-slider-card {
+  border: 1px solid var(--n-border-color);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--n-color-embedded);
+}
+.proxy-history-slider-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--n-text-color-3);
+}
+.proxy-history-event-list {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.proxy-history-event-item {
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--n-color-embedded);
+}
+.proxy-history-event-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--n-text-color-2);
+}
+.proxy-history-event-sub {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--n-text-color-3);
+  word-break: break-word;
+}
 
 @media (max-width: 900px) {
   .filter-search {
     width: 100%;
+  }
+  .proxy-history-toolbar {
+    align-items: flex-start;
+  }
+  .proxy-history-slider-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .proxy-history-detail-grid {
+    grid-template-columns: 1fr;
+  }
+  .proxy-history-event-header,
+  .proxy-history-event-sub {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 

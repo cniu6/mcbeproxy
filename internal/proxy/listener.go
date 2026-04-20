@@ -100,9 +100,7 @@ func (l *UDPListener) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", l.config.ListenAddr, err)
 	}
-	if err := configureUDPConnBuffers(conn, l.config.GetUDPSocketBufferSize()); err != nil {
-		logger.Warn("Failed to tune UDP listener socket buffers for %s: %v", l.serverID, err)
-	}
+	tuneUDPSocketForServer(conn, l.config, "udp_listener:"+l.serverID)
 
 	l.conn = conn
 	l.closed.Store(false)
@@ -517,9 +515,7 @@ func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.S
 	if err != nil {
 		return fmt.Errorf("failed to connect to remote %s: %w", targetAddr, err)
 	}
-	if err := configureUDPConnBuffers(remoteConn, cfg.GetUDPSocketBufferSize()); err != nil {
-		logger.Debug("Failed to tune remote UDP socket buffers for %s: %v", targetAddr, err)
-	}
+	tuneUDPSocketForServer(remoteConn, cfg, "udp_listener_remote:"+targetAddr)
 
 	sess.RemoteConn = remoteConn
 

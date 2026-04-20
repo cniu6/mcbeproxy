@@ -476,13 +476,23 @@ func (p *RawUDPProxy) shouldUseProxy() bool {
 	return p.outboundMgr != nil && !p.config.IsDirectConnection()
 }
 
-// setUDPSocketOptions sets buffer sizes for UDP connections
+// setUDPSocketOptions applies UDP socket tuning to the given connection. In
+// addition to the historical per-server buffer sizes, this honors the
+// latency_mode=aggressive opt-in by marking the socket with the EF DSCP code
+// point and upgrading the "auto" buffer target to a larger default. Errors
+// are logged inside the helper; the return value is kept for API stability
+// with the previous signature and is always nil today.
 func (p *RawUDPProxy) setUDPSocketOptions(conn *net.UDPConn) error {
-	requested := 0
-	if p != nil && p.config != nil {
-		requested = p.config.GetUDPSocketBufferSize()
+	label := "raw_udp"
+	var cfg *config.ServerConfig
+	if p != nil {
+		cfg = p.config
+		if p.serverID != "" {
+			label = "raw_udp:" + p.serverID
+		}
 	}
-	return configureUDPConnBuffers(conn, requested)
+	tuneUDPSocketForServer(conn, cfg, label)
+	return nil
 }
 
 // Listen starts accepting and forwarding UDP packets.
@@ -1011,6 +1021,9 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 		case <-ticker.C:
 			p.cleanupExpiredBans()
 			p.cleanupUnconnectedPingLimiter()
+			if p.config != nil && p.config.IsShowRealLatency() {
+				p.maybeRefreshPingCacheAsync(false)
+			}
 			now := time.Now()
 			p.clients.Range(func(key, value interface{}) bool {
 				clientInfo := value.(*rawUDPClientInfo)
@@ -2642,7 +2655,6 @@ func (p *RawUDPProxy) writeVaruint32(w *bytes.Buffer, x uint32) {
 // GetCachedLatency returns the latency by pinging the server on-demand.
 // Returns -1 if the server is offline or ping fails.
 func (p *RawUDPProxy) GetCachedLatency() int64 {
-	p.maybeRefreshPingCacheAsync(false)
 	p.latencyMu.RLock()
 	defer p.latencyMu.RUnlock()
 	return p.cachedLatency
@@ -2650,7 +2662,6 @@ func (p *RawUDPProxy) GetCachedLatency() int64 {
 
 // GetCachedPong returns the cached pong response (MOTD).
 func (p *RawUDPProxy) GetCachedPong() []byte {
-	p.maybeRefreshPingCacheAsync(false)
 	return p.getCachedAdvertisementForAPI()
 }
 

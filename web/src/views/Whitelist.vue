@@ -5,7 +5,7 @@
       <n-space>
         <n-input
           v-model:value="search"
-          placeholder="搜索玩家名 / 服务器"
+          placeholder="搜索玩家名 / 原因 / 服务器"
           style="width: 220px"
           clearable
           @keyup.enter="load"
@@ -20,7 +20,7 @@
         </n-popconfirm>
         <n-button @click="openExportModal">导出</n-button>
         <n-button @click="openImportModal">导入</n-button>
-        <n-button type="primary" @click="showAddModal = true">添加</n-button>
+        <n-button type="primary" @click="openAddModal">添加</n-button>
       </n-space>
     </n-space>
     <n-card size="small" style="margin-bottom: 16px">
@@ -47,7 +47,7 @@
           :data="filteredWhitelist"
           :bordered="false"
           :pagination="pagination"
-          :scroll-x="700"
+          :scroll-x="960"
           :row-key="rowKey"
           v-model:checked-row-keys="checkedRowKeys"
           @update:page="p => pagination.page = p"
@@ -65,7 +65,14 @@
     >
       <n-space vertical>
         <n-input v-model:value="form.player_name" placeholder="玩家名" />
+        <n-input v-model:value="form.reason" placeholder="原因 (可选)" />
+        <n-space size="6" wrap>
+          <n-button v-for="reason in reasonOptions" :key="reason" size="small" secondary @click="form.reason = reason">{{ reason }}</n-button>
+        </n-space>
         <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
+        <n-select v-model:value="form.expiry_mode" :options="expiryOptions" />
+        <n-date-picker v-if="form.expiry_mode === 'custom'" v-model:value="form.custom_expires_at" type="datetime" clearable style="width: 100%" />
+        <n-alert v-if="expiryPreviewText" type="info">{{ expiryPreviewText }}</n-alert>
         <n-space justify="space-between" align="center">
           <n-text>启用该白名单条目</n-text>
           <n-switch v-model:value="form.enabled" />
@@ -103,8 +110,8 @@
           <n-input v-model:value="importJson" type="textarea" :rows="10" placeholder="粘贴 JSON..." />
         </n-tab-pane>
         <n-tab-pane name="text" tab="用户名列表">
-          <n-alert type="info" style="margin-bottom: 12px">每行一个用户名</n-alert>
-          <n-input v-model:value="importText" type="textarea" :rows="10" placeholder="用户名1&#10;用户名2&#10;用户名3" />
+          <n-alert type="info" style="margin-bottom: 12px">每行一个用户名，可选添加原因（用逗号分隔）</n-alert>
+          <n-input v-model:value="importText" type="textarea" :rows="10" placeholder="用户名1&#10;用户名2,活动服豁免&#10;用户名3" />
         </n-tab-pane>
       </n-tabs>
       <template #footer>
@@ -144,7 +151,24 @@ const aclSettings = reactive({
   whitelist_message: '你不在白名单中'
 })
 const entryToggleLoading = reactive({})
-const form = reactive({ player_name: '', server_id: '', enabled: true })
+const reasonOptions = ['临时放行', '活动服豁免', '测试账号', '管理成员', '可信玩家']
+const expiryOptions = [
+  { label: '永久', value: 'permanent' },
+  { label: '12 小时', value: '12h' },
+  { label: '1 天', value: '1d' },
+  { label: '5 天', value: '5d' },
+  { label: '15 天', value: '15d' },
+  { label: '30 天', value: '30d' },
+  { label: '自定义', value: 'custom' }
+]
+const expiryDurationMs = {
+  '12h': 12 * 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+  '5d': 5 * 24 * 60 * 60 * 1000,
+  '15d': 15 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000
+}
+const form = reactive({ player_name: '', reason: '', server_id: '', enabled: true, expiry_mode: 'permanent', custom_expires_at: null })
 const editingEntry = ref(null)
 const search = ref('')
 const checkedRowKeys = ref([])
@@ -158,13 +182,41 @@ const pagination = ref({
 
 const rowKey = (row) => `${row.player_name}||${row.server_id || ''}`
 
+const resolveExpiresAt = () => {
+  if (form.expiry_mode === 'permanent') return null
+  if (form.expiry_mode === 'custom') {
+    if (!form.custom_expires_at) return undefined
+    return new Date(form.custom_expires_at).toISOString()
+  }
+  const durationMs = expiryDurationMs[form.expiry_mode]
+  if (!durationMs) return undefined
+  return new Date(Date.now() + durationMs).toISOString()
+}
+
+const expiryPreviewText = computed(() => {
+  const expiresAt = resolveExpiresAt()
+  if (expiresAt === undefined) return ''
+  if (expiresAt === null) return '该条目将永久生效。'
+  return `该条目将于 ${formatTime(expiresAt)} 自动失效。`
+})
+
+const resetForm = () => {
+  form.player_name = ''
+  form.reason = ''
+  form.server_id = ''
+  form.enabled = true
+  form.expiry_mode = 'permanent'
+  form.custom_expires_at = null
+}
+
 const filteredWhitelist = computed(() => {
   const s = (search.value || '').toLowerCase().trim()
   if (!s) return whitelist.value
   return whitelist.value.filter((w) => {
     const name = (w.player_name || '').toLowerCase()
+    const reason = (w.reason || '').toLowerCase()
     const server = (w.server_id || '').toLowerCase()
-    return name.includes(s) || server.includes(s)
+    return name.includes(s) || reason.includes(s) || server.includes(s)
   })
 })
 
@@ -188,8 +240,10 @@ const columns = [
       }, () => ((r.enabled ?? true) ? '启用' : '禁用'))
     ])
   },
+  { title: '原因', key: 'reason', render: r => r.reason || '-' },
   { title: '服务器', key: 'server_id', render: r => r.server_id || '全局' },
   { title: '添加时间', key: 'created_at', render: r => formatTime(r.created_at) },
+  { title: '过期时间', key: 'expires_at', render: r => r.expires_at ? formatTime(r.expires_at) : '永久' },
   {
     title: '操作',
     key: 'actions',
@@ -318,10 +372,17 @@ const clearSearch = () => {
 }
 
 const addToWhitelist = async () => {
+  const expiresAt = resolveExpiresAt()
+  if (expiresAt === undefined) {
+    message.warning('请选择有效的到期时间')
+    return { success: false, silent: true }
+  }
   const res = await api('/api/acl/whitelist', 'POST', {
-    ...form,
+    player_name: form.player_name,
+    reason: form.reason,
     enabled: form.enabled,
-    server_id: form.server_id || null
+    server_id: form.server_id || null,
+    expires_at: expiresAt || null
   })
   return res
 }
@@ -350,20 +411,32 @@ const submitForm = async () => {
     message.success(editingEntry.value ? '已保存' : '已添加')
     showAddModal.value = false
     editingEntry.value = null
-    form.player_name = ''
-    form.server_id = ''
-    form.enabled = true
+    resetForm()
     load()
-  } else {
+  } else if (!res.silent) {
     message.error(res.msg || '失败')
   }
+}
+
+const openAddModal = () => {
+  editingEntry.value = null
+  resetForm()
+  showAddModal.value = true
 }
 
 const openEdit = (row) => {
   editingEntry.value = { player_name: row.player_name, server_id: row.server_id || '', enabled: row.enabled ?? true }
   form.player_name = row.player_name
+  form.reason = row.reason || ''
   form.server_id = row.server_id || ''
   form.enabled = row.enabled ?? true
+  if (row.expires_at) {
+    form.expiry_mode = 'custom'
+    form.custom_expires_at = new Date(row.expires_at).getTime()
+  } else {
+    form.expiry_mode = 'permanent'
+    form.custom_expires_at = null
+  }
   showAddModal.value = true
 }
 
@@ -400,7 +473,7 @@ const batchRemove = async () => {
 
 const openExportModal = () => { 
   exportJson.value = JSON.stringify(whitelist.value, null, 2)
-  exportText.value = whitelist.value.map(w => w.player_name).join('\n')
+  exportText.value = whitelist.value.map(w => w.reason ? `${w.player_name},${w.reason}` : w.player_name).join('\n')
   showExportModal.value = true 
 }
 const copyExport = async () => { 
@@ -439,9 +512,11 @@ const importData = async () => {
   if (importText.value.trim()) {
     const lines = importText.value.split('\n').filter(l => l.trim())
     for (const line of lines) {
-      const playerName = line.trim()
+      const parts = line.split(',')
+      const playerName = parts[0].trim()
+      const reason = parts[1]?.trim() || ''
       if (playerName) {
-        const res = await api('/api/acl/whitelist', 'POST', { player_name: playerName })
+        const res = await api('/api/acl/whitelist', 'POST', { player_name: playerName, reason })
         if (res.success) success++
         else failed++
       }

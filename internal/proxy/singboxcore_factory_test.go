@@ -200,3 +200,20 @@ func TestWSConnRead_RejectsOversizedFrame(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestWSConnRead_SkipsControlFramesAndReturnsNextDataFrame(t *testing.T) {
+	frame := bytes.NewBuffer(nil)
+	frame.Write([]byte{0x89, 0x00})
+	frame.Write([]byte{0x82, 0x05})
+	frame.WriteString("hello")
+
+	conn := &wsConn{reader: bufio.NewReader(bytes.NewReader(frame.Bytes()))}
+	buf := make([]byte, 8)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read returned error: %v", err)
+	}
+	if got := string(buf[:n]); got != "hello" {
+		t.Fatalf("unexpected payload: %q", got)
+	}
+}

@@ -168,6 +168,53 @@ func TestDebugRoutes_RequireValidKeyWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestAPIRoutes_RequireConfigAPIKeyWhenConfigured(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	api.globalConfig.APIKey = "config-only-key"
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("missing config key status code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req.Header.Set("X-API-Key", "config-only-key")
+	w = httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid config key status code = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	req.Header.Set("X-API-Key", "wrong-key")
+	w = httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid config key status code = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateAPIKey_UsesConfigKeyWhenConfigured(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	api.globalConfig.APIKey = "config-only-key"
+
+	if !api.ValidateAPIKey("config-only-key") {
+		t.Fatal("expected config API key to validate successfully")
+	}
+	if api.ValidateAPIKey("wrong-key") {
+		t.Fatal("expected wrong config API key to be rejected")
+	}
+	if api.ValidateAPIKey("") {
+		t.Fatal("expected empty API key to be rejected when config key is configured")
+	}
+}
+
 func TestAnyValidAPIKeyCanDeleteKeys(t *testing.T) {
 	api, database, cleanup := setupTestAPI(t)
 	defer cleanup()

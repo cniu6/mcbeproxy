@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,7 @@ type mockOutboundManager struct {
 	outbounds map[string]*config.ProxyOutbound
 	latency   map[string]int64
 	history   map[string][]proxy.ServerNodeLatencySample
+	outbound   map[string][]proxy.OutboundLatencySample
 	selected  map[string]string
 }
 
@@ -32,6 +34,7 @@ func newMockOutboundManager() *mockOutboundManager {
 		outbounds: make(map[string]*config.ProxyOutbound),
 		latency:   make(map[string]int64),
 		history:   make(map[string][]proxy.ServerNodeLatencySample),
+		outbound:  make(map[string][]proxy.OutboundLatencySample),
 		selected:  make(map[string]string),
 	}
 }
@@ -73,6 +76,23 @@ func (m *mockOutboundManager) GetHealthStatus(name string) *proxy.HealthStatus {
 		return nil
 	}
 	return &proxy.HealthStatus{Healthy: true}
+}
+
+func (m *mockOutboundManager) SetOutboundLatency(name, sortBy string, latencyMs int64) {
+	key := name + "|" + sortBy
+	m.outbound[key] = append(m.outbound[key], proxy.OutboundLatencySample{
+		Timestamp: time.Now().UnixMilli(),
+		LatencyMs: latencyMs,
+		OK:        latencyMs > 0,
+	})
+}
+
+func (m *mockOutboundManager) GetOutboundLatencyHistory(name, sortBy string) []proxy.OutboundLatencySample {
+	key := name + "|" + sortBy
+	items := m.outbound[key]
+	result := make([]proxy.OutboundLatencySample, len(items))
+	copy(result, items)
+	return result
 }
 
 func (m *mockOutboundManager) DialPacketConn(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
@@ -230,6 +250,8 @@ func setupTestHandler() (*ProxyOutboundHandler, *mockOutboundManager) {
 
 func setupTestRouter(handler *ProxyOutboundHandler) *gin.Engine {
 	router := gin.New()
+	router.GET("/api/proxy-outbounds/latency-overview", handler.GetProxyOutboundLatencyOverview)
+	router.GET("/api/proxy-outbounds/:name/latency-history", handler.GetProxyOutboundLatencyHistory)
 	router.GET("/api/proxy-outbounds/groups", handler.ListGroups)
 	router.GET("/api/proxy-outbounds/groups/:name", handler.GetGroup)
 	router.POST("/api/proxy-outbounds/parse-import", handler.ParseImportContent)
@@ -328,6 +350,120 @@ func TestGetServerNodeLatencyHistory_Success(t *testing.T) {
 	}
 	if len(nodeMap["node-b"]["samples"].([]interface{})) != 1 {
 		t.Fatalf("Expected node-b to have 1 sample, got %#v", nodeMap["node-b"]["samples"])
+	}
+}
+
+func TestGetProxyOutboundLatencyHistory_Success(t *testing.T) {
+	handler, mockMgr := setupTestHandler()
+	router := setupTestRouter(handler)
+
+	if err := handler.configMgr.AddOutbound(&config.ProxyOutbound{
+		Name:     "node-a",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "a.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "test",
+	}); err != nil {
+		t.Fatalf("AddOutbound failed: %v", err)
+	}
+	mockMgr.AddOutbound(&config.ProxyOutbound{Name: "node-a", Type: config.ProtocolShadowsocks, Server: "a.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"})
+
+	now := time.Now().UnixMilli()
+	mockMgr.outbound["node-a|tcp"] = []proxy.OutboundLatencySample{
+		{Timestamp: now - 3_600_000, LatencyMs: 120, OK: true},
+		{Timestamp: now - 1_800_000, LatencyMs: 90, OK: true},
+		{Timestamp: now - 600_000, LatencyMs: 0, OK: false},
+	}
+	mockMgr.outbound["node-a|http"] = []proxy.OutboundLatencySample{{Timestamp: now - 1_800_000, LatencyMs: 240, OK: true}}
+	mockMgr.outbound["node-a|udp"] = []proxy.OutboundLatencySample{{Timestamp: now - 900_000, LatencyMs: 80, OK: true}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy-outbounds/node-a/latency-history?from="+strconv.FormatInt(now-2_000_000, 10)+"&to="+strconv.FormatInt(now, 10)+"&limit=2", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response APIResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("Expected success=true, got false: %v", response.Msg)
+	}
+	data, ok := response.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected object response, got %T", response.Data)
+	}
+	metrics, ok := data["metrics"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected metrics object, got %T", data["metrics"])
+	}
+	tcp, ok := metrics["tcp"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected tcp array, got %T", metrics["tcp"])
+	}
+	if len(tcp) != 2 {
+		t.Fatalf("Expected tcp length 2, got %d", len(tcp))
+	}
+	httpSamples, ok := metrics["http"].([]interface{})
+	if !ok || len(httpSamples) != 1 {
+		t.Fatalf("Expected one http sample, got %#v", metrics["http"])
+	}
+	udpSamples, ok := metrics["udp"].([]interface{})
+	if !ok || len(udpSamples) != 1 {
+		t.Fatalf("Expected one udp sample, got %#v", metrics["udp"])
+	}
+}
+
+func TestGetProxyOutboundLatencyOverview_Success(t *testing.T) {
+	handler, mockMgr := setupTestHandler()
+	router := setupTestRouter(handler)
+
+	outboundA := &config.ProxyOutbound{Name: "node-a", Type: config.ProtocolShadowsocks, Server: "a.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	outboundB := &config.ProxyOutbound{Name: "node-b", Type: config.ProtocolShadowsocks, Server: "b.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	if err := handler.configMgr.AddOutbound(outboundA); err != nil {
+		t.Fatalf("AddOutbound node-a failed: %v", err)
+	}
+	if err := handler.configMgr.AddOutbound(outboundB); err != nil {
+		t.Fatalf("AddOutbound node-b failed: %v", err)
+	}
+	mockMgr.AddOutbound(outboundA)
+	mockMgr.AddOutbound(outboundB)
+	mockMgr.outbound["node-a|tcp"] = []proxy.OutboundLatencySample{{Timestamp: time.Now().UnixMilli(), LatencyMs: 88, OK: true}}
+	mockMgr.outbound["node-b|udp"] = []proxy.OutboundLatencySample{{Timestamp: time.Now().UnixMilli(), LatencyMs: 166, OK: true}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy-outbounds/latency-overview?limit=10", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response APIResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to unmarshal response: %v", err)
+	}
+	if !response.Success {
+		t.Fatalf("Expected success=true, got false: %v", response.Msg)
+	}
+	data, ok := response.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected object response, got %T", response.Data)
+	}
+	history, ok := data["latency_history"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected history map, got %T", data["latency_history"])
+	}
+	if _, ok := history["node-a"].(map[string]interface{}); !ok {
+		t.Fatalf("Expected node-a history entry, got %#v", history["node-a"])
+	}
+	if _, ok := history["node-b"].(map[string]interface{}); !ok {
+		t.Fatalf("Expected node-b history entry, got %#v", history["node-b"])
 	}
 }
 

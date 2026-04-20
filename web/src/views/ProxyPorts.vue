@@ -1318,6 +1318,7 @@ const confirmDeletePort = (port) => {
 const buildPortPayload = (port) => {
   applyLoadBalanceDefaults(port)
   applyAutoPingDefaults(port)
+  const autoPingDefaults = getProxyPortAutoPingDefaults()
   return {
     id: port.id,
     name: port.name,
@@ -1330,11 +1331,11 @@ const buildPortPayload = (port) => {
     load_balance: port.load_balance || '',
     load_balance_sort: port.load_balance_sort || '',
     auto_ping_enabled: !!port.auto_ping_enabled,
-    auto_ping_interval_minutes: port.auto_ping_interval_minutes || 10,
-    auto_ping_top_candidates: port.auto_ping_top_candidates || 10,
+    auto_ping_interval_minutes: port.auto_ping_interval_minutes || autoPingDefaults.interval_minutes,
+    auto_ping_top_candidates: port.auto_ping_top_candidates || autoPingDefaults.top_candidates,
     auto_ping_full_scan_mode: port.auto_ping_full_scan_mode || '',
-    auto_ping_full_scan_time: port.auto_ping_full_scan_time || '04:00',
-    auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours || 24,
+    auto_ping_full_scan_time: port.auto_ping_full_scan_time || autoPingDefaults.full_scan_time,
+    auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours || autoPingDefaults.full_scan_interval_hours,
     allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean)
   }
 }

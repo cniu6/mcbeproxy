@@ -68,6 +68,7 @@ func (p *PlainUDPProxy) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", p.config.ListenAddr, err)
 	}
+	tuneUDPSocketForServer(conn, p.config, "plain_udp:"+p.serverID)
 	p.listener = conn
 	p.closed.Store(false)
 	p.refreshTargetAddr()
@@ -195,6 +196,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 		if err != nil {
 			return nil, nil, err
 		}
+		tuneUDPSocketForServer(conn, p.config, "plain_udp_direct:"+udpAddr.String())
 		return conn, udpAddr, nil
 	}
 
@@ -220,6 +222,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 				}
 				conn, derr := net.DialUDP("udp", nil, udpAddr)
 				if derr == nil {
+					tuneUDPSocketForServer(conn, p.config, "plain_udp_direct:"+udpAddr.String())
 					return conn, p.targetAddr, nil
 				}
 				exclude = append(exclude, DirectNodeName)

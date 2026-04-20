@@ -42,12 +42,14 @@ func (be *BlacklistEntry) IsExpired() bool {
 
 // WhitelistEntry represents a whitelist entry in the database.
 type WhitelistEntry struct {
-	ID          int64     `json:"id"`
-	DisplayName string    `json:"display_name"`
-	Enabled     bool      `json:"enabled"`
-	ServerID    string    `json:"server_id,omitempty"` // empty for global
-	AddedAt     time.Time `json:"added_at"`
-	AddedBy     string    `json:"added_by,omitempty"`
+	ID          int64      `json:"id"`
+	DisplayName string     `json:"display_name"`
+	Enabled     bool       `json:"enabled"`
+	Reason      string     `json:"reason,omitempty"`
+	ServerID    string     `json:"server_id,omitempty"` // empty for global
+	AddedAt     time.Time  `json:"added_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	AddedBy     string     `json:"added_by,omitempty"`
 }
 
 // ToJSON serializes the whitelist entry to JSON.
@@ -62,6 +64,13 @@ func WhitelistEntryFromJSON(data []byte) (*WhitelistEntry, error) {
 		return nil, err
 	}
 	return &we, nil
+}
+
+func (we *WhitelistEntry) IsExpired() bool {
+	if we.ExpiresAt == nil {
+		return false
+	}
+	return time.Now().After(*we.ExpiresAt)
 }
 
 // ACLSettings represents access control settings for a server.
@@ -126,12 +135,14 @@ func (be *BlacklistEntry) ToDTO() BlacklistEntryDTO {
 
 // WhitelistEntryDTO is the data transfer object for whitelist API responses.
 type WhitelistEntryDTO struct {
-	ID         int64     `json:"id"`
-	PlayerName string    `json:"player_name"`
-	Enabled    bool      `json:"enabled"`
-	ServerID   string    `json:"server_id,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	AddedBy    string    `json:"added_by,omitempty"`
+	ID         int64      `json:"id"`
+	PlayerName string     `json:"player_name"`
+	Enabled    bool       `json:"enabled"`
+	Reason     string     `json:"reason,omitempty"`
+	ServerID   string     `json:"server_id,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	AddedBy    string     `json:"added_by,omitempty"`
 }
 
 // ToDTO converts the whitelist entry to a DTO for API responses.
@@ -140,8 +151,10 @@ func (we *WhitelistEntry) ToDTO() WhitelistEntryDTO {
 		ID:         we.ID,
 		PlayerName: we.DisplayName,
 		Enabled:    we.Enabled,
+		Reason:     we.Reason,
 		ServerID:   we.ServerID,
 		CreatedAt:  we.AddedAt,
+		ExpiresAt:  we.ExpiresAt,
 		AddedBy:    we.AddedBy,
 	}
 }
@@ -186,10 +199,12 @@ func (r *AddBlacklistRequest) GetPlayerName() string {
 
 // AddWhitelistRequest is the request body for adding a player to the whitelist.
 type AddWhitelistRequest struct {
-	DisplayName string `json:"display_name"`
-	PlayerName  string `json:"player_name"`
-	Enabled     *bool  `json:"enabled,omitempty"`
-	ServerID    string `json:"server_id,omitempty"`
+	DisplayName string     `json:"display_name"`
+	PlayerName  string     `json:"player_name"`
+	Enabled     *bool      `json:"enabled,omitempty"`
+	Reason      string     `json:"reason,omitempty"`
+	ServerID    string     `json:"server_id,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 // GetPlayerName returns the player name from either DisplayName or PlayerName field.

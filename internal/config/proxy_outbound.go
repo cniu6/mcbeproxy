@@ -102,18 +102,22 @@ type ProxyOutbound struct {
 	RealityShortID   string `json:"reality_short_id,omitempty"`   // Reality short ID (sid)
 
 	// Transport fields (WebSocket, gRPC, etc.)
-	Network         string `json:"network,omitempty"`          // Transport type: tcp, ws, grpc, httpupgrade, xhttp
-	WSPath          string `json:"ws_path,omitempty"`          // WebSocket/XHTTP path
-	WSHost          string `json:"ws_host,omitempty"`          // WebSocket/XHTTP Host header
-	XHTTPMode       string `json:"xhttp_mode,omitempty"`       // XHTTP mode override
+	Network         string `json:"network,omitempty"`           // Transport type: tcp, ws, grpc, httpupgrade, xhttp
+	WSPath          string `json:"ws_path,omitempty"`           // WebSocket/XHTTP path
+	WSHost          string `json:"ws_host,omitempty"`           // WebSocket/XHTTP Host header
+	XHTTPMode       string `json:"xhttp_mode,omitempty"`        // XHTTP mode override
 	GRPCServiceName string `json:"grpc_service_name,omitempty"` // gRPC service name
-	GRPCAuthority   string `json:"grpc_authority,omitempty"`   // gRPC authority / :authority header override
+	GRPCAuthority   string `json:"grpc_authority,omitempty"`    // gRPC authority / :authority header override
 
 	// Test results (persisted)
 	TCPLatencyMs  int64 `json:"tcp_latency_ms,omitempty"`  // TCP ping latency in milliseconds
 	HTTPLatencyMs int64 `json:"http_latency_ms,omitempty"` // HTTP test latency in milliseconds
 	UDPAvailable  *bool `json:"udp_available,omitempty"`   // UDP (MCBE) test result
 	UDPLatencyMs  int64 `json:"udp_latency_ms,omitempty"`  // UDP (MCBE) latency in milliseconds
+
+	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
+	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
+	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
 
 	// Runtime state (not serialized)
 	mu            sync.RWMutex          `json:"-"`
@@ -279,6 +283,8 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		Port:                     p.Port,
 		Enabled:                  p.Enabled,
 		Group:                    p.Group,
+		AutoSelectBlocked:        p.AutoSelectBlocked,
+		AutoSelectBlockReason:    p.AutoSelectBlockReason,
 		SubscriptionID:           p.SubscriptionID,
 		SubscriptionName:         p.SubscriptionName,
 		SubscriptionNodeID:       p.SubscriptionNodeID,
@@ -323,8 +329,41 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		udp := *p.UDPAvailable
 		clone.UDPAvailable = &udp
 	}
+	if p.AutoSelectBlockExpiresAt != nil {
+		expiresAt := *p.AutoSelectBlockExpiresAt
+		clone.AutoSelectBlockExpiresAt = &expiresAt
+	}
 	p.mu.RUnlock()
 	return clone
+}
+
+func (p *ProxyOutbound) IsAutoSelectBlocked() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.isAutoSelectBlockedLocked(time.Now())
+}
+
+func (p *ProxyOutbound) GetEffectiveAutoSelectBlock() (bool, string, *time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.isAutoSelectBlockedLocked(time.Now()) {
+		return false, "", nil
+	}
+	if p.AutoSelectBlockExpiresAt == nil {
+		return true, p.AutoSelectBlockReason, nil
+	}
+	expiresAt := *p.AutoSelectBlockExpiresAt
+	return true, p.AutoSelectBlockReason, &expiresAt
+}
+
+func (p *ProxyOutbound) isAutoSelectBlockedLocked(now time.Time) bool {
+	if !p.AutoSelectBlocked {
+		return false
+	}
+	if p.AutoSelectBlockExpiresAt == nil {
+		return true
+	}
+	return p.AutoSelectBlockExpiresAt.After(now)
 }
 
 func (p *ProxyOutbound) runtimeState() *proxyOutboundRuntime {

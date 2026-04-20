@@ -20,7 +20,7 @@
         </n-popconfirm>
         <n-button @click="openExportModal">导出</n-button>
         <n-button @click="openImportModal">导入</n-button>
-        <n-button type="primary" @click="showAddModal = true">添加</n-button>
+        <n-button type="primary" @click="openAddModal">添加</n-button>
       </n-space>
     </n-space>
     <n-card size="small" style="margin-bottom: 16px">
@@ -66,7 +66,13 @@
       <n-space vertical>
         <n-input v-model:value="form.player_name" placeholder="玩家名" />
         <n-input v-model:value="form.reason" placeholder="原因" />
+        <n-space size="6" wrap>
+          <n-button v-for="reason in reasonOptions" :key="reason" size="small" secondary @click="form.reason = reason">{{ reason }}</n-button>
+        </n-space>
         <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
+        <n-select v-model:value="form.expiry_mode" :options="expiryOptions" />
+        <n-date-picker v-if="form.expiry_mode === 'custom'" v-model:value="form.custom_expires_at" type="datetime" clearable style="width: 100%" />
+        <n-alert v-if="expiryPreviewText" type="info">{{ expiryPreviewText }}</n-alert>
         <n-space justify="space-between" align="center">
           <n-text>启用该黑名单条目</n-text>
           <n-switch v-model:value="form.enabled" />
@@ -145,7 +151,24 @@ const aclSettings = reactive({
   whitelist_message: '你不在白名单中'
 })
 const entryToggleLoading = reactive({})
-const form = reactive({ player_name: '', reason: '', server_id: '', enabled: true })
+const reasonOptions = ['被封禁IP', '报VPN', '不稳定', '延迟高', '频繁失败']
+const expiryOptions = [
+  { label: '永久', value: 'permanent' },
+  { label: '12 小时', value: '12h' },
+  { label: '1 天', value: '1d' },
+  { label: '5 天', value: '5d' },
+  { label: '15 天', value: '15d' },
+  { label: '30 天', value: '30d' },
+  { label: '自定义', value: 'custom' }
+]
+const expiryDurationMs = {
+  '12h': 12 * 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+  '5d': 5 * 24 * 60 * 60 * 1000,
+  '15d': 15 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000
+}
+const form = reactive({ player_name: '', reason: '', server_id: '', enabled: true, expiry_mode: 'permanent', custom_expires_at: null })
 const editingEntry = ref(null)
 const search = ref('')
 const checkedRowKeys = ref([])
@@ -158,6 +181,33 @@ const pagination = ref({
 })
 
 const rowKey = (row) => `${row.player_name}||${row.server_id || ''}`
+
+const resolveExpiresAt = () => {
+  if (form.expiry_mode === 'permanent') return null
+  if (form.expiry_mode === 'custom') {
+    if (!form.custom_expires_at) return undefined
+    return new Date(form.custom_expires_at).toISOString()
+  }
+  const durationMs = expiryDurationMs[form.expiry_mode]
+  if (!durationMs) return undefined
+  return new Date(Date.now() + durationMs).toISOString()
+}
+
+const expiryPreviewText = computed(() => {
+  const expiresAt = resolveExpiresAt()
+  if (expiresAt === undefined) return ''
+  if (expiresAt === null) return '该条目将永久生效。'
+  return `该条目将于 ${formatTime(expiresAt)} 自动失效。`
+})
+
+const resetForm = () => {
+  form.player_name = ''
+  form.reason = ''
+  form.server_id = ''
+  form.enabled = true
+  form.expiry_mode = 'permanent'
+  form.custom_expires_at = null
+}
 
 const filteredBlacklist = computed(() => {
   const s = (search.value || '').toLowerCase().trim()
@@ -321,10 +371,17 @@ const clearSearch = () => {
 }
 
 const addToBlacklist = async () => {
+  const expiresAt = resolveExpiresAt()
+  if (expiresAt === undefined) {
+    message.warning('请选择有效的到期时间')
+    return { success: false, silent: true }
+  }
   const res = await api('/api/acl/blacklist', 'POST', {
-    ...form,
+    player_name: form.player_name,
+    reason: form.reason,
     enabled: form.enabled,
-    server_id: form.server_id || null
+    server_id: form.server_id || null,
+    expires_at: expiresAt || null
   })
   return res
 }
@@ -353,14 +410,17 @@ const submitForm = async () => {
     message.success(editingEntry.value ? '已保存' : '已添加')
     showAddModal.value = false
     editingEntry.value = null
-    form.player_name = ''
-    form.reason = ''
-    form.server_id = ''
-    form.enabled = true
+    resetForm()
     load()
-  } else {
+  } else if (!res.silent) {
     message.error(res.msg || '失败')
   }
+}
+
+const openAddModal = () => {
+  editingEntry.value = null
+  resetForm()
+  showAddModal.value = true
 }
 
 const openEdit = (row) => {
@@ -369,6 +429,13 @@ const openEdit = (row) => {
   form.reason = row.reason || ''
   form.server_id = row.server_id || ''
   form.enabled = row.enabled ?? true
+  if (row.expires_at) {
+    form.expiry_mode = 'custom'
+    form.custom_expires_at = new Date(row.expires_at).getTime()
+  } else {
+    form.expiry_mode = 'permanent'
+    form.custom_expires_at = null
+  }
   showAddModal.value = true
 }
 

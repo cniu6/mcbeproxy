@@ -36,6 +36,11 @@ func (h *ProxyOutboundHandler) TestTCP(name string) error {
 			outbound.SetTCPLatencyMs(0)
 		}
 	})
+	if err == nil {
+		h.recordOutboundLatency(name, config.LoadBalanceSortTCP, latency)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortTCP, 0)
+	}
 
 	return err
 }
@@ -69,6 +74,11 @@ func (h *ProxyOutboundHandler) TestHTTP(name string) error {
 			outbound.SetHTTPLatencyMs(0)
 		}
 	})
+	if httpResult.Success {
+		h.recordOutboundLatency(name, config.LoadBalanceSortHTTP, httpResult.LatencyMs)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortHTTP, 0)
+	}
 
 	if httpResult.Success {
 		return nil
@@ -104,6 +114,11 @@ func (h *ProxyOutboundHandler) TestUDP(name string) error {
 			outbound.SetUDPLatencyMs(0)
 		}
 	})
+	if result.Success {
+		h.recordOutboundLatency(name, config.LoadBalanceSortUDP, result.LatencyMs)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortUDP, 0)
+	}
 
 	if result.Success {
 		return nil

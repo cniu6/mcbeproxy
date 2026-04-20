@@ -38,11 +38,48 @@ const (
 	AutoPingFullScanModeDaily    = "daily"
 	AutoPingFullScanModeInterval = "interval"
 
-	defaultAutoPingIntervalMinutes    = 10
-	defaultAutoPingTopCandidates      = 10
-	defaultAutoPingFullScanTime       = "04:00"
-	defaultAutoPingFullScanIntervalHr = 24
+	defaultAutoPingIntervalMinutes         = 10
+	defaultAutoPingTopCandidates           = 10
+	defaultAutoPingFullScanTime            = "04:00"
+	defaultAutoPingFullScanIntervalHr      = 24
+	defaultLatencyHistoryMinIntervalMinute = 10
+	defaultLatencyHistoryRenderLimit       = 100
+	defaultLatencyHistoryStorageLimit      = 1000
+	defaultLatencyHistoryRetentionDays     = 5
 )
+
+// LatencyMode constants control optional UDP latency-acceleration behavior.
+//
+//   - LatencyModeNormal: current default behavior, no extra socket / pipeline tuning.
+//   - LatencyModeAggressive: low-risk inline UDP optimizations (DSCP/EF marking
+//     on UDP sockets, larger default UDP socket buffer when user did not override).
+//   - LatencyModeFECTunnel: requires udp_speeder to be configured and enabled. The
+//     existing speeder pipeline (FEC, retransmit) is the actual transport. This
+//     mode is just a strict declaration that the operator wants speeder semantics
+//     so misconfiguration is rejected at validation time instead of silently
+//     falling back to plain UDP.
+const (
+	LatencyModeNormal     = "normal"
+	LatencyModeAggressive = "aggressive"
+	LatencyModeFECTunnel  = "fec_tunnel"
+)
+
+func isValidLatencyMode(mode string) bool {
+	switch normalizeLatencyMode(mode) {
+	case LatencyModeNormal, LatencyModeAggressive, LatencyModeFECTunnel:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeLatencyMode(mode string) string {
+	v := strings.ToLower(strings.TrimSpace(mode))
+	if v == "" {
+		return LatencyModeNormal
+	}
+	return v
+}
 
 // ServerConfig represents a proxy target server configuration.
 type ServerConfig struct {
@@ -65,13 +102,14 @@ type ServerConfig struct {
 	ProxyMode           string            `json:"proxy_mode"`             // "transparent" (default) or "raknet" (full RakNet proxy)
 	ACLServerID         string            `json:"acl_server_id,omitempty"`
 	RawUDPKickStrategy  string            `json:"raw_udp_kick_strategy,omitempty"`
-	XboxAuthEnabled     bool              `json:"xbox_auth_enabled"` // Enable Xbox Live authentication for remote connections
-	XboxTokenPath       string            `json:"xbox_token_path"`   // Custom token file path for Xbox Live tokens (optional)
-	ProxyOutbound       string            `json:"proxy_outbound"`    // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
-	ShowRealLatency     bool              `json:"show_real_latency"` // Show real latency through proxy in server list ping
-	LoadBalance         string            `json:"load_balance"`      // Load balance strategy: least-latency, round-robin, random, least-connections
-	LoadBalanceSort     string            `json:"load_balance_sort"` // Latency sort type: udp, tcp, http
-	ProtocolVersion     int               `json:"protocol_version"`  // Override protocol version in Login packet (0 = don't modify)
+	XboxAuthEnabled     bool              `json:"xbox_auth_enabled"`      // Enable Xbox Live authentication for remote connections
+	XboxTokenPath       string            `json:"xbox_token_path"`        // Custom token file path for Xbox Live tokens (optional)
+	ProxyOutbound       string            `json:"proxy_outbound"`         // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
+	ShowRealLatency     bool              `json:"show_real_latency"`      // Show real latency through proxy in server list ping
+	LoadBalance         string            `json:"load_balance"`           // Load balance strategy: least-latency, round-robin, random, least-connections
+	LoadBalanceSort     string            `json:"load_balance_sort"`      // Latency sort type: udp, tcp, http
+	ProtocolVersion     int               `json:"protocol_version"`       // Override protocol version in Login packet (0 = don't modify)
+	LatencyMode         string            `json:"latency_mode,omitempty"` // "normal" (default), "aggressive", or "fec_tunnel"
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"`         // Per-server ping interval in minutes
@@ -198,6 +236,32 @@ func (sc *ServerConfig) GetProxyMode() string {
 	return sc.ProxyMode
 }
 
+// GetLatencyMode returns the normalized latency mode. Empty / unknown values
+// are treated as LatencyModeNormal so callers never have to re-check.
+func (sc *ServerConfig) GetLatencyMode() string {
+	if sc == nil {
+		return LatencyModeNormal
+	}
+	mode := normalizeLatencyMode(sc.LatencyMode)
+	switch mode {
+	case LatencyModeNormal, LatencyModeAggressive, LatencyModeFECTunnel:
+		return mode
+	default:
+		return LatencyModeNormal
+	}
+}
+
+// IsAggressiveLatency reports whether the server opted into the inline
+// aggressive UDP optimizations (DSCP marking, larger default socket buffer).
+func (sc *ServerConfig) IsAggressiveLatency() bool {
+	return sc.GetLatencyMode() == LatencyModeAggressive
+}
+
+// IsFECTunnelLatency reports whether the server requires udp_speeder semantics.
+func (sc *ServerConfig) IsFECTunnelLatency() bool {
+	return sc.GetLatencyMode() == LatencyModeFECTunnel
+}
+
 // Validate checks if all required fields are present and valid.
 // Returns an error if any required field is missing or invalid.
 func (sc *ServerConfig) Validate() error {
@@ -248,6 +312,25 @@ func (sc *ServerConfig) Validate() error {
 		}
 		if err := sc.UDPSpeeder.Validate(); err != nil {
 			return err
+		}
+	}
+	if !isValidLatencyMode(sc.LatencyMode) {
+		return fmt.Errorf("invalid latency_mode: %s", sc.LatencyMode)
+	}
+	switch normalizeLatencyMode(sc.LatencyMode) {
+	case LatencyModeAggressive:
+		// aggressive mode tunes UDP sockets; on pure TCP listeners it has no effect.
+		// Reject the combination up front so operators are not misled.
+		if strings.EqualFold(strings.TrimSpace(sc.Protocol), "tcp") {
+			return fmt.Errorf("latency_mode=aggressive is not supported for protocol tcp")
+		}
+	case LatencyModeFECTunnel:
+		switch strings.ToLower(strings.TrimSpace(sc.Protocol)) {
+		case "tcp", "tcp_udp":
+			return fmt.Errorf("latency_mode=fec_tunnel is not supported for protocol %s", sc.Protocol)
+		}
+		if sc.UDPSpeeder == nil || !sc.UDPSpeeder.Enabled {
+			return errors.New("latency_mode=fec_tunnel requires udp_speeder to be configured and enabled")
 		}
 	}
 	return nil
@@ -315,15 +398,18 @@ type ServerConfigDTO struct {
 	RawUDPKickStrategy  string               `json:"raw_udp_kick_strategy,omitempty"`
 	XboxAuthEnabled     bool                 `json:"xbox_auth_enabled"`
 	XboxTokenPath       string               `json:"xbox_token_path"`
-	ProxyOutbound       string               `json:"proxy_outbound"`    // Proxy outbound node name or "@group" for group selection
-	ShowRealLatency     bool                 `json:"show_real_latency"` // Show real latency through proxy
-	LoadBalance         string               `json:"load_balance"`      // Load balance strategy
-	LoadBalanceSort     string               `json:"load_balance_sort"` // Latency sort type
-	Status              string               `json:"status"`            // running, stopped
+	ProxyOutbound       string               `json:"proxy_outbound"`         // Proxy outbound node name or "@group" for group selection
+	ShowRealLatency     bool                 `json:"show_real_latency"`      // Show real latency through proxy
+	LoadBalance         string               `json:"load_balance"`           // Load balance strategy
+	LoadBalanceSort     string               `json:"load_balance_sort"`      // Latency sort type
+	LatencyMode         string               `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
+	Status              string               `json:"status"`                 // running, stopped
 	ActiveSessions      int                  `json:"active_sessions"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval
+	LastAutoPingAt               int64  `json:"last_auto_ping_at,omitempty"`
+	NextAutoPingAt               int64  `json:"next_auto_ping_at,omitempty"`
 	AutoPingTopCandidates         int    `json:"auto_ping_top_candidates"`
 	AutoPingFullScanMode          string `json:"auto_ping_full_scan_mode,omitempty"`
 	AutoPingFullScanTime          string `json:"auto_ping_full_scan_time,omitempty"`
@@ -358,10 +444,11 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		ShowRealLatency:               sc.ShowRealLatency,
 		LoadBalance:                   sc.LoadBalance,
 		LoadBalanceSort:               sc.LoadBalanceSort,
+		LatencyMode:                   sc.GetLatencyMode(),
 		Status:                        status,
 		ActiveSessions:                activeSessions,
 		AutoPingEnabled:               sc.AutoPingEnabled,
-		AutoPingIntervalMinutes:       sc.AutoPingIntervalMinutes,
+		AutoPingIntervalMinutes:       sc.GetAutoPingIntervalMinutes(),
 		AutoPingTopCandidates:         sc.GetAutoPingTopCandidates(),
 		AutoPingFullScanMode:          sc.GetAutoPingFullScanMode(),
 		AutoPingFullScanTime:          sc.GetAutoPingFullScanTime(),
@@ -369,27 +456,21 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 	}
 }
 
-// IsShowRealLatency returns whether to show real latency through proxy.
 func (sc *ServerConfig) IsShowRealLatency() bool {
 	return sc.ShowRealLatency
 }
 
-// GetCustomMOTD returns the custom MOTD or empty string if not set.
 func (sc *ServerConfig) GetCustomMOTD() string {
 	return sc.CustomMOTD
 }
 
-// GetBufferSize returns the effective buffer size.
-// Returns -1 for auto mode, otherwise the configured size.
 func (sc *ServerConfig) GetBufferSize() int {
 	if sc.BufferSize == 0 {
-		return -1 // Default to auto
+		return -1
 	}
 	return sc.BufferSize
 }
 
-// GetUDPSocketBufferSize returns the configured UDP socket buffer size.
-// 0 means use the proxy's recommended default; -1 means keep the OS default.
 func (sc *ServerConfig) GetUDPSocketBufferSize() int {
 	if sc == nil {
 		return 0
@@ -397,7 +478,6 @@ func (sc *ServerConfig) GetUDPSocketBufferSize() int {
 	return sc.UDPSocketBufferSize
 }
 
-// GetDisabledMessage returns the custom disabled message or a default.
 func (sc *ServerConfig) GetDisabledMessage() string {
 	if sc.DisabledMessage == "" {
 		return "Server is currently disabled"
@@ -405,12 +485,10 @@ func (sc *ServerConfig) GetDisabledMessage() string {
 	return sc.DisabledMessage
 }
 
-// IsXboxAuthEnabled returns whether Xbox Live authentication is enabled for this server.
 func (sc *ServerConfig) IsXboxAuthEnabled() bool {
 	return sc.XboxAuthEnabled
 }
 
-// GetXboxTokenPath returns the Xbox token file path, or a default path if not set.
 func (sc *ServerConfig) GetXboxTokenPath() string {
 	if sc.XboxTokenPath == "" {
 		return "xbox_token.json"
@@ -418,24 +496,18 @@ func (sc *ServerConfig) GetXboxTokenPath() string {
 	return sc.XboxTokenPath
 }
 
-// GetProxyOutbound returns the proxy outbound node name.
-// Returns empty string for direct connection.
 func (sc *ServerConfig) GetProxyOutbound() string {
 	return sc.ProxyOutbound
 }
 
-// IsDirectConnection returns true if the server should use direct connection (no proxy).
-// This is the case when ProxyOutbound is empty or "direct".
 func (sc *ServerConfig) IsDirectConnection() bool {
 	return sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct"
 }
 
-// IsGroupSelection returns true if the proxy_outbound specifies a group (starts with "@").
 func (sc *ServerConfig) IsGroupSelection() bool {
 	return strings.HasPrefix(sc.ProxyOutbound, "@")
 }
 
-// IsMultiNodeSelection returns true if the proxy_outbound specifies multiple nodes (comma-separated).
 func (sc *ServerConfig) IsMultiNodeSelection() bool {
 	if sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct" {
 		return false
@@ -446,8 +518,6 @@ func (sc *ServerConfig) IsMultiNodeSelection() bool {
 	return strings.Contains(sc.ProxyOutbound, ",")
 }
 
-// GetNodeList returns the list of node names from proxy_outbound.
-// Returns nil if not a multi-node selection.
 func (sc *ServerConfig) GetNodeList() []string {
 	if !sc.IsMultiNodeSelection() {
 		return nil
@@ -463,8 +533,6 @@ func (sc *ServerConfig) GetNodeList() []string {
 	return result
 }
 
-// GetGroupName returns the group name without the "@" prefix.
-// Returns empty string if not a group selection.
 func (sc *ServerConfig) GetGroupName() string {
 	if sc.IsGroupSelection() {
 		return strings.TrimPrefix(sc.ProxyOutbound, "@")
@@ -472,10 +540,18 @@ func (sc *ServerConfig) GetGroupName() string {
 	return ""
 }
 
-// GetProtocolVersion returns the protocol version override.
-// Returns 0 if not set (don't modify).
 func (sc *ServerConfig) GetProtocolVersion() int {
 	return sc.ProtocolVersion
+}
+
+func (sc *ServerConfig) GetAutoPingIntervalMinutes() int {
+	if sc == nil {
+		return defaultAutoPingIntervalMinutes
+	}
+	if sc.AutoPingIntervalMinutes <= 0 {
+		return defaultAutoPingIntervalMinutes
+	}
+	return sc.AutoPingIntervalMinutes
 }
 
 func (sc *ServerConfig) GetACLServerID() string {
@@ -494,7 +570,6 @@ func (sc *ServerConfig) GetRawUDPKickStrategy() string {
 	return strategy
 }
 
-// GetLoadBalance returns the load balance strategy, defaulting to "least-latency".
 func (sc *ServerConfig) GetLoadBalance() string {
 	if sc.LoadBalance == "" {
 		return LoadBalanceLeastLatency
@@ -502,7 +577,6 @@ func (sc *ServerConfig) GetLoadBalance() string {
 	return sc.LoadBalance
 }
 
-// GetLoadBalanceSort returns the latency sort type, defaulting to "udp".
 func (sc *ServerConfig) GetLoadBalanceSort() string {
 	if sc.LoadBalanceSort == "" {
 		return LoadBalanceSortUDP
@@ -990,6 +1064,10 @@ type GlobalConfig struct {
 	ProxyPortAutoPingFullScanModeDefault          string `json:"proxy_port_auto_ping_full_scan_mode_default"`
 	ProxyPortAutoPingFullScanTimeDefault          string `json:"proxy_port_auto_ping_full_scan_time_default"`
 	ProxyPortAutoPingFullScanIntervalHoursDefault int    `json:"proxy_port_auto_ping_full_scan_interval_hours_default"`
+	LatencyHistoryMinIntervalMinutes              int    `json:"latency_history_min_interval_minutes"`
+	LatencyHistoryRenderLimit                     int    `json:"latency_history_render_limit"`
+	LatencyHistoryStorageLimit                    int    `json:"latency_history_storage_limit"`
+	LatencyHistoryRetentionDays                   int    `json:"latency_history_retention_days"`
 }
 
 // DefaultGlobalConfig returns a GlobalConfig with default values.
@@ -1020,6 +1098,10 @@ func DefaultGlobalConfig() *GlobalConfig {
 		ProxyPortAutoPingFullScanModeDefault:          AutoPingFullScanModeDisabled,
 		ProxyPortAutoPingFullScanTimeDefault:          defaultAutoPingFullScanTime,
 		ProxyPortAutoPingFullScanIntervalHoursDefault: defaultAutoPingFullScanIntervalHr,
+		LatencyHistoryMinIntervalMinutes:              defaultLatencyHistoryMinIntervalMinute,
+		LatencyHistoryRenderLimit:                     defaultLatencyHistoryRenderLimit,
+		LatencyHistoryStorageLimit:                    defaultLatencyHistoryStorageLimit,
+		LatencyHistoryRetentionDays:                   defaultLatencyHistoryRetentionDays,
 	}
 }
 
@@ -1084,6 +1166,18 @@ func LoadGlobalConfig(path string) (*GlobalConfig, error) {
 	}
 	if config.ProxyPortAutoPingFullScanIntervalHoursDefault <= 0 {
 		config.ProxyPortAutoPingFullScanIntervalHoursDefault = defaultAutoPingFullScanIntervalHr
+	}
+	if config.LatencyHistoryMinIntervalMinutes <= 0 {
+		config.LatencyHistoryMinIntervalMinutes = defaultLatencyHistoryMinIntervalMinute
+	}
+	if config.LatencyHistoryRenderLimit <= 0 {
+		config.LatencyHistoryRenderLimit = defaultLatencyHistoryRenderLimit
+	}
+	if config.LatencyHistoryStorageLimit <= 0 {
+		config.LatencyHistoryStorageLimit = defaultLatencyHistoryStorageLimit
+	}
+	if config.LatencyHistoryRetentionDays <= 0 {
+		config.LatencyHistoryRetentionDays = defaultLatencyHistoryRetentionDays
 	}
 
 	return config, nil
@@ -1158,6 +1252,21 @@ func (gc *GlobalConfig) Validate() error {
 	default:
 		return fmt.Errorf("invalid proxy_port_auto_ping_full_scan_mode_default: %s", gc.ProxyPortAutoPingFullScanModeDefault)
 	}
+	if gc.GetLatencyHistoryMinIntervalMinutes() < 1 {
+		return errors.New("latency_history_min_interval_minutes must be >= 1")
+	}
+	if gc.GetLatencyHistoryRenderLimit() < 1 {
+		return errors.New("latency_history_render_limit must be >= 1")
+	}
+	if gc.GetLatencyHistoryStorageLimit() < 1 {
+		return errors.New("latency_history_storage_limit must be >= 1")
+	}
+	if gc.GetLatencyHistoryRenderLimit() > gc.GetLatencyHistoryStorageLimit() {
+		return errors.New("latency_history_render_limit cannot exceed latency_history_storage_limit")
+	}
+	if gc.GetLatencyHistoryRetentionDays() < 1 {
+		return errors.New("latency_history_retention_days must be >= 1")
+	}
 	return nil
 }
 
@@ -1229,6 +1338,34 @@ func (gc *GlobalConfig) GetProxyPortAutoPingFullScanIntervalHoursDefault() int {
 		return defaultAutoPingFullScanIntervalHr
 	}
 	return gc.ProxyPortAutoPingFullScanIntervalHoursDefault
+}
+
+func (gc *GlobalConfig) GetLatencyHistoryMinIntervalMinutes() int {
+	if gc == nil || gc.LatencyHistoryMinIntervalMinutes <= 0 {
+		return defaultLatencyHistoryMinIntervalMinute
+	}
+	return gc.LatencyHistoryMinIntervalMinutes
+}
+
+func (gc *GlobalConfig) GetLatencyHistoryRenderLimit() int {
+	if gc == nil || gc.LatencyHistoryRenderLimit <= 0 {
+		return defaultLatencyHistoryRenderLimit
+	}
+	return gc.LatencyHistoryRenderLimit
+}
+
+func (gc *GlobalConfig) GetLatencyHistoryStorageLimit() int {
+	if gc == nil || gc.LatencyHistoryStorageLimit <= 0 {
+		return defaultLatencyHistoryStorageLimit
+	}
+	return gc.LatencyHistoryStorageLimit
+}
+
+func (gc *GlobalConfig) GetLatencyHistoryRetentionDays() int {
+	if gc == nil || gc.LatencyHistoryRetentionDays <= 0 {
+		return defaultLatencyHistoryRetentionDays
+	}
+	return gc.LatencyHistoryRetentionDays
 }
 
 // Watch starts watching the configuration file for changes.

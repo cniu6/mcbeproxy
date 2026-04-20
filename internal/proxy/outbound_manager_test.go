@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"mcpeserverproxy/internal/config"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -383,6 +384,96 @@ func TestServerNodeLatencyHistoryKeepsMostRecentSamples(t *testing.T) {
 	expectedLast := int64(serverNodeLatencyHistoryLimit + 12)
 	if samples[len(samples)-1].LatencyMs != expectedLast {
 		t.Fatalf("expected last retained sample latency %d, got %d", expectedLast, samples[len(samples)-1].LatencyMs)
+	}
+}
+
+func TestServerNodeLatencyHistoryUsesServerAutoPingIntervalWhenShorterThanGlobalMinInterval(t *testing.T) {
+	globalConfig := config.DefaultGlobalConfig()
+	globalConfig.LatencyHistoryMinIntervalMinutes = 10
+	mockUpdater := newMockServerConfigUpdater()
+	mockUpdater.AddServer(&config.ServerConfig{
+		ID:                      "srv1",
+		Name:                    "srv1",
+		Target:                  "127.0.0.1",
+		Port:                    19132,
+		ListenAddr:              "0.0.0.0:19132",
+		Protocol:                "raknet",
+		Enabled:                 true,
+		AutoPingEnabled:         true,
+		AutoPingIntervalMinutes: 1,
+	})
+
+	manager := NewOutboundManagerWithConfig(mockUpdater, globalConfig).(*outboundManagerImpl)
+	base := time.Now().Add(-3 * time.Minute)
+	manager.setServerNodeLatencyAt("srv1", "node-a", config.LoadBalanceSortUDP, 91, base)
+	manager.setServerNodeLatencyAt("srv1", "node-a", config.LoadBalanceSortUDP, 73, base.Add(2*time.Minute))
+
+	samples := manager.GetServerNodeLatencyHistory("srv1", "node-a", config.LoadBalanceSortUDP)
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(samples))
+	}
+	if samples[0].LatencyMs != 91 || !samples[0].OK {
+		t.Fatalf("unexpected first sample: %+v", samples[0])
+	}
+	if samples[1].LatencyMs != 73 || !samples[1].OK {
+		t.Fatalf("unexpected second sample: %+v", samples[1])
+	}
+}
+
+func TestOutboundLatencyHistoryUsesOverrideWhenShorterThanGlobalMinInterval(t *testing.T) {
+	globalConfig := config.DefaultGlobalConfig()
+	globalConfig.LatencyHistoryMinIntervalMinutes = 10
+	manager := NewOutboundManagerWithConfig(nil, globalConfig).(*outboundManagerImpl)
+	base := time.Now().Add(-3 * time.Minute)
+	manager.setOutboundLatencyAt("node-a", config.LoadBalanceSortUDP, 91, base, autoPingHistoryMinIntervalOverrideMs(1))
+	manager.setOutboundLatencyAt("node-a", config.LoadBalanceSortUDP, 73, base.Add(2*time.Minute), autoPingHistoryMinIntervalOverrideMs(1))
+
+	samples := manager.GetOutboundLatencyHistory("node-a", config.LoadBalanceSortUDP)
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 samples, got %d", len(samples))
+	}
+	if samples[0].LatencyMs != 91 || !samples[0].OK {
+		t.Fatalf("unexpected first sample: %+v", samples[0])
+	}
+	if samples[1].LatencyMs != 73 || !samples[1].OK {
+		t.Fatalf("unexpected second sample: %+v", samples[1])
+	}
+}
+
+func TestRecordAutoPingOutboundLatencySkipsDirectAndUnknownNodes(t *testing.T) {
+	globalConfig := config.DefaultGlobalConfig()
+	globalConfig.LatencyHistoryMinIntervalMinutes = 10
+	outboundCfgMgr := config.NewProxyOutboundConfigManager(filepath.Join(t.TempDir(), "proxy_outbounds.json"))
+	node := &config.ProxyOutbound{Name: "node-a", Type: config.ProtocolVLESS, Server: "a.example.com", Port: 443, UUID: "11111111-1111-1111-1111-111111111111", Enabled: true}
+	if err := outboundCfgMgr.AddOutbound(node); err != nil {
+		t.Fatalf("AddOutbound(configMgr) failed: %v", err)
+	}
+	manager := NewOutboundManagerWithConfig(nil, globalConfig).(*outboundManagerImpl)
+	if err := manager.AddOutbound(node); err != nil {
+		t.Fatalf("AddOutbound(outboundMgr) failed: %v", err)
+	}
+	proxyServer := &ProxyServer{
+		config:                 globalConfig,
+		outboundMgr:            manager,
+		proxyOutboundConfigMgr: outboundCfgMgr,
+	}
+	base := time.Now().Add(-3 * time.Minute)
+	proxyServer.recordAutoPingOutboundLatency("node-a", config.LoadBalanceSortUDP, 91, base, autoPingHistoryMinIntervalOverrideMs(1))
+	proxyServer.recordAutoPingOutboundLatency(DirectNodeName, config.LoadBalanceSortUDP, 55, base.Add(time.Minute), autoPingHistoryMinIntervalOverrideMs(1))
+	proxyServer.recordAutoPingOutboundLatency("missing-node", config.LoadBalanceSortUDP, 44, base.Add(2*time.Minute), autoPingHistoryMinIntervalOverrideMs(1))
+
+	samples := manager.GetOutboundLatencyHistory("node-a", config.LoadBalanceSortUDP)
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 recorded sample for configured outbound, got %d", len(samples))
+	}
+	if samples[0].LatencyMs != 91 || !samples[0].OK {
+		t.Fatalf("unexpected outbound sample: %+v", samples[0])
+	}
+	if directSamples := manager.GetOutboundLatencyHistory(DirectNodeName, config.LoadBalanceSortUDP); len(directSamples) != 0 {
+		t.Fatalf("expected direct node history to be skipped, got %+v", directSamples)
+	}
+	if missingSamples := manager.GetOutboundLatencyHistory("missing-node", config.LoadBalanceSortUDP); len(missingSamples) != 0 {
+		t.Fatalf("expected unknown outbound history to be skipped, got %+v", missingSamples)
 	}
 }
 

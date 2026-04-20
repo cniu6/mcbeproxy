@@ -5,7 +5,8 @@
       <n-space align="center" wrap>
         <n-text depth="3">自动刷新:</n-text>
         <n-select v-model:value="refreshInterval" :options="refreshOptions" style="width: 110px" size="small" @update:value="setupAutoRefresh" />
-        <n-button size="small" @click="loadData">刷新</n-button>
+        <n-tag size="small" type="warning">下次页面刷新: {{ pageRefreshCountdownText }}</n-tag>
+        <n-button size="small" @click="handleManualRefresh">刷新</n-button>
       </n-space>
     </n-space>
 
@@ -135,6 +136,13 @@
       </n-drawer-content>
     </n-drawer>
 
+    <ServerLatencyHistoryModal
+      v-model:show="showServerLatencyHistoryModal"
+      :server="selectedHistoryServer"
+      :refresh-countdown-text="selectedServerLatencyCountdownText"
+      :refresh-nonce="latencyRefreshNonce"
+    />
+
     <!-- 服务器状态 -->
     <n-card title="服务器状态">
       <n-collapse v-model:expanded-names="expandedServers">
@@ -146,12 +154,16 @@
               <n-tag size="small" :type="getProxyModeType(s.proxy_mode)">{{ getProxyModeLabel(s.proxy_mode) }}</n-tag>
               <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
               <n-tag size="small" :type="getLatencyType(s)">{{ getLatencyText(s) }}</n-tag>
+              <n-tag size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
               <n-tag v-if="getMotdPlayers(s.id)" size="small" type="info">在线: {{ getMotdPlayers(s.id) }}</n-tag>
               <n-tag v-if="getMotdServerName(s.id)" size="small" type="warning">标题: {{ getMotdServerName(s.id) }}</n-tag>
             </n-space>
           </template>
           <template #header-extra>
-            <n-text v-if="!isMobile" depth="3" style="font-size: 12px">{{ s.listen_addr }} → {{ s.target }}:{{ s.port }}</n-text>
+            <n-space align="center" size="small">
+              <n-text v-if="!isMobile" depth="3" style="font-size: 12px">{{ s.listen_addr }} → {{ s.target }}:{{ s.port }}</n-text>
+              <LatencySparkline :samples="getLatencyHistorySamples(s.id)" :show-label="false" :width="110" :height="28" :label="`${s.name} 延迟历史`" clickable @click="openServerLatencyHistoryModal(s)" />
+            </n-space>
           </template>
           <div class="table-wrapper">
             <n-table v-if="activeSessions[s.id]?.length" size="small" :bordered="false" :single-line="false" style="min-width: 600px">
@@ -177,16 +189,25 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { apiBase, formatBytes, formatDuration, formatTime, formatStartTime, formatNumber } from '../api'
+import LatencySparkline from '../components/LatencySparkline.vue'
+import ServerLatencyHistoryModal from '../components/ServerLatencyHistoryModal.vue'
 
 const stats = reactive({})
 const servers = ref([])
 const activeSessions = reactive({})
 const serverPings = reactive({})
+const serverLatencyHistory = reactive({})
 const refreshInterval = ref(60)
 const expandedServers = ref([])
 const showNetworkDrawer = ref(false)
 const windowWidth = ref(window.innerWidth)
+const showServerLatencyHistoryModal = ref(false)
+const selectedHistoryServer = ref(null)
+const latencyRefreshNonce = ref(0)
+const countdownNow = ref(Date.now())
+const nextLatencyRefreshAt = ref(0)
 let timer = null
+let countdownTimer = null
 let loadSeq = 0
 
 const isMobile = computed(() => windowWidth.value < 768)
@@ -210,6 +231,34 @@ const getProxyModeType = (mode) => {
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 
+const formatCountdown = (targetAt) => {
+  if (!refreshInterval.value || refreshInterval.value <= 0 || !targetAt) return '自动刷新关闭'
+  const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
+  const minutes = Math.floor(seconds / 60)
+  const remain = seconds % 60
+  return minutes > 0 ? `${minutes}分${String(remain).padStart(2, '0')}秒` : `${remain}秒`
+}
+
+const formatServerAutoPingCountdown = (server) => {
+  if (server?.status !== 'running') return '已停止'
+  if (!server?.auto_ping_enabled) return '未启用'
+  const targetAt = Number(server?.next_auto_ping_at || 0)
+  if (!targetAt) return '即将'
+  const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
+  if (seconds <= 0) return '即将'
+  const minutes = Math.floor(seconds / 60)
+  const remain = seconds % 60
+  return minutes > 0 ? `${minutes}分${String(remain).padStart(2, '0')}秒` : `${remain}秒`
+}
+
+const pageRefreshCountdownText = computed(() => formatCountdown(nextLatencyRefreshAt.value))
+const selectedServerLatencyCountdownText = computed(() => {
+  const selected = selectedHistoryServer.value
+  if (!selected?.id) return formatServerAutoPingCountdown(selected)
+  const current = servers.value.find(server => server.id === selected.id)
+  return formatServerAutoPingCountdown(current || selected)
+})
+
 const loadData = async () => {
   const currentSeq = ++loadSeq
   try {
@@ -229,6 +278,13 @@ const loadData = async () => {
         if (!newPings[k]) delete serverPings[k]
       })
       Object.assign(serverPings, newPings)
+
+      const newHistory = payload.data.latency_history || {}
+      Object.keys(serverLatencyHistory).forEach(k => {
+        if (!newHistory[k]) delete serverLatencyHistory[k]
+      })
+      Object.assign(serverLatencyHistory, newHistory)
+      latencyRefreshNonce.value = Date.now()
 
       const serversWithPlayers = Object.keys(grouped).filter(k => (grouped[k] || []).length > 0)
       if (serversWithPlayers.length > 0) expandedServers.value = serversWithPlayers
@@ -272,15 +328,52 @@ const getMotdServerName = (serverId) => {
   return ping.parsed_motd.server_name
 }
 
+const getLatencyHistorySamples = (serverId) => {
+  const samples = serverLatencyHistory[serverId]
+  return Array.isArray(samples) ? samples : []
+}
+
+const getServerLatencyCountdownText = (server) => {
+  return formatServerAutoPingCountdown(server)
+}
+
+const openServerLatencyHistoryModal = (server) => {
+  selectedHistoryServer.value = server ? { ...server, server_name: getMotdServerName(server.id) || server.name } : null
+  showServerLatencyHistoryModal.value = true
+}
+
 const setupAutoRefresh = (val) => {
   if (timer) clearInterval(timer)
-  if (val > 0) timer = setInterval(loadData, val * 1000)
+  const seconds = Number(val) || 0
+  if (seconds > 0) {
+    nextLatencyRefreshAt.value = Date.now() + seconds * 1000
+    timer = setInterval(() => {
+      nextLatencyRefreshAt.value = Date.now() + seconds * 1000
+      loadData()
+    }, seconds * 1000)
+    return
+  }
+  nextLatencyRefreshAt.value = 0
+}
+
+const handleManualRefresh = () => {
+  loadData()
+  setupAutoRefresh(refreshInterval.value)
 }
 
 const handleResize = () => { windowWidth.value = window.innerWidth }
 
-onMounted(() => { loadData(); setupAutoRefresh(refreshInterval.value); window.addEventListener('resize', handleResize) })
-onUnmounted(() => { if (timer) clearInterval(timer); window.removeEventListener('resize', handleResize) })
+onMounted(() => {
+  loadData()
+  setupAutoRefresh(refreshInterval.value)
+  countdownTimer = setInterval(() => { countdownNow.value = Date.now() }, 1000)
+  window.addEventListener('resize', handleResize)
+})
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+  if (countdownTimer) clearInterval(countdownTimer)
+  window.removeEventListener('resize', handleResize)
+})
 </script>
 
 <style scoped>

@@ -1030,6 +1030,8 @@ func upgradeToGRPC(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound
 }
 
 func upgradeToHTTPUpgrade(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	setTransportHandshakeDeadline(conn)
+	defer clearTransportConnDeadline(conn)
 	keyBytes := make([]byte, 16)
 	if _, err := crand.Read(keyBytes); err != nil {
 		return nil, fmt.Errorf("failed to generate HTTPUpgrade key: %w", err)
@@ -1077,6 +1079,74 @@ func upgradeToHTTPUpgrade(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, e
 
 	logger.Debug("HTTPUpgrade: upgrade successful to %s%s", host, path)
 	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+func upgradeToWebSocket(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	setTransportHandshakeDeadline(conn)
+	defer clearTransportConnDeadline(conn)
+	// Generate WebSocket key
+	keyBytes := make([]byte, 16)
+	if _, err := crand.Read(keyBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate WebSocket key: %w", err)
+	}
+	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
+
+	path := cfg.WSPath
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	host := cfg.WSHost
+	if host == "" {
+		host = cfg.Server
+		if cfg.Port != 80 && cfg.Port != 443 {
+			host = fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
+		}
+	}
+
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: %s\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"\r\n", path, host, wsKey)
+
+	// Send upgrade request
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, fmt.Errorf("failed to send WebSocket upgrade request: %w", err)
+	}
+
+	// Read response
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read WebSocket upgrade response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("WebSocket upgrade failed: status %d", resp.StatusCode)
+	}
+
+	logger.Debug("WebSocket: upgrade successful to %s%s", host, path)
+
+	return &wsConn{
+		Conn:   conn,
+		reader: reader,
+	}, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }
 
 func decodeRealityPublicKeyValue(value string) ([]byte, error) {
@@ -2956,74 +3026,6 @@ func (c *hysteria2PacketConn) SetWriteDeadline(_ time.Time) error {
 	return nil
 }
 
-// upgradeToWebSocket performs a WebSocket handshake and returns a WebSocket connection.
-func upgradeToWebSocket(conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
-	// Generate WebSocket key
-	keyBytes := make([]byte, 16)
-	if _, err := crand.Read(keyBytes); err != nil {
-		return nil, fmt.Errorf("failed to generate WebSocket key: %w", err)
-	}
-	wsKey := base64.StdEncoding.EncodeToString(keyBytes)
-
-	// Build WebSocket upgrade request
-	path := cfg.WSPath
-	if path == "" {
-		path = "/"
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	host := cfg.WSHost
-	if host == "" {
-		host = cfg.Server
-		if cfg.Port != 80 && cfg.Port != 443 {
-			host = fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
-		}
-	}
-
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
-		"Host: %s\r\n"+
-		"Upgrade: websocket\r\n"+
-		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n"+
-		"\r\n", path, host, wsKey)
-
-	// Send upgrade request
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return nil, fmt.Errorf("failed to send WebSocket upgrade request: %w", err)
-	}
-
-	// Read response
-	reader := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read WebSocket upgrade response: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return nil, fmt.Errorf("WebSocket upgrade failed: status %d", resp.StatusCode)
-	}
-
-	logger.Debug("WebSocket: upgrade successful to %s%s", host, path)
-
-	return &wsConn{
-		Conn:   conn,
-		reader: reader,
-	}, nil
-}
-
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
-}
-
 type grpcTunnelConn struct {
 	net.Conn
 	clientConn *grpc.ClientConn
@@ -3042,6 +3044,20 @@ func (c *grpcTunnelConn) Close() error {
 	return err
 }
 
+func setTransportHandshakeDeadline(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+}
+
+func clearTransportConnDeadline(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+}
+
 const maxWebSocketFramePayload = 16 * 1024 * 1024
 
 // wsConn wraps a net.Conn with WebSocket framing.
@@ -3054,6 +3070,9 @@ type wsConn struct {
 
 // Read reads data from the WebSocket connection.
 func (c *wsConn) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	// If we have buffered data, return it first
 	if c.readOffset < len(c.readBuf) {
 		n = copy(p, c.readBuf[c.readOffset:])
@@ -3065,76 +3084,81 @@ func (c *wsConn) Read(p []byte) (n int, err error) {
 		return n, nil
 	}
 
-	// Read WebSocket frame header
-	header := make([]byte, 2)
-	if _, err := io.ReadFull(c.reader, header); err != nil {
-		return 0, err
+	for {
+		var header [2]byte
+		if _, err := io.ReadFull(c.reader, header[:]); err != nil {
+			return 0, err
+		}
+
+		opcode := header[0] & 0x0F
+		masked := header[1]&0x80 != 0
+		payloadLen, err := readWebSocketPayloadLength(c.reader, header[1]&0x7F)
+		if err != nil {
+			return 0, err
+		}
+		if opcode >= 0x8 && payloadLen > 125 {
+			return 0, fmt.Errorf("invalid websocket control frame length: %d", payloadLen)
+		}
+
+		var maskKey [4]byte
+		if masked {
+			if _, err := io.ReadFull(c.reader, maskKey[:]); err != nil {
+				return 0, err
+			}
+		}
+
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(c.reader, payload); err != nil {
+			return 0, err
+		}
+
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+
+		if opcode == 0x8 {
+			return 0, io.EOF
+		}
+		if opcode == 0x9 {
+			_, _ = c.writeFrame(0xA, payload)
+			continue
+		}
+		if opcode == 0xA {
+			continue
+		}
+
+		// Copy data to output buffer
+		n = copy(p, payload)
+		if n < len(payload) {
+			c.readBuf = payload
+			c.readOffset = n
+		}
+
+		return n, nil
 	}
+}
 
-	// Parse frame header
-	// fin := header[0]&0x80 != 0
-	opcode := header[0] & 0x0F
-	masked := header[1]&0x80 != 0
-	payloadLen := int(header[1] & 0x7F)
-
-	// Handle extended payload length
+func readWebSocketPayloadLength(reader *bufio.Reader, indicator byte) (int, error) {
+	payloadLen := uint64(indicator)
 	if payloadLen == 126 {
-		extLen := make([]byte, 2)
-		if _, err := io.ReadFull(c.reader, extLen); err != nil {
+		var extLen [2]byte
+		if _, err := io.ReadFull(reader, extLen[:]); err != nil {
 			return 0, err
 		}
-		payloadLen = int(binary.BigEndian.Uint16(extLen))
+		payloadLen = uint64(binary.BigEndian.Uint16(extLen[:]))
 	} else if payloadLen == 127 {
-		extLen := make([]byte, 8)
-		if _, err := io.ReadFull(c.reader, extLen); err != nil {
+		var extLen [8]byte
+		if _, err := io.ReadFull(reader, extLen[:]); err != nil {
 			return 0, err
 		}
-		payloadLen = int(binary.BigEndian.Uint64(extLen))
+		payloadLen = binary.BigEndian.Uint64(extLen[:])
 	}
-	if payloadLen > maxWebSocketFramePayload {
+	if payloadLen > uint64(maxWebSocketFramePayload) {
 		return 0, fmt.Errorf("websocket frame too large: %d", payloadLen)
 	}
-
-	// Read masking key if present
-	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(c.reader, maskKey[:]); err != nil {
-			return 0, err
-		}
-	}
-
-	// Read payload
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(c.reader, payload); err != nil {
-		return 0, err
-	}
-
-	// Unmask if needed
-	if masked {
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
-	}
-
-	// Handle control frames
-	if opcode == 0x8 { // Close
-		return 0, io.EOF
-	} else if opcode == 0x9 { // Ping
-		// Send pong
-		c.writeFrame(0xA, payload)
-		return c.Read(p) // Read next frame
-	} else if opcode == 0xA { // Pong
-		return c.Read(p) // Ignore pong, read next frame
-	}
-
-	// Copy data to output buffer
-	n = copy(p, payload)
-	if n < len(payload) {
-		c.readBuf = payload
-		c.readOffset = n
-	}
-
-	return n, nil
+	return int(payloadLen), nil
 }
 
 // Write writes data to the WebSocket connection.
@@ -3144,6 +3168,9 @@ func (c *wsConn) Write(p []byte) (n int, err error) {
 
 // writeFrame writes a WebSocket frame.
 func (c *wsConn) writeFrame(opcode byte, payload []byte) (n int, err error) {
+	if c == nil || c.Conn == nil {
+		return 0, errors.New("websocket connection is nil")
+	}
 	// Build frame header
 	var header []byte
 	payloadLen := len(payload)

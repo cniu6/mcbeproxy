@@ -34,6 +34,7 @@ type ProxyOutboundHandler struct {
 	configMgr              *config.ProxyOutboundConfigManager
 	subConfigMgr           *config.ProxySubscriptionConfigManager
 	serverConfigMgr        *config.ConfigManager
+	globalConfig           *config.GlobalConfig
 	outboundMgr            proxy.OutboundManager
 	singboxFactory         singboxcore.Factory
 	subService             *subscription.Service
@@ -50,10 +51,14 @@ var metadataLikeImportNamePattern = regexp.MustCompile(`(?i)^(剩余流量|套�
 
 // NewProxyOutboundHandler creates a new ProxyOutboundHandler instance.
 func NewProxyOutboundHandler(configMgr *config.ProxyOutboundConfigManager, subConfigMgr *config.ProxySubscriptionConfigManager, serverConfigMgr *config.ConfigManager, outboundMgr proxy.OutboundManager) *ProxyOutboundHandler {
-	return NewProxyOutboundHandlerWithSingboxFactory(configMgr, subConfigMgr, serverConfigMgr, outboundMgr, nil)
+	return NewProxyOutboundHandlerWithConfig(configMgr, subConfigMgr, serverConfigMgr, nil, outboundMgr)
 }
 
-func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundConfigManager, subConfigMgr *config.ProxySubscriptionConfigManager, serverConfigMgr *config.ConfigManager, outboundMgr proxy.OutboundManager, factory singboxcore.Factory) *ProxyOutboundHandler {
+func NewProxyOutboundHandlerWithConfig(configMgr *config.ProxyOutboundConfigManager, subConfigMgr *config.ProxySubscriptionConfigManager, serverConfigMgr *config.ConfigManager, globalConfig *config.GlobalConfig, outboundMgr proxy.OutboundManager) *ProxyOutboundHandler {
+	return NewProxyOutboundHandlerWithSingboxFactory(configMgr, subConfigMgr, serverConfigMgr, globalConfig, outboundMgr, nil)
+}
+
+func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundConfigManager, subConfigMgr *config.ProxySubscriptionConfigManager, serverConfigMgr *config.ConfigManager, globalConfig *config.GlobalConfig, outboundMgr proxy.OutboundManager, factory singboxcore.Factory) *ProxyOutboundHandler {
 	if factory == nil {
 		factory = proxy.NewSingboxCoreFactory()
 	}
@@ -61,6 +66,7 @@ func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundCo
 		configMgr:       configMgr,
 		subConfigMgr:    subConfigMgr,
 		serverConfigMgr: serverConfigMgr,
+		globalConfig:    globalConfig,
 		outboundMgr:     outboundMgr,
 		singboxFactory:  factory,
 		subService:      subscription.NewServiceWithSingboxFactory(configMgr, outboundMgr, factory),
@@ -141,12 +147,15 @@ type ProxyOutboundDTO struct {
 	RealityShortID   string `json:"reality_short_id,omitempty"`
 
 	// Transport fields
-	Network         string `json:"network,omitempty"`
-	WSPath          string `json:"ws_path,omitempty"`
-	WSHost          string `json:"ws_host,omitempty"`
-	XHTTPMode       string `json:"xhttp_mode,omitempty"`
-	GRPCServiceName string `json:"grpc_service_name,omitempty"`
-	GRPCAuthority   string `json:"grpc_authority,omitempty"`
+	Network                  string     `json:"network,omitempty"`
+	WSPath                   string     `json:"ws_path,omitempty"`
+	WSHost                   string     `json:"ws_host,omitempty"`
+	XHTTPMode                string     `json:"xhttp_mode,omitempty"`
+	GRPCServiceName          string     `json:"grpc_service_name,omitempty"`
+	GRPCAuthority            string     `json:"grpc_authority,omitempty"`
+	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
+	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
+	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
 }
 
 // toDTO converts a ProxyOutbound to ProxyOutboundDTO with health status.
@@ -191,6 +200,10 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 		GRPCServiceName: cfg.GRPCServiceName,
 		GRPCAuthority:   cfg.GRPCAuthority,
 	}
+	blocked, blockReason, blockExpiresAt := cfg.GetEffectiveAutoSelectBlock()
+	dto.AutoSelectBlocked = blocked
+	dto.AutoSelectBlockReason = blockReason
+	dto.AutoSelectBlockExpiresAt = blockExpiresAt
 
 	// Use persisted test results from config
 	dto.LatencyMs = cfg.TCPLatencyMs
@@ -250,12 +263,15 @@ type CreateProxyOutboundRequest struct {
 	RealityShortID   string `json:"reality_short_id,omitempty"`
 
 	// Transport fields (WebSocket, gRPC, etc.)
-	Network         string `json:"network,omitempty"`
-	WSPath          string `json:"ws_path,omitempty"`
-	WSHost          string `json:"ws_host,omitempty"`
-	XHTTPMode       string `json:"xhttp_mode,omitempty"`
-	GRPCServiceName string `json:"grpc_service_name,omitempty"`
-	GRPCAuthority   string `json:"grpc_authority,omitempty"`
+	Network                  string     `json:"network,omitempty"`
+	WSPath                   string     `json:"ws_path,omitempty"`
+	WSHost                   string     `json:"ws_host,omitempty"`
+	XHTTPMode                string     `json:"xhttp_mode,omitempty"`
+	GRPCServiceName          string     `json:"grpc_service_name,omitempty"`
+	GRPCAuthority            string     `json:"grpc_authority,omitempty"`
+	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
+	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
+	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
 }
 
 // toProxyOutbound converts the request to a ProxyOutbound config.
@@ -293,12 +309,15 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		RealityPublicKey: r.RealityPublicKey,
 		RealityShortID:   r.RealityShortID,
 		// Transport
-		Network:         r.Network,
-		WSPath:          r.WSPath,
-		WSHost:          r.WSHost,
-		XHTTPMode:       r.XHTTPMode,
-		GRPCServiceName: r.GRPCServiceName,
-		GRPCAuthority:   r.GRPCAuthority,
+		Network:                  r.Network,
+		WSPath:                   r.WSPath,
+		WSHost:                   r.WSHost,
+		XHTTPMode:                r.XHTTPMode,
+		GRPCServiceName:          r.GRPCServiceName,
+		GRPCAuthority:            r.GRPCAuthority,
+		AutoSelectBlocked:        r.AutoSelectBlocked,
+		AutoSelectBlockReason:    r.AutoSelectBlockReason,
+		AutoSelectBlockExpiresAt: r.AutoSelectBlockExpiresAt,
 	}
 }
 
@@ -313,6 +332,18 @@ type TestResult struct {
 type NameRequest struct {
 	Name     string `json:"name" binding:"required"`
 	ServerID string `json:"server_id,omitempty"`
+}
+
+type ProxyOutboundAutoSelectBlockRequest struct {
+	Name      string     `json:"name" binding:"required"`
+	Reason    string     `json:"reason,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+type BatchProxyOutboundAutoSelectBlockRequest struct {
+	Names     []string   `json:"names" binding:"required"`
+	Reason    string     `json:"reason,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 type BatchProxyTestRequest struct {
@@ -376,6 +407,13 @@ func (h *ProxyOutboundHandler) updateOutboundRuntime(name string, update func(ou
 	_ = h.configMgr.UpdateOutboundRuntime(name, update)
 }
 
+func (h *ProxyOutboundHandler) recordOutboundLatency(name, sortBy string, latencyMs int64) {
+	if h == nil || h.outboundMgr == nil {
+		return
+	}
+	h.outboundMgr.SetOutboundLatency(name, sortBy, latencyMs)
+}
+
 type ProxySubscriptionDTO struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
@@ -395,6 +433,123 @@ type ProxySubscriptionDTO struct {
 type ServerNodeLatencyHistoryItem struct {
 	Name    string                          `json:"name"`
 	Samples []proxy.ServerNodeLatencySample `json:"samples"`
+}
+
+type ProxyOutboundLatencyHistoryMetrics struct {
+	TCP  []proxy.OutboundLatencySample `json:"tcp"`
+	HTTP []proxy.OutboundLatencySample `json:"http"`
+	UDP  []proxy.OutboundLatencySample `json:"udp"`
+}
+
+func (h *ProxyOutboundHandler) defaultLatencyHistoryLimit() int {
+	if h == nil || h.globalConfig == nil {
+		return 100
+	}
+	return h.globalConfig.GetLatencyHistoryRenderLimit()
+}
+
+func (h *ProxyOutboundHandler) maxLatencyHistoryLimit() int {
+	if h == nil || h.globalConfig == nil {
+		return 1000
+	}
+	return h.globalConfig.GetLatencyHistoryStorageLimit()
+}
+
+func (h *ProxyOutboundHandler) parseLatencyHistoryLimit(raw string) int {
+	return parseHistoryLimit(raw, h.defaultLatencyHistoryLimit(), h.maxLatencyHistoryLimit())
+}
+
+func parseOptionalUnixMilli(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
+}
+
+func filterServerNodeLatencyHistorySamples(samples []proxy.ServerNodeLatencySample, fromMs, toMs int64, limit int) []proxy.ServerNodeLatencySample {
+	if len(samples) == 0 {
+		return []proxy.ServerNodeLatencySample{}
+	}
+	if fromMs > 0 && toMs > 0 && fromMs > toMs {
+		fromMs, toMs = toMs, fromMs
+	}
+	filtered := make([]proxy.ServerNodeLatencySample, 0, len(samples))
+	for _, sample := range samples {
+		if fromMs > 0 && sample.Timestamp < fromMs {
+			continue
+		}
+		if toMs > 0 && sample.Timestamp > toMs {
+			continue
+		}
+		if sample.LatencyMs < 0 {
+			sample.LatencyMs = 0
+		}
+		filtered = append(filtered, sample)
+	}
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+	return filtered
+}
+
+func filterOutboundLatencyHistorySamples(samples []proxy.OutboundLatencySample, fromMs, toMs int64, limit int) []proxy.OutboundLatencySample {
+	if len(samples) == 0 {
+		return []proxy.OutboundLatencySample{}
+	}
+	if fromMs > 0 && toMs > 0 && fromMs > toMs {
+		fromMs, toMs = toMs, fromMs
+	}
+	filtered := make([]proxy.OutboundLatencySample, 0, len(samples))
+	for _, sample := range samples {
+		if fromMs > 0 && sample.Timestamp < fromMs {
+			continue
+		}
+		if toMs > 0 && sample.Timestamp > toMs {
+			continue
+		}
+		if sample.LatencyMs < 0 {
+			sample.LatencyMs = 0
+		}
+		filtered = append(filtered, sample)
+	}
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+	return filtered
+}
+
+func (h *ProxyOutboundHandler) getProxyOutboundLatencyHistoryMetrics(name string, fromMs, toMs int64, limit int) ProxyOutboundLatencyHistoryMetrics {
+	if h == nil || h.outboundMgr == nil {
+		return ProxyOutboundLatencyHistoryMetrics{
+			TCP:  []proxy.OutboundLatencySample{},
+			HTTP: []proxy.OutboundLatencySample{},
+			UDP:  []proxy.OutboundLatencySample{},
+		}
+	}
+	return ProxyOutboundLatencyHistoryMetrics{
+		TCP:  filterOutboundLatencyHistorySamples(h.outboundMgr.GetOutboundLatencyHistory(name, config.LoadBalanceSortTCP), fromMs, toMs, limit),
+		HTTP: filterOutboundLatencyHistorySamples(h.outboundMgr.GetOutboundLatencyHistory(name, config.LoadBalanceSortHTTP), fromMs, toMs, limit),
+		UDP:  filterOutboundLatencyHistorySamples(h.outboundMgr.GetOutboundLatencyHistory(name, config.LoadBalanceSortUDP), fromMs, toMs, limit),
+	}
+}
+
+func (h *ProxyOutboundHandler) buildProxyOutboundLatencyHistorySnapshot(outbounds []*config.ProxyOutbound, fromMs, toMs int64, limit int) map[string]ProxyOutboundLatencyHistoryMetrics {
+	result := make(map[string]ProxyOutboundLatencyHistoryMetrics)
+	if h == nil || h.outboundMgr == nil || len(outbounds) == 0 {
+		return result
+	}
+	for _, outbound := range outbounds {
+		if outbound == nil || strings.TrimSpace(outbound.Name) == "" {
+			continue
+		}
+		result[outbound.Name] = h.getProxyOutboundLatencyHistoryMetrics(outbound.Name, fromMs, toMs, limit)
+	}
+	return result
 }
 
 type ProxySubscriptionRequest struct {
@@ -947,6 +1102,11 @@ func (h *ProxyOutboundHandler) executeTCPTest(ctx context.Context, name string) 
 			outbound.SetTCPLatencyMs(0)
 		}
 	})
+	if result.Success {
+		h.recordOutboundLatency(name, config.LoadBalanceSortTCP, result.LatencyMs)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortTCP, 0)
+	}
 	return result
 }
 
@@ -1449,6 +1609,7 @@ func (h *ProxyOutboundHandler) executeBatchHTTPTest(ctx context.Context, name st
 			if strings.TrimSpace(req.ServerID) != "" && h.outboundMgr != nil {
 				h.outboundMgr.SetServerNodeLatency(req.ServerID, name, config.LoadBalanceSortHTTP, 0)
 			}
+			h.recordOutboundLatency(name, config.LoadBalanceSortHTTP, 0)
 			return item
 		}
 		defer dialer.Close()
@@ -1531,6 +1692,11 @@ func (h *ProxyOutboundHandler) executeBatchHTTPTest(ctx context.Context, name st
 			outbound.SetHTTPLatencyMs(0)
 		}
 	})
+	if bestLatency >= 0 {
+		h.recordOutboundLatency(name, config.LoadBalanceSortHTTP, bestLatency)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortHTTP, 0)
+	}
 	return item
 }
 
@@ -1566,6 +1732,11 @@ func (h *ProxyOutboundHandler) executeBatchUDPTest(ctx context.Context, name str
 			outbound.SetUDPLatencyMs(0)
 		}
 	})
+	if result.Success {
+		h.recordOutboundLatency(name, config.LoadBalanceSortUDP, result.LatencyMs)
+	} else {
+		h.recordOutboundLatency(name, config.LoadBalanceSortUDP, 0)
+	}
 	return item
 }
 
@@ -1776,6 +1947,146 @@ func (h *ProxyOutboundHandler) DeleteProxyOutboundByBody(c *gin.Context) {
 	respondSuccessWithMsg(c, "代理出站节点已删除", nil)
 }
 
+func (h *ProxyOutboundHandler) BlockProxyOutboundAutoSelectByBody(c *gin.Context) {
+	var req ProxyOutboundAutoSelectBlockRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "expires_at must be in the future")
+		return
+	}
+	outbound, err := h.applyProxyOutboundAutoSelectBlock(req.Name, strings.TrimSpace(req.Reason), req.ExpiresAt, true)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update proxy outbound", err.Error())
+		return
+	}
+	respondSuccess(c, h.toDTO(outbound))
+}
+
+func (h *ProxyOutboundHandler) UnblockProxyOutboundAutoSelectByBody(c *gin.Context) {
+	var req NameRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	outbound, err := h.applyProxyOutboundAutoSelectBlock(req.Name, "", nil, false)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update proxy outbound", err.Error())
+		return
+	}
+	respondSuccess(c, h.toDTO(outbound))
+}
+
+func (h *ProxyOutboundHandler) BatchBlockProxyOutboundAutoSelectByBody(c *gin.Context) {
+	var req BatchProxyOutboundAutoSelectBlockRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "expires_at must be in the future")
+		return
+	}
+	items, updated, err := h.batchApplyProxyOutboundAutoSelectBlock(req.Names, strings.TrimSpace(req.Reason), req.ExpiresAt, true)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update proxy outbounds", err.Error())
+		return
+	}
+	respondSuccess(c, map[string]interface{}{
+		"updated":  updated,
+		"outbounds": items,
+	})
+}
+
+func (h *ProxyOutboundHandler) BatchUnblockProxyOutboundAutoSelectByBody(c *gin.Context) {
+	var req struct {
+		Names []string `json:"names" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	items, updated, err := h.batchApplyProxyOutboundAutoSelectBlock(req.Names, "", nil, false)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update proxy outbounds", err.Error())
+		return
+	}
+	respondSuccess(c, map[string]interface{}{
+		"updated":  updated,
+		"outbounds": items,
+	})
+}
+
+func (h *ProxyOutboundHandler) applyProxyOutboundAutoSelectBlock(name, reason string, expiresAt *time.Time, blocked bool) (*config.ProxyOutbound, error) {
+	if h == nil || h.configMgr == nil {
+		return nil, fmt.Errorf("proxy outbound config manager not initialized")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("name is required")
+	}
+	outbound, exists := h.configMgr.GetOutbound(name)
+	if !exists || outbound == nil {
+		return nil, fmt.Errorf("proxy outbound %s not found", name)
+	}
+	if blocked {
+		outbound.AutoSelectBlocked = true
+		outbound.AutoSelectBlockReason = reason
+		if expiresAt != nil {
+			value := *expiresAt
+			outbound.AutoSelectBlockExpiresAt = &value
+		} else {
+			outbound.AutoSelectBlockExpiresAt = nil
+		}
+	} else {
+		outbound.AutoSelectBlocked = false
+		outbound.AutoSelectBlockReason = ""
+		outbound.AutoSelectBlockExpiresAt = nil
+	}
+	if err := h.configMgr.UpdateOutbound(name, outbound); err != nil {
+		return nil, err
+	}
+	if h.outboundMgr != nil {
+		_ = h.outboundMgr.UpdateOutbound(name, outbound)
+	}
+	return outbound, nil
+}
+
+func (h *ProxyOutboundHandler) batchApplyProxyOutboundAutoSelectBlock(names []string, reason string, expiresAt *time.Time, blocked bool) ([]ProxyOutboundDTO, int, error) {
+	if h == nil || h.configMgr == nil {
+		return nil, 0, fmt.Errorf("proxy outbound config manager not initialized")
+	}
+	unique := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		unique = append(unique, name)
+	}
+	if len(unique) == 0 {
+		return nil, 0, fmt.Errorf("names are required")
+	}
+	items := make([]ProxyOutboundDTO, 0, len(unique))
+	updated := 0
+	for _, name := range unique {
+		outbound, err := h.applyProxyOutboundAutoSelectBlock(name, reason, expiresAt, blocked)
+		if err != nil {
+			return nil, updated, err
+		}
+		items = append(items, h.toDTO(outbound))
+		updated++
+	}
+	return items, updated, nil
+}
+
 // DetailedTestResult represents the result of a detailed proxy test.
 type DetailedTestResult struct {
 	Success    bool             `json:"success"`
@@ -1945,6 +2256,25 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 	if includePing {
 		pingResult := h.testPing(testCtx, cfg)
 		result.PingTest = &pingResult
+		if req.ServerID != "" && h.outboundMgr != nil {
+			if pingResult.Success {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortTCP, pingResult.LatencyMs)
+			} else {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortTCP, 0)
+			}
+		}
+		h.updateOutboundRuntime(req.Name, func(outbound *config.ProxyOutbound) {
+			if pingResult.Success {
+				outbound.SetTCPLatencyMs(pingResult.LatencyMs)
+			} else {
+				outbound.SetTCPLatencyMs(0)
+			}
+		})
+		if pingResult.Success {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortTCP, pingResult.LatencyMs)
+		} else {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortTCP, 0)
+		}
 		if !pingResult.Success {
 			allSuccess = false
 		}
@@ -2093,9 +2423,21 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 				outbound.SetHTTPLatencyMs(0)
 			}
 		})
+		if bestLatency >= 0 {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortHTTP, bestLatency)
+		} else {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortHTTP, 0)
+		}
 	}
 	if result.UDPTest != nil {
 		udpAvailable := result.UDPTest.Success
+		if req.ServerID != "" && h.outboundMgr != nil {
+			if udpAvailable {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortUDP, result.UDPTest.LatencyMs)
+			} else {
+				h.outboundMgr.SetServerNodeLatency(req.ServerID, req.Name, config.LoadBalanceSortUDP, 0)
+			}
+		}
 		h.updateOutboundRuntime(req.Name, func(outbound *config.ProxyOutbound) {
 			outbound.SetUDPAvailable(&udpAvailable)
 			if udpAvailable {
@@ -2104,6 +2446,11 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 				outbound.SetUDPLatencyMs(0)
 			}
 		})
+		if udpAvailable {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortUDP, result.UDPTest.LatencyMs)
+		} else {
+			h.recordOutboundLatency(req.Name, config.LoadBalanceSortUDP, 0)
+		}
 	}
 
 	respondSuccess(c, result)
@@ -2738,8 +3085,66 @@ func (h *ProxyOutboundHandler) TestMCBEUDP(c *gin.Context) {
 			outbound.SetUDPLatencyMs(0)
 		}
 	})
+	if result.Success {
+		h.recordOutboundLatency(req.Name, config.LoadBalanceSortUDP, result.LatencyMs)
+	} else {
+		h.recordOutboundLatency(req.Name, config.LoadBalanceSortUDP, 0)
+	}
 
 	respondSuccess(c, result)
+}
+
+func (h *ProxyOutboundHandler) GetProxyOutboundLatencyOverview(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	if h.configMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Proxy outbound config manager not initialized", "")
+		return
+	}
+	fromMs, _ := parseOptionalUnixMilli(c.Query("from"))
+	toMs, _ := parseOptionalUnixMilli(c.Query("to"))
+	limit := h.parseLatencyHistoryLimit(c.Query("limit"))
+	outbounds := h.configMgr.GetAllOutbounds()
+	respondSuccess(c, map[string]interface{}{
+		"from":            fromMs,
+		"to":              toMs,
+		"limit":           limit,
+		"latency_history": h.buildProxyOutboundLatencyHistorySnapshot(outbounds, fromMs, toMs, limit),
+	})
+}
+
+func (h *ProxyOutboundHandler) GetProxyOutboundLatencyHistory(c *gin.Context) {
+	if h.outboundMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
+		return
+	}
+	if h.configMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Proxy outbound config manager not initialized", "")
+		return
+	}
+	name := strings.TrimSpace(c.Param("name"))
+	if name == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "name parameter is required")
+		return
+	}
+	outbound, exists := h.configMgr.GetOutbound(name)
+	if !exists || outbound == nil {
+		respondError(c, http.StatusNotFound, "Proxy outbound not found", "No proxy outbound found with the specified name")
+		return
+	}
+	fromMs, _ := parseOptionalUnixMilli(c.Query("from"))
+	toMs, _ := parseOptionalUnixMilli(c.Query("to"))
+	limit := h.parseLatencyHistoryLimit(c.Query("limit"))
+	respondSuccess(c, map[string]interface{}{
+		"name":     name,
+		"from":     fromMs,
+		"to":       toMs,
+		"limit":    limit,
+		"outbound": h.toDTO(outbound),
+		"metrics":  h.getProxyOutboundLatencyHistoryMetrics(name, fromMs, toMs, limit),
+	})
 }
 
 // testMCBEServer tests connectivity to a MCBE server through the proxy.
@@ -3038,19 +3443,26 @@ func (h *ProxyOutboundHandler) GetServerNodeLatencyHistory(c *gin.Context) {
 	if sortBy == "" {
 		sortBy = serverCfg.GetLoadBalanceSort()
 	}
+	fromMs, _ := parseOptionalUnixMilli(c.Query("from"))
+	toMs, _ := parseOptionalUnixMilli(c.Query("to"))
+	limit := h.parseLatencyHistoryLimit(c.Query("limit"))
 
 	candidateNodes := h.listServerCandidateNodes(serverCfg)
 	items := make([]ServerNodeLatencyHistoryItem, 0, len(candidateNodes))
 	for _, nodeName := range candidateNodes {
+		samples := h.outboundMgr.GetServerNodeLatencyHistory(serverID, nodeName, sortBy)
 		items = append(items, ServerNodeLatencyHistoryItem{
 			Name:    nodeName,
-			Samples: h.outboundMgr.GetServerNodeLatencyHistory(serverID, nodeName, sortBy),
+			Samples: filterServerNodeLatencyHistorySamples(samples, fromMs, toMs, limit),
 		})
 	}
 
 	respondSuccess(c, map[string]interface{}{
 		"server_id": serverID,
 		"sort_by":   sortBy,
+		"from":      fromMs,
+		"to":        toMs,
+		"limit":     limit,
 		"nodes":     items,
 	})
 }

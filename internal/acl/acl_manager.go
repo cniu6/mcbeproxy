@@ -35,6 +35,8 @@ type ACLManager struct {
 	whitelistRepo *db.WhitelistRepository
 	settingsRepo  *db.ACLSettingsRepository
 	mu            sync.RWMutex
+	cleanupMu     sync.Mutex
+	lastCleanup   time.Time
 }
 
 // NewACLManager creates a new ACL manager with the given database.
@@ -46,10 +48,48 @@ func NewACLManager(database *db.Database) *ACLManager {
 	}
 }
 
+func (m *ACLManager) cleanupExpiredEntriesIfDue() {
+	if m == nil {
+		return
+	}
+	now := time.Now()
+	m.cleanupMu.Lock()
+	defer m.cleanupMu.Unlock()
+	if !m.lastCleanup.IsZero() && now.Sub(m.lastCleanup) < time.Minute {
+		return
+	}
+	_, _ = m.blacklistRepo.DeleteExpired()
+	_, _ = m.whitelistRepo.DeleteExpired()
+	m.lastCleanup = now
+}
+
+func filterActiveBlacklistEntries(entries []*db.BlacklistEntry) []*db.BlacklistEntry {
+	filtered := make([]*db.BlacklistEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.IsExpired() {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func filterActiveWhitelistEntries(entries []*db.WhitelistEntry) []*db.WhitelistEntry {
+	filtered := make([]*db.WhitelistEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.IsExpired() {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 // IsBlacklisted checks if a player is blacklisted for a specific server.
 // It checks both global blacklist (serverID="") and server-specific blacklist.
 // Returns true and the blacklist entry if the player is blacklisted and the entry has not expired.
 func (m *ACLManager) IsBlacklisted(playerName, serverID string) (bool, *db.BlacklistEntry) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -73,6 +113,7 @@ func (m *ACLManager) IsBlacklisted(playerName, serverID string) (bool, *db.Black
 // IsWhitelisted checks if a player is whitelisted for a specific server.
 // It checks both global whitelist (serverID="") and server-specific whitelist.
 func (m *ACLManager) IsWhitelisted(playerName, serverID string) bool {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -130,6 +171,7 @@ func (m *ACLManager) CheckAccessWithError(playerName, serverID string) (allowed 
 // 4) Optional future ACL rules
 // On database errors, it returns Allowed=true (fail-open) and the error.
 func (m *ACLManager) CheckAccessFull(playerName, serverID string) (AccessDecision, error) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -314,16 +356,26 @@ func (m *ACLManager) RemoveFromBlacklist(displayName, serverID string) error {
 
 // GetBlacklist retrieves all blacklist entries for a specific server.
 func (m *ACLManager) GetBlacklist(serverID string) ([]*db.BlacklistEntry, error) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.blacklistRepo.List(serverID)
+	entries, err := m.blacklistRepo.List(serverID)
+	if err != nil {
+		return nil, err
+	}
+	return filterActiveBlacklistEntries(entries), nil
 }
 
 // GetAllBlacklist retrieves all blacklist entries from all servers.
 func (m *ACLManager) GetAllBlacklist() ([]*db.BlacklistEntry, error) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.blacklistRepo.ListAll()
+	entries, err := m.blacklistRepo.ListAll()
+	if err != nil {
+		return nil, err
+	}
+	return filterActiveBlacklistEntries(entries), nil
 }
 
 // AddToWhitelist adds a player to the whitelist.
@@ -358,16 +410,26 @@ func (m *ACLManager) RemoveFromWhitelist(displayName, serverID string) error {
 
 // GetWhitelist retrieves all whitelist entries for a specific server.
 func (m *ACLManager) GetWhitelist(serverID string) ([]*db.WhitelistEntry, error) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.whitelistRepo.List(serverID)
+	entries, err := m.whitelistRepo.List(serverID)
+	if err != nil {
+		return nil, err
+	}
+	return filterActiveWhitelistEntries(entries), nil
 }
 
 // GetAllWhitelist retrieves all whitelist entries from all servers.
 func (m *ACLManager) GetAllWhitelist() ([]*db.WhitelistEntry, error) {
+	m.cleanupExpiredEntriesIfDue()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.whitelistRepo.ListAll()
+	entries, err := m.whitelistRepo.ListAll()
+	if err != nil {
+		return nil, err
+	}
+	return filterActiveWhitelistEntries(entries), nil
 }
 
 // DeleteExpiredBlacklistEntries removes all expired blacklist entries.
@@ -397,6 +459,9 @@ func IsWhitelistedByEntry(playerName string, entry *db.WhitelistEntry) bool {
 		return false
 	}
 	if !entry.Enabled {
+		return false
+	}
+	if entry.IsExpired() {
 		return false
 	}
 	return strings.EqualFold(playerName, entry.DisplayName)
@@ -509,4 +574,3 @@ type ACLManagerInterface interface {
 
 // Ensure sql.ErrNoRows is available for error checking
 var ErrNotFound = sql.ErrNoRows
-

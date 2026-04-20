@@ -4,6 +4,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -20,7 +21,9 @@ import (
 )
 
 const (
-	defaultProxyDialTimeout = 10 * time.Second
+	defaultProxyDialTimeout      = 10 * time.Second
+	defaultProxyHandshakeTimeout = 15 * time.Second
+	maxSocks4FieldLength         = 4096
 )
 
 // ProxyPortManager manages local proxy port listeners.
@@ -264,6 +267,7 @@ func (l *proxyPortListener) acceptLoop() {
 			defer l.wg.Done()
 			l.activeConns.Add(1)
 			defer l.activeConns.Add(-1)
+			setProxyHandshakeDeadline(c)
 			l.handleConn(c)
 		}(conn)
 	}
@@ -308,10 +312,12 @@ func (l *proxyPortListener) handleMixed(conn net.Conn, reader *bufio.Reader) {
 
 func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 	for {
+		setProxyHandshakeDeadline(conn)
 		req, err := http.ReadRequest(reader)
 		if err != nil {
 			return
 		}
+		clearProxyConnDeadline(conn)
 		if l.requiresAuth() && !l.checkHTTPAuth(req) {
 			writeHTTPAuthRequired(conn)
 			return
@@ -389,6 +395,7 @@ func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reade
 		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway")
 		return
 	}
+	clearProxyConnDeadline(conn)
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
@@ -417,6 +424,7 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 		writeSocks5Reply(conn, 0x05)
 		return
 	}
+	clearProxyConnDeadline(conn)
 	writeSocks5Reply(conn, 0x00)
 
 	go func() {
@@ -490,7 +498,7 @@ func (l *proxyPortListener) handleSocks5Auth(conn net.Conn, reader *bufio.Reader
 		return err
 	}
 
-	if string(uname) != l.cfg.Username || string(pass) != l.cfg.Password {
+	if !secureStringEqual(string(uname), l.cfg.Username) || !secureStringEqual(string(pass), l.cfg.Password) {
 		_, _ = conn.Write([]byte{0x01, 0x01})
 		return fmt.Errorf("auth failed")
 	}
@@ -575,12 +583,19 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 	if _, err := io.ReadFull(reader, ipBuf); err != nil {
 		return
 	}
-	_, _ = readUntilNull(reader) // user id
+	if _, err := readUntilNull(reader, maxSocks4FieldLength); err != nil {
+		writeSocks4Reply(conn, 0x5B, nil, 0)
+		return
+	}
 
 	destIP := net.IP(ipBuf)
 	host := destIP.String()
 	if ipBuf[0] == 0 && ipBuf[1] == 0 && ipBuf[2] == 0 && ipBuf[3] != 0 {
-		domain, _ := readUntilNull(reader)
+		domain, err := readUntilNull(reader, maxSocks4FieldLength)
+		if err != nil {
+			writeSocks4Reply(conn, 0x5B, destIP, 0)
+			return
+		}
 		if domain != "" {
 			host = domain
 		}
@@ -596,6 +611,7 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 		writeSocks4Reply(conn, 0x5B, destIP, port)
 		return
 	}
+	clearProxyConnDeadline(conn)
 
 	writeSocks4Reply(conn, 0x5A, destIP, port)
 
@@ -619,9 +635,15 @@ func writeSocks4Reply(conn net.Conn, status byte, ip net.IP, port int) {
 	_, _ = conn.Write(reply)
 }
 
-func readUntilNull(reader *bufio.Reader) (string, error) {
+func readUntilNull(reader *bufio.Reader, maxLen int) (string, error) {
+	if maxLen <= 0 {
+		maxLen = maxSocks4FieldLength
+	}
 	var buf []byte
 	for {
+		if len(buf) >= maxLen {
+			return "", fmt.Errorf("field too long")
+		}
 		b, err := reader.ReadByte()
 		if err != nil {
 			return "", err
@@ -631,6 +653,20 @@ func readUntilNull(reader *bufio.Reader) (string, error) {
 		}
 		buf = append(buf, b)
 	}
+}
+
+func setProxyHandshakeDeadline(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Now().Add(defaultProxyHandshakeTimeout))
+}
+
+func clearProxyConnDeadline(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
 }
 
 func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (net.Conn, string, error) {
@@ -751,7 +787,7 @@ func (l *proxyPortListener) checkHTTPAuth(req *http.Request) bool {
 	}
 	user := pair[:idx]
 	pass := pair[idx+1:]
-	return user == l.cfg.Username && pass == l.cfg.Password
+	return secureStringEqual(user, l.cfg.Username) && secureStringEqual(pass, l.cfg.Password)
 }
 
 func writeHTTPAuthRequired(conn net.Conn) {
@@ -769,4 +805,8 @@ func containsByte(list []byte, v byte) bool {
 		}
 	}
 	return false
+}
+
+func secureStringEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }

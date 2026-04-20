@@ -14,6 +14,15 @@ set "BUILD_DIR=build"
 set "WEB_DIR=web"
 set "DIST_DIR=internal\api\dist"
 set "MAIN_FILE=cmd\mcpeserverproxy\main.go"
+set "RELEASE_VERSION="
+for /f "delims=" %%I in ('git describe --tags --always --dirty 2^>nul') do set "RELEASE_VERSION=%%I"
+if not defined RELEASE_VERSION set "RELEASE_VERSION=dev"
+set "BUILD_TIME="
+for /f "usebackq delims=" %%I in (`powershell -NoLogo -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'"`) do set "BUILD_TIME=%%I"
+if not defined BUILD_TIME set "BUILD_TIME=unknown"
+set "GIT_COMMIT="
+for /f "delims=" %%I in ('git rev-parse --short HEAD 2^>nul') do set "GIT_COMMIT=%%I"
+if not defined GIT_COMMIT set "GIT_COMMIT=unknown"
 
 :: 检查 Go 是否安装
 where go >nul 2>&1
@@ -128,7 +137,8 @@ set "OUTPUT=%BUILD_DIR%\%PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%"
 echo       Building %GOOS%/%GOARCH%...
 
 set "CGO_ENABLED=0"
-go build -tags=with_utls -ldflags="-s -w" -o "%OUTPUT%" "%MAIN_FILE%"
+set "LDFLAGS=-s -w -X=mcpeserverproxy/internal/logger.Version=!RELEASE_VERSION! -X=mcpeserverproxy/internal/logger.BuildTime=!BUILD_TIME! -X=mcpeserverproxy/internal/logger.GitCommit=!GIT_COMMIT!"
+go build -tags=with_utls -ldflags="!LDFLAGS!" -o "%OUTPUT%" "%MAIN_FILE%"
 
 if %errorlevel% equ 0 (
     echo       [OK] %PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%

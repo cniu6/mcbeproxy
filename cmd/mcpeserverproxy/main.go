@@ -154,10 +154,11 @@ func main() {
 
 	// Create proxy outbound handler for API
 	// OutboundManager and ProxyOutboundConfigManager are now created inside NewProxyServer
-	proxyOutboundHandler := api.NewProxyOutboundHandler(
+	proxyOutboundHandler := api.NewProxyOutboundHandlerWithConfig(
 		proxyServer.GetProxyOutboundConfigManager(),
 		proxySubscriptionMgr,
 		configMgr,
+		globalConfig,
 		proxyServer.GetOutboundManager(),
 	)
 	proxyOutboundHandler.SetUsageContext(proxyServer.GetProxyPortConfigManager(), proxyServer)
@@ -192,8 +193,8 @@ func main() {
 		proxyOutboundHandler,
 		proxyServer.GetProxyPortConfigManager(),
 	)
+	proxyServer.SetServerLatencyRecorder(apiServer)
 
-	// Start proxy server
 	if err := proxyServer.Start(); err != nil {
 		logger.Error("Failed to start proxy server: %v", err)
 		os.Exit(1)

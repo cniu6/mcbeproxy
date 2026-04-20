@@ -19,6 +19,8 @@ type ExternalVerifier struct {
 	url          string
 	cacheMinutes int
 	cache        map[string]*cacheEntry
+	lastCleanup  time.Time
+	cleanupEvery time.Duration
 	mu           sync.RWMutex
 	client       *http.Client
 }
@@ -54,11 +56,20 @@ func NewExternalVerifier(enabled bool, url string, cacheMinutes int) *ExternalVe
 		cacheMinutes = 15
 	}
 
+	cleanupEvery := time.Minute
+	if candidate := time.Duration(cacheMinutes) * time.Minute / 2; candidate > cleanupEvery {
+		cleanupEvery = candidate
+	}
+	if cleanupEvery > 5*time.Minute {
+		cleanupEvery = 5 * time.Minute
+	}
+
 	return &ExternalVerifier{
 		enabled:      enabled,
 		url:          url,
 		cacheMinutes: cacheMinutes,
 		cache:        make(map[string]*cacheEntry),
+		cleanupEvery: cleanupEvery,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -76,6 +87,7 @@ func (v *ExternalVerifier) Verify(xuid, uuid, gamertag, serverID, clientIP strin
 	if !v.IsEnabled() {
 		return true, ""
 	}
+	v.maybeCleanupExpired(time.Now())
 
 	// Check cache first
 	cacheKey := fmt.Sprintf("%s:%s", xuid, serverID)
@@ -180,22 +192,29 @@ func (v *ExternalVerifier) doVerify(xuid, uuid, playerName, serverID, clientAddr
 	return allowed, verifyResp.Msg
 }
 
-// ClearCache clears the verification cache.
-func (v *ExternalVerifier) ClearCache() {
+func (v *ExternalVerifier) maybeCleanupExpired(now time.Time) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.cache = make(map[string]*cacheEntry)
+
+	if now.Sub(v.lastCleanup) < v.cleanupEvery {
+		return
+	}
+
+	v.cleanupExpiredLocked(now)
+	v.lastCleanup = now
 }
 
-// CleanupExpired removes expired cache entries.
-func (v *ExternalVerifier) CleanupExpired() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	now := time.Now()
+func (v *ExternalVerifier) cleanupExpiredLocked(now time.Time) {
 	for key, entry := range v.cache {
 		if now.After(entry.expiresAt) {
 			delete(v.cache, key)
 		}
 	}
+}
+
+// ClearCache clears the verification cache.
+func (v *ExternalVerifier) ClearCache() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.cache = make(map[string]*cacheEntry)
 }

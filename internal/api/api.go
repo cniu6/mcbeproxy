@@ -54,7 +54,8 @@ type APIServer struct {
 	// Proxy outbound handler for managing proxy outbound nodes
 	proxyOutboundHandler *ProxyOutboundHandler
 	// Proxy port config manager
-	proxyPortConfigMgr *config.ProxyPortConfigManager
+	proxyPortConfigMgr   *config.ProxyPortConfigManager
+	serverLatencyHistory *serverLatencyHistoryStore
 }
 
 // ProxyController defines the interface for controlling proxy servers.
@@ -151,6 +152,7 @@ func NewAPIServer(
 		aclManager:           aclManager,
 		proxyOutboundHandler: proxyOutboundHandler,
 		proxyPortConfigMgr:   proxyPortConfigMgr,
+		serverLatencyHistory: newServerLatencyHistoryStore(globalConfig),
 	}
 
 	api.setupRoutes()
@@ -176,6 +178,7 @@ func (a *APIServer) setupRoutes() {
 	{
 		web.GET("/index", a.getWebIndex)
 		web.GET("/index-api", a.getWebIndexAPI)
+		web.GET("/servers/:id/latency-history", a.getWebServerLatencyHistory)
 	}
 
 	// API routes group
@@ -189,6 +192,7 @@ func (a *APIServer) setupRoutes() {
 
 		// Server management endpoints
 		api.GET("/servers", a.getServers)
+		api.GET("/servers/latency-overview", a.getServerLatencyOverview)
 		api.POST("/servers", a.createServer)
 		api.PUT("/servers/:id", a.updateServer)
 		api.DELETE("/servers/:id", a.deleteServer)
@@ -198,6 +202,7 @@ func (a *APIServer) setupRoutes() {
 		api.POST("/servers/:id/disable", a.disableServer)
 		api.POST("/servers/:id/enable", a.enableServer)
 		api.GET("/servers/:id/latency", a.getServerLatency)
+		api.GET("/servers/:id/latency-history", a.getWebServerLatencyHistory)
 		if a.proxyOutboundHandler != nil {
 			api.GET("/servers/:id/node-latency", a.proxyOutboundHandler.GetServerNodeLatency)
 			api.GET("/servers/:id/node-latency-history", a.proxyOutboundHandler.GetServerNodeLatencyHistory)
@@ -292,11 +297,17 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.POST("/get", a.proxyOutboundHandler.GetProxyOutboundByBody)
 				proxyOutboundGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
 				proxyOutboundGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)
+				proxyOutboundGroup.POST("/block-auto-select", a.proxyOutboundHandler.BlockProxyOutboundAutoSelectByBody)
+				proxyOutboundGroup.POST("/block-auto-select/batch", a.proxyOutboundHandler.BatchBlockProxyOutboundAutoSelectByBody)
+				proxyOutboundGroup.POST("/unblock-auto-select", a.proxyOutboundHandler.UnblockProxyOutboundAutoSelectByBody)
+				proxyOutboundGroup.POST("/unblock-auto-select/batch", a.proxyOutboundHandler.BatchUnblockProxyOutboundAutoSelectByBody)
+				proxyOutboundGroup.GET("/latency-overview", a.proxyOutboundHandler.GetProxyOutboundLatencyOverview)
 				// Group statistics endpoints (must be before /:name to avoid conflicts)
 				// Requirements: 8.1, 8.2, 8.3, 8.4
 				proxyOutboundGroup.GET("/groups", a.proxyOutboundHandler.ListGroups)
 				proxyOutboundGroup.GET("/groups/:name", a.proxyOutboundHandler.GetGroup)
 				// Legacy endpoints with name in URL (kept for compatibility)
+				proxyOutboundGroup.GET("/:name/latency-history", a.proxyOutboundHandler.GetProxyOutboundLatencyHistory)
 				proxyOutboundGroup.GET("/:name", a.proxyOutboundHandler.GetProxyOutbound)
 				proxyOutboundGroup.PUT("/:name", a.proxyOutboundHandler.UpdateProxyOutbound)
 				proxyOutboundGroup.DELETE("/:name", a.proxyOutboundHandler.DeleteProxyOutbound)
@@ -334,8 +345,12 @@ func (a *APIServer) setupRoutes() {
 // Start starts the API server on the specified address.
 func (a *APIServer) Start(addr string) error {
 	a.server = &http.Server{
-		Addr:    addr,
-		Handler: a.router,
+		Addr:              addr,
+		Handler:           a.router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
@@ -489,24 +504,31 @@ func (a *APIServer) requireAdminMiddleware() gin.HandlerFunc {
 // ValidateAPIKey checks if an API key is valid.
 // Returns true if valid, false otherwise.
 func (a *APIServer) ValidateAPIKey(apiKey string) bool {
-	if apiKey == "" {
-		return false
-	}
-
-	// Check if any API keys exist
-	keys, err := a.keyRepo.List()
-	if err != nil {
-		return false
-	}
-
-	// If no API keys configured, all requests are allowed
-	if len(keys) == 0 {
+	configKeySet := a.globalConfig != nil && a.globalConfig.APIKey != ""
+	if configKeySet && apiKey == a.globalConfig.APIKey {
 		return true
 	}
 
-	// Validate the key
-	_, err = a.keyRepo.GetByKey(apiKey)
-	return err == nil
+	anyKeyConfigured := configKeySet
+	if a.keyRepo != nil {
+		keys, err := a.keyRepo.List()
+		if err != nil {
+			return false
+		}
+		anyKeyConfigured = anyKeyConfigured || len(keys) > 0
+		if apiKey != "" {
+			_, err = a.keyRepo.GetByKey(apiKey)
+			if err == nil {
+				return true
+			}
+		}
+	}
+
+	if !anyKeyConfigured {
+		return true
+	}
+
+	return false
 }
 
 // Server Management Handlers
@@ -585,6 +607,9 @@ func (a *APIServer) deleteServer(c *gin.Context) {
 	if err := a.configMgr.DeleteServer(serverID); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to delete server", err.Error())
 		return
+	}
+	if a.serverLatencyHistory != nil {
+		a.serverLatencyHistory.Delete(serverID)
 	}
 
 	respondSuccessWithMsg(c, "服务器删除成功", nil)
@@ -688,7 +713,7 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 			if motd != "" {
 				response["parsed_motd"] = parseMOTD(motd)
 			}
-			return response
+			return a.recordServerLatencyInfo(response)
 		}
 	}
 
@@ -696,12 +721,12 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 	latency, ok := a.proxyController.GetServerLatency(serverID)
 	if ok {
 		online := latency >= 0
-		return map[string]interface{}{
+		return a.recordServerLatencyInfo(map[string]interface{}{
 			"server_id": serverID,
 			"latency":   latency,
 			"online":    online,
 			"source":    "proxy",
-		}
+		})
 	}
 
 	if a.configMgr != nil {
@@ -730,18 +755,18 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 				if ping.Error != "" {
 					response["error"] = ping.Error
 				}
-				return response
+				return a.recordServerLatencyInfo(response)
 			}
 		}
 	}
 
 	// Return not_found flag to avoid browser console errors
-	return map[string]interface{}{
+	return a.recordServerLatencyInfo(map[string]interface{}{
 		"server_id": serverID,
 		"latency":   -1,
 		"online":    false,
 		"not_found": true,
-	}
+	})
 }
 
 // getServerLatency returns the cached latency for a server.
@@ -1021,30 +1046,10 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)
 	}
 
-	// Fetch all server pings concurrently and wait for completion
-	type pingResult struct {
-		id   string
-		info map[string]interface{}
-	}
-	results := make(chan pingResult, len(servers))
-	var pingWG sync.WaitGroup
-	for _, srv := range servers {
-		s := srv
-		pingWG.Add(1)
-		go func(server config.ServerConfigDTO) {
-			defer pingWG.Done()
-			info := a.buildServerPingFromConfig(server)
-			results <- pingResult{id: server.ID, info: info}
-		}(s)
-	}
-	go func() {
-		pingWG.Wait()
-		close(results)
-	}()
-
-	pings := make(map[string]map[string]interface{}, len(servers))
-	for res := range results {
-		pings[res.id] = res.info
+	pings := a.collectServerPings(servers)
+	serverIDs := make([]string, 0, len(servers))
+	for _, server := range servers {
+		serverIDs = append(serverIDs, server.ID)
 	}
 
 	wg.Wait()
@@ -1055,6 +1060,7 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 		"sessions":        sessionDTOs,
 		"active_sessions": activeSessions,
 		"pings":           pings,
+		"latency_history": a.buildServerLatencyHistorySnapshot(serverIDs, a.defaultLatencyHistoryRenderLimit()),
 		"generated_at":    time.Now(),
 	}
 	if statsErr != nil {
@@ -1089,7 +1095,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 			info["motd"] = server.CustomMOTD
 			info["parsed_motd"] = parseMOTD(server.CustomMOTD)
 		}
-		return info
+		return a.recordServerLatencyInfo(info)
 	}
 
 	// Prefer proxy cached latency/MOTD if available.
@@ -1106,7 +1112,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 			if motd != "" {
 				info["parsed_motd"] = parseMOTD(motd)
 			}
-			return info
+			return a.recordServerLatencyInfo(info)
 		}
 	}
 
@@ -1135,15 +1141,15 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 		if ping.Error != "" {
 			info["error"] = ping.Error
 		}
-		return info
+		return a.recordServerLatencyInfo(info)
 	}
 
-	return map[string]interface{}{
+	return a.recordServerLatencyInfo(map[string]interface{}{
 		"server_id": serverID,
 		"latency":   -1,
 		"online":    false,
 		"not_found": true,
-	}
+	})
 }
 
 // getConfig returns the global configuration (read-only).
@@ -1181,6 +1187,10 @@ func (a *APIServer) getConfig(c *gin.Context) {
 		"proxy_port_auto_ping_full_scan_mode_default":           a.globalConfig.GetProxyPortAutoPingFullScanModeDefault(),
 		"proxy_port_auto_ping_full_scan_time_default":           a.globalConfig.GetProxyPortAutoPingFullScanTimeDefault(),
 		"proxy_port_auto_ping_full_scan_interval_hours_default": a.globalConfig.GetProxyPortAutoPingFullScanIntervalHoursDefault(),
+		"latency_history_min_interval_minutes":                  a.globalConfig.GetLatencyHistoryMinIntervalMinutes(),
+		"latency_history_render_limit":                          a.globalConfig.GetLatencyHistoryRenderLimit(),
+		"latency_history_storage_limit":                         a.globalConfig.GetLatencyHistoryStorageLimit(),
+		"latency_history_retention_days":                        a.globalConfig.GetLatencyHistoryRetentionDays(),
 	}
 	respondSuccess(c, configDTO)
 }
@@ -1218,6 +1228,10 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 		ProxyPortAutoPingFullScanModeDefault          *string `json:"proxy_port_auto_ping_full_scan_mode_default"`
 		ProxyPortAutoPingFullScanTimeDefault          *string `json:"proxy_port_auto_ping_full_scan_time_default"`
 		ProxyPortAutoPingFullScanIntervalHoursDefault *int    `json:"proxy_port_auto_ping_full_scan_interval_hours_default"`
+		LatencyHistoryMinIntervalMinutes              *int    `json:"latency_history_min_interval_minutes"`
+		LatencyHistoryRenderLimit                     *int    `json:"latency_history_render_limit"`
+		LatencyHistoryStorageLimit                    *int    `json:"latency_history_storage_limit"`
+		LatencyHistoryRetentionDays                   *int    `json:"latency_history_retention_days"`
 		Restart                                       bool    `json:"restart"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1301,6 +1315,18 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	}
 	if req.ProxyPortAutoPingFullScanIntervalHoursDefault != nil {
 		nextConfig.ProxyPortAutoPingFullScanIntervalHoursDefault = *req.ProxyPortAutoPingFullScanIntervalHoursDefault
+	}
+	if req.LatencyHistoryMinIntervalMinutes != nil {
+		nextConfig.LatencyHistoryMinIntervalMinutes = *req.LatencyHistoryMinIntervalMinutes
+	}
+	if req.LatencyHistoryRenderLimit != nil {
+		nextConfig.LatencyHistoryRenderLimit = *req.LatencyHistoryRenderLimit
+	}
+	if req.LatencyHistoryStorageLimit != nil {
+		nextConfig.LatencyHistoryStorageLimit = *req.LatencyHistoryStorageLimit
+	}
+	if req.LatencyHistoryRetentionDays != nil {
+		nextConfig.LatencyHistoryRetentionDays = *req.LatencyHistoryRetentionDays
 	}
 	if err := nextConfig.Validate(); err != nil {
 		respondError(c, http.StatusBadRequest, "Invalid config", err.Error())
@@ -1649,8 +1675,10 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 	entry := &db.WhitelistEntry{
 		DisplayName: playerName,
 		Enabled:     enabled,
+		Reason:      req.Reason,
 		ServerID:    req.ServerID,
 		AddedAt:     time.Now(),
+		ExpiresAt:   req.ExpiresAt,
 		AddedBy:     "", // Could be set from API key context if needed
 	}
 

@@ -192,6 +192,36 @@
       </n-form>
     </n-card>
 
+    <n-card title="历史延迟限制" style="margin-bottom: 24px">
+      <n-alert type="info" style="margin-bottom: 16px">
+        统一控制服务器历史延迟、代理节点历史延迟以及相关趋势图的采样间隔、渲染上限、后端保留数量和最长保留周期。对于自动Ping历史，实际记录间隔会自动取“采样最小间隔”和对应自动Ping间隔中的较小值，避免 1 分钟自动Ping 只显示一个点。
+      </n-alert>
+      <n-form :model="config" label-placement="left" label-width="170">
+        <n-grid :cols="2" :x-gap="24">
+          <n-gi>
+            <n-form-item label="采样最小间隔 (分钟)">
+              <n-input-number v-model:value="config.latency_history_min_interval_minutes" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="前端渲染上限">
+              <n-input-number v-model:value="config.latency_history_render_limit" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="后端存储上限">
+              <n-input-number v-model:value="config.latency_history_storage_limit" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="最长保留周期 (天)">
+              <n-input-number v-model:value="config.latency_history_retention_days" :min="1" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+      </n-form>
+    </n-card>
+
     <!-- 日志配置 -->
     <n-card title="日志配置" style="margin-bottom: 24px">
       <n-form :model="config" label-placement="left" label-width="150">
@@ -246,9 +276,9 @@
     <n-space>
       <n-popconfirm @positive-click="saveConfigAndRestart">
         <template #trigger>
-          <n-button type="primary" size="large">保存配置并重启</n-button>
+          <n-button type="primary" size="large">保存配置</n-button>
         </template>
-        确定保存配置并重启服务吗？这将断开所有当前连接。
+        确认保存配置？
       </n-popconfirm>
       <n-button size="large" @click="loadConfig">重新加载</n-button>
     </n-space>
@@ -339,6 +369,10 @@ const config = reactive({
   proxy_port_auto_ping_full_scan_mode_default: '',
   proxy_port_auto_ping_full_scan_time_default: '04:00',
   proxy_port_auto_ping_full_scan_interval_hours_default: 24,
+  latency_history_min_interval_minutes: 10,
+  latency_history_render_limit: 100,
+  latency_history_storage_limit: 1000,
+  latency_history_retention_days: 5,
   log_dir: 'logs',
   log_retention_days: 7,
   log_max_size_mb: 100,
@@ -411,12 +445,32 @@ const saveConfigAndRestart = async () => {
     message.error('端口默认扫描时间格式应为 HH:mm')
     return
   }
-  const res = await api('/api/config', 'PUT', { ...config, restart: true })
+  if (Number(config.latency_history_min_interval_minutes || 0) < 1) {
+    message.error('采样最小间隔必须大于等于 1 分钟')
+    return
+  }
+  if (Number(config.latency_history_render_limit || 0) < 1) {
+    message.error('前端渲染上限必须大于等于 1')
+    return
+  }
+  if (Number(config.latency_history_storage_limit || 0) < 1) {
+    message.error('后端存储上限必须大于等于 1')
+    return
+  }
+  if (Number(config.latency_history_render_limit || 0) > Number(config.latency_history_storage_limit || 0)) {
+    message.error('前端渲染上限不能超过后端存储上限')
+    return
+  }
+  if (Number(config.latency_history_retention_days || 0) < 1) {
+    message.error('最长保留周期必须大于等于 1 天')
+    return
+  }
+  const res = await api('/api/config', 'PUT', { ...config })
   if (res.success) {
-    message.success('配置已保存，服务正在重启...')
+    message.success('配置已保存')
     // 等待几秒后刷新页面
     setTimeout(() => {
-      message.info('正在重新连接...')
+      message.info('正在刷新页面...')
       setTimeout(() => window.location.reload(), 2000)
     }, 3000)
   } else {

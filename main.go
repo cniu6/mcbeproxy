@@ -131,10 +131,11 @@ func main() {
 	aclManager := acl.NewACLManager(database)
 	proxyServer.SetACLManager(aclManager)
 
-	proxyOutboundHandler := api.NewProxyOutboundHandler(
+	proxyOutboundHandler := api.NewProxyOutboundHandlerWithConfig(
 		proxyServer.GetProxyOutboundConfigManager(),
 		proxySubscriptionMgr,
 		configMgr,
+		globalConfig,
 		proxyServer.GetOutboundManager(),
 	)
 	proxyOutboundHandler.SetUsageContext(proxyServer.GetProxyPortConfigManager(), proxyServer)
@@ -168,6 +169,7 @@ func main() {
 		proxyOutboundHandler,
 		proxyServer.GetProxyPortConfigManager(),
 	)
+	proxyServer.SetServerLatencyRecorder(apiServer)
 
 	if err := proxyServer.Start(); err != nil {
 		logger.Error("Failed to start proxy server: %v", err)

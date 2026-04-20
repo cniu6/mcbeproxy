@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // WhitelistRepository handles whitelist persistence operations.
@@ -20,8 +21,8 @@ func NewWhitelistRepository(db *Database) *WhitelistRepository {
 // Create inserts a new whitelist entry into the database.
 func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 	query := `
-		INSERT INTO whitelist (display_name, display_name_lower, enabled, server_id, added_at, added_by)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO whitelist (display_name, display_name_lower, enabled, reason, server_id, added_at, expires_at, added_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	// Convert empty string to NULL for server_id (global whitelist)
@@ -36,8 +37,10 @@ func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 		entry.DisplayName,
 		strings.ToLower(entry.DisplayName),
 		entry.Enabled,
+		entry.Reason,
 		serverID,
 		entry.AddedAt,
+		entry.ExpiresAt,
 		entry.AddedBy,
 	)
 	if err != nil {
@@ -57,7 +60,7 @@ func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 // Uses case-insensitive matching on display name.
 func (r *WhitelistRepository) GetByName(displayName, serverID string) (*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, enabled, server_id, added_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM whitelist 
 		WHERE display_name_lower = ? AND (
 			server_id = ? OR 
@@ -128,13 +131,13 @@ func (r *WhitelistRepository) Delete(displayName, serverID string) error {
 // List retrieves all whitelist entries for a specific server (or global if serverID is empty).
 func (r *WhitelistRepository) List(serverID string) ([]*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, enabled, server_id, added_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM whitelist 
-		WHERE server_id = ? OR (server_id IS NULL AND ? = '')
+		WHERE server_id = ? OR (server_id IS NULL AND ? = '') OR (server_id = '' AND ? = '')
 		ORDER BY added_at DESC
 	`
 
-	rows, err := r.db.DB().Query(query, serverID, serverID)
+	rows, err := r.db.DB().Query(query, serverID, serverID, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list whitelist entries: %w", err)
 	}
@@ -146,7 +149,7 @@ func (r *WhitelistRepository) List(serverID string) ([]*WhitelistEntry, error) {
 // ListAll retrieves all whitelist entries from all servers.
 func (r *WhitelistRepository) ListAll() ([]*WhitelistEntry, error) {
 	query := `
-		SELECT id, display_name, enabled, server_id, added_at, added_by
+		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM whitelist 
 		ORDER BY added_at DESC
 	`
@@ -160,18 +163,40 @@ func (r *WhitelistRepository) ListAll() ([]*WhitelistEntry, error) {
 	return r.scanWhitelistEntries(rows)
 }
 
+func (r *WhitelistRepository) DeleteExpired() (int, error) {
+	query := `
+		DELETE FROM whitelist 
+		WHERE expires_at IS NOT NULL AND expires_at < ?
+	`
+
+	result, err := r.db.DB().Exec(query, time.Now())
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete expired whitelist entries: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get affected rows: %w", err)
+	}
+
+	return int(affected), nil
+}
+
 // scanWhitelistEntry scans a single row into a WhitelistEntry.
 func (r *WhitelistRepository) scanWhitelistEntry(row *sql.Row) (*WhitelistEntry, error) {
 	var entry WhitelistEntry
 	var enabled sql.NullBool
-	var serverID, addedBy sql.NullString
+	var reason, serverID, addedBy sql.NullString
+	var expiresAt sql.NullTime
 
 	err := row.Scan(
 		&entry.ID,
 		&entry.DisplayName,
 		&enabled,
+		&reason,
 		&serverID,
 		&entry.AddedAt,
+		&expiresAt,
 		&addedBy,
 	)
 	if err != nil {
@@ -186,8 +211,15 @@ func (r *WhitelistRepository) scanWhitelistEntry(row *sql.Row) (*WhitelistEntry,
 	} else {
 		entry.Enabled = true
 	}
+	if reason.Valid {
+		entry.Reason = reason.String
+	}
 	if serverID.Valid {
 		entry.ServerID = serverID.String
+	}
+	if expiresAt.Valid {
+		t := expiresAt.Time
+		entry.ExpiresAt = &t
 	}
 	if addedBy.Valid {
 		entry.AddedBy = addedBy.String
@@ -203,14 +235,17 @@ func (r *WhitelistRepository) scanWhitelistEntries(rows *sql.Rows) ([]*Whitelist
 	for rows.Next() {
 		var entry WhitelistEntry
 		var enabled sql.NullBool
-		var serverID, addedBy sql.NullString
+		var reason, serverID, addedBy sql.NullString
+		var expiresAt sql.NullTime
 
 		err := rows.Scan(
 			&entry.ID,
 			&entry.DisplayName,
 			&enabled,
+			&reason,
 			&serverID,
 			&entry.AddedAt,
+			&expiresAt,
 			&addedBy,
 		)
 		if err != nil {
@@ -222,8 +257,15 @@ func (r *WhitelistRepository) scanWhitelistEntries(rows *sql.Rows) ([]*Whitelist
 		} else {
 			entry.Enabled = true
 		}
+		if reason.Valid {
+			entry.Reason = reason.String
+		}
 		if serverID.Valid {
 			entry.ServerID = serverID.String
+		}
+		if expiresAt.Valid {
+			t := expiresAt.Time
+			entry.ExpiresAt = &t
 		}
 		if addedBy.Valid {
 			entry.AddedBy = addedBy.String

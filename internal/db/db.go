@@ -122,8 +122,10 @@ func (d *Database) Initialize() error {
 		display_name TEXT NOT NULL,
 		display_name_lower TEXT NOT NULL,
 		enabled BOOLEAN DEFAULT TRUE,
+		reason TEXT,
 		server_id TEXT, -- NULL or empty for global whitelist
 		added_at DATETIME NOT NULL,
+		expires_at DATETIME,
 		added_by TEXT,
 		UNIQUE(display_name_lower, server_id)
 	);
@@ -155,6 +157,8 @@ func (d *Database) Initialize() error {
 		"UPDATE blacklist SET enabled = TRUE WHERE enabled IS NULL",
 		"ALTER TABLE whitelist ADD COLUMN enabled BOOLEAN DEFAULT TRUE",
 		"UPDATE whitelist SET enabled = TRUE WHERE enabled IS NULL",
+		"ALTER TABLE whitelist ADD COLUMN reason TEXT DEFAULT ''",
+		"ALTER TABLE whitelist ADD COLUMN expires_at DATETIME",
 		"ALTER TABLE acl_settings ADD COLUMN blacklist_enabled BOOLEAN DEFAULT TRUE",
 		"UPDATE acl_settings SET blacklist_enabled = TRUE WHERE blacklist_enabled IS NULL",
 	}
