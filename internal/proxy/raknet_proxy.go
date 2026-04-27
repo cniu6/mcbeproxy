@@ -215,7 +215,7 @@ func (p *RakNetProxy) fetchRemotePongWithLatency() {
 	var err error
 
 	// If using proxy outbound, ping through proxy
-	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
+	if !serverCfg.IsDirectConnection() {
 		pong, latency, err = p.pingThroughProxy(targetAddr, serverCfg.GetProxyOutbound())
 	} else {
 		// Direct ping
@@ -425,7 +425,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 
 	// Check if we should use proxy outbound
 	// Requirements: 2.1, 2.2, 2.3, 2.4
-	useProxy := p.outboundMgr != nil && !serverCfg.IsDirectConnection()
+	useProxy := !serverCfg.IsDirectConnection()
 
 	var lastProxyDialer *ProxyDialer
 	for i := 0; i < 3; i++ {

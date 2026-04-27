@@ -346,6 +346,79 @@ func TestSelectOutboundWithFailoverForServerIgnoresPinnedNodeOutsideSelector(t *
 	}
 }
 
+func TestGetBestNodeForServerIncludesDirectFromMultiNodeSelector(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	node := &config.ProxyOutbound{Name: "node-a", Type: config.ProtocolShadowsocks, Server: "node-a.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+
+	if err := manager.AddOutbound(node); err != nil {
+		t.Fatalf("AddOutbound node failed: %v", err)
+	}
+
+	manager.SetServerNodeLatency("srv1", DirectNodeName, config.LoadBalanceSortUDP, 35)
+	manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 80)
+
+	bestName, bestLatency := manager.GetBestNodeForServer("srv1", "direct,node-a", config.LoadBalanceSortUDP)
+	if bestName != DirectNodeName || bestLatency != 35 {
+		t.Fatalf("expected direct best node with 35ms latency, got name=%q latency=%d", bestName, bestLatency)
+	}
+}
+
+func TestGetBestNodeForServerSingleDirectSelectionUsesCachedLatency(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	manager.SetServerNodeLatency("srv1", DirectNodeName, config.LoadBalanceSortUDP, 42)
+
+	bestName, bestLatency := manager.GetBestNodeForServer("srv1", DirectNodeName, config.LoadBalanceSortUDP)
+	if bestName != DirectNodeName || bestLatency != 42 {
+		t.Fatalf("expected direct best node with 42ms latency, got name=%q latency=%d", bestName, bestLatency)
+	}
+}
+
+func TestSelectOutboundWithFailoverForServerKeepsPinnedDirectWhenImprovementIsSmall(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	best := &config.ProxyOutbound{Name: "best", Type: config.ProtocolShadowsocks, Server: "best.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+
+	if err := manager.AddOutbound(best); err != nil {
+		t.Fatalf("AddOutbound best failed: %v", err)
+	}
+
+	manager.SetServerSelectedNode("srv1", DirectNodeName)
+	manager.SetServerNodeLatency("srv1", DirectNodeName, config.LoadBalanceSortUDP, 100)
+	manager.SetServerNodeLatency("srv1", "best", config.LoadBalanceSortUDP, 95)
+
+	selected, err := manager.SelectOutboundWithFailoverForServer("srv1", "direct,best", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil {
+		t.Fatalf("SelectOutboundWithFailoverForServer failed: %v", err)
+	}
+	if !IsDirectSelection(selected) {
+		t.Fatalf("expected pinned direct selection to be kept when improvement is below hysteresis threshold, got %+v", selected)
+	}
+}
+
+func TestSelectOutboundWithFailoverForServerLeastLatency_IgnoresZeroLatencyFailures(t *testing.T) {
+	manager := NewOutboundManager(nil)
+
+	fast := &config.ProxyOutbound{Name: "fast", Type: config.ProtocolShadowsocks, Server: "fast.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	failed := &config.ProxyOutbound{Name: "failed", Type: config.ProtocolShadowsocks, Server: "failed.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+
+	if err := manager.AddOutbound(fast); err != nil {
+		t.Fatalf("AddOutbound fast failed: %v", err)
+	}
+	if err := manager.AddOutbound(failed); err != nil {
+		t.Fatalf("AddOutbound failed node failed: %v", err)
+	}
+
+	manager.SetServerNodeLatency("srv1", "failed", config.LoadBalanceSortUDP, 0)
+	manager.SetServerNodeLatency("srv1", "fast", config.LoadBalanceSortUDP, 80)
+
+	selected, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil {
+		t.Fatalf("SelectOutboundWithFailoverForServer failed: %v", err)
+	}
+	if selected == nil || selected.Name != "fast" {
+		t.Fatalf("expected fast node when another node only has failed 0ms sample, got %+v", selected)
+	}
+}
+
 func TestServerNodeLatencyHistoryPreservesOrderAndFailureSamples(t *testing.T) {
 	manager := NewOutboundManager(nil)
 	manager.SetServerNodeLatency("srv1", "node-a", config.LoadBalanceSortUDP, 91)

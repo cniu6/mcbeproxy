@@ -127,10 +127,16 @@ func (p *PlainTCPProxy) handleConn(ctx context.Context, client net.Conn) {
 }
 
 func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.Conn, string, error) {
-	if p.config == nil || p.outboundMgr == nil || p.config.IsDirectConnection() {
+	if p.config == nil {
+		return nil, "", fmt.Errorf("plain tcp proxy configuration is nil")
+	}
+	if p.config.IsDirectConnection() {
 		dialer := &net.Dialer{Timeout: plainTCPDialTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", address)
-		return conn, "direct", err
+		return conn, DirectNodeName, err
+	}
+	if p.outboundMgr == nil {
+		return nil, "", fmt.Errorf("proxy outbound manager unavailable for plain tcp server %s", p.serverID)
 	}
 
 	exclude := make([]string, 0, 4)

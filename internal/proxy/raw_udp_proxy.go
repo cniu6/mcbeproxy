@@ -287,7 +287,7 @@ func (p *RawUDPProxy) getResolvedACLSettings(serverID string) *db.ACLSettings {
 }
 
 func (p *RawUDPProxy) refreshTargetAddrs() error {
-	shouldPreserveHostname := p.config != nil && p.outboundMgr != nil && !p.config.IsDirectConnection()
+	shouldPreserveHostname := p.config != nil && !p.config.IsDirectConnection()
 	addr, udpAddr, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
 	if err != nil {
 		return err
@@ -295,6 +295,26 @@ func (p *RawUDPProxy) refreshTargetAddrs() error {
 	p.targetPacketAddr = addr
 	p.targetAddr = udpAddr
 	return nil
+}
+
+func (p *RawUDPProxy) effectiveTargetPacketAddr() net.Addr {
+	if p == nil {
+		return nil
+	}
+	if p.targetPacketAddr != nil {
+		return p.targetPacketAddr
+	}
+	return p.targetAddr
+}
+
+func (p *RawUDPProxy) effectiveTargetAddrString() string {
+	if addr := p.effectiveTargetPacketAddr(); addr != nil {
+		return addr.String()
+	}
+	if p != nil && p.config != nil {
+		return p.config.GetTargetAddr()
+	}
+	return ""
 }
 
 // NewRawUDPProxy creates a new raw UDP forwarding proxy.
@@ -473,7 +493,7 @@ func (p *RawUDPProxy) cleanupExpiredBans() {
 
 // shouldUseProxy returns true if proxy outbound should be used
 func (p *RawUDPProxy) shouldUseProxy() bool {
-	return p.outboundMgr != nil && !p.config.IsDirectConnection()
+	return p != nil && p.config != nil && !p.config.IsDirectConnection()
 }
 
 // setUDPSocketOptions applies UDP socket tuning to the given connection. In
@@ -572,9 +592,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Log new connection
 			if isNew {
 				if p.shouldUseProxy() {
-					logger.Info("Raw UDP client connected: %s -> %s (via proxy: %s)", clientAddr.String(), p.targetAddr.String(), clientInfo.proxyNode)
+					logger.Info("Raw UDP client connected: %s -> %s (via proxy: %s)", clientAddr.String(), p.effectiveTargetAddrString(), clientInfo.proxyNode)
 				} else {
-					logger.Info("Raw UDP client connected: %s -> %s (direct)", clientAddr.String(), p.targetAddr.String())
+					logger.Info("Raw UDP client connected: %s -> %s (direct)", clientAddr.String(), p.effectiveTargetAddrString())
 				}
 			}
 
@@ -655,15 +675,15 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		// Use proxy outbound
 		targetConn, selectedNode, err = p.dialThroughProxy()
 		if err != nil {
-			logger.Error("Failed to connect to target %s via proxy: %v", p.targetAddr.String(), err)
+			logger.Error("Failed to connect to target %s via proxy: %v", p.effectiveTargetAddrString(), err)
 			return nil, false
 		}
-		targetAddr = p.targetAddr
+		targetAddr = p.effectiveTargetPacketAddr()
 	} else {
 		// Direct connection
 		directConn, dialErr := net.DialUDP("udp", nil, p.targetAddr)
 		if dialErr != nil {
-			logger.Error("Failed to connect to target %s: %v", p.targetAddr.String(), dialErr)
+			logger.Error("Failed to connect to target %s: %v", p.effectiveTargetAddrString(), dialErr)
 			return nil, false
 		}
 		// Set socket options
@@ -705,6 +725,13 @@ func (p *RawUDPProxy) dialThroughProxy() (net.PacketConn, string, error) {
 }
 
 func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.PacketConn, string, error) {
+	if p == nil || p.config == nil {
+		return nil, "", fmt.Errorf("raw udp proxy configuration is nil")
+	}
+	if p.outboundMgr == nil {
+		return nil, "", fmt.Errorf("proxy outbound manager unavailable for raw udp server %s", p.serverID)
+	}
+
 	baseCtx := p.ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
@@ -727,6 +754,24 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 		}
 
 		logger.Info("RawUDPProxy: Selected node '%s' for %s", selectedOutbound.Name, targetAddr)
+		if IsDirectSelection(selectedOutbound) {
+			udpAddr := p.targetAddr
+			if udpAddr == nil {
+				resolved, rerr := resolveUDPAddrWithContext(ctx, targetAddr)
+				if rerr != nil {
+					return nil, "", rerr
+				}
+				udpAddr = resolved
+			}
+			conn, err := net.DialUDP("udp", nil, udpAddr)
+			if err != nil {
+				return nil, "", err
+			}
+			if setErr := p.setUDPSocketOptions(conn); setErr != nil {
+				logger.Warn("Failed to set target socket options: %v", setErr)
+			}
+			return conn, DirectNodeName, nil
+		}
 		conn, err := p.outboundMgr.DialPacketConn(ctx, selectedOutbound.Name, targetAddr)
 		return conn, selectedOutbound.Name, err
 	}
@@ -2687,6 +2732,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	var conn net.PacketConn
 	var err error
 	var selectedNode string
+	targetPacketAddr := p.effectiveTargetPacketAddr()
 
 	if p.shouldUseProxy() {
 		conn, selectedNode, err = p.dialThroughProxyWithTimeout(8 * time.Second)
@@ -2696,7 +2742,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 
 	if err != nil {
 		logger.Debug("RawUDP pingTargetServer dial failed: server=%s target=%s node=%s err=%v",
-			p.serverID, p.targetAddr.String(), selectedNode, err)
+			p.serverID, p.effectiveTargetAddrString(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2707,10 +2753,10 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// Send ping
 	startTime := time.Now()
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = conn.WriteTo(pingPacket.Bytes(), p.targetAddr)
+	_, err = conn.WriteTo(pingPacket.Bytes(), targetPacketAddr)
 	if err != nil {
 		logger.Debug("RawUDP pingTargetServer write failed: server=%s target=%s node=%s err=%v",
-			p.serverID, p.targetAddr.String(), selectedNode, err)
+			p.serverID, p.effectiveTargetAddrString(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2723,7 +2769,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	n, _, err := conn.ReadFrom(buffer)
 	if err != nil {
 		logger.Debug("RawUDP pingTargetServer read failed: server=%s target=%s node=%s err=%v",
-			p.serverID, p.targetAddr.String(), selectedNode, err)
+			p.serverID, p.effectiveTargetAddrString(), selectedNode, err)
 		p.latencyMu.Lock()
 		p.cachedLatency = -1
 		p.latencyMu.Unlock()
@@ -2748,7 +2794,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 		}
 		p.latencyMu.Unlock()
 		logger.Debug("RawUDP pingTargetServer ok: server=%s target=%s node=%s latency=%dms",
-			p.serverID, p.targetAddr.String(), selectedNode, latency)
+			p.serverID, p.effectiveTargetAddrString(), selectedNode, latency)
 		return latency
 	}
 
@@ -2756,7 +2802,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	p.cachedLatency = -1
 	p.latencyMu.Unlock()
 	logger.Debug("RawUDP pingTargetServer invalid pong: server=%s target=%s node=%s latency=%dms",
-		p.serverID, p.targetAddr.String(), selectedNode, latency)
+		p.serverID, p.effectiveTargetAddrString(), selectedNode, latency)
 	return -1
 }
 

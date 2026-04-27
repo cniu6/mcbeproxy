@@ -658,10 +658,16 @@ func clearProxyConnDeadline(conn net.Conn) {
 }
 
 func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (net.Conn, string, error) {
-	if l.cfg.IsDirectConnection() || l.outboundMgr == nil {
+	if l.cfg == nil {
+		return nil, "", fmt.Errorf("proxy port configuration is nil")
+	}
+	if l.cfg.IsDirectConnection() {
 		dialer := &net.Dialer{Timeout: defaultProxyDialTimeout}
 		conn, err := dialer.DialContext(ctx, "tcp", address)
 		return conn, DirectNodeName, err
+	}
+	if l.outboundMgr == nil {
+		return nil, "", fmt.Errorf("proxy outbound manager unavailable for proxy port %s", l.cfg.ID)
 	}
 
 	exclude := make([]string, 0, 4)

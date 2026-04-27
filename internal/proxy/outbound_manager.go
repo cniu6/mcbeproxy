@@ -624,11 +624,21 @@ func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy
 			if n == "" {
 				continue
 			}
+			if n == DirectNodeName {
+				nodeNames = append(nodeNames, n)
+				continue
+			}
 			if outbound, exists := m.outbounds[n]; exists && m.isSelectableOutboundLocked(outbound) && outboundSupportsSort(outbound, sortBy) {
 				nodeNames = append(nodeNames, n)
 			}
 		}
 	} else {
+		if groupOrName == DirectNodeName {
+			if latency, ok := m.GetServerNodeLatency(serverID, DirectNodeName, sortBy); ok {
+				return DirectNodeName, latency
+			}
+			return "", 0
+		}
 		if outbound, exists := m.outbounds[groupOrName]; exists && m.isSelectableOutboundLocked(outbound) && outboundSupportsSort(outbound, sortBy) {
 			return groupOrName, 0
 		}
@@ -661,7 +671,7 @@ func (m *outboundManagerImpl) selectLeastLatencyForServer(serverID string, nodes
 
 	for _, node := range nodes {
 		latency, ok := m.GetServerNodeLatency(serverID, node.Name, sortBy)
-		if !ok {
+		if !ok || latency <= 0 {
 			continue
 		}
 		hasCached = true
@@ -681,23 +691,32 @@ func (m *outboundManagerImpl) selectLeastLatencyForServer(serverID string, nodes
 	return loadBalancer.Select(nodes, config.LoadBalanceLeastLatency, sortBy, "")
 }
 
-func selectorIncludesOutbound(groupOrName string, outbound *config.ProxyOutbound) bool {
+func selectorIncludesSelection(groupOrName, nodeName, groupName string) bool {
 	groupOrName = strings.TrimSpace(groupOrName)
-	if groupOrName == "" || outbound == nil {
+	nodeName = strings.TrimSpace(nodeName)
+	groupName = strings.TrimSpace(groupName)
+	if groupOrName == "" || nodeName == "" {
 		return false
 	}
 	if strings.HasPrefix(groupOrName, "@") {
-		return outbound.Group == strings.TrimPrefix(groupOrName, "@")
+		return groupName == strings.TrimPrefix(groupOrName, "@")
 	}
 	if strings.Contains(groupOrName, ",") {
-		for _, nodeName := range strings.Split(groupOrName, ",") {
-			if strings.TrimSpace(nodeName) == outbound.Name {
+		for _, entry := range strings.Split(groupOrName, ",") {
+			if strings.TrimSpace(entry) == nodeName {
 				return true
 			}
 		}
 		return false
 	}
-	return groupOrName == outbound.Name
+	return groupOrName == nodeName
+}
+
+func selectorIncludesOutbound(groupOrName string, outbound *config.ProxyOutbound) bool {
+	if outbound == nil {
+		return false
+	}
+	return selectorIncludesSelection(groupOrName, outbound.Name, outbound.Group)
 }
 
 func shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency int64) bool {
@@ -740,6 +759,18 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 			}
 		}
 		if !excluded {
+			if pinnedName == DirectNodeName && selectorIncludesSelection(groupOrName, DirectNodeName, "") {
+				usePinned := true
+				if strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
+					pinnedLatency, ok := m.GetServerNodeLatency(serverID, pinnedName, sortBy)
+					if !ok || shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency) {
+						usePinned = false
+					}
+				}
+				if usePinned {
+					return newDirectVirtualOutbound(), nil
+				}
+			}
 			m.mu.RLock()
 			if o, exists := m.outbounds[pinnedName]; exists && o != nil && o.Enabled && !o.IsAutoSelectBlocked() && outboundSupportsSort(o, sortBy) && selectorIncludesOutbound(groupOrName, o) {
 				lastCheck := o.GetLastCheck()

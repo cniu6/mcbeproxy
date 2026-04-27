@@ -68,7 +68,7 @@ func TestProperty5_DirectRoutingForEmptyOrDirectProxyOutbound(t *testing.T) {
 		directProxyOutboundGen,
 	))
 
-	properties.Property("nil outbound manager uses direct connection", prop.ForAll(
+	properties.Property("nil outbound manager does not imply direct connection", prop.ForAll(
 		func(proxyOutbound string) bool {
 			cfg := &config.ServerConfig{
 				ID:            "test-server",
@@ -84,9 +84,26 @@ func TestProperty5_DirectRoutingForEmptyOrDirectProxyOutbound(t *testing.T) {
 			// Create a ProxyDialer with nil OutboundManager
 			dialer := NewProxyDialer(nil, cfg, 5*time.Second)
 
-			// Verify shouldUseDirect returns true when outboundMgr is nil
-			if !dialer.shouldUseDirect() {
-				t.Logf("shouldUseDirect should return true when outboundMgr is nil")
+			// Verify shouldUseDirect only reflects explicit direct mode.
+			if dialer.shouldUseDirect() != cfg.IsDirectConnection() {
+				t.Logf("shouldUseDirect mismatch for proxy_outbound=%q", proxyOutbound)
+				return false
+			}
+			if cfg.IsDirectConnection() {
+				return true
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := dialer.DialContext(ctx, "udp", "127.0.0.1:19132")
+			if err == nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				t.Logf("expected outbound manager unavailable error for proxy_outbound=%q", proxyOutbound)
+				return false
+			}
+			if !strings.Contains(err.Error(), "outbound manager unavailable") {
+				t.Logf("unexpected error: %v", err)
 				return false
 			}
 
@@ -95,15 +112,28 @@ func TestProperty5_DirectRoutingForEmptyOrDirectProxyOutbound(t *testing.T) {
 		gen.AnyString(),
 	))
 
-	properties.Property("nil server config uses direct connection", prop.ForAll(
+	properties.Property("nil server config fails closed", prop.ForAll(
 		func(_ bool) bool {
 			// Create a ProxyDialer with nil ServerConfig
 			outboundMgr := NewOutboundManager(nil)
 			dialer := NewProxyDialer(outboundMgr, nil, 5*time.Second)
 
-			// Verify shouldUseDirect returns true when serverConfig is nil
-			if !dialer.shouldUseDirect() {
-				t.Logf("shouldUseDirect should return true when serverConfig is nil")
+			if dialer.shouldUseDirect() {
+				t.Logf("shouldUseDirect should return false when serverConfig is nil")
+				return false
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := dialer.DialContext(ctx, "udp", "127.0.0.1:19132")
+			if err == nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				t.Logf("expected missing server config error")
+				return false
+			}
+			if !strings.Contains(err.Error(), "missing server config") {
+				t.Logf("unexpected error: %v", err)
 				return false
 			}
 
@@ -436,6 +466,127 @@ func TestPlainUDPProxyRefreshTargetAddr_PreserveHostnameWhenProxying(t *testing.
 	}
 }
 
+func TestPlainTCPProxyDialOutboundFailsClosedWithoutOutboundManager(t *testing.T) {
+	proxy := NewPlainTCPProxy("server-1", &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	})
+
+	conn, nodeName, err := proxy.dialOutbound(context.Background(), "127.0.0.1:19132")
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected PlainTCPProxy to fail closed without outbound manager")
+	}
+	if nodeName != "" {
+		t.Fatalf("expected empty node name on failure, got %q", nodeName)
+	}
+	if !strings.Contains(err.Error(), "outbound manager unavailable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestPlainUDPProxyDialTargetConnFailsClosedWithoutOutboundManager(t *testing.T) {
+	proxy := NewPlainUDPProxy("server-1", &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	})
+	proxy.refreshTargetAddr()
+
+	conn, addr, err := proxy.dialTargetConn(context.Background())
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected PlainUDPProxy to fail closed without outbound manager")
+	}
+	if addr != nil {
+		t.Fatalf("expected nil target addr on failure, got %v", addr)
+	}
+	if !strings.Contains(err.Error(), "outbound manager unavailable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProxyPortListenerDialOutboundFailsClosedWithoutOutboundManager(t *testing.T) {
+	listener := newProxyPortListener(&config.ProxyPortConfig{
+		ID:           "port-1",
+		ListenAddr:   "127.0.0.1:1080",
+		Type:         "mixed",
+		Enabled:      true,
+		ProxyOutbound:"node-a",
+	}, nil, newProxyPortDialerPool(nil))
+
+	conn, nodeName, err := listener.dialOutbound(context.Background(), "127.0.0.1:19132")
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected proxy port dial to fail closed without outbound manager")
+	}
+	if nodeName != "" {
+		t.Fatalf("expected empty node name on failure, got %q", nodeName)
+	}
+	if !strings.Contains(err.Error(), "outbound manager unavailable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRawUDPProxyDialThroughProxyFailsClosedWithoutOutboundManager(t *testing.T) {
+	proxy := NewRawUDPProxy("server-1", &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}, nil, nil)
+
+	conn, nodeName, err := proxy.dialThroughProxyWithTimeout(200 * time.Millisecond)
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected RawUDPProxy to fail closed without outbound manager")
+	}
+	if nodeName != "" {
+		t.Fatalf("expected empty node name on failure, got %q", nodeName)
+	}
+	if !strings.Contains(err.Error(), "outbound manager unavailable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRawUDPProxyDialThroughProxySupportsDirectToken(t *testing.T) {
+	proxy := NewRawUDPProxy("server-1", &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:19133",
+		Enabled:       true,
+		ProxyOutbound: "missing-node,direct",
+	}, nil, nil)
+	proxy.SetOutboundManager(NewOutboundManager(nil))
+
+	conn, nodeName, err := proxy.dialThroughProxyWithTimeout(time.Second)
+	if err != nil {
+		t.Fatalf("expected explicit direct token to work for RawUDPProxy, got error: %v", err)
+	}
+	defer conn.Close()
+	if nodeName != DirectNodeName {
+		t.Fatalf("expected selected node %q, got %q", DirectNodeName, nodeName)
+	}
+}
+
 func TestWrapHysteria2UDPError(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -492,6 +643,58 @@ func containsAny(s string, subs []string) bool {
 	return false
 }
 
+func TestProxyDialerDirectTokenInMultiNodeSelectorStillWorks(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "test-server",
+		Name:          "Test Server",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "0.0.0.0:19132",
+		Protocol:      "bedrock",
+		Enabled:       true,
+		ProxyOutbound: "missing-node,direct",
+	}
+
+	dialer := NewProxyDialer(NewOutboundManager(nil), cfg, 5*time.Second)
+	conn, err := dialer.DialContext(context.Background(), "udp", "127.0.0.1:19132")
+	if err != nil {
+		t.Fatalf("expected explicit direct token to keep working, got error: %v", err)
+	}
+	defer conn.Close()
+	if dialer.GetSelectedNode() != DirectNodeName {
+		t.Fatalf("expected selected node %q, got %q", DirectNodeName, dialer.GetSelectedNode())
+	}
+}
+
+func TestProxyDialerMultiNodeSelectorFailsClosedWithoutExplicitDirect(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "test-server",
+		Name:          "Test Server",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "0.0.0.0:19132",
+		Protocol:      "bedrock",
+		Enabled:       true,
+		ProxyOutbound: "missing-a,missing-b",
+	}
+
+	dialer := NewProxyDialer(NewOutboundManager(nil), cfg, 5*time.Second)
+	dialer.setSelectedNode("stale-node")
+	conn, err := dialer.DialContext(context.Background(), "udp", "127.0.0.1:19132")
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("expected multi-node selector without direct to fail closed")
+	}
+	if !errors.Is(err, ErrOutboundNotFound) {
+		t.Fatalf("expected ErrOutboundNotFound, got: %v", err)
+	}
+	if dialer.GetSelectedNode() != "" {
+		t.Fatalf("selected node should be cleared after failure, got %q", dialer.GetSelectedNode())
+	}
+}
+
 // **Feature: singbox-outbound-proxy, Property 6: Fallback to direct for non-existent outbound**
 // **Validates: Requirements 2.4**
 // For any ServerConfig referencing a non-existent proxy outbound name,
@@ -506,29 +709,13 @@ func TestProperty6_FallbackToDirectForNonExistentOutbound(t *testing.T) {
 		return "nonexistent_" + s
 	})
 
-	properties.Property("non-existent outbound falls back to direct connection", prop.ForAll(
+	properties.Property("non-existent outbound returns error without direct fallback", prop.ForAll(
 		func(proxyOutbound string) bool {
-			// Create a local UDP server to test fallback
-			serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-			if err != nil {
-				t.Logf("Failed to resolve server address: %v", err)
-				return false
-			}
-
-			serverConn, err := net.ListenUDP("udp", serverAddr)
-			if err != nil {
-				t.Logf("Failed to create server connection: %v", err)
-				return false
-			}
-			defer serverConn.Close()
-
-			actualServerAddr := serverConn.LocalAddr().String()
-
 			cfg := &config.ServerConfig{
 				ID:            "test-server",
 				Name:          "Test Server",
 				Target:        "127.0.0.1",
-				Port:          serverConn.LocalAddr().(*net.UDPAddr).Port,
+				Port:          19132,
 				ListenAddr:    "0.0.0.0:19132",
 				Protocol:      "bedrock",
 				Enabled:       true,
@@ -547,18 +734,21 @@ func TestProperty6_FallbackToDirectForNonExistentOutbound(t *testing.T) {
 				return false
 			}
 
-			// Dial should succeed by falling back to direct connection
-			// because the outbound doesn't exist
-			conn, err := dialer.Dial("udp", actualServerAddr)
-			if err != nil {
-				t.Logf("Failed to dial (should have fallen back to direct): %v", err)
+			dialer.setSelectedNode("stale-node")
+			conn, err := dialer.Dial("udp", "127.0.0.1:19132")
+			if err == nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				t.Logf("Dial should fail closed for proxy_outbound=%q", proxyOutbound)
 				return false
 			}
-			defer conn.Close()
-
-			// Verify connection is established
-			if conn == nil {
-				t.Logf("Connection should not be nil")
+			if !errors.Is(err, ErrOutboundNotFound) {
+				t.Logf("expected ErrOutboundNotFound, got: %v", err)
+				return false
+			}
+			if dialer.GetSelectedNode() != "" {
+				t.Logf("selected node should be cleared after failure, got %q", dialer.GetSelectedNode())
 				return false
 			}
 
@@ -567,29 +757,13 @@ func TestProperty6_FallbackToDirectForNonExistentOutbound(t *testing.T) {
 		nonExistentOutboundGen,
 	))
 
-	properties.Property("DialContext also falls back for non-existent outbound", prop.ForAll(
+	properties.Property("DialContext also returns error without direct fallback", prop.ForAll(
 		func(proxyOutbound string) bool {
-			// Create a local UDP server to test fallback
-			serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-			if err != nil {
-				t.Logf("Failed to resolve server address: %v", err)
-				return false
-			}
-
-			serverConn, err := net.ListenUDP("udp", serverAddr)
-			if err != nil {
-				t.Logf("Failed to create server connection: %v", err)
-				return false
-			}
-			defer serverConn.Close()
-
-			actualServerAddr := serverConn.LocalAddr().String()
-
 			cfg := &config.ServerConfig{
 				ID:            "test-server",
 				Name:          "Test Server",
 				Target:        "127.0.0.1",
-				Port:          serverConn.LocalAddr().(*net.UDPAddr).Port,
+				Port:          19132,
 				ListenAddr:    "0.0.0.0:19132",
 				Protocol:      "bedrock",
 				Enabled:       true,
@@ -602,20 +776,24 @@ func TestProperty6_FallbackToDirectForNonExistentOutbound(t *testing.T) {
 			// Create a ProxyDialer
 			dialer := NewProxyDialer(outboundMgr, cfg, 5*time.Second)
 
-			// DialContext should succeed by falling back to direct connection
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			conn, err := dialer.DialContext(ctx, "udp", actualServerAddr)
-			if err != nil {
-				t.Logf("DialContext failed (should have fallen back to direct): %v", err)
+			dialer.setSelectedNode("stale-node")
+			conn, err := dialer.DialContext(ctx, "udp", "127.0.0.1:19132")
+			if err == nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				t.Logf("DialContext should fail closed for proxy_outbound=%q", proxyOutbound)
 				return false
 			}
-			defer conn.Close()
-
-			// Verify connection is established
-			if conn == nil {
-				t.Logf("Connection should not be nil")
+			if !errors.Is(err, ErrOutboundNotFound) {
+				t.Logf("expected ErrOutboundNotFound, got: %v", err)
+				return false
+			}
+			if dialer.GetSelectedNode() != "" {
+				t.Logf("selected node should be cleared after failure, got %q", dialer.GetSelectedNode())
 				return false
 			}
 

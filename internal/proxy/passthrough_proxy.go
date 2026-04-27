@@ -326,7 +326,7 @@ func (p *PassthroughProxy) fetchRemotePongWithLatencyWithResult() bool {
 
 	// If using proxy outbound, ping through proxy with a shorter timeout
 	// to avoid blocking for too long on unhealthy nodes
-	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
+	if !serverCfg.IsDirectConnection() {
 		pong, latency, err = p.pingThroughProxy(targetAddr, serverCfg.GetProxyOutbound())
 	} else {
 		// Direct ping
@@ -617,7 +617,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 	// Check if we should use proxy outbound
 	var proxyDialer *ProxyDialer
 	var selectedNodeName string
-	if p.outboundMgr != nil && !serverCfg.IsDirectConnection() {
+	if !serverCfg.IsDirectConnection() {
 		proxyDialer = NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
 		dialer := raknet.Dialer{
 			UpstreamDialer: proxyDialer,

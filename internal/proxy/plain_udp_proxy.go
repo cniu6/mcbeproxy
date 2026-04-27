@@ -187,7 +187,10 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 	if p.targetAddr == nil {
 		return nil, nil, fmt.Errorf("target address not resolved")
 	}
-	if p.config == nil || p.outboundMgr == nil || p.config.IsDirectConnection() {
+	if p.config == nil {
+		return nil, nil, fmt.Errorf("plain udp proxy configuration is nil")
+	}
+	if p.config.IsDirectConnection() {
 		udpAddr, ok := p.resolvedTargetAddr()
 		if !ok || udpAddr == nil {
 			return nil, nil, fmt.Errorf("target address %s is not resolved for direct dialing", p.effectiveTargetAddrString())
@@ -198,6 +201,9 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 		}
 		tuneUDPSocketForServer(conn, p.config, "plain_udp_direct:"+udpAddr.String())
 		return conn, udpAddr, nil
+	}
+	if p.outboundMgr == nil {
+		return nil, nil, fmt.Errorf("proxy outbound manager unavailable for plain udp server %s", p.serverID)
 	}
 
 	proxyOutbound := p.config.GetProxyOutbound()
@@ -326,7 +332,7 @@ func (p *PlainUDPProxy) effectiveBufferSize() int {
 }
 
 func (p *PlainUDPProxy) refreshTargetAddr() {
-	shouldPreserveHostname := p.config != nil && p.outboundMgr != nil && !p.config.IsDirectConnection()
+	shouldPreserveHostname := p.config != nil && !p.config.IsDirectConnection()
 	addr, _, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
 	if err != nil {
 		logger.Warn("PlainUDPProxy: failed to resolve target %s: %v", p.config.GetTargetAddr(), err)

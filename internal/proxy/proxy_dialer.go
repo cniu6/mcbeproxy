@@ -74,6 +74,12 @@ func (d *ProxyDialer) ResetFailover() {
 	d.selectedNode = ""
 }
 
+func (d *ProxyDialer) setSelectedNode(nodeName string) {
+	d.mu.Lock()
+	d.selectedNode = nodeName
+	d.mu.Unlock()
+}
+
 // Dial creates a connection to the specified address.
 // If a proxy outbound is configured, it routes through the proxy.
 // Otherwise, it uses a direct connection.
@@ -91,12 +97,20 @@ func (d *ProxyDialer) Dial(network, address string) (net.Conn, error) {
 // This method is required by raknet.UpstreamDialer interface.
 // Requirements: 2.1, 2.2, 2.4, 3.1, 3.2
 func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	d.setSelectedNode("")
+	if d.serverConfig == nil {
+		return nil, errors.New("proxy dial failed: missing server config")
+	}
+
 	// Check if we should use direct connection
 	// Requirements: 2.2
 	if d.shouldUseDirect() {
 		logger.Debug("ProxyDialer: Using direct connection for %s", address)
 		dialer := &net.Dialer{Timeout: d.timeout}
 		return dialer.DialContext(ctx, network, address)
+	}
+	if d.outboundMgr == nil {
+		return nil, errors.New("proxy dial failed: outbound manager unavailable")
 	}
 
 	proxyOutbound := d.serverConfig.GetProxyOutbound()
@@ -117,16 +131,13 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	// Get PacketConn through the outbound manager
 	packetConn, packetConnCancel, err := d.dialDetachedPacketConn(ctx, proxyOutbound, address)
 	if err != nil {
-		// Requirements: 2.4 - Fallback to direct connection on error
-		logger.Warn("ProxyDialer: Failed to dial through proxy %s: %v, falling back to direct", proxyOutbound, err)
-		dialer := &net.Dialer{Timeout: d.timeout}
-		return dialer.DialContext(ctx, network, address)
+		d.setSelectedNode("")
+		logger.Warn("ProxyDialer: Failed to dial through proxy %s: %v", proxyOutbound, err)
+		return nil, fmt.Errorf("proxy dial failed via outbound %q: %w", proxyOutbound, err)
 	}
 
 	// Track the selected node
-	d.mu.Lock()
-	d.selectedNode = proxyOutbound
-	d.mu.Unlock()
+	d.setSelectedNode(proxyOutbound)
 
 	logger.Debug("ProxyDialer: PacketConn created successfully for %s via %s", address, proxyOutbound)
 
@@ -208,10 +219,8 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 				logger.Warn("ProxyDialer: No healthy nodes available in %s %s: %v", selectorType, selectorDisplay, err)
 			}
 
-			// Fallback to direct connection
-			logger.Warn("ProxyDialer: Falling back to direct connection for %s", address)
-			dialer := &net.Dialer{Timeout: d.timeout}
-			return dialer.DialContext(ctx, network, address)
+			d.setSelectedNode("")
+			return nil, fmt.Errorf("proxy dial failed for selector %q after tried=%v: %w", groupSelector, excludedNodes, err)
 		}
 
 		nodeName := selectedOutbound.Name
@@ -224,9 +233,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 			directDialer := &net.Dialer{Timeout: d.timeout}
 			directConn, directErr := directDialer.DialContext(ctx, network, address)
 			if directErr == nil {
-				d.mu.Lock()
-				d.selectedNode = DirectNodeName
-				d.mu.Unlock()
+				d.setSelectedNode(DirectNodeName)
 				return directConn, nil
 			}
 			excludedNodes = append(excludedNodes, DirectNodeName)
@@ -331,18 +338,7 @@ func (d *ProxyDialer) dialDetachedPacketConn(ctx context.Context, outboundName s
 // shouldUseDirect returns true if direct connection should be used.
 // Requirements: 2.2
 func (d *ProxyDialer) shouldUseDirect() bool {
-	// No outbound manager configured
-	if d.outboundMgr == nil {
-		return true
-	}
-
-	// No server config
-	if d.serverConfig == nil {
-		return true
-	}
-
-	// Check if proxy outbound is empty or "direct"
-	return d.serverConfig.IsDirectConnection()
+	return d.serverConfig != nil && d.serverConfig.IsDirectConnection()
 }
 
 // parseUDPAddr parses an address string into a UDP address.
