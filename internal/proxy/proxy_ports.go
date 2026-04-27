@@ -300,6 +300,10 @@ func (l *proxyPortListener) handleMixed(conn net.Conn, reader *bufio.Reader) {
 	if err != nil {
 		return
 	}
+	if banner, berr := reader.Peek(4); berr == nil && string(banner) == "SSH-" {
+		logger.Warn("ProxyPort: received raw SSH banner on mixed proxy port %s (%s); use SOCKS5/HTTP CONNECT or a plain TCP forward instead", l.cfg.ID, l.cfg.ListenAddr)
+		return
+	}
 	switch peek[0] {
 	case 0x05:
 		l.handleSocks5(conn, reader)
@@ -398,13 +402,8 @@ func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reade
 	clearProxyConnDeadline(conn)
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	go func() {
-		_, _ = io.Copy(remote, reader)
-		remote.Close()
-	}()
-	_, _ = io.Copy(conn, remote)
-	remote.Close()
+	defer remote.Close()
+	relayStream(conn, reader, remote)
 }
 
 func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
@@ -426,13 +425,8 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 	}
 	clearProxyConnDeadline(conn)
 	writeSocks5Reply(conn, 0x00)
-
-	go func() {
-		_, _ = io.Copy(remote, reader)
-		remote.Close()
-	}()
-	_, _ = io.Copy(conn, remote)
-	remote.Close()
+	defer remote.Close()
+	relayStream(conn, reader, remote)
 }
 
 func (l *proxyPortListener) handleSocks5Handshake(conn net.Conn, reader *bufio.Reader) error {
@@ -518,7 +512,7 @@ func readSocks5Request(reader *bufio.Reader) (string, error) {
 	if cmd != 0x01 {
 		return "", fmt.Errorf("unsupported command")
 	}
-	_, _ = reader.ReadByte() // RSV
+	_, _ = reader.ReadByte()
 	atyp, err := reader.ReadByte()
 	if err != nil {
 		return "", err
@@ -561,7 +555,6 @@ func readSocks5Request(reader *bufio.Reader) (string, error) {
 }
 
 func writeSocks5Reply(conn net.Conn, rep byte) {
-	// VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
 	_, _ = conn.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 }
 
@@ -614,13 +607,8 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 	clearProxyConnDeadline(conn)
 
 	writeSocks4Reply(conn, 0x5A, destIP, port)
-
-	go func() {
-		_, _ = io.Copy(remote, reader)
-		remote.Close()
-	}()
-	_, _ = io.Copy(conn, remote)
-	remote.Close()
+	defer remote.Close()
+	relayStream(conn, reader, remote)
 }
 
 func writeSocks4Reply(conn net.Conn, status byte, ip net.IP, port int) {

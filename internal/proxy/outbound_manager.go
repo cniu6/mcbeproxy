@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ var (
 	ErrGroupNotFound      = errors.New("proxy group not found")
 	ErrNoHealthyNodes     = errors.New("no healthy nodes available")
 	ErrAllFailoversFailed = errors.New("all failover attempts failed")
+	metadataLikeOutboundNamePattern = regexp.MustCompile(`(?i)^(剩余流量|套餐到期|到期时间|过期时间|流量重置|订阅信息|订阅更新时间|更新时间|使用说明|官网|公告|客服|telegram|tg|email|邮箱)\s*[：:]`)
 )
 
 // DirectNodeName is the reserved token meaning "connect directly, no proxy".
@@ -49,6 +51,10 @@ const DirectNodeName = "direct"
 // dial path on this so mixed lists like "direct,HK-01" work.
 func IsDirectSelection(outbound *config.ProxyOutbound) bool {
 	return outbound != nil && outbound.Name == DirectNodeName
+}
+
+func isMetadataLikeOutboundName(name string) bool {
+	return metadataLikeOutboundNamePattern.MatchString(strings.TrimSpace(name))
 }
 
 // newDirectVirtualOutbound returns the sentinel outbound used to represent
@@ -582,7 +588,7 @@ func (m *outboundManagerImpl) SetServerSelectedNode(serverID, nodeName string) {
 }
 
 func (m *outboundManagerImpl) isSelectableOutboundLocked(outbound *config.ProxyOutbound) bool {
-	if outbound == nil || !outbound.Enabled || outbound.IsAutoSelectBlocked() {
+	if outbound == nil || isMetadataLikeOutboundName(outbound.Name) || !outbound.Enabled || outbound.IsAutoSelectBlocked() {
 		return false
 	}
 	lastCheck := outbound.GetLastCheck()
@@ -1159,6 +1165,9 @@ func (m *outboundManagerImpl) CheckHealth(ctx context.Context, name string) erro
 		return ErrOutboundNotFound
 	}
 	m.mu.RUnlock()
+	if cfg == nil || isMetadataLikeOutboundName(cfg.Name) {
+		return ErrOutboundNotFound
+	}
 
 	startTime := time.Now()
 	testDestination := "1.1.1.1:443"
@@ -1758,7 +1767,7 @@ func (m *outboundManagerImpl) GetOutboundsByGroup(groupName string) []*config.Pr
 
 	var result []*config.ProxyOutbound
 	for _, outbound := range m.outbounds {
-		if outbound.Group == groupName {
+		if outbound.Group == groupName && !isMetadataLikeOutboundName(outbound.Name) {
 			result = append(result, outbound.Clone())
 		}
 	}
@@ -1805,7 +1814,7 @@ func (m *outboundManagerImpl) ListGroups() []*GroupStats {
 func (m *outboundManagerImpl) calculateGroupStats(groupName string) *GroupStats {
 	var nodes []*config.ProxyOutbound
 	for _, outbound := range m.outbounds {
-		if outbound.Group == groupName {
+		if outbound.Group == groupName && !isMetadataLikeOutboundName(outbound.Name) {
 			nodes = append(nodes, outbound)
 		}
 	}
@@ -2056,6 +2065,9 @@ func (m *outboundManagerImpl) selectSingleNode(nodeName string, excludeNodes []s
 		if excluded == nodeName {
 			return nil, fmt.Errorf("%w: '%s' has already been tried", ErrAllFailoversFailed, nodeName)
 		}
+	}
+	if isMetadataLikeOutboundName(nodeName) {
+		return nil, fmt.Errorf("%w: '%s'", ErrOutboundNotFound, nodeName)
 	}
 
 	// Find the node

@@ -1340,7 +1340,7 @@ func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []strin
 			}
 			out = append(out, n.Name)
 		}
-		return out
+		return p.filterAutoPingNodeNames(out)
 	}
 
 	// Multi node selection
@@ -1354,11 +1354,11 @@ func (p *ProxyServer) getServerNodeNames(serverCfg *config.ServerConfig) []strin
 			}
 			out = append(out, n)
 		}
-		return out
+		return p.filterAutoPingNodeNames(out)
 	}
 
 	// Single node
-	return []string{proxyOutbound}
+	return p.filterAutoPingNodeNames([]string{proxyOutbound})
 }
 
 func (p *ProxyServer) getProxyPortNodeNames(portCfg *config.ProxyPortConfig) []string {
@@ -1380,7 +1380,7 @@ func (p *ProxyServer) getProxyPortNodeNames(portCfg *config.ProxyPortConfig) []s
 			}
 			out = append(out, n.Name)
 		}
-		return out
+		return p.filterAutoPingNodeNames(out)
 	}
 
 	if portCfg.IsMultiNodeSelection() {
@@ -1393,10 +1393,36 @@ func (p *ProxyServer) getProxyPortNodeNames(portCfg *config.ProxyPortConfig) []s
 			}
 			out = append(out, n)
 		}
-		return out
+		return p.filterAutoPingNodeNames(out)
 	}
 
-	return []string{proxyOutbound}
+	return p.filterAutoPingNodeNames([]string{proxyOutbound})
+}
+
+func (p *ProxyServer) filterAutoPingNodeNames(nodeNames []string) []string {
+	if len(nodeNames) == 0 || p == nil || p.outboundMgr == nil {
+		return nil
+	}
+	result := make([]string, 0, len(nodeNames))
+	for _, nodeName := range nodeNames {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+		if nodeName == DirectNodeName {
+			result = append(result, nodeName)
+			continue
+		}
+		if isMetadataLikeOutboundName(nodeName) {
+			continue
+		}
+		outbound, exists := p.outboundMgr.GetOutbound(nodeName)
+		if !exists || outbound == nil || !outbound.Enabled {
+			continue
+		}
+		result = append(result, nodeName)
+	}
+	return result
 }
 
 func shouldRunScheduledFullScan(serverCfg *config.ServerConfig, now, lastFullScan time.Time) (bool, string) {

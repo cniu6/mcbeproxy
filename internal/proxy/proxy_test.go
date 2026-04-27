@@ -121,6 +121,74 @@ func TestProperty_PacketContentPreservation(t *testing.T) {
 	properties.TestingRun(t)
 }
 
+func TestProxyServerGetServerNodeNames_FiltersInvalidAutoPingCandidates(t *testing.T) {
+	outboundMgr := NewOutboundManager(nil)
+	if err := outboundMgr.AddOutbound(&config.ProxyOutbound{
+		Name:     "node-a",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "node-a.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}); err != nil {
+		t.Fatalf("seed node-a: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(&config.ProxyOutbound{
+		Name:     "node-disabled",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "node-disabled.example.com",
+		Port:     443,
+		Enabled:  false,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}); err != nil {
+		t.Fatalf("seed node-disabled: %v", err)
+	}
+
+	server := &ProxyServer{outboundMgr: outboundMgr}
+	cfg := &config.ServerConfig{ProxyOutbound: " direct , node-a , 剩余流量：1 GB , missing-node , node-disabled "}
+
+	nodes := server.getServerNodeNames(cfg)
+	if len(nodes) != 2 || nodes[0] != DirectNodeName || nodes[1] != "node-a" {
+		t.Fatalf("unexpected filtered server nodes: %+v", nodes)
+	}
+}
+
+func TestProxyServerGetProxyPortNodeNames_FiltersInvalidAutoPingCandidates(t *testing.T) {
+	outboundMgr := NewOutboundManager(nil)
+	if err := outboundMgr.AddOutbound(&config.ProxyOutbound{
+		Name:     "node-a",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "node-a.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}); err != nil {
+		t.Fatalf("seed node-a: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(&config.ProxyOutbound{
+		Name:     "套餐到期：2099-01-01",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "meta.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}); err != nil {
+		t.Fatalf("seed metadata-like node: %v", err)
+	}
+
+	server := &ProxyServer{outboundMgr: outboundMgr}
+	cfg := &config.ProxyPortConfig{ProxyOutbound: "node-a, 套餐到期：2099-01-01, missing-node"}
+
+	nodes := server.getProxyPortNodeNames(cfg)
+	if len(nodes) != 1 || nodes[0] != "node-a" {
+		t.Fatalf("unexpected filtered proxy-port nodes: %+v", nodes)
+	}
+}
+
 type testPlayerKickerListener struct {
 	kickCount int
 	reason    string

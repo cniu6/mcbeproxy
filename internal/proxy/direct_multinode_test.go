@@ -105,3 +105,74 @@ func TestIsDirectSelection_NilSafe(t *testing.T) {
 		t.Fatal("synthetic direct outbound should be a direct selection")
 	}
 }
+
+func TestSelectFromNodeList_IgnoresMetadataLikeOutboundNames(t *testing.T) {
+	mgr := NewOutboundManager(nil)
+	metaCfg := &config.ProxyOutbound{
+		Name:     "剩余流量：1 GB",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "meta.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}
+	realCfg := &config.ProxyOutbound{
+		Name:     "node-a",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "real.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+	}
+	if err := mgr.AddOutbound(metaCfg); err != nil {
+		t.Fatalf("seed metadata-like outbound: %v", err)
+	}
+	if err := mgr.AddOutbound(realCfg); err != nil {
+		t.Fatalf("seed real outbound: %v", err)
+	}
+
+	selected, err := mgr.SelectOutboundWithFailover("剩余流量：1 GB,node-a", "round-robin", "tcp", nil)
+	if err != nil {
+		t.Fatalf("expected selection to succeed, got: %v", err)
+	}
+	if selected == nil || selected.Name != "node-a" {
+		t.Fatalf("expected node-a after metadata filtering, got %+v", selected)
+	}
+}
+
+func TestGetOutboundsByGroup_FiltersMetadataLikeNodes(t *testing.T) {
+	mgr := NewOutboundManager(nil)
+	metaCfg := &config.ProxyOutbound{
+		Name:     "套餐到期：2099-01-01",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "meta.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+		Group:    "g1",
+	}
+	realCfg := &config.ProxyOutbound{
+		Name:     "node-a",
+		Type:     config.ProtocolShadowsocks,
+		Server:   "real.example.com",
+		Port:     443,
+		Enabled:  true,
+		Method:   "aes-256-gcm",
+		Password: "dummy",
+		Group:    "g1",
+	}
+	if err := mgr.AddOutbound(metaCfg); err != nil {
+		t.Fatalf("seed metadata-like outbound: %v", err)
+	}
+	if err := mgr.AddOutbound(realCfg); err != nil {
+		t.Fatalf("seed real outbound: %v", err)
+	}
+
+	nodes := mgr.GetOutboundsByGroup("g1")
+	if len(nodes) != 1 || nodes[0] == nil || nodes[0].Name != "node-a" {
+		t.Fatalf("expected only node-a in group listing, got %+v", nodes)
+	}
+}

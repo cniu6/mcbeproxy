@@ -123,11 +123,7 @@ func (p *PlainTCPProxy) handleConn(ctx context.Context, client net.Conn) {
 	}
 	defer remote.Close()
 
-	go func() {
-		_, _ = io.Copy(remote, client)
-		_ = remote.Close()
-	}()
-	_, _ = io.Copy(client, remote)
+	relayStream(client, client, remote)
 }
 
 func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.Conn, string, error) {
@@ -145,6 +141,15 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 		if err != nil {
 			return nil, "", err
 		}
+		if IsDirectSelection(selected) {
+			dialer := &net.Dialer{Timeout: plainTCPDialTimeout}
+			conn, derr := dialer.DialContext(ctx, "tcp", address)
+			if derr != nil {
+				exclude = append(exclude, DirectNodeName)
+				continue
+			}
+			return conn, DirectNodeName, nil
+		}
 		dialer, err := p.dialerPool.Get(selected)
 		if err != nil {
 			exclude = append(exclude, selected.Name)
@@ -158,4 +163,22 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 		return conn, selected.Name, nil
 	}
 	return nil, "", fmt.Errorf("all proxy outbounds failed")
+}
+
+func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
+	go func() {
+		_, _ = io.Copy(remote, localReader)
+		closeWriteSide(remote)
+	}()
+	_, _ = io.Copy(local, remote)
+	closeWriteSide(local)
+}
+
+func closeWriteSide(conn net.Conn) {
+	type closeWriter interface {
+		CloseWrite() error
+	}
+	if cw, ok := conn.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
 }
