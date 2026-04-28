@@ -172,6 +172,31 @@ func TestServerConfig_Validate_FECTunnelRejectsTCPOnlyProtocol(t *testing.T) {
 	}
 }
 
+func TestServerConfig_Normalize_ClearsProxyModeForNonRakNetProtocols(t *testing.T) {
+	for _, proto := range []string{"tcp", "udp", "tcp_udp"} {
+		cfg := baseValidServerConfig()
+		cfg.Protocol = proto
+		cfg.ProxyMode = ProxyModePassthrough
+		cfg.Normalize()
+		if cfg.ProxyMode != "" {
+			t.Fatalf("Normalize(protocol=%s) should clear proxy_mode, got %q", proto, cfg.ProxyMode)
+		}
+		if got := cfg.GetProxyMode(); got != ProxyModeTransparent {
+			t.Fatalf("GetProxyMode(protocol=%s) = %q, want %q", proto, got, ProxyModeTransparent)
+		}
+	}
+}
+
+func TestServerConfig_Normalize_PreservesRakNetProxyMode(t *testing.T) {
+	cfg := baseValidServerConfig()
+	cfg.Protocol = "raknet"
+	cfg.ProxyMode = ProxyModePassthrough
+	cfg.Normalize()
+	if cfg.ProxyMode != ProxyModePassthrough {
+		t.Fatalf("Normalize should preserve raknet proxy_mode, got %q", cfg.ProxyMode)
+	}
+}
+
 func TestServerConfig_ToDTO_PropagatesLatencyMode(t *testing.T) {
 	cfg := baseValidServerConfig()
 	cfg.LatencyMode = LatencyModeAggressive

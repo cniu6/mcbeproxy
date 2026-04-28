@@ -48,6 +48,35 @@ const (
 	defaultLatencyHistoryRetentionDays     = 5
 )
 
+const (
+	ProxyModeTransparent = "transparent"
+	ProxyModePassthrough = "passthrough"
+	ProxyModeRakNet      = "raknet"
+	ProxyModeRawUDP      = "raw_udp"
+	ProxyModeMITM        = "mitm"
+)
+
+func normalizeProtocol(protocol string) string {
+	return strings.ToLower(strings.TrimSpace(protocol))
+}
+
+func normalizeServerProxyMode(protocol, mode string) string {
+	normalizedProtocol := normalizeProtocol(protocol)
+	if normalizedProtocol != "" && normalizedProtocol != ProxyModeRakNet {
+		return ""
+	}
+
+	normalizedMode := strings.ToLower(strings.TrimSpace(mode))
+	switch normalizedMode {
+	case "", ProxyModeTransparent:
+		return ""
+	case ProxyModePassthrough, ProxyModeRakNet, ProxyModeRawUDP, ProxyModeMITM:
+		return normalizedMode
+	default:
+		return ""
+	}
+}
+
 // LatencyMode constants control optional UDP latency-acceleration behavior.
 //
 //   - LatencyModeNormal: current default behavior, no extra socket / pipeline tuning.
@@ -230,10 +259,22 @@ func (c *UDPSpeederConfig) Validate() error {
 
 // GetProxyMode returns the proxy mode, defaulting to "transparent".
 func (sc *ServerConfig) GetProxyMode() string {
-	if sc.ProxyMode == "" {
-		return "transparent"
+	if sc == nil {
+		return ProxyModeTransparent
 	}
-	return sc.ProxyMode
+	mode := normalizeServerProxyMode(sc.Protocol, sc.ProxyMode)
+	if mode == "" {
+		return ProxyModeTransparent
+	}
+	return mode
+}
+
+func (sc *ServerConfig) Normalize() {
+	if sc == nil {
+		return
+	}
+	sc.Protocol = normalizeProtocol(sc.Protocol)
+	sc.ProxyMode = normalizeServerProxyMode(sc.Protocol, sc.ProxyMode)
 }
 
 // GetLatencyMode returns the normalized latency mode. Empty / unknown values
@@ -280,7 +321,8 @@ func (sc *ServerConfig) Validate() error {
 	if sc.ListenAddr == "" {
 		return errors.New("listen_addr is required")
 	}
-	if sc.Protocol == "" {
+	protocol := normalizeProtocol(sc.Protocol)
+	if protocol == "" {
 		return errors.New("protocol is required")
 	}
 	if sc.UDPSocketBufferSize < -1 {
@@ -306,7 +348,7 @@ func (sc *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid raw_udp_kick_strategy: %s", sc.RawUDPKickStrategy)
 	}
 	if sc.UDPSpeeder != nil && sc.UDPSpeeder.Enabled {
-		switch strings.ToLower(sc.Protocol) {
+		switch protocol {
 		case "tcp", "tcp_udp":
 			return fmt.Errorf("udp_speeder is not supported for protocol %s", sc.Protocol)
 		}
@@ -321,11 +363,11 @@ func (sc *ServerConfig) Validate() error {
 	case LatencyModeAggressive:
 		// aggressive mode tunes UDP sockets; on pure TCP listeners it has no effect.
 		// Reject the combination up front so operators are not misled.
-		if strings.EqualFold(strings.TrimSpace(sc.Protocol), "tcp") {
+		if protocol == "tcp" {
 			return fmt.Errorf("latency_mode=aggressive is not supported for protocol tcp")
 		}
 	case LatencyModeFECTunnel:
-		switch strings.ToLower(strings.TrimSpace(sc.Protocol)) {
+		switch protocol {
 		case "tcp", "tcp_udp":
 			return fmt.Errorf("latency_mode=fec_tunnel is not supported for protocol %s", sc.Protocol)
 		}
@@ -424,7 +466,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		Target:                        sc.Target,
 		Port:                          sc.Port,
 		ListenAddr:                    sc.ListenAddr,
-		Protocol:                      sc.Protocol,
+		Protocol:                      normalizeProtocol(sc.Protocol),
 		Enabled:                       sc.Enabled,
 		Disabled:                      sc.Disabled,
 		UDPSpeeder:                    sc.UDPSpeeder.ToDTO(),
@@ -435,7 +477,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		UDPSocketBufferSize:           sc.UDPSocketBufferSize,
 		DisabledMessage:               sc.DisabledMessage,
 		CustomMOTD:                    sc.CustomMOTD,
-		ProxyMode:                     sc.ProxyMode,
+		ProxyMode:                     sc.GetProxyMode(),
 		ACLServerID:                   sc.GetACLServerID(),
 		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
 		XboxAuthEnabled:               sc.XboxAuthEnabled,
@@ -826,6 +868,7 @@ func (cm *ConfigManager) Load() error {
 
 	// Validate all configs before applying
 	for _, config := range configs {
+		config.Normalize()
 		if err := config.Validate(); err != nil {
 			return fmt.Errorf("invalid config for server %s: %w", config.ID, err)
 		}
@@ -883,6 +926,7 @@ func (cm *ConfigManager) GetAllServers() []*ServerConfig {
 
 // AddServer adds a new server configuration.
 func (cm *ConfigManager) AddServer(config *ServerConfig) error {
+	config.Normalize()
 	if err := config.Validate(); err != nil {
 		return err
 	}
@@ -905,6 +949,7 @@ func (cm *ConfigManager) AddServer(config *ServerConfig) error {
 
 // UpdateServer updates an existing server configuration.
 func (cm *ConfigManager) UpdateServer(id string, config *ServerConfig) error {
+	config.Normalize()
 	if err := config.Validate(); err != nil {
 		return err
 	}

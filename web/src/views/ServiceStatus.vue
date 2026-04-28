@@ -151,7 +151,7 @@
             <n-space align="center" wrap size="small">
               <n-text strong>{{ s.name }}</n-text>
               <n-tag size="small" :type="s.status === 'running' ? 'success' : 'error'">{{ s.status === 'running' ? '运行' : '停止' }}</n-tag>
-              <n-tag size="small" :type="getProxyModeType(s.proxy_mode)">{{ getProxyModeLabel(s.proxy_mode) }}</n-tag>
+              <n-tag size="small" :type="getProxyModeType(s)">{{ getProxyModeLabel(s) }}</n-tag>
               <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
               <n-tag size="small" :type="getLatencyType(s)">{{ getLatencyText(s) }}</n-tag>
               <n-tag size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
@@ -219,13 +219,23 @@ const refreshOptions = [
   { label: '120秒', value: 120 }
 ]
 
-const getProxyModeLabel = (mode) => {
-  const modeMap = { 'raw_udp': 'Raw UDP', 'passthrough': 'Pass', 'transparent': 'Trans', 'raknet': 'RakNet' }
-  return modeMap[mode] || mode || '-'
+const getProxyModeLabel = (server) => {
+  const protocol = String(server?.protocol || '').trim().toLowerCase()
+  if (protocol && protocol !== 'raknet') {
+    return 'Plain'
+  }
+  const mode = String(server?.proxy_mode || '').trim().toLowerCase()
+  const modeMap = { raw_udp: 'Raw UDP', passthrough: 'Pass', transparent: 'Trans', raknet: 'RakNet', mitm: 'MITM' }
+  return modeMap[mode] || server?.proxy_mode || 'Trans'
 }
 
-const getProxyModeType = (mode) => {
-  const typeMap = { 'raw_udp': 'success', 'passthrough': 'info', 'transparent': 'warning', 'raknet': 'default' }
+const getProxyModeType = (server) => {
+  const protocol = String(server?.protocol || '').trim().toLowerCase()
+  if (protocol && protocol !== 'raknet') {
+    return 'default'
+  }
+  const mode = String(server?.proxy_mode || '').trim().toLowerCase()
+  const typeMap = { raw_udp: 'success', passthrough: 'info', transparent: 'warning', raknet: 'default', mitm: 'error' }
   return typeMap[mode] || 'default'
 }
 

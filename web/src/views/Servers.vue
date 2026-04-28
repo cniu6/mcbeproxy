@@ -1200,6 +1200,33 @@ const makeDefaultForm = () => ({
   auto_ping_full_scan_time: globalAutoPingDefaults.full_scan_time,
   auto_ping_full_scan_interval_hours: globalAutoPingDefaults.full_scan_interval_hours
 })
+const normalizeProtocolValue = (protocol) => String(protocol || '').trim().toLowerCase()
+const normalizeServerProxyMode = (protocol, mode) => {
+  const normalizedProtocol = normalizeProtocolValue(protocol)
+  if (normalizedProtocol && normalizedProtocol !== 'raknet') {
+    return ''
+  }
+  const normalizedMode = String(mode || '').trim().toLowerCase()
+  if (!normalizedMode || normalizedMode === 'transparent') {
+    return ''
+  }
+  return ['raw_udp', 'passthrough', 'raknet', 'mitm'].includes(normalizedMode) ? normalizedMode : ''
+}
+const getServerModeTag = (server) => {
+  const protocol = normalizeProtocolValue(server?.protocol)
+  if (protocol && protocol !== 'raknet') {
+    return { label: 'Plain', type: 'default' }
+  }
+  const modeMap = {
+    raw_udp: { label: 'Raw UDP', type: 'success' },
+    passthrough: { label: 'Pass', type: 'info' },
+    transparent: { label: 'Trans', type: 'warning' },
+    raknet: { label: 'RakNet', type: 'default' },
+    mitm: { label: 'MITM', type: 'error' }
+  }
+  const normalizedMode = String(server?.proxy_mode || '').trim().toLowerCase()
+  return modeMap[normalizedMode] || { label: server?.proxy_mode || 'Trans', type: 'default' }
+}
 const normalizeServerForm = (server = {}) => {
   const defaults = makeDefaultForm()
   return {
@@ -1211,7 +1238,9 @@ const normalizeServerForm = (server = {}) => {
       extra_args: Array.isArray(server?.udp_speeder?.extra_args)
         ? server.udp_speeder.extra_args.map(v => String(v ?? '').trim()).filter(Boolean)
         : []
-    }
+    },
+    protocol: normalizeProtocolValue(server.protocol ?? defaults.protocol),
+    proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? defaults.proxy_mode)
   }
 }
 const buildUDPSpeederPayload = (udpSpeeder) => {
@@ -1236,6 +1265,7 @@ const buildUDPSpeederPayload = (udpSpeeder) => {
 }
 const buildServerPayload = (server) => {
   const payload = normalizeServerForm(server)
+  payload.proxy_mode = normalizeServerProxyMode(payload.protocol, payload.proxy_mode)
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
   return payload
 }
@@ -4031,8 +4061,34 @@ const columns = [
     ])
   },
   { title: '模式', key: 'proxy_mode', width: 85, render: r => {
-    const modeMap = { 'raw_udp': { label: 'Raw UDP', type: 'success' }, 'passthrough': { label: 'Pass', type: 'info' }, 'transparent': { label: 'Trans', type: 'warning' }, 'raknet': { label: 'RakNet', type: 'default' } }
-    const mode = modeMap[r.proxy_mode] || { label: r.proxy_mode || '-', type: 'default' }
+    const normalizeProtocolValue = (protocol) => String(protocol || '').trim().toLowerCase()
+    const normalizeServerProxyMode = (protocol, mode) => {
+      const normalizedProtocol = normalizeProtocolValue(protocol)
+      if (normalizedProtocol && normalizedProtocol !== 'raknet') {
+        return ''
+      }
+      const normalizedMode = String(mode || '').trim().toLowerCase()
+      if (!normalizedMode || normalizedMode === 'transparent') {
+        return ''
+      }
+      return ['raw_udp', 'passthrough', 'raknet', 'mitm'].includes(normalizedMode) ? normalizedMode : ''
+    }
+    const getServerModeTag = (server) => {
+      const protocol = normalizeProtocolValue(server?.protocol)
+      if (protocol && protocol !== 'raknet') {
+        return { label: 'Plain', type: 'default' }
+      }
+      const modeMap = {
+        raw_udp: { label: 'Raw UDP', type: 'success' },
+        passthrough: { label: 'Pass', type: 'info' },
+        transparent: { label: 'Trans', type: 'warning' },
+        raknet: { label: 'RakNet', type: 'default' },
+        mitm: { label: 'MITM', type: 'error' }
+      }
+      const normalizedMode = String(server?.proxy_mode || '').trim().toLowerCase()
+      return modeMap[normalizedMode] || { label: server?.proxy_mode || 'Trans', type: 'default' }
+    }
+    const mode = getServerModeTag(r)
     return h(NTag, { type: mode.type, size: 'small' }, () => mode.label)
   }},
   { title: '协议', key: 'protocol', width: 70 },
@@ -4089,6 +4145,13 @@ watch(
     }
     if (currentMode === 'fec_tunnel' && (!hasEnabledUDPSpeeder.value || protocol === 'tcp' || protocol === 'tcp_udp')) {
       form.value.latency_mode = 'normal'
+    }
+    const normalizedProxyMode = normalizeServerProxyMode(protocol, form.value?.proxy_mode)
+    if ((form.value?.proxy_mode || '') !== normalizedProxyMode) {
+      form.value.proxy_mode = normalizedProxyMode
+    }
+    if (protocol === 'raknet' && !form.value?.proxy_mode) {
+      form.value.proxy_mode = 'passthrough'
     }
   }
 )
