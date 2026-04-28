@@ -413,7 +413,7 @@ func (m *outboundManagerImpl) serverLatencyHistoryMinIntervalMs(serverID string)
 		return baseMinIntervalMs
 	}
 	serverCfg, exists := getter.GetServer(serverID)
-	if !exists || serverCfg == nil || !serverCfg.AutoPingEnabled {
+	if !exists || serverCfg == nil || !serverCfg.IsAutoPingEnabled() {
 		return baseMinIntervalMs
 	}
 	intervalMinutes := serverCfg.AutoPingIntervalMinutes

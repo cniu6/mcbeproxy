@@ -392,7 +392,7 @@ func (p *ProxyServer) recordAutoPingOutboundLatency(nodeName, sortBy string, lat
 }
 
 func (p *ProxyServer) getServerAutoPingSchedule(serverCfg *config.ServerConfig, status string, now time.Time) (int64, int64) {
-	if p == nil || serverCfg == nil || !serverCfg.AutoPingEnabled || status != "running" {
+	if p == nil || serverCfg == nil || !serverCfg.IsAutoPingEnabled() || status != "running" {
 		return 0, 0
 	}
 	interval := time.Duration(p.effectiveServerAutoPingIntervalMinutes(serverCfg)) * time.Minute
@@ -677,7 +677,7 @@ func (p *ProxyServer) startAutoPingScheduler() {
 				if serverCfg == nil {
 					continue
 				}
-				if !serverCfg.AutoPingEnabled {
+				if !serverCfg.IsAutoPingEnabled() {
 					continue
 				}
 				intervalMin := p.effectiveServerAutoPingIntervalMinutes(serverCfg)
@@ -864,7 +864,7 @@ func (p *ProxyServer) runAutoLatencyRefresh(forceFullScan bool) topologyRefreshS
 	var pingWG sync.WaitGroup
 
 	for _, serverCfg := range p.configMgr.GetAllServers() {
-		if serverCfg == nil || !serverCfg.AutoPingEnabled {
+		if serverCfg == nil || !serverCfg.IsAutoPingEnabled() {
 			continue
 		}
 		summary.servers++
@@ -916,7 +916,7 @@ func (p *ProxyServer) runAutoLatencyRefresh(forceFullScan bool) topologyRefreshS
 	}
 
 	for _, serverCfg := range p.configMgr.GetAllServers() {
-		if serverCfg == nil || !serverCfg.AutoPingEnabled {
+		if serverCfg == nil || !serverCfg.IsAutoPingEnabled() {
 			continue
 		}
 		p.setServerAutoPingLastRun(serverCfg.ID, now)

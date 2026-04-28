@@ -60,6 +60,10 @@ func normalizeProtocol(protocol string) string {
 	return strings.ToLower(strings.TrimSpace(protocol))
 }
 
+func normalizeProxyOutboundValue(proxyOutbound string) string {
+	return strings.TrimSpace(proxyOutbound)
+}
+
 func normalizeServerProxyMode(protocol, mode string) string {
 	normalizedProtocol := normalizeProtocol(protocol)
 	if normalizedProtocol != "" && normalizedProtocol != ProxyModeRakNet {
@@ -274,7 +278,13 @@ func (sc *ServerConfig) Normalize() {
 		return
 	}
 	sc.Protocol = normalizeProtocol(sc.Protocol)
+	sc.ProxyOutbound = normalizeProxyOutboundValue(sc.ProxyOutbound)
 	sc.ProxyMode = normalizeServerProxyMode(sc.Protocol, sc.ProxyMode)
+	sc.AutoPingFullScanMode = normalizeAutoPingFullScanMode(sc.AutoPingFullScanMode)
+	if !sc.SupportsAutoPing() {
+		sc.AutoPingEnabled = false
+		sc.AutoPingFullScanMode = AutoPingFullScanModeDisabled
+	}
 }
 
 // GetLatencyMode returns the normalized latency mode. Empty / unknown values
@@ -482,14 +492,14 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
 		XboxAuthEnabled:               sc.XboxAuthEnabled,
 		XboxTokenPath:                 sc.XboxTokenPath,
-		ProxyOutbound:                 sc.ProxyOutbound,
+		ProxyOutbound:                 sc.GetProxyOutbound(),
 		ShowRealLatency:               sc.ShowRealLatency,
 		LoadBalance:                   sc.LoadBalance,
 		LoadBalanceSort:               sc.LoadBalanceSort,
 		LatencyMode:                   sc.GetLatencyMode(),
 		Status:                        status,
 		ActiveSessions:                activeSessions,
-		AutoPingEnabled:               sc.AutoPingEnabled,
+		AutoPingEnabled:               sc.IsAutoPingEnabled(),
 		AutoPingIntervalMinutes:       sc.GetAutoPingIntervalMinutes(),
 		AutoPingTopCandidates:         sc.GetAutoPingTopCandidates(),
 		AutoPingFullScanMode:          sc.GetAutoPingFullScanMode(),
@@ -539,32 +549,37 @@ func (sc *ServerConfig) GetXboxTokenPath() string {
 }
 
 func (sc *ServerConfig) GetProxyOutbound() string {
-	return sc.ProxyOutbound
+	if sc == nil {
+		return ""
+	}
+	return normalizeProxyOutboundValue(sc.ProxyOutbound)
 }
 
 func (sc *ServerConfig) IsDirectConnection() bool {
-	return sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct"
+	proxyOutbound := sc.GetProxyOutbound()
+	return proxyOutbound == "" || strings.EqualFold(proxyOutbound, "direct")
 }
 
 func (sc *ServerConfig) IsGroupSelection() bool {
-	return strings.HasPrefix(sc.ProxyOutbound, "@")
+	return strings.HasPrefix(sc.GetProxyOutbound(), "@")
 }
 
 func (sc *ServerConfig) IsMultiNodeSelection() bool {
-	if sc.ProxyOutbound == "" || sc.ProxyOutbound == "direct" {
+	proxyOutbound := sc.GetProxyOutbound()
+	if proxyOutbound == "" || strings.EqualFold(proxyOutbound, "direct") {
 		return false
 	}
-	if strings.HasPrefix(sc.ProxyOutbound, "@") {
+	if strings.HasPrefix(proxyOutbound, "@") {
 		return false
 	}
-	return strings.Contains(sc.ProxyOutbound, ",")
+	return strings.Contains(proxyOutbound, ",")
 }
 
 func (sc *ServerConfig) GetNodeList() []string {
 	if !sc.IsMultiNodeSelection() {
 		return nil
 	}
-	nodes := strings.Split(sc.ProxyOutbound, ",")
+	nodes := strings.Split(sc.GetProxyOutbound(), ",")
 	result := make([]string, 0, len(nodes))
 	for _, node := range nodes {
 		trimmed := strings.TrimSpace(node)
@@ -577,9 +592,23 @@ func (sc *ServerConfig) GetNodeList() []string {
 
 func (sc *ServerConfig) GetGroupName() string {
 	if sc.IsGroupSelection() {
-		return strings.TrimPrefix(sc.ProxyOutbound, "@")
+		return strings.TrimPrefix(sc.GetProxyOutbound(), "@")
 	}
 	return ""
+}
+
+func (sc *ServerConfig) SupportsAutoPing() bool {
+	if sc == nil {
+		return false
+	}
+	if sc.IsGroupSelection() {
+		return true
+	}
+	return len(sc.GetNodeList()) > 1
+}
+
+func (sc *ServerConfig) IsAutoPingEnabled() bool {
+	return sc != nil && sc.AutoPingEnabled && sc.SupportsAutoPing()
 }
 
 func (sc *ServerConfig) GetProtocolVersion() int {

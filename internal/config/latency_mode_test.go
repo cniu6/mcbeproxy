@@ -197,6 +197,70 @@ func TestServerConfig_Normalize_PreservesRakNetProxyMode(t *testing.T) {
 	}
 }
 
+func TestServerConfig_Normalize_DisablesAutoPingForUnsupportedProxySelections(t *testing.T) {
+	testCases := []struct {
+		name          string
+		proxyOutbound string
+	}{
+		{name: "empty", proxyOutbound: ""},
+		{name: "direct", proxyOutbound: "direct"},
+		{name: "single-node", proxyOutbound: "node-a"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidServerConfig()
+			cfg.ProxyOutbound = tc.proxyOutbound
+			cfg.AutoPingEnabled = true
+			cfg.AutoPingFullScanMode = AutoPingFullScanModeDaily
+
+			cfg.Normalize()
+
+			if cfg.AutoPingEnabled {
+				t.Fatalf("Normalize(proxy_outbound=%q) should disable auto_ping_enabled", tc.proxyOutbound)
+			}
+			if cfg.GetAutoPingFullScanMode() != AutoPingFullScanModeDisabled {
+				t.Fatalf("Normalize(proxy_outbound=%q) should clear auto_ping_full_scan_mode, got %q", tc.proxyOutbound, cfg.GetAutoPingFullScanMode())
+			}
+			if cfg.IsAutoPingEnabled() {
+				t.Fatalf("IsAutoPingEnabled(proxy_outbound=%q) should be false", tc.proxyOutbound)
+			}
+		})
+	}
+}
+
+func TestServerConfig_Normalize_PreservesAutoPingForLoadBalancedProxySelections(t *testing.T) {
+	for _, proxyOutbound := range []string{"@group-a", "node-a,node-b"} {
+		cfg := baseValidServerConfig()
+		cfg.ProxyOutbound = proxyOutbound
+		cfg.AutoPingEnabled = true
+		cfg.AutoPingFullScanMode = AutoPingFullScanModeDaily
+
+		cfg.Normalize()
+
+		if !cfg.AutoPingEnabled {
+			t.Fatalf("Normalize(proxy_outbound=%q) should preserve auto_ping_enabled", proxyOutbound)
+		}
+		if !cfg.IsAutoPingEnabled() {
+			t.Fatalf("IsAutoPingEnabled(proxy_outbound=%q) should remain true", proxyOutbound)
+		}
+		if cfg.GetAutoPingFullScanMode() != AutoPingFullScanModeDaily {
+			t.Fatalf("Normalize(proxy_outbound=%q) should preserve auto_ping_full_scan_mode, got %q", proxyOutbound, cfg.GetAutoPingFullScanMode())
+		}
+	}
+}
+
+func TestServerConfig_ToDTO_HidesAutoPingForUnsupportedProxySelections(t *testing.T) {
+	cfg := baseValidServerConfig()
+	cfg.ProxyOutbound = "node-a"
+	cfg.AutoPingEnabled = true
+
+	dto := cfg.ToDTO("running", 0)
+	if dto.AutoPingEnabled {
+		t.Fatalf("ToDTO should hide auto_ping_enabled for single-node proxy selection")
+	}
+}
+
 func TestServerConfig_ToDTO_PropagatesLatencyMode(t *testing.T) {
 	cfg := baseValidServerConfig()
 	cfg.LatencyMode = LatencyModeAggressive

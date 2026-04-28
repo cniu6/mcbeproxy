@@ -142,7 +142,9 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 	publicServers := make([]publicServerDTO, 0, len(servers))
 	serverIDs := make([]string, 0, len(servers))
 	for _, srv := range servers {
-		serverIDs = append(serverIDs, srv.ID)
+		if shouldExposeServerLatencyOverview(srv) {
+			serverIDs = append(serverIDs, srv.ID)
+		}
 		ping := pings[srv.ID]
 		latency := int64(-1)
 		online := false

@@ -240,10 +240,17 @@ func (a *APIServer) getServerLatencyOverview(c *gin.Context) {
 	respondSuccess(c, a.buildServerLatencyOverview(servers, limit))
 }
 
+func shouldExposeServerLatencyOverview(server config.ServerConfigDTO) bool {
+	return server.AutoPingEnabled
+}
+
 func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO, historyLimit int) map[string]interface{} {
 	pings := a.collectServerPings(servers)
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
+		if !shouldExposeServerLatencyOverview(server) {
+			continue
+		}
 		serverIDs = append(serverIDs, server.ID)
 	}
 	return map[string]interface{}{
@@ -262,9 +269,15 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO) map[str
 		id   string
 		info map[string]interface{}
 	}
-	results := make(chan pingResult, len(servers))
+	eligibleServers := make([]config.ServerConfigDTO, 0, len(servers))
+	for _, server := range servers {
+		if shouldExposeServerLatencyOverview(server) {
+			eligibleServers = append(eligibleServers, server)
+		}
+	}
+	results := make(chan pingResult, len(eligibleServers))
 	var pingWG sync.WaitGroup
-	for _, srv := range servers {
+	for _, srv := range eligibleServers {
 		server := srv
 		pingWG.Add(1)
 		go func() {
@@ -277,7 +290,7 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO) map[str
 		close(results)
 	}()
 
-	pings := make(map[string]map[string]interface{}, len(servers))
+	pings := make(map[string]map[string]interface{}, len(eligibleServers))
 	for result := range results {
 		pings[result.id] = result.info
 	}
@@ -311,7 +324,7 @@ func (a *APIServer) latencyHistoryMinIntervalOverrideMs(serverID string, source 
 		return 0
 	}
 	serverCfg, ok := a.configMgr.GetServer(serverID)
-	if !ok || serverCfg == nil || !serverCfg.AutoPingEnabled {
+	if !ok || serverCfg == nil || !serverCfg.IsAutoPingEnabled() {
 		return 0
 	}
 	intervalMinutes := serverCfg.AutoPingIntervalMinutes

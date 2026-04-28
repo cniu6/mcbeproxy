@@ -153,8 +153,8 @@
               <n-tag size="small" :type="s.status === 'running' ? 'success' : 'error'">{{ s.status === 'running' ? '运行' : '停止' }}</n-tag>
               <n-tag size="small" :type="getProxyModeType(s)">{{ getProxyModeLabel(s) }}</n-tag>
               <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
-              <n-tag size="small" :type="getLatencyType(s)">{{ getLatencyText(s) }}</n-tag>
-              <n-tag size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
+              <n-tag v-if="shouldShowServerLatencyOverview(s)" size="small" :type="getLatencyType(s)">{{ getLatencyText(s) }}</n-tag>
+              <n-tag v-if="shouldShowServerLatencyOverview(s)" size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
               <n-tag v-if="getMotdPlayers(s.id)" size="small" type="info">在线: {{ getMotdPlayers(s.id) }}</n-tag>
               <n-tag v-if="getMotdServerName(s.id)" size="small" type="warning">标题: {{ getMotdServerName(s.id) }}</n-tag>
             </n-space>
@@ -162,7 +162,7 @@
           <template #header-extra>
             <n-space align="center" size="small">
               <n-text v-if="!isMobile" depth="3" style="font-size: 12px">{{ s.listen_addr }} → {{ s.target }}:{{ s.port }}</n-text>
-              <LatencySparkline :samples="getLatencyHistorySamples(s.id)" :show-label="false" :width="110" :height="28" :label="`${s.name} 延迟历史`" clickable @click="openServerLatencyHistoryModal(s)" />
+              <LatencySparkline v-if="shouldShowServerLatencyOverview(s)" :samples="getLatencyHistorySamples(s.id)" :show-label="false" :width="110" :height="28" :label="`${s.name} 延迟历史`" clickable @click="openServerLatencyHistoryModal(s)" />
             </n-space>
           </template>
           <div class="table-wrapper">
@@ -239,6 +239,8 @@ const getProxyModeType = (server) => {
   return typeMap[mode] || 'default'
 }
 
+const shouldShowServerLatencyOverview = (server) => !!server?.auto_ping_enabled
+
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 
 const formatCountdown = (targetAt) => {
@@ -251,7 +253,7 @@ const formatCountdown = (targetAt) => {
 
 const formatServerAutoPingCountdown = (server) => {
   if (server?.status !== 'running') return '已停止'
-  if (!server?.auto_ping_enabled) return '未启用'
+  if (!shouldShowServerLatencyOverview(server)) return '未启用'
   const targetAt = Number(server?.next_auto_ping_at || 0)
   if (!targetAt) return '即将'
   const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
@@ -305,6 +307,7 @@ const loadData = async () => {
 }
 
 const getLatencyText = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) return '—'
   if (server.status !== 'running') return '已停止'
   const ping = serverPings[server.id]
   if (!ping) return '检测中...'
@@ -315,6 +318,7 @@ const getLatencyText = (server) => {
 }
 
 const getLatencyType = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) return 'default'
   if (server.status !== 'running') return 'default'
   const ping = serverPings[server.id]
   if (!ping) return 'default'
@@ -348,6 +352,9 @@ const getServerLatencyCountdownText = (server) => {
 }
 
 const openServerLatencyHistoryModal = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) {
+    return
+  }
   selectedHistoryServer.value = server ? { ...server, server_name: getMotdServerName(server.id) || server.name } : null
   showServerLatencyHistoryModal.value = true
 }

@@ -26,6 +26,7 @@ import (
 func TestRunProxyPortConnectivityTest_HTTP_Direct(t *testing.T) {
 	// 1) Upstream target the test URL should hit through the proxy.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Millisecond)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer target.Close()

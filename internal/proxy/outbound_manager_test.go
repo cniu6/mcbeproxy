@@ -472,6 +472,7 @@ func TestServerNodeLatencyHistoryUsesServerAutoPingIntervalWhenShorterThanGlobal
 		ListenAddr:              "0.0.0.0:19132",
 		Protocol:                "raknet",
 		Enabled:                 true,
+		ProxyOutbound:           "node-a,node-b",
 		AutoPingEnabled:         true,
 		AutoPingIntervalMinutes: 1,
 	})

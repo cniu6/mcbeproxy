@@ -1201,6 +1201,7 @@ const makeDefaultForm = () => ({
   auto_ping_full_scan_interval_hours: globalAutoPingDefaults.full_scan_interval_hours
 })
 const normalizeProtocolValue = (protocol) => String(protocol || '').trim().toLowerCase()
+const normalizeProxyOutboundValue = (proxyOutbound) => String(proxyOutbound || '').trim()
 const normalizeServerProxyMode = (protocol, mode) => {
   const normalizedProtocol = normalizeProtocolValue(protocol)
   if (normalizedProtocol && normalizedProtocol !== 'raknet') {
@@ -1227,6 +1228,18 @@ const getServerModeTag = (server) => {
   const normalizedMode = String(server?.proxy_mode || '').trim().toLowerCase()
   return modeMap[normalizedMode] || { label: server?.proxy_mode || 'Trans', type: 'default' }
 }
+const supportsServerAutoPing = (server) => {
+  const proxyOutbound = normalizeProxyOutboundValue(server?.proxy_outbound)
+  if (!proxyOutbound || proxyOutbound.toLowerCase() === 'direct') {
+    return false
+  }
+  if (proxyOutbound.startsWith('@')) {
+    return true
+  }
+  return proxyOutbound.split(',').map(v => v.trim()).filter(Boolean).length > 1
+}
+const normalizeServerAutoPingEnabled = (server) => supportsServerAutoPing(server) ? !!server?.auto_ping_enabled : false
+const shouldShowServerLatencyOverview = (server) => normalizeServerAutoPingEnabled(server)
 const normalizeServerForm = (server = {}) => {
   const defaults = makeDefaultForm()
   return {
@@ -1240,6 +1253,7 @@ const normalizeServerForm = (server = {}) => {
         : []
     },
     protocol: normalizeProtocolValue(server.protocol ?? defaults.protocol),
+    proxy_outbound: normalizeProxyOutboundValue(server.proxy_outbound ?? defaults.proxy_outbound),
     proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? defaults.proxy_mode)
   }
 }
@@ -1265,7 +1279,12 @@ const buildUDPSpeederPayload = (udpSpeeder) => {
 }
 const buildServerPayload = (server) => {
   const payload = normalizeServerForm(server)
+  payload.proxy_outbound = normalizeProxyOutboundValue(payload.proxy_outbound)
   payload.proxy_mode = normalizeServerProxyMode(payload.protocol, payload.proxy_mode)
+  payload.auto_ping_enabled = normalizeServerAutoPingEnabled(payload)
+  if (!payload.auto_ping_enabled) {
+    payload.auto_ping_full_scan_mode = ''
+  }
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
   return payload
 }
@@ -2217,12 +2236,12 @@ const openServerLatencyHistoryModal = async (server = form.value) => {
     return
   }
   const currentServer = servers.value.find(item => String(item?.id || '').trim() === serverId)
-  selectedServerLatencyHistoryServer.value = normalizeServerModalTarget({
+  const targetServer = {
     ...currentServer,
     ...server,
     id: serverId,
     name: String(server?.name || form.value?.name || serverId).trim(),
-    proxy_outbound: String(server?.proxy_outbound || form.value?.proxy_outbound || currentServer?.proxy_outbound || '').trim(),
+    proxy_outbound: normalizeProxyOutboundValue(server?.proxy_outbound || form.value?.proxy_outbound || currentServer?.proxy_outbound || ''),
     load_balance_sort: String(server?.load_balance_sort || form.value?.load_balance_sort || currentServer?.load_balance_sort || '').trim(),
     status: String(server?.status || currentServer?.status || '').trim(),
     server_name: String(server?.server_name || currentServer?.server_name || '').trim(),
@@ -2230,7 +2249,13 @@ const openServerLatencyHistoryModal = async (server = form.value) => {
       ? server.auto_ping_enabled
       : (typeof currentServer?.auto_ping_enabled === 'boolean' ? currentServer.auto_ping_enabled : form.value?.auto_ping_enabled),
     next_auto_ping_at: Number(server?.next_auto_ping_at || currentServer?.next_auto_ping_at || 0)
-  })
+  }
+  targetServer.auto_ping_enabled = normalizeServerAutoPingEnabled(targetServer)
+  if (!shouldShowServerLatencyOverview(targetServer)) {
+    message.warning('当前服务器未启用自动 Ping，暂无延迟历史')
+    return
+  }
+  selectedServerLatencyHistoryServer.value = normalizeServerModalTarget(targetServer)
   selectedServerLatencyHistoryId.value = serverId
   selectedServerLatencyHistoryName.value = String(server?.name || form.value?.name || serverId).trim()
   serverNodeLatencyHistorySearch.value = ''
@@ -2244,7 +2269,7 @@ const refreshServerLatencyHistoryDetail = async () => {}
 
 const formatServerAutoPingCountdown = (server) => {
   if (server?.status !== 'running') return '已停止'
-  if (!server?.auto_ping_enabled) return '未启用'
+  if (!shouldShowServerLatencyOverview(server)) return '未启用'
   const targetAt = Number(server?.next_auto_ping_at || 0)
   if (!targetAt) return '即将'
   const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
@@ -2259,6 +2284,7 @@ const selectedServerLatencyCountdownText = computed(() => {
 })
 
 const getServerLatencyType = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) return 'default'
   const ping = getServerPing(server.id)
   if (server?.status !== 'running' || ping?.stopped) return 'default'
   if (!ping) return 'default'
@@ -2271,6 +2297,7 @@ const getServerLatencyType = (server) => {
 }
 
 const getServerLatencyText = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) return '—'
   const ping = getServerPing(server.id)
   if (server?.status !== 'running' || ping?.stopped) return '已停止'
   if (!ping) return '检测中...'
@@ -2280,6 +2307,9 @@ const getServerLatencyText = (server) => {
 }
 
 const renderServerLatencyCell = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) {
+    return h('span', { style: 'color: var(--n-text-color-3);' }, '—')
+  }
   const ping = getServerPing(server.id)
   const tags = []
   if (server.status === 'running' && ping?.source === 'proxy') {
@@ -2291,17 +2321,22 @@ const renderServerLatencyCell = (server) => {
   return h(NSpace, { size: 'small', wrap: true }, () => tags)
 }
 
-const renderServerLatencyHistoryCell = (server) => h(LatencySparkline, {
-  samples: getServerLatencyHistorySamples(server.id),
-  loading: serverOverviewLoading.value,
-  label: `${server.name || server.id} 延迟历史`,
-  width: 138,
-  height: 34,
-  showLabel: false,
-  clickable: true,
-  onClick: () => openServerLatencyHistoryModal(server),
-  maxSamples: Math.max(Number(latencyHistoryConfig.render_limit) || 100, 1)
-})
+const renderServerLatencyHistoryCell = (server) => {
+  if (!shouldShowServerLatencyOverview(server)) {
+    return h('span', { style: 'color: var(--n-text-color-3);' }, '—')
+  }
+  return h(LatencySparkline, {
+    samples: getServerLatencyHistorySamples(server.id),
+    loading: serverOverviewLoading.value,
+    label: `${server.name || server.id} 延迟历史`,
+    width: 138,
+    height: 34,
+    showLabel: false,
+    clickable: true,
+    onClick: () => openServerLatencyHistoryModal(server),
+    maxSamples: Math.max(Number(latencyHistoryConfig.render_limit) || 100, 1)
+  })
+}
 
 const refreshServerLatencyOverview = async () => {
   const token = ++serverOverviewFetchToken
@@ -4061,33 +4096,6 @@ const columns = [
     ])
   },
   { title: '模式', key: 'proxy_mode', width: 85, render: r => {
-    const normalizeProtocolValue = (protocol) => String(protocol || '').trim().toLowerCase()
-    const normalizeServerProxyMode = (protocol, mode) => {
-      const normalizedProtocol = normalizeProtocolValue(protocol)
-      if (normalizedProtocol && normalizedProtocol !== 'raknet') {
-        return ''
-      }
-      const normalizedMode = String(mode || '').trim().toLowerCase()
-      if (!normalizedMode || normalizedMode === 'transparent') {
-        return ''
-      }
-      return ['raw_udp', 'passthrough', 'raknet', 'mitm'].includes(normalizedMode) ? normalizedMode : ''
-    }
-    const getServerModeTag = (server) => {
-      const protocol = normalizeProtocolValue(server?.protocol)
-      if (protocol && protocol !== 'raknet') {
-        return { label: 'Plain', type: 'default' }
-      }
-      const modeMap = {
-        raw_udp: { label: 'Raw UDP', type: 'success' },
-        passthrough: { label: 'Pass', type: 'info' },
-        transparent: { label: 'Trans', type: 'warning' },
-        raknet: { label: 'RakNet', type: 'default' },
-        mitm: { label: 'MITM', type: 'error' }
-      }
-      const normalizedMode = String(server?.proxy_mode || '').trim().toLowerCase()
-      return modeMap[normalizedMode] || { label: server?.proxy_mode || 'Trans', type: 'default' }
-    }
     const mode = getServerModeTag(r)
     return h(NTag, { type: mode.type, size: 'small' }, () => mode.label)
   }},
@@ -4135,7 +4143,7 @@ watch(
 )
 
 watch(
-  () => [form.value?.protocol, form.value?.udp_speeder?.enabled, form.value?.latency_mode],
+  () => [form.value?.protocol, form.value?.proxy_outbound, form.value?.udp_speeder?.enabled, form.value?.latency_mode],
   () => {
     const currentMode = form.value?.latency_mode || 'normal'
     const protocol = (form.value?.protocol || '').toLowerCase()
@@ -4152,6 +4160,10 @@ watch(
     }
     if (protocol === 'raknet' && !form.value?.proxy_mode) {
       form.value.proxy_mode = 'passthrough'
+    }
+    const normalizedProxyOutbound = normalizeProxyOutboundValue(form.value?.proxy_outbound)
+    if ((form.value?.proxy_outbound || '') !== normalizedProxyOutbound) {
+      form.value.proxy_outbound = normalizedProxyOutbound
     }
   }
 )
