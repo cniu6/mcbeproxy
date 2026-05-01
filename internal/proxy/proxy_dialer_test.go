@@ -4,6 +4,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"reflect"
@@ -21,6 +22,83 @@ import (
 
 	"mcpeserverproxy/internal/config"
 )
+
+type fakeConnectedPacketConn struct {
+	writeToCalls int
+	writeCalls   int
+	payload      []byte
+}
+
+func (c *fakeConnectedPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, io.EOF
+}
+
+func (c *fakeConnectedPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	c.writeToCalls++
+	return 0, fmt.Errorf("write udp 127.0.0.1:1->127.0.0.1:2: use of WriteTo with pre-connected connection")
+}
+
+func (c *fakeConnectedPacketConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	c.payload = append(c.payload[:0], p...)
+	return len(p), nil
+}
+
+func (c *fakeConnectedPacketConn) Close() error                     { return nil }
+func (c *fakeConnectedPacketConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *fakeConnectedPacketConn) SetDeadline(time.Time) error      { return nil }
+func (c *fakeConnectedPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeConnectedPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestPacketConnWrapperWriteFallsBackForConnectedPacketConn(t *testing.T) {
+	conn := &fakeConnectedPacketConn{}
+	wrapper := &packetConnWrapper{
+		PacketConn: conn,
+		remoteAddr: &net.UDPAddr{
+			IP:   net.IPv4(127, 0, 0, 1),
+			Port: 19132,
+		},
+	}
+	payload := []byte("hello")
+
+	n, err := wrapper.Write(payload)
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected %d bytes written, got %d", len(payload), n)
+	}
+	if conn.writeToCalls != 1 {
+		t.Fatalf("expected one WriteTo attempt, got %d", conn.writeToCalls)
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("expected one fallback Write call, got %d", conn.writeCalls)
+	}
+	if string(conn.payload) != string(payload) {
+		t.Fatalf("unexpected payload: %q", conn.payload)
+	}
+}
+
+func TestTrackedPacketConnWriteToFallsBackForConnectedPacketConn(t *testing.T) {
+	conn := &fakeConnectedPacketConn{}
+	tracked := &trackedPacketConn{PacketConn: conn}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
+	payload := []byte("hello")
+
+	n, err := tracked.WriteTo(payload, addr)
+	if err != nil {
+		t.Fatalf("WriteTo returned error: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected %d bytes written, got %d", len(payload), n)
+	}
+	if conn.writeToCalls != 1 {
+		t.Fatalf("expected one WriteTo attempt, got %d", conn.writeToCalls)
+	}
+	if conn.writeCalls != 1 {
+		t.Fatalf("expected one fallback Write call, got %d", conn.writeCalls)
+	}
+}
 
 // **Feature: singbox-outbound-proxy, Property 5: Direct routing for empty/direct proxy_outbound**
 // **Validates: Requirements 2.2**
@@ -444,6 +522,122 @@ func TestRawUDPProxyRefreshTargetAddrs_PreserveHostnameWhenProxying(t *testing.T
 	}
 }
 
+func TestRawUDPProxyStart_PreserveHostnameWhenProxying(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "play.venitymc.com",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:0",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}
+	proxy := NewRawUDPProxy("server-1", cfg, nil, nil)
+	proxy.SetOutboundManager(NewOutboundManager(nil))
+
+	if err := proxy.Start(); err != nil {
+		t.Fatalf("unexpected start error: %v", err)
+	}
+	defer func() {
+		_ = proxy.Stop()
+	}()
+
+	if proxy.targetAddr != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after Start, got %+v", proxy.targetAddr)
+	}
+	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	if !ok {
+		t.Fatalf("expected HostnamePortAddr after Start, got %T", proxy.targetPacketAddr)
+	}
+	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
+		t.Fatalf("unexpected targetPacketAddr after Start: %q", got)
+	}
+}
+
+func TestRawUDPProxyUpdateConfig_PreserveHostnameWhenProxying(t *testing.T) {
+	cfg := &config.ServerConfig{
+		ID:            "server-1",
+		Target:        "play.venitymc.com",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:0",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}
+	proxy := NewRawUDPProxy("server-1", cfg, nil, nil)
+	proxy.SetOutboundManager(NewOutboundManager(nil))
+
+	if err := proxy.Start(); err != nil {
+		t.Fatalf("unexpected start error: %v", err)
+	}
+	defer func() {
+		_ = proxy.Stop()
+	}()
+
+	nextCfg := *cfg
+	nextCfg.Target = "geo.example.com"
+	nextCfg.Port = 19133
+	proxy.UpdateConfig(&nextCfg)
+
+	if proxy.targetAddr != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after UpdateConfig, got %+v", proxy.targetAddr)
+	}
+	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	if !ok {
+		t.Fatalf("expected HostnamePortAddr after UpdateConfig, got %T", proxy.targetPacketAddr)
+	}
+	if got := hostnameAddr.String(); got != "geo.example.com:19133" {
+		t.Fatalf("unexpected targetPacketAddr after UpdateConfig: %q", got)
+	}
+}
+
+func TestRawUDPProxyPingTargetServer_DirectConnectedUDPWrite(t *testing.T) {
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen target udp: %v", err)
+	}
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, MaxUDPPacketSize)
+		_ = serverConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, addr, err := serverConn.ReadFromUDP(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		if n == 0 || buf[0] != raknetUnconnectedPing {
+			done <- errors.New("target did not receive a RakNet ping")
+			return
+		}
+		pong := buildUnconnectedPongPacket(0, 123456789, []byte("MCPE;Test;1;1.20;0;20;123456789;Test;Survival;1;19132;19133;"))
+		_, err = serverConn.WriteToUDP(pong, addr)
+		done <- err
+	}()
+
+	targetAddr := serverConn.LocalAddr().(*net.UDPAddr)
+	cfg := &config.ServerConfig{
+		ID:         "server-1",
+		Target:     targetAddr.IP.String(),
+		Port:       targetAddr.Port,
+		ListenAddr: "127.0.0.1:0",
+		Enabled:    true,
+	}
+	proxy := NewRawUDPProxy("server-1", cfg, nil, nil)
+	if err := proxy.Start(); err != nil {
+		t.Fatalf("unexpected start error: %v", err)
+	}
+	defer func() {
+		_ = proxy.Stop()
+	}()
+
+	if latency := proxy.pingTargetServer(); latency < 0 {
+		t.Fatalf("expected direct RawUDP target ping to succeed, got %d", latency)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("target server failed: %v", err)
+	}
+}
+
 func TestPlainUDPProxyRefreshTargetAddr_PreserveHostnameWhenProxying(t *testing.T) {
 	cfg := &config.ServerConfig{
 		ID:            "server-1",
@@ -519,11 +713,11 @@ func TestPlainUDPProxyDialTargetConnFailsClosedWithoutOutboundManager(t *testing
 
 func TestProxyPortListenerDialOutboundFailsClosedWithoutOutboundManager(t *testing.T) {
 	listener := newProxyPortListener(&config.ProxyPortConfig{
-		ID:           "port-1",
-		ListenAddr:   "127.0.0.1:1080",
-		Type:         "mixed",
-		Enabled:      true,
-		ProxyOutbound:"node-a",
+		ID:            "port-1",
+		ListenAddr:    "127.0.0.1:1080",
+		Type:          "mixed",
+		Enabled:       true,
+		ProxyOutbound: "node-a",
 	}, nil, newProxyPortDialerPool(nil))
 
 	conn, nodeName, err := listener.dialOutbound(context.Background(), "127.0.0.1:19132")

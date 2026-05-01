@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -92,6 +93,53 @@ func (c *stubConn) SetDeadline(time.Time) error      { return nil }
 func (c *stubConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *stubConn) SetWriteDeadline(time.Time) error { return nil }
 
+type scriptedUDPFactory struct {
+	outbounds   []singboxcore.UDPOutbound
+	createCount int
+}
+
+func (f *scriptedUDPFactory) CreateUDPOutbound(context.Context, *config.ProxyOutbound) (singboxcore.UDPOutbound, error) {
+	if f.createCount >= len(f.outbounds) {
+		return &stubPacketConnOutbound{}, nil
+	}
+	outbound := f.outbounds[f.createCount]
+	f.createCount++
+	return outbound, nil
+}
+
+func (f *scriptedUDPFactory) CreateDialer(context.Context, *config.ProxyOutbound) (singboxcore.Dialer, error) {
+	return &countingDialer{}, nil
+}
+
+type stubPacketConnOutbound struct{}
+
+func (o *stubPacketConnOutbound) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	return &stubPacketConn{}, nil
+}
+
+func (o *stubPacketConnOutbound) Close() error { return nil }
+
+type scriptedUDPOutbound struct {
+	errs        []error
+	listenCalls int
+	closeCalls  int
+}
+
+func (o *scriptedUDPOutbound) ListenPacket(context.Context, string) (net.PacketConn, error) {
+	o.listenCalls++
+	if len(o.errs) > 0 {
+		err := o.errs[0]
+		o.errs = o.errs[1:]
+		return nil, err
+	}
+	return &stubPacketConn{}, nil
+}
+
+func (o *scriptedUDPOutbound) Close() error {
+	o.closeCalls++
+	return nil
+}
+
 func testFactoryOutboundConfig() *config.ProxyOutbound {
 	return &config.ProxyOutbound{
 		Name:    "node-a",
@@ -133,6 +181,45 @@ func TestOutboundManagerWithSingboxFactoryUsesInjectedUDPFactory(t *testing.T) {
 	}
 	if factory.lastUDP.lastDestination != "example.com:19132" {
 		t.Fatalf("unexpected last destination: %q", factory.lastUDP.lastDestination)
+	}
+}
+
+func TestOutboundManagerRecreatesAnyTLSUDPOutboundOnClosedError(t *testing.T) {
+	first := &scriptedUDPOutbound{errs: []error{errors.New("connection closed")}}
+	second := &scriptedUDPOutbound{}
+	factory := &scriptedUDPFactory{outbounds: []singboxcore.UDPOutbound{first, second}}
+	manager := NewOutboundManagerWithSingboxFactory(nil, factory)
+	cfg := &config.ProxyOutbound{
+		Name:     "anytls-a",
+		Type:     config.ProtocolAnyTLS,
+		Server:   "127.0.0.1",
+		Port:     443,
+		Enabled:  true,
+		Password: "password",
+		TLS:      true,
+	}
+	if err := manager.AddOutbound(cfg); err != nil {
+		t.Fatalf("AddOutbound returned error: %v", err)
+	}
+
+	conn, err := manager.DialPacketConn(context.Background(), cfg.Name, "example.com:19132")
+	if err != nil {
+		t.Fatalf("DialPacketConn returned error: %v", err)
+	}
+	_ = conn.Close()
+
+	if factory.createCount != 2 {
+		t.Fatalf("expected factory to recreate UDP outbound, got createCount=%d", factory.createCount)
+	}
+	if first.closeCalls != 1 {
+		t.Fatalf("expected stale outbound to be closed once, got %d", first.closeCalls)
+	}
+	if first.listenCalls != 1 || second.listenCalls != 1 {
+		t.Fatalf("unexpected listen calls: first=%d second=%d", first.listenCalls, second.listenCalls)
+	}
+	status := manager.GetHealthStatus(cfg.Name)
+	if status == nil || !status.Healthy || status.LastError != "" {
+		t.Fatalf("expected outbound healthy after recreate, got %+v", status)
 	}
 }
 
@@ -179,6 +266,37 @@ func TestProxyPortDialerPoolUsesFactoryAndCachesDialers(t *testing.T) {
 	}
 	if factory.dialerCreateCount != 1 {
 		t.Fatalf("expected factory dialer creation once, got %d", factory.dialerCreateCount)
+	}
+}
+
+func TestProxyPortDialerPoolRecreatesDialerWhenSameNameConfigChanges(t *testing.T) {
+	factory := &countingFactory{}
+	pool := newProxyPortDialerPool(factory)
+	cfg := testFactoryOutboundConfig()
+
+	dialer1, err := pool.Get(cfg)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	updated := *cfg
+	updated.Server = "127.0.0.2"
+	dialer2, err := pool.Get(&updated)
+	if err != nil {
+		t.Fatalf("Get updated returned error: %v", err)
+	}
+	dialer3, err := pool.Get(cfg)
+	if err != nil {
+		t.Fatalf("Get original returned error: %v", err)
+	}
+
+	if dialer1 == dialer2 {
+		t.Fatal("expected changed config to create a different dialer")
+	}
+	if dialer1 != dialer3 {
+		t.Fatal("expected unchanged original config to reuse original dialer")
+	}
+	if factory.dialerCreateCount != 2 {
+		t.Fatalf("expected two dialer creations, got %d", factory.dialerCreateCount)
 	}
 }
 

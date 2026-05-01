@@ -366,18 +366,13 @@ func (p *RawUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
 	p.updateTimeouts()
 	newTarget := cfg.GetTargetAddr()
 
-	// Update target address if changed
-	if oldTarget != newTarget {
-		targetAddr, err := net.ResolveUDPAddr("udp", newTarget)
-		if err != nil {
-			logger.Error("RawUDPProxy: Failed to resolve new target address %s: %v", newTarget, err)
-		} else {
-			p.targetAddr = targetAddr
-			logger.Info("RawUDPProxy: Target address updated from %s to %s for server %s (existing clients preserved)", oldTarget, newTarget, p.serverID)
-			if p.config.IsShowRealLatency() {
-				p.maybeRefreshPingCacheAsync(true)
-			}
-		}
+	if err := p.refreshTargetAddrs(); err != nil {
+		logger.Error("RawUDPProxy: Failed to resolve new target address %s: %v", newTarget, err)
+	} else if oldTarget != newTarget {
+		logger.Info("RawUDPProxy: Target address updated from %s to %s for server %s (existing clients preserved)", oldTarget, newTarget, p.serverID)
+	}
+	if p.config != nil && p.config.IsShowRealLatency() {
+		p.maybeRefreshPingCacheAsync(true)
 	}
 
 	logger.Debug("RawUDPProxy config updated for server %s", p.serverID)
@@ -393,12 +388,9 @@ func (p *RawUDPProxy) Start() error {
 		return fmt.Errorf("failed to resolve listen address: %w", err)
 	}
 
-	// Parse target address
-	targetAddr, err := net.ResolveUDPAddr("udp", p.config.GetTargetAddr())
-	if err != nil {
+	if err := p.refreshTargetAddrs(); err != nil {
 		return fmt.Errorf("failed to resolve target address: %w", err)
 	}
-	p.targetAddr = targetAddr
 
 	// Create UDP listener
 	listener, err := net.ListenUDP("udp", listenAddr)
@@ -619,11 +611,11 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 				// Forward the packet (whether or not it's a Login packet)
 				clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
-				_, err = clientInfo.targetConn.WriteTo(packetCopy, clientInfo.targetAddr)
+				_, err = writePacketConn(clientInfo.targetConn, packetCopy, clientInfo.targetAddr)
 			} else {
 				// Login already parsed, forward directly without copying
 				clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
-				_, err = clientInfo.targetConn.WriteTo(buffer[:n], clientInfo.targetAddr)
+				_, err = writePacketConn(clientInfo.targetConn, buffer[:n], clientInfo.targetAddr)
 			}
 
 			if err != nil {
@@ -2753,7 +2745,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// Send ping
 	startTime := time.Now()
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	_, err = conn.WriteTo(pingPacket.Bytes(), targetPacketAddr)
+	_, err = writePacketConn(conn, pingPacket.Bytes(), targetPacketAddr)
 	if err != nil {
 		logger.Debug("RawUDP pingTargetServer write failed: server=%s target=%s node=%s err=%v",
 			p.serverID, p.effectiveTargetAddrString(), selectedNode, err)

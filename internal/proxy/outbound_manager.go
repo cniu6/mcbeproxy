@@ -19,13 +19,13 @@ import (
 
 // Error definitions for OutboundManager operations.
 var (
-	ErrOutboundNotFound   = errors.New("proxy outbound not found")
-	ErrOutboundExists     = errors.New("proxy outbound already exists")
-	ErrOutboundUnhealthy  = errors.New("proxy outbound is unhealthy")
-	ErrAllRetriesFailed   = errors.New("all retry attempts failed")
-	ErrGroupNotFound      = errors.New("proxy group not found")
-	ErrNoHealthyNodes     = errors.New("no healthy nodes available")
-	ErrAllFailoversFailed = errors.New("all failover attempts failed")
+	ErrOutboundNotFound             = errors.New("proxy outbound not found")
+	ErrOutboundExists               = errors.New("proxy outbound already exists")
+	ErrOutboundUnhealthy            = errors.New("proxy outbound is unhealthy")
+	ErrAllRetriesFailed             = errors.New("all retry attempts failed")
+	ErrGroupNotFound                = errors.New("proxy group not found")
+	ErrNoHealthyNodes               = errors.New("no healthy nodes available")
+	ErrAllFailoversFailed           = errors.New("all failover attempts failed")
 	metadataLikeOutboundNamePattern = regexp.MustCompile(`(?i)^(剩余流量|套餐到期|到期时间|过期时间|流量重置|订阅信息|订阅更新时间|更新时间|使用说明|官网|公告|客服|telegram|tg|email|邮箱)\s*[：:]`)
 )
 
@@ -1400,14 +1400,7 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 	// Create packet connection
 	conn, err := singboxOutbound.ListenPacket(ctx, destination)
 	if err != nil {
-		errStr := err.Error()
-		// For Hysteria2 temporary failures (connection closed, EOF), try to recreate the outbound
-		// These are recoverable errors that may require a fresh connection
-		isTemporaryError := strings.Contains(errStr, "connection closed") ||
-			strings.Contains(errStr, "EOF") ||
-			strings.Contains(errStr, "after retries")
-
-		if cfg.Type == config.ProtocolHysteria2 && isTemporaryError {
+		if shouldRecreateSingboxUDPOutbound(cfg, err) {
 			newOutbound, recreateErr := m.recreateSingboxOutbound(outboundName)
 			if recreateErr == nil {
 				conn, err = newOutbound.ListenPacket(ctx, destination)
@@ -1600,7 +1593,7 @@ func (c *trackedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error)
 }
 
 func (c *trackedPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	n, err = c.PacketConn.WriteTo(p, addr)
+	n, err = writePacketConn(c.PacketConn, p, addr)
 	if n > 0 && c.cfg != nil {
 		c.cfg.AddBytesUp(int64(n))
 	}
@@ -1616,6 +1609,27 @@ func (c *trackedPacketConn) Close() error {
 		}
 	})
 	return c.closeErr
+}
+
+func shouldRecreateSingboxUDPOutbound(cfg *config.ProxyOutbound, err error) bool {
+	if cfg == nil || err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	if cfg.Type == config.ProtocolHysteria2 {
+		return strings.Contains(errText, "connection closed") ||
+			strings.Contains(errText, "closed") ||
+			strings.Contains(errText, "eof") ||
+			strings.Contains(errText, "after retries")
+	}
+	if cfg.Type == config.ProtocolAnyTLS {
+		return strings.Contains(errText, "connection closed") ||
+			strings.Contains(errText, "closed") ||
+			strings.Contains(errText, "eof") ||
+			strings.Contains(errText, "broken pipe") ||
+			strings.Contains(errText, "reset by peer")
+	}
+	return false
 }
 
 // Start initializes all sing-box outbound instances for configured proxy outbounds.

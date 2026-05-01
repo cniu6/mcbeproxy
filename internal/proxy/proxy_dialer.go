@@ -439,7 +439,7 @@ func (c *packetConnWrapper) Write(b []byte) (n int, err error) {
 	if c.remoteAddr == nil {
 		return 0, fmt.Errorf("remote address not set")
 	}
-	n, err = c.PacketConn.WriteTo(b, c.remoteAddr)
+	n, err = writePacketConn(c.PacketConn, b, c.remoteAddr)
 	if err != nil {
 		logger.Debug("packetConnWrapper.Write error: %v", err)
 	}

@@ -161,14 +161,15 @@ func (p *proxyPortDialerPool) Get(cfg *config.ProxyOutbound) (singboxcore.Dialer
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if d, ok := p.dialers[cfg.Name]; ok {
+	cacheKey := proxyOutboundDialerCacheKey(cfg)
+	if d, ok := p.dialers[cacheKey]; ok {
 		return d, nil
 	}
 	dialer, err := p.factory.CreateDialer(context.Background(), cfg)
 	if err != nil {
 		return nil, err
 	}
-	p.dialers[cfg.Name] = dialer
+	p.dialers[cacheKey] = dialer
 	return dialer, nil
 }
 
@@ -179,6 +180,49 @@ func (p *proxyPortDialerPool) CloseAll() {
 		_ = d.Close()
 		delete(p.dialers, name)
 	}
+}
+
+func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
+	if cfg == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%d|%d|%d|%d|%s|%t|%s|%t|%s|%t|%s|%s|%s|%s|%s|%s|%s|%s",
+		cfg.Name,
+		cfg.Type,
+		cfg.Server,
+		cfg.Port,
+		cfg.Username,
+		cfg.Method,
+		cfg.Password,
+		cfg.UUID,
+		cfg.Security,
+		cfg.AlterID,
+		cfg.Flow,
+		cfg.Obfs,
+		cfg.ObfsPassword,
+		cfg.HopInterval,
+		cfg.UpMbps,
+		cfg.PortHopping,
+		cfg.CertFingerprint,
+		cfg.DownMbps,
+		cfg.IdleSessionCheckInterval,
+		cfg.IdleSessionTimeout,
+		cfg.MinIdleSession,
+		cfg.ALPN,
+		cfg.TLS,
+		cfg.SNI,
+		cfg.Insecure,
+		cfg.Fingerprint,
+		cfg.Reality,
+		cfg.RealityPublicKey,
+		cfg.RealityShortID,
+		cfg.Network,
+		cfg.WSPath,
+		cfg.WSHost,
+		cfg.XHTTPMode,
+		cfg.GRPCServiceName,
+		cfg.GRPCAuthority,
+	)
 }
 
 type proxyPortListener struct {
