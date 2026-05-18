@@ -1098,7 +1098,7 @@
 
 <script setup>
  import { ref, reactive, computed, onMounted, onUnmounted, h, nextTick, watch } from 'vue'
- import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip } from 'naive-ui'
+ import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip, NSwitch } from 'naive-ui'
  import { api, apiStream } from '../api'
  import LatencySparkline from '../components/LatencySparkline.vue'
  import ServerLatencyHistoryModal from '../components/ServerLatencyHistoryModal.vue'
@@ -3071,8 +3071,9 @@ const formProxyColumns = [
 const formProxyColumnsWithActions = computed(() => [
   { type: 'selection' },
   ...formProxyColumns,
-  { title: '操作', key: 'actions', width: 130, fixed: 'right', render: r => h(NSpace, { size: 'small' }, () => [
+  { title: '操作', key: 'actions', width: 200, fixed: 'right', render: r => h(NSpace, { size: 'small', wrap: false }, () => [
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'tcp', form.value?.id || '') } }, () => 'TCP'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'http', form.value?.id || '') } }, () => 'HTTP'),
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'udp', form.value?.id || '') } }, () => 'UDP'),
     h(NButton, { size: 'tiny', type: 'primary', onClick: (e) => { e.stopPropagation(); formSelectedNodes.value = [r.name] } }, () => '选择')
   ])}
@@ -4101,14 +4102,41 @@ const columns = [
   }},
   { title: '协议', key: 'protocol', width: 70 },
   { title: '状态', key: 'status', width: 70, render: r => h(NTag, { type: r.status === 'running' ? 'success' : 'error', size: 'small' }, () => r.status === 'running' ? '运行' : '停止') },
-  { title: '启用', key: 'enabled', width: 50, render: r => h(NTag, { type: r.enabled ? 'success' : 'warning', size: 'small' }, () => r.enabled ? '是' : '否') },
+  { title: '启用', key: 'enabled', width: 70, render: r => h(NSwitch, {
+    value: !!r.enabled,
+    size: 'small',
+    loading: !!serverActionLoading.value[`enable:${r.id}`],
+    'onUpdate:value': (val) => toggleServerEnabled(r, val)
+  }) },
   { title: '在线', key: 'active_sessions', width: 45 },
   { title: '延迟', key: 'latency', width: 150, render: r => renderServerLatencyCell(r) },
   { title: '历史趋势', key: 'latency_history', width: 170, render: r => renderServerLatencyHistoryCell(r) },
-  { title: '操作', key: 'actions', width: 130, render: r => h(NSpace, { size: 'small' }, () => [
-    h(NButton, { size: 'tiny', onClick: () => openEditModal(r) }, () => '编辑'),
-    h(NPopconfirm, { onPositiveClick: () => deleteServer(r.id) }, { trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'), default: () => '确定删除?' })
-  ])}
+  { title: '操作', key: 'actions', width: 260, fixed: 'right', render: r => {
+    const running = r.status === 'running'
+    return h(NSpace, { size: 4, wrap: false }, () => [
+      running
+        ? h(NButton, {
+            size: 'tiny',
+            type: 'warning',
+            loading: !!serverActionLoading.value[`stop:${r.id}`],
+            onClick: () => controlServer(r.id, 'stop')
+          }, () => '停止')
+        : h(NButton, {
+            size: 'tiny',
+            type: 'success',
+            loading: !!serverActionLoading.value[`start:${r.id}`],
+            onClick: () => controlServer(r.id, 'start')
+          }, () => '启动'),
+      h(NButton, {
+        size: 'tiny',
+        type: 'info',
+        loading: !!serverActionLoading.value[`reload:${r.id}`],
+        onClick: () => controlServer(r.id, 'reload')
+      }, () => '重载'),
+      h(NButton, { size: 'tiny', onClick: () => openEditModal(r) }, () => '编辑'),
+      h(NPopconfirm, { onPositiveClick: () => deleteServer(r.id) }, { trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'), default: () => '确定删除?' })
+    ])
+  }}
 ]
 
 // ...
@@ -4319,6 +4347,54 @@ const saveServer = async () => {
 const deleteServer = async (id) => {
   const res = await api(`/api/servers/${id}`, 'DELETE')
   if (res.success) { message.success('已删除'); load() } else message.error(res.error || '删除失败')
+}
+
+// 启停控制：start/stop/reload，单个 server 的 loading 状态记录在 serverActionLoading 上
+const serverActionLoading = ref({})
+
+const setServerActionLoading = (id, action, loading) => {
+  const next = { ...serverActionLoading.value }
+  const key = `${action}:${id}`
+  if (loading) next[key] = true
+  else delete next[key]
+  serverActionLoading.value = next
+}
+
+const controlServer = async (id, action) => {
+  if (!id || !['start', 'stop', 'reload'].includes(action)) return
+  setServerActionLoading(id, action, true)
+  try {
+    const res = await api(`/api/servers/${id}/${action}`, 'POST')
+    if (res.success) {
+      message.success({
+        start: '已启动',
+        stop: '已停止',
+        reload: '已重载'
+      }[action])
+      load()
+    } else {
+      message.error(res.error || res.msg || '操作失败')
+    }
+  } finally {
+    setServerActionLoading(id, action, false)
+  }
+}
+
+const toggleServerEnabled = async (row, nextEnabled) => {
+  const id = row.id
+  const action = nextEnabled ? 'enable' : 'disable'
+  setServerActionLoading(id, 'enable', true)
+  try {
+    const res = await api(`/api/servers/${id}/${action}`, 'POST')
+    if (res.success) {
+      message.success(nextEnabled ? '已启用' : '已禁用')
+      load()
+    } else {
+      message.error(res.error || res.msg || '操作失败')
+    }
+  } finally {
+    setServerActionLoading(id, 'enable', false)
+  }
 }
 
 const openExportModal = () => { exportJson.value = JSON.stringify(servers.value, null, 2); showExportModal.value = true }

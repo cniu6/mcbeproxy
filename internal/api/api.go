@@ -554,6 +554,18 @@ func (a *APIServer) createServer(c *gin.Context) {
 		return
 	}
 
+	// 显式启动 listener，不再依赖 fsnotify -> Reload 触发链。
+	// 同进程改写自己的 config.json 时，fsnotify 偶发延迟 / 丢事件
+	// （Windows 下尤甚），导致"新建成功但 listener 未起来"。
+	if serverCfg.Enabled && a.proxyController != nil {
+		if !a.proxyController.IsServerRunning(serverCfg.ID) {
+			if err := a.proxyController.StartServer(serverCfg.ID); err != nil {
+				// 不阻断创建流程，记到响应里供前端展示
+				fmt.Printf("Warning: failed to start listener for new server %s: %v\n", serverCfg.ID, err)
+			}
+		}
+	}
+
 	// Return the created server with status
 	status := a.proxyController.GetServerStatus(serverCfg.ID)
 	activeSessions := a.proxyController.GetActiveSessionsForServer(serverCfg.ID)
@@ -576,12 +588,25 @@ func (a *APIServer) updateServer(c *gin.Context) {
 		return
 	}
 
-	// Reload the server to apply new configuration
-	// This will stop and restart the listener with the new config
-	if a.proxyController.IsServerRunning(serverID) {
-		if err := a.proxyController.ReloadServer(serverCfg.ID); err != nil {
-			// Log the error but don't fail the request - config was saved successfully
-			fmt.Printf("Warning: failed to reload server %s after config update: %v\n", serverCfg.ID, err)
+	// 让 listener 状态与最新配置严格一致：
+	// - 如果在跑：ReloadServer 会按新配置 stop+start
+	// - 如果没在跑且新配置 enabled：直接 StartServer，避免依赖 fsnotify
+	// - 如果在跑但新配置 disabled：StopServer
+	if a.proxyController != nil {
+		running := a.proxyController.IsServerRunning(serverCfg.ID)
+		switch {
+		case running && serverCfg.Enabled:
+			if err := a.proxyController.ReloadServer(serverCfg.ID); err != nil {
+				fmt.Printf("Warning: failed to reload server %s after config update: %v\n", serverCfg.ID, err)
+			}
+		case running && !serverCfg.Enabled:
+			if err := a.proxyController.StopServer(serverCfg.ID); err != nil {
+				fmt.Printf("Warning: failed to stop server %s after disable: %v\n", serverCfg.ID, err)
+			}
+		case !running && serverCfg.Enabled:
+			if err := a.proxyController.StartServer(serverCfg.ID); err != nil {
+				fmt.Printf("Warning: failed to start server %s after enable: %v\n", serverCfg.ID, err)
+			}
 		}
 	}
 

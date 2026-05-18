@@ -20,6 +20,7 @@ internal/api/dist/*
 
 # Build output
 build/
+release/
 mcpeserverproxy
 data.db
 .claude/settings.local.json

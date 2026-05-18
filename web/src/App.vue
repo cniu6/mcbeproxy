@@ -40,18 +40,20 @@
             </n-drawer>
             
             <n-layout-content :style="{ padding: isMobile ? '12px' : '16px', overflowX: 'auto' }">
-              <Dashboard v-if="currentPage === 'dashboard'" />
-              <ServiceStatus v-else-if="currentPage === 'service-status'" />
-              <Servers v-else-if="currentPage === 'servers'" />
-              <ProxyOutbounds v-else-if="currentPage === 'proxy-outbounds'" :initial-search="searchParam" :initial-highlight="highlightParam" :key="'proxy-outbounds-' + searchKey" />
-              <ProxyPorts v-else-if="currentPage === 'proxy-ports'" />
-              <Players v-else-if="currentPage === 'players'" :initial-search="searchParam" :key="'players-' + searchKey" />
-              <Blacklist v-else-if="currentPage === 'blacklist'" />
-              <Whitelist v-else-if="currentPage === 'whitelist'" />
-              <Sessions v-else-if="currentPage === 'sessions'" :initial-search="searchParam" :key="'sessions-' + searchKey" />
-              <Logs v-else-if="currentPage === 'logs'" />
-              <Debug v-else-if="currentPage === 'debug'" />
-              <Settings v-else-if="currentPage === 'settings'" />
+              <Suspense>
+                <template #default>
+                  <component
+                    :is="currentView"
+                    v-bind="currentViewProps"
+                    :key="currentViewKey"
+                  />
+                </template>
+                <template #fallback>
+                  <div style="display:flex;justify-content:center;align-items:center;padding:48px 0;">
+                    <n-spin size="large" />
+                  </div>
+                </template>
+              </Suspense>
             </n-layout-content>
           </n-layout>
         </n-layout>
@@ -61,22 +63,24 @@
 </template>
 
 <script setup>
-import { ref, h, onMounted, onUnmounted, computed } from 'vue'
+import { ref, h, onMounted, onUnmounted, computed, defineAsyncComponent } from 'vue'
 import { darkTheme } from 'naive-ui'
 import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
-import Dashboard from './views/Dashboard.vue'
-import ServiceStatus from './views/ServiceStatus.vue'
-import Servers from './views/Servers.vue'
-import Players from './views/Players.vue'
-import Blacklist from './views/Blacklist.vue'
-import Whitelist from './views/Whitelist.vue'
-import Sessions from './views/Sessions.vue'
-import Logs from './views/Logs.vue'
-import Settings from './views/Settings.vue'
-import ProxyOutbounds from './views/ProxyOutbounds.vue'
-import ProxyPorts from './views/ProxyPorts.vue'
-import Debug from './views/Debug.vue'
+
+// 视图按需加载（每个页面一个 chunk），减小入口体积
+const Dashboard = defineAsyncComponent(() => import('./views/Dashboard.vue'))
+const ServiceStatus = defineAsyncComponent(() => import('./views/ServiceStatus.vue'))
+const Servers = defineAsyncComponent(() => import('./views/Servers.vue'))
+const Players = defineAsyncComponent(() => import('./views/Players.vue'))
+const Blacklist = defineAsyncComponent(() => import('./views/Blacklist.vue'))
+const Whitelist = defineAsyncComponent(() => import('./views/Whitelist.vue'))
+const Sessions = defineAsyncComponent(() => import('./views/Sessions.vue'))
+const Logs = defineAsyncComponent(() => import('./views/Logs.vue'))
+const Settings = defineAsyncComponent(() => import('./views/Settings.vue'))
+const ProxyOutbounds = defineAsyncComponent(() => import('./views/ProxyOutbounds.vue'))
+const ProxyPorts = defineAsyncComponent(() => import('./views/ProxyPorts.vue'))
+const Debug = defineAsyncComponent(() => import('./views/Debug.vue'))
 
 const currentPage = ref('dashboard')
 const searchParam = ref('')
@@ -105,6 +109,44 @@ const menuOptions = [
 ]
 
 const highlightParam = ref('')
+
+// 页面映射 + 每页特定 props（保留原 :key 重置语义）
+const pageComponentMap = {
+  'dashboard': Dashboard,
+  'service-status': ServiceStatus,
+  'servers': Servers,
+  'proxy-outbounds': ProxyOutbounds,
+  'proxy-ports': ProxyPorts,
+  'players': Players,
+  'blacklist': Blacklist,
+  'whitelist': Whitelist,
+  'sessions': Sessions,
+  'logs': Logs,
+  'debug': Debug,
+  'settings': Settings
+}
+
+const currentView = computed(() => pageComponentMap[currentPage.value] || Dashboard)
+
+const currentViewProps = computed(() => {
+  switch (currentPage.value) {
+    case 'proxy-outbounds':
+      return { initialSearch: searchParam.value, initialHighlight: highlightParam.value }
+    case 'players':
+    case 'sessions':
+      return { initialSearch: searchParam.value }
+    default:
+      return {}
+  }
+})
+
+const currentViewKey = computed(() => {
+  // 仅对依赖搜索参数的页面附加 searchKey，避免无关页面被销毁重建
+  if (['proxy-outbounds', 'players', 'sessions'].includes(currentPage.value)) {
+    return `${currentPage.value}-${searchKey.value}`
+  }
+  return currentPage.value
+})
 
 const normalizePage = (page) => {
   const validPages = new Set(menuOptions.map(opt => opt.key))
