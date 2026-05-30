@@ -27,6 +27,7 @@ type mockProxyController struct {
 	lastKickReason string
 	kickCalls      int
 	kickReturn     int
+	statuses       []config.ServerConfigDTO
 }
 
 func (m *mockProxyController) StartServer(serverID string) error              { return nil }
@@ -35,7 +36,7 @@ func (m *mockProxyController) ReloadServer(serverID string) error             { 
 func (m *mockProxyController) IsServerRunning(serverID string) bool           { return false }
 func (m *mockProxyController) GetServerStatus(serverID string) string         { return "stopped" }
 func (m *mockProxyController) GetActiveSessionsForServer(serverID string) int { return 0 }
-func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO { return nil }
+func (m *mockProxyController) GetAllServerStatuses() []config.ServerConfigDTO { return m.statuses }
 func (m *mockProxyController) KickPlayer(playerName string, reason string) int {
 	m.lastKickPlayer = playerName
 	m.lastKickReason = reason
@@ -573,4 +574,105 @@ func TestProperty10_APIKeyAuthentication(t *testing.T) {
 	))
 
 	properties.TestingRun(t)
+}
+
+// TestBuildWebIndexResponse_ExcludesHiddenServers verifies that servers marked
+// Hidden are omitted from the public status page (/api/web/index): both the
+// server list and the total/online counts must exclude them.
+func TestBuildWebIndexResponse_ExcludesHiddenServers(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	api.proxyController = &mockProxyController{statuses: []config.ServerConfigDTO{
+		{ID: "visible-1", Name: "visible-1", Status: "running"},
+		{ID: "hidden-1", Name: "hidden-1", Status: "running", Hidden: true},
+		{ID: "visible-2", Name: "visible-2", Status: "stopped"},
+	}}
+
+	data := api.buildWebIndexResponse()
+
+	var resp struct {
+		Servers []struct {
+			ID string `json:"id"`
+		} `json:"servers"`
+		TotalServers  int `json:"total_servers"`
+		OnlineServers int `json:"online_servers"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("failed to unmarshal web index response: %v", err)
+	}
+
+	if resp.TotalServers != 2 {
+		t.Errorf("total_servers = %d, want 2 (hidden server must not be counted)", resp.TotalServers)
+	}
+	ids := make(map[string]bool, len(resp.Servers))
+	for _, s := range resp.Servers {
+		ids[s.ID] = true
+	}
+	if ids["hidden-1"] {
+		t.Errorf("hidden server 'hidden-1' must not appear in public server list, got %v", resp.Servers)
+	}
+	if !ids["visible-1"] || !ids["visible-2"] {
+		t.Errorf("visible servers missing from public list, got %v", resp.Servers)
+	}
+}
+
+// TestHideShowServerEndpoints verifies the hide/show endpoints (and their
+// disable/enable aliases) toggle the Hidden flag without affecting the server.
+func TestHideShowServerEndpoints(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	srv := &config.ServerConfig{
+		ID:         "srv-hide",
+		Name:       "srv-hide",
+		Target:     "127.0.0.1",
+		Port:       19132,
+		ListenAddr: "0.0.0.0:19132",
+		Protocol:   "raknet",
+		Enabled:    true,
+	}
+	if err := api.configMgr.AddServer(srv); err != nil {
+		t.Fatalf("failed to add server: %v", err)
+	}
+
+	post := func(path string) {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		w := httptest.NewRecorder()
+		api.GetRouter().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST %s returned %d, body=%s", path, w.Code, w.Body.String())
+		}
+	}
+	hiddenNow := func() bool {
+		cfg, ok := api.configMgr.GetServer("srv-hide")
+		if !ok {
+			t.Fatal("server disappeared")
+		}
+		return cfg.Hidden
+	}
+
+	post("/api/servers/srv-hide/hide")
+	if !hiddenNow() {
+		t.Error("after /hide, server should be Hidden=true")
+	}
+	post("/api/servers/srv-hide/show")
+	if hiddenNow() {
+		t.Error("after /show, server should be Hidden=false")
+	}
+	// Backward-compatible aliases.
+	post("/api/servers/srv-hide/disable")
+	if !hiddenNow() {
+		t.Error("after /disable (alias), server should be Hidden=true")
+	}
+	post("/api/servers/srv-hide/enable")
+	if hiddenNow() {
+		t.Error("after /enable (alias), server should be Hidden=false")
+	}
+
+	// Visibility must never change the enabled/running intent.
+	post("/api/servers/srv-hide/hide")
+	if cfg, _ := api.configMgr.GetServer("srv-hide"); !cfg.Enabled {
+		t.Error("hiding a server must not change Enabled")
+	}
 }

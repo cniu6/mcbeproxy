@@ -547,6 +547,7 @@
             :row-key="r => r.name"
             :row-props="quickSelectRowProps"
             v-model:checked-row-keys="quickCheckedKeys"
+            :virtual-scroll="true"
             :pagination="proxySelectorPagination"
             @update:page="p => proxySelectorPagination.page = p"
             @update:page-size="s => { proxySelectorPagination.pageSize = s; proxySelectorPagination.page = 1 }"
@@ -713,6 +714,7 @@
             :row-key="r => r.name"
             :row-props="formSelectRowProps"
             v-model:checked-row-keys="formSelectedNodes"
+            :virtual-scroll="true"
             :pagination="formProxySelectorPagination"
             @update:page="p => formProxySelectorPagination.page = p"
             @update:page-size="s => { formProxySelectorPagination.pageSize = s; formProxySelectorPagination.page = 1 }"
@@ -1177,6 +1179,7 @@ const latencyHistoryConfig = reactive({
 })
 const baseDefaultForm = {
   id: '', name: '', listen_addr: '0.0.0.0:19132', target: '', port: 19132, protocol: 'raknet', enabled: true,
+  hidden: false,
   disabled_message: '§c服务器维护中§r\n§7请稍后再试',
   custom_motd: '', // 留空则从远程服务器获取
   xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
@@ -4102,11 +4105,11 @@ const columns = [
   }},
   { title: '协议', key: 'protocol', width: 70 },
   { title: '状态', key: 'status', width: 70, render: r => h(NTag, { type: r.status === 'running' ? 'success' : 'error', size: 'small' }, () => r.status === 'running' ? '运行' : '停止') },
-  { title: '启用', key: 'enabled', width: 70, render: r => h(NSwitch, {
-    value: !!r.enabled,
+  { title: '展示', key: 'hidden', width: 70, render: r => h(NSwitch, {
+    value: !r.hidden,
     size: 'small',
-    loading: !!serverActionLoading.value[`enable:${r.id}`],
-    'onUpdate:value': (val) => toggleServerEnabled(r, val)
+    loading: !!serverActionLoading.value[`visible:${r.id}`],
+    'onUpdate:value': (val) => toggleServerVisible(r, val)
   }) },
   { title: '在线', key: 'active_sessions', width: 45 },
   { title: '延迟', key: 'latency', width: 150, render: r => renderServerLatencyCell(r) },
@@ -4380,20 +4383,22 @@ const controlServer = async (id, action) => {
   }
 }
 
-const toggleServerEnabled = async (row, nextEnabled) => {
+// Toggle whether a server is shown on the public status page (/api/web/index).
+// Display-only: does NOT start/stop the server or affect connections.
+const toggleServerVisible = async (row, nextVisible) => {
   const id = row.id
-  const action = nextEnabled ? 'enable' : 'disable'
-  setServerActionLoading(id, 'enable', true)
+  const action = nextVisible ? 'show' : 'hide'
+  setServerActionLoading(id, 'visible', true)
   try {
     const res = await api(`/api/servers/${id}/${action}`, 'POST')
     if (res.success) {
-      message.success(nextEnabled ? '已启用' : '已禁用')
+      message.success(nextVisible ? '已在公开页展示' : '已从公开页隐藏')
       load()
     } else {
       message.error(res.error || res.msg || '操作失败')
     }
   } finally {
-    setServerActionLoading(id, 'enable', false)
+    setServerActionLoading(id, 'visible', false)
   }
 }
 

@@ -255,6 +255,7 @@
             :row-key="r => r.name"
             :row-props="formSelectRowProps"
             v-model:checked-row-keys="formSelectedNodes"
+            :virtual-scroll="true"
             :pagination="formProxySelectorPagination"
             @update:page="p => formProxySelectorPagination.page = p"
             @update:page-size="s => { formProxySelectorPagination.pageSize = s; formProxySelectorPagination.page = 1 }"

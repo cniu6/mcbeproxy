@@ -128,20 +128,26 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 
 	// Build filtered server list (no IP/port/sensitive fields, no "来源")
 	type publicServerDTO struct {
-		ID             string `json:"id"`
-		Status         string `json:"status"`
-		Latency        int64  `json:"latency"`
-		Online         bool   `json:"online"`
-		ServerName     string `json:"server_name"`
-		Stopped        bool   `json:"stopped"`
-		AutoPingEnabled bool  `json:"auto_ping_enabled"`
-		NextAutoPingAt int64  `json:"next_auto_ping_at"`
+		ID              string `json:"id"`
+		Status          string `json:"status"`
+		Latency         int64  `json:"latency"`
+		Online          bool   `json:"online"`
+		ServerName      string `json:"server_name"`
+		Stopped         bool   `json:"stopped"`
+		AutoPingEnabled bool   `json:"auto_ping_enabled"`
+		NextAutoPingAt  int64  `json:"next_auto_ping_at"`
 	}
 	onlineCount := 0
-	totalCount := len(servers)
+	totalCount := 0
 	publicServers := make([]publicServerDTO, 0, len(servers))
 	serverIDs := make([]string, 0, len(servers))
 	for _, srv := range servers {
+		// Hidden servers are excluded from the public status page entirely
+		// (list, total/online counts, and latency overview).
+		if srv.Hidden {
+			continue
+		}
+		totalCount++
 		if shouldExposeServerLatencyOverview(srv) {
 			serverIDs = append(serverIDs, srv.ID)
 		}
@@ -391,10 +397,10 @@ func (a *APIServer) getWebServerLatencyHistory(c *gin.Context) {
 		samples = filterWebServerLatencyHistorySamples(a.serverLatencyHistory.History(serverID), fromMs, toMs, limit)
 	}
 	respondSuccess(c, map[string]interface{}{
-		"id":     serverID,
-		"from":   fromMs,
-		"to":     toMs,
-		"limit":  limit,
+		"id":      serverID,
+		"from":    fromMs,
+		"to":      toMs,
+		"limit":   limit,
 		"samples": samples,
 	})
 }
