@@ -83,19 +83,67 @@ func (a *APIServer) serveDashboardHTML(c *gin.Context) {
 // the client doesn't accept compression. Each variant is matched as a separate
 // embedded file (e.g. "assets/index-abc.js.br" / ".gz").
 func pickPrecompressed(subFS fs.FS, assetPath string, acceptEncoding string) (encoding string, data []byte) {
-	ae := strings.ToLower(acceptEncoding)
 	// Prefer Brotli when the client supports it (better ratio for text assets).
-	if strings.Contains(ae, "br") {
+	if encodingAccepted(acceptEncoding, "br") {
 		if b, err := fs.ReadFile(subFS, "assets"+assetPath+".br"); err == nil {
 			return "br", b
 		}
 	}
-	if strings.Contains(ae, "gzip") {
+	if encodingAccepted(acceptEncoding, "gzip") {
 		if b, err := fs.ReadFile(subFS, "assets"+assetPath+".gz"); err == nil {
 			return "gzip", b
 		}
 	}
 	return "", nil
+}
+
+// encodingAccepted reports whether the client accepts the given content coding
+// according to its Accept-Encoding header. It parses the comma-separated list
+// of codings and honours q-values, so a coding explicitly disabled with "q=0"
+// (e.g. "br;q=0") is treated as not accepted. A "*" wildcard is respected as a
+// fallback. Matching the bare coding token avoids the substring false positives
+// of strings.Contains (e.g. serving Brotli to a client that sent "br;q=0").
+func encodingAccepted(acceptEncoding, coding string) bool {
+	coding = strings.ToLower(strings.TrimSpace(coding))
+	if coding == "" {
+		return false
+	}
+
+	wildcardSeen := false
+	wildcardAccepted := false
+	for _, part := range strings.Split(acceptEncoding, ",") {
+		token := strings.TrimSpace(strings.ToLower(part))
+		if token == "" {
+			continue
+		}
+
+		name := token
+		q := 1.0
+		if idx := strings.Index(token, ";"); idx >= 0 {
+			name = strings.TrimSpace(token[:idx])
+			for _, param := range strings.Split(token[idx+1:], ";") {
+				param = strings.TrimSpace(param)
+				if strings.HasPrefix(param, "q=") {
+					if v, err := strconv.ParseFloat(strings.TrimSpace(param[2:]), 64); err == nil {
+						q = v
+					}
+				}
+			}
+		}
+
+		switch name {
+		case coding:
+			return q > 0
+		case "*":
+			wildcardSeen = true
+			wildcardAccepted = q > 0
+		}
+	}
+
+	if wildcardSeen {
+		return wildcardAccepted
+	}
+	return false
 }
 
 func contentTypeForPath(filepath string) string {

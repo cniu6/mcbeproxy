@@ -1459,14 +1459,13 @@ func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbou
 	}
 
 	m.mu.RLock()
-	if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+	if _, ok := m.singboxOutbounds[cfg.Name]; ok {
 		m.mu.RUnlock()
 		m.mu.Lock()
+		var existing singboxcore.UDPOutbound
 		if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
 			m.singboxLastUsed[cfg.Name] = time.Now()
 			existing = current
-		} else {
-			existing = nil
 		}
 		m.mu.Unlock()
 		if existing != nil {
@@ -1478,14 +1477,13 @@ func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbou
 
 	result, err, _ := m.singboxInitGroup.Do(cfg.Name, func() (interface{}, error) {
 		m.mu.RLock()
-		if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+		if _, ok := m.singboxOutbounds[cfg.Name]; ok {
 			m.mu.RUnlock()
 			m.mu.Lock()
+			var existing singboxcore.UDPOutbound
 			if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
 				m.singboxLastUsed[cfg.Name] = time.Now()
 				existing = current
-			} else {
-				existing = nil
 			}
 			m.mu.Unlock()
 			if existing != nil {

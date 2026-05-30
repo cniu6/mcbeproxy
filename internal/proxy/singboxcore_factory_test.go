@@ -278,9 +278,9 @@ func TestProxyPortDialerPoolRecreatesDialerWhenSameNameConfigChanges(t *testing.
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	updated := *cfg
+	updated := cfg.Clone()
 	updated.Server = "127.0.0.2"
-	dialer2, err := pool.Get(&updated)
+	dialer2, err := pool.Get(updated)
 	if err != nil {
 		t.Fatalf("Get updated returned error: %v", err)
 	}
