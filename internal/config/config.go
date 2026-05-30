@@ -154,8 +154,21 @@ type ServerConfig struct {
 	AutoPingFullScanMode          string `json:"auto_ping_full_scan_mode,omitempty"` // "", daily, interval
 	AutoPingFullScanTime          string `json:"auto_ping_full_scan_time,omitempty"` // HH:MM for daily full scan
 	AutoPingFullScanIntervalHours int    `json:"auto_ping_full_scan_interval_hours"` // Full-scan interval in hours when mode=interval
-	resolvedIP                    string
-	lastResolved                  time.Time
+	// AutoSelectBlockedNodes holds per-server auto-select bans keyed by node name.
+	// A node listed here is excluded from THIS server's automatic node selection
+	// (load balancing / auto-switch) without affecting other servers. It is the
+	// per-server counterpart to ProxyOutbound.AutoSelectBlocked, which bans a node
+	// globally for every server that references it.
+	AutoSelectBlockedNodes map[string]*NodeAutoSelectBlock `json:"auto_select_blocked_nodes,omitempty"`
+	resolvedIP             string
+	lastResolved           time.Time
+}
+
+// NodeAutoSelectBlock describes a per-server auto-select ban on a single node.
+type NodeAutoSelectBlock struct {
+	Reason    string     `json:"reason,omitempty"`
+	BlockedAt time.Time  `json:"blocked_at,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 const (
@@ -666,6 +679,45 @@ func (sc *ServerConfig) GetLoadBalanceSort() string {
 		return LoadBalanceSortUDP
 	}
 	return sc.LoadBalanceSort
+}
+
+// IsNodeAutoSelectBlocked reports whether the given node currently has an active
+// per-server auto-select ban on this server. Expired bans are treated as inactive.
+func (sc *ServerConfig) IsNodeAutoSelectBlocked(name string) bool {
+	if sc == nil || len(sc.AutoSelectBlockedNodes) == 0 {
+		return false
+	}
+	block, ok := sc.AutoSelectBlockedNodes[strings.TrimSpace(name)]
+	if !ok || block == nil {
+		return false
+	}
+	if block.ExpiresAt != nil && !block.ExpiresAt.After(time.Now()) {
+		return false
+	}
+	return true
+}
+
+// ActiveBlockedNodes returns a copy of the per-server auto-select bans that are
+// still active (not expired), keyed by node name. Returns nil when there are none.
+func (sc *ServerConfig) ActiveBlockedNodes() map[string]*NodeAutoSelectBlock {
+	if sc == nil || len(sc.AutoSelectBlockedNodes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	result := make(map[string]*NodeAutoSelectBlock)
+	for name, block := range sc.AutoSelectBlockedNodes {
+		if block == nil {
+			continue
+		}
+		if block.ExpiresAt != nil && !block.ExpiresAt.After(now) {
+			continue
+		}
+		result[name] = block
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 func (sc *ServerConfig) GetAutoPingTopCandidates() int {

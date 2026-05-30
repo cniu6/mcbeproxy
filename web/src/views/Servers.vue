@@ -254,6 +254,12 @@
                   <n-form-item v-if="currentNodeBlockForm.duration === 'custom'" label="到期时间">
                     <n-date-picker v-model:value="currentNodeBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
                   </n-form-item>
+                  <n-form-item label="作用范围">
+                    <n-space align="center" size="8">
+                      <n-switch v-model:value="currentNodeBlockForm.global" />
+                      <span style="font-size: 13px;">{{ currentNodeBlockForm.global ? '全局封禁（影响所有引用该节点的服务器）' : '仅当前服务器（不影响其他服务器）' }}</span>
+                    </n-space>
+                  </n-form-item>
                   <n-alert v-if="currentNodeBlockPreviewText" type="info">{{ currentNodeBlockPreviewText }}</n-alert>
                 </n-form>
               </n-space>
@@ -1066,17 +1072,23 @@
           <n-form-item v-if="serverNodeBlockForm.duration === 'custom'" label="到期时间">
             <n-date-picker v-model:value="serverNodeBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
           </n-form-item>
+          <n-form-item label="作用范围">
+            <n-space align="center" size="8">
+              <n-switch v-model:value="serverNodeBlockForm.global" />
+              <span style="font-size: 13px;">{{ serverNodeBlockForm.global ? '全局封禁（影响所有引用该节点的服务器）' : '仅当前服务器（不影响其他服务器）' }}</span>
+            </n-space>
+          </n-form-item>
           <n-alert v-if="serverNodeBlockPreviewText" type="info">{{ serverNodeBlockPreviewText }}</n-alert>
         </n-form>
         <n-space align="center" wrap>
           <n-button type="error" :disabled="serverNodeBlockCheckedKeys.length === 0" :loading="savingServerNodeBlock" @click="submitServerNodeBlock()">
             封禁所选
           </n-button>
-          <n-popconfirm @positive-click="clearServerNodeBlock()">
+          <n-popconfirm @positive-click="submitServerNodeUnblock()">
             <template #trigger>
               <n-button type="success" :disabled="serverNodeBlockCheckedKeys.length === 0" :loading="savingServerNodeBlock">解封所选</n-button>
             </template>
-            确定解除选中的 {{ serverNodeBlockCheckedKeys.length }} 个节点自动选择封禁吗？
+            确定解除选中的 {{ serverNodeBlockCheckedKeys.length }} 个节点{{ serverNodeBlockForm.global ? '全局' : '当前服务器' }}封禁吗？
           </n-popconfirm>
         </n-space>
         <n-data-table
@@ -1770,12 +1782,16 @@ const currentNodeBlockForm = reactive({
   name: '',
   reason: '',
   duration: '1d',
-  customExpiresAt: null
+  customExpiresAt: null,
+  // 图1: false = ban for THIS server only (default); true = ban globally.
+  global: false
 })
 const serverNodeBlockForm = reactive({
   reason: '',
   duration: '1d',
-  customExpiresAt: null
+  customExpiresAt: null,
+  // 图1: false = ban for THIS server only (default); true = ban globally.
+  global: false
 })
 const editServerLiveLoading = ref(false)
 const editServerLiveSessions = ref([])
@@ -1874,14 +1890,25 @@ const finalServerLatencyMetricLabel = computed(() => {
 
 const finalServerCurrentNodeName = computed(() => String(currentNodeData.value?.current_node || '').trim())
 
+// Per-server auto-select bans (图1) keyed by node name, sourced from the
+// current-node endpoint's blocked_nodes map. These only affect THIS server.
+const finalServerBlockedNodeMap = computed(() => {
+  const raw = currentNodeData.value?.blocked_nodes
+  if (!raw || typeof raw !== 'object') return {}
+  return raw
+})
+
 const finalServerCandidates = computed(() => {
   const uniqueNames = Array.from(new Set(resolveProxyOutboundCandidateNames(form.value?.proxy_outbound)))
+  const serverBlocks = finalServerBlockedNodeMap.value
   return uniqueNames.map(name => {
     const detail = proxyOutboundDetails.value?.[name] || { name, server: '-', port: '-', type: '', group: '', enabled: true }
     const runtime = finalServerNodeLatencyMap.value?.[name] || {}
     const tcpOk = runtime.tcp_ok === true
     const httpOk = runtime.http_ok === true
     const udpKnown = runtime.udp_ok === true || runtime.udp_ok === false
+    const serverBlock = serverBlocks?.[name] || null
+    const globalBlocked = !!detail.auto_select_blocked
     return {
       ...detail,
       name,
@@ -1893,12 +1920,16 @@ const finalServerCandidates = computed(() => {
       _http_ok: httpOk,
       _udp_ok: runtime.udp_ok === true,
       _udp_known: udpKnown,
-      _has_runtime_sample: tcpOk || httpOk || udpKnown
+      _has_runtime_sample: tcpOk || httpOk || udpKnown,
+      _server_block: serverBlock,
+      _global_blocked: globalBlocked,
+      // Effective ban for THIS server: either a global ban or a per-server ban.
+      _blocked: globalBlocked || !!serverBlock
     }
   })
 })
 
-const finalServerBlockedCount = computed(() => finalServerCandidates.value.filter(node => node.auto_select_blocked).length)
+const finalServerBlockedCount = computed(() => finalServerCandidates.value.filter(node => node._blocked).length)
 
 const finalServerHasRuntimeLatencySamples = computed(() => {
   return finalServerCandidates.value.some(node => getLatencySortValue(node, finalServerLatencyMetric.value) !== null)
@@ -1907,8 +1938,8 @@ const finalServerHasRuntimeLatencySamples = computed(() => {
 const finalServerSortedCandidates = computed(() => {
   const metric = finalServerLatencyMetric.value
   return [...finalServerCandidates.value].sort((a, b) => {
-    if (!!a.auto_select_blocked !== !!b.auto_select_blocked) {
-      return a.auto_select_blocked ? 1 : -1
+    if (!!a._blocked !== !!b._blocked) {
+      return a._blocked ? 1 : -1
     }
     const latencyCmp = compareLatencySort(a, b, metric, 'asc')
     if (latencyCmp !== 0) return latencyCmp
@@ -1922,7 +1953,7 @@ const finalServerSortedCandidates = computed(() => {
 const finalServerExtraTopNameSet = computed(() => {
   return new Set(
     finalServerSortedCandidates.value
-      .filter(node => !node.auto_select_blocked)
+      .filter(node => !node._blocked)
       .filter(node => node.name !== finalServerCurrentNodeName.value)
       .filter(node => getLatencySortValue(node, finalServerLatencyMetric.value) !== null)
       .slice(0, finalServerTopCandidateLimit.value)
@@ -1942,7 +1973,7 @@ const finalServerCandidateRankMap = computed(() => {
   const rankMap = {}
   let rank = 0
   finalServerSortedCandidates.value.forEach(node => {
-    if (node.auto_select_blocked) {
+    if (node._blocked) {
       rankMap[node.name] = null
       return
     }
@@ -1958,7 +1989,7 @@ const filteredFinalServerCandidates = computed(() => {
     if (finalServerCandidateScope.value === 'selected' && !finalServerAutoPingSelectedNameSet.value.has(node.name)) return false
     if (finalServerCandidateScope.value === 'top' && !finalServerExtraTopNameSet.value.has(node.name)) return false
     if (finalServerCandidateScope.value === 'outside' && finalServerExtraTopNameSet.value.has(node.name)) return false
-    if (finalServerCandidateScope.value === 'blocked' && !node.auto_select_blocked) return false
+    if (finalServerCandidateScope.value === 'blocked' && !node._blocked) return false
     if (finalServerCandidateScope.value === 'unsampled' && getLatencySortValue(node, finalServerLatencyMetric.value) !== null) return false
     if (!keyword) return true
     return [node.name, node.server, node.group, node.type]
@@ -2533,6 +2564,47 @@ const manualSwitchNode = async () => {
   } finally { switchingNode.value = false }
 }
 
+// 图2: temporarily switch to a specific node (even with high/no latency).
+// Sends {node} so the backend pins it as a manual override; automatic
+// selection resumes normally on the next cycle.
+const switchToSpecificNode = async (nodeName) => {
+  const serverId = form.value?.id
+  const name = String(nodeName || '').trim()
+  if (!serverId || !name) return
+  switchingNode.value = true
+  try {
+    const res = await api(`/api/servers/${serverId}/switch-node`, 'POST', { node: name })
+    if (res?.success && res.data) {
+      const lat = Number(res.data.latency_ms || 0)
+      message.success(`已临时切换到节点: ${res.data.new_node}${lat > 0 ? ` (${lat}ms)` : ''}`)
+      await fetchCurrentNode()
+    } else {
+      message.error(res?.error || res?.msg || '切换失败')
+    }
+  } catch (e) {
+    message.error(`切换失败: ${e.message}`)
+  } finally { switchingNode.value = false }
+}
+
+// 图1: remove a per-server (current server only) auto-select ban.
+const unblockServerNodeForCurrent = async (names = []) => {
+  const serverId = form.value?.id
+  const uniqueNames = Array.from(new Set((Array.isArray(names) ? names : []).map(name => String(name || '').trim()).filter(Boolean)))
+  if (!serverId || uniqueNames.length === 0) return
+  savingServerNodeBlock.value = true
+  try {
+    const res = await api(`/api/servers/${serverId}/unblock-node`, 'POST', uniqueNames.length === 1 ? { name: uniqueNames[0] } : { names: uniqueNames })
+    if (!res?.success) {
+      message.error(res?.msg || res?.error || '解封失败')
+      return
+    }
+    message.success(uniqueNames.length === 1 ? '已解除当前服务器的封禁' : `已解除 ${uniqueNames.length} 个节点在当前服务器的封禁`)
+    await fetchCurrentNode()
+  } finally {
+    savingServerNodeBlock.value = false
+  }
+}
+
 const openFinalServerLoadBalanceModal = async () => {
   await loadProxyOutbounds()
   if (!finalServerCandidates.value.length) {
@@ -2559,6 +2631,7 @@ const openCurrentNodeBlockModal = async () => {
   currentNodeBlockForm.reason = ''
   currentNodeBlockForm.duration = '1d'
   currentNodeBlockForm.customExpiresAt = null
+  currentNodeBlockForm.global = false
   try {
     const res = await api('/api/proxy-outbounds/get', 'POST', { name: nodeName })
     const data = res?.success ? res.data : null
@@ -2585,18 +2658,29 @@ const submitCurrentNodeBlock = async () => {
   }
   savingCurrentNodeBlock.value = true
   try {
+    const isGlobal = !!currentNodeBlockForm.global
+    const serverId = form.value?.id
     const payload = {
       name: currentNodeBlockForm.name,
       reason: (currentNodeBlockForm.reason || '').trim()
     }
     if (expiresAt) payload.expires_at = expiresAt
-    const res = await api('/api/proxy-outbounds/block-auto-select', 'POST', payload)
+    let res
+    if (isGlobal) {
+      res = await api('/api/proxy-outbounds/block-auto-select', 'POST', payload)
+    } else {
+      // 图1 default: ban the current node for THIS server only.
+      if (!serverId) {
+        message.error('缺少服务器ID，无法按服务器封禁')
+        return
+      }
+      res = await api(`/api/servers/${serverId}/block-node`, 'POST', payload)
+    }
     if (!res?.success) {
       message.error(res?.msg || res?.error || '封禁失败')
       return
     }
     showCurrentNodeBlockModal.value = false
-    const serverId = form.value?.id
     if (!serverId) {
       message.success('已封禁当前节点的自动选择')
       return
@@ -2631,6 +2715,7 @@ const openServerNodeBlockModal = async (server = activeServerNodeBlockTarget.val
   serverNodeBlockForm.reason = ''
   serverNodeBlockForm.duration = '1d'
   serverNodeBlockForm.customExpiresAt = null
+  serverNodeBlockForm.global = false
   showServerNodeBlockModal.value = true
 }
 
@@ -2656,22 +2741,57 @@ const submitServerNodeBlock = async (names = serverNodeBlockCheckedKeys.value) =
   }
   savingServerNodeBlock.value = true
   try {
-    const payload = uniqueNames.length === 1
-      ? { name: uniqueNames[0], reason: String(serverNodeBlockForm.reason || '').trim() }
-      : { names: uniqueNames, reason: String(serverNodeBlockForm.reason || '').trim() }
-    if (expiresAt) payload.expires_at = expiresAt
-    const res = await api(uniqueNames.length === 1 ? '/api/proxy-outbounds/block-auto-select' : '/api/proxy-outbounds/block-auto-select/batch', 'POST', payload)
+    const reason = String(serverNodeBlockForm.reason || '').trim()
+    const isGlobal = !!serverNodeBlockForm.global
+    let res
+    if (isGlobal) {
+      // 图1: explicit global ban — affects every server referencing the node.
+      const payload = uniqueNames.length === 1
+        ? { name: uniqueNames[0], reason }
+        : { names: uniqueNames, reason }
+      if (expiresAt) payload.expires_at = expiresAt
+      res = await api(uniqueNames.length === 1 ? '/api/proxy-outbounds/block-auto-select' : '/api/proxy-outbounds/block-auto-select/batch', 'POST', payload)
+    } else {
+      // 图1 default: ban for the current server only.
+      const serverId = String(activeServerNodeBlockTarget.value?.id || form.value?.id || '').trim()
+      if (!serverId) {
+        message.error('缺少服务器ID，无法按服务器封禁')
+        return
+      }
+      const payload = { names: uniqueNames, reason }
+      if (expiresAt) payload.expires_at = expiresAt
+      res = await api(`/api/servers/${serverId}/block-node`, 'POST', payload)
+    }
     if (!res?.success) {
       message.error(res?.msg || res?.error || '封禁失败')
       return
     }
-    message.success(uniqueNames.length === 1 ? '已封禁指定节点' : `已批量封禁 ${uniqueNames.length} 个节点`)
+    const scopeLabel = isGlobal ? '全局' : '当前服务器'
+    message.success(uniqueNames.length === 1 ? `已封禁指定节点（${scopeLabel}）` : `已批量封禁 ${uniqueNames.length} 个节点（${scopeLabel}）`)
     serverNodeBlockCheckedKeys.value = []
+    showServerNodeBlockModal.value = false
     await loadProxyOutbounds()
     await fetchCurrentNode()
   } finally {
     savingServerNodeBlock.value = false
   }
+}
+
+// Bulk-modal unblock that routes to the per-server or global endpoint based on
+// the same scope toggle used for blocking (图1).
+const submitServerNodeUnblock = async (names = serverNodeBlockCheckedKeys.value) => {
+  const uniqueNames = Array.from(new Set((Array.isArray(names) ? names : []).map(name => String(name || '').trim()).filter(Boolean)))
+  if (uniqueNames.length === 0) {
+    message.warning('请先选择要解封的节点')
+    return
+  }
+  if (serverNodeBlockForm.global) {
+    await clearServerNodeBlock(uniqueNames)
+    serverNodeBlockCheckedKeys.value = []
+    return
+  }
+  await unblockServerNodeForCurrent(uniqueNames)
+  serverNodeBlockCheckedKeys.value = []
 }
 
 const clearServerNodeBlock = async (names = serverNodeBlockCheckedKeys.value) => {
@@ -3440,7 +3560,7 @@ const finalServerCandidateColumns = computed(() => {
       const tags = []
       if (row.name === finalServerCurrentNodeName.value) {
         tags.push(h(NTag, { type: 'success', size: 'small', bordered: false }, () => '当前节点'))
-        tags.push(h(NTag, { type: 'info', size: 'small', bordered: false }, () => '自动保留'))
+        tags.push(h(NTag, { type: currentNodeData.value?.manual ? 'warning' : 'info', size: 'small', bordered: false }, () => currentNodeData.value?.manual ? '手动切换' : '自动保留'))
       }
       if (row.name === currentNodeData.value?.best_node && row.name !== finalServerCurrentNodeName.value) {
         tags.push(h(NTag, { type: 'warning', size: 'small', bordered: false }, () => '最优候选'))
@@ -3448,14 +3568,21 @@ const finalServerCandidateColumns = computed(() => {
       if (finalServerExtraTopNameSet.value.has(row.name)) {
         tags.push(h(NTag, { type: 'info', size: 'small', bordered: false }, () => '额外TopN'))
       }
-      if (!row.auto_select_blocked && getLatencySortValue(row, finalServerLatencyMetric.value) === null) {
+      if (!row._blocked && getLatencySortValue(row, finalServerLatencyMetric.value) === null) {
         tags.push(h(NTag, { type: 'default', size: 'small', bordered: false }, () => '无样本'))
       }
-      if (row.auto_select_blocked) {
-        tags.push(h(NTag, { type: 'error', size: 'small', bordered: false }, () => '已封禁'))
+      if (row._global_blocked) {
+        tags.push(h(NTag, { type: 'error', size: 'small', bordered: false }, () => '已封禁(全局)'))
         const summary = formatNodeBlockSummary(row)
         if (summary) {
           tags.push(h('span', { style: 'font-size: 12px;' }, summary))
+        }
+      }
+      if (row._server_block) {
+        tags.push(h(NTag, { type: 'error', size: 'small', bordered: false }, () => '已封禁(当前服务器)'))
+        const reason = String(row._server_block?.reason || '').trim()
+        if (reason) {
+          tags.push(h('span', { style: 'font-size: 12px;' }, reason))
         }
       }
       if (!tags.length) {
@@ -3511,16 +3638,29 @@ const finalServerCandidateColumns = computed(() => {
     columns.push({ title: '启用', key: 'enabled', width: 60, render: row => h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '是' : '否') })
   }
 
-  columns.push({ title: '操作', key: 'actions', width: 360, render: row => h(NSpace, { size: 'small', wrap: false }, () => [
+  columns.push({ title: '操作', key: 'actions', width: 430, render: row => h(NSpace, { size: 'small', wrap: false }, () => [
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(row.name, 'tcp', form.value?.id || '') } }, () => 'TCP'),
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(row.name, 'http', form.value?.id || '') } }, () => 'HTTP'),
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(row.name, 'udp', form.value?.id || '') } }, () => 'UDP'),
-    row.auto_select_blocked
-      ? h(NPopconfirm, { onPositiveClick: () => clearServerNodeBlock([row.name]) }, {
+    // 图2: directly switch to this node (even with high/no latency). Auto-select
+    // resumes normally afterwards, so it is a temporary manual override.
+    row.name === finalServerCurrentNodeName.value
+      ? h(NTag, { size: 'small', type: 'success', bordered: false }, () => '使用中')
+      : h(NPopconfirm, { onPositiveClick: () => switchToSpecificNode(row.name) }, {
+          trigger: () => h(NButton, { size: 'tiny', type: 'primary', disabled: row._blocked, loading: switchingNode.value }, () => '切换'),
+          default: () => '临时切换到该节点？下次自动选优仍会正常切换。'
+        }),
+    row._server_block
+      ? h(NPopconfirm, { onPositiveClick: () => unblockServerNodeForCurrent([row.name]) }, {
           trigger: () => h(NButton, { size: 'tiny', type: 'success' }, () => '解封'),
-          default: () => '确定解除该节点自动选择封禁吗？'
+          default: () => '确定解除该节点在当前服务器的封禁吗？'
         })
-      : h(NButton, { size: 'tiny', type: 'error', onClick: () => openFinalServerBlockModal([row.name]) }, () => '封禁'),
+      : row._global_blocked
+        ? h(NPopconfirm, { onPositiveClick: () => clearServerNodeBlock([row.name]) }, {
+            trigger: () => h(NButton, { size: 'tiny', type: 'success' }, () => '解封(全局)'),
+            default: () => '确定解除该节点的全局自动选择封禁吗？'
+          })
+        : h(NButton, { size: 'tiny', type: 'error', onClick: () => openFinalServerBlockModal([row.name]) }, () => '封禁'),
     h(NButton, { size: 'tiny', secondary: true, onClick: () => goToProxyOutbound(row.name) }, () => '查看')
   ]) })
 

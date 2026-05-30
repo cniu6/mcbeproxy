@@ -31,6 +31,7 @@ type mockOutboundManager struct {
 	history   map[string][]proxy.ServerNodeLatencySample
 	outbound  map[string][]proxy.OutboundLatencySample
 	selected  map[string]string
+	manual    map[string]bool
 }
 
 func newMockOutboundManager() *mockOutboundManager {
@@ -40,6 +41,7 @@ func newMockOutboundManager() *mockOutboundManager {
 		history:   make(map[string][]proxy.ServerNodeLatencySample),
 		outbound:  make(map[string][]proxy.OutboundLatencySample),
 		selected:  make(map[string]string),
+		manual:    make(map[string]bool),
 	}
 }
 
@@ -215,6 +217,22 @@ func (m *mockOutboundManager) SetServerSelectedNode(serverID, nodeName string) {
 		return
 	}
 	m.selected[serverID] = nodeName
+}
+
+func (m *mockOutboundManager) SetServerSelectedNodeManual(serverID, nodeName string) {
+	m.SetServerSelectedNode(serverID, nodeName)
+	if m.manual == nil {
+		m.manual = make(map[string]bool)
+	}
+	if nodeName == "" {
+		delete(m.manual, serverID)
+	} else {
+		m.manual[serverID] = true
+	}
+}
+
+func (m *mockOutboundManager) IsServerNodeManual(serverID string) bool {
+	return m.manual[serverID]
 }
 
 func (m *mockOutboundManager) GetBestNodeForServer(serverID, groupOrName, sortBy string) (string, int64) {
@@ -1358,5 +1376,154 @@ func TestBatchProxyTestLimiter_Concurrency(t *testing.T) {
 	}
 	if atomic.LoadInt32(&maxActive) < 2 {
 		t.Fatalf("expected at least 2 concurrent permit holders, got maxActive=%d", maxActive)
+	}
+}
+
+func TestServerNodeBlockUnblockLifecycle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(t.TempDir(), "proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(filepath.Join(t.TempDir(), "proxy_subscriptions.json"))
+	serverConfigMgr, err := config.NewConfigManager(filepath.Join(t.TempDir(), "servers.json"))
+	if err != nil {
+		t.Fatalf("NewConfigManager failed: %v", err)
+	}
+	outboundMgr := newMockOutboundManager()
+	handler := NewProxyOutboundHandler(configMgr, subConfigMgr, serverConfigMgr, outboundMgr)
+
+	serverCfg := &config.ServerConfig{
+		ID:            "srv1",
+		Name:          "Server 1",
+		Target:        "example.com",
+		Port:          19132,
+		ListenAddr:    "0.0.0.0:19132",
+		Protocol:      "raknet",
+		Enabled:       true,
+		ProxyOutbound: "node-a,node-b",
+	}
+	if err := serverConfigMgr.AddServer(serverCfg); err != nil {
+		t.Fatalf("AddServer failed: %v", err)
+	}
+
+	router := gin.New()
+	router.POST("/api/servers/:id/block-node", handler.BlockServerNode)
+	router.POST("/api/servers/:id/unblock-node", handler.UnblockServerNode)
+	router.GET("/api/servers/:id/blocked-nodes", handler.GetServerBlockedNodes)
+
+	// Block node-a for this server only.
+	body, _ := json.Marshal(map[string]interface{}{"name": "node-a", "reason": "test"})
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/srv1/block-node", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("block: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Persisted on the server config.
+	stored, ok := serverConfigMgr.GetServer("srv1")
+	if !ok || !stored.IsNodeAutoSelectBlocked("node-a") {
+		t.Fatalf("expected node-a to be blocked on srv1, got %+v", stored.AutoSelectBlockedNodes)
+	}
+	if stored.IsNodeAutoSelectBlocked("node-b") {
+		t.Fatalf("node-b should not be blocked")
+	}
+
+	// GET reflects the ban.
+	req = httptest.NewRequest(http.MethodGet, "/api/servers/srv1/blocked-nodes", nil)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get blocked: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp APIResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, _ := resp.Data.(map[string]interface{})
+	blocked, _ := data["blocked"].(map[string]interface{})
+	if _, exists := blocked["node-a"]; !exists {
+		t.Fatalf("expected node-a in blocked map, got %v", blocked)
+	}
+
+	// Unblock node-a.
+	body, _ = json.Marshal(map[string]interface{}{"name": "node-a"})
+	req = httptest.NewRequest(http.MethodPost, "/api/servers/srv1/unblock-node", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unblock: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	stored, _ = serverConfigMgr.GetServer("srv1")
+	if stored.IsNodeAutoSelectBlocked("node-a") {
+		t.Fatalf("expected node-a unblocked")
+	}
+}
+
+func TestSwitchServerNodeToSpecificNode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(t.TempDir(), "proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(filepath.Join(t.TempDir(), "proxy_subscriptions.json"))
+	serverConfigMgr, err := config.NewConfigManager(filepath.Join(t.TempDir(), "servers.json"))
+	if err != nil {
+		t.Fatalf("NewConfigManager failed: %v", err)
+	}
+	outboundMgr := newMockOutboundManager()
+	handler := NewProxyOutboundHandler(configMgr, subConfigMgr, serverConfigMgr, outboundMgr)
+
+	nodeA := &config.ProxyOutbound{Name: "node-a", Type: config.ProtocolShadowsocks, Server: "a.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	nodeB := &config.ProxyOutbound{Name: "node-b", Type: config.ProtocolShadowsocks, Server: "b.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	// Candidate resolution reads from configMgr; selection state from outboundMgr.
+	if err := configMgr.AddOutbound(nodeA); err != nil {
+		t.Fatalf("configMgr AddOutbound node-a: %v", err)
+	}
+	if err := configMgr.AddOutbound(nodeB); err != nil {
+		t.Fatalf("configMgr AddOutbound node-b: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(nodeA); err != nil {
+		t.Fatalf("AddOutbound node-a: %v", err)
+	}
+	if err := outboundMgr.AddOutbound(nodeB); err != nil {
+		t.Fatalf("AddOutbound node-b: %v", err)
+	}
+
+	serverCfg := &config.ServerConfig{
+		ID:            "srv1",
+		Name:          "Server 1",
+		Target:        "example.com",
+		Port:          19132,
+		ListenAddr:    "0.0.0.0:19132",
+		Protocol:      "raknet",
+		Enabled:       true,
+		ProxyOutbound: "node-a,node-b",
+	}
+	if err := serverConfigMgr.AddServer(serverCfg); err != nil {
+		t.Fatalf("AddServer failed: %v", err)
+	}
+
+	router := gin.New()
+	router.POST("/api/servers/:id/switch-node", handler.SwitchServerNode)
+
+	// Switch to node-b explicitly.
+	body, _ := json.Marshal(map[string]interface{}{"node": "node-b"})
+	req := httptest.NewRequest(http.MethodPost, "/api/servers/srv1/switch-node", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("switch: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if node, ok := outboundMgr.GetServerSelectedNode("srv1"); !ok || node != "node-b" {
+		t.Fatalf("expected selected node-b, got %q ok=%v", node, ok)
+	}
+
+	// Switching to an unknown node is rejected.
+	body, _ = json.Marshal(map[string]interface{}{"node": "ghost"})
+	req = httptest.NewRequest(http.MethodPost, "/api/servers/srv1/switch-node", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("switch to unknown: expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }

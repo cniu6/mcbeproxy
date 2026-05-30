@@ -261,6 +261,9 @@ func (a *APIServer) setupRoutes() {
 			api.GET("/servers/:id/node-latency-history", a.proxyOutboundHandler.GetServerNodeLatencyHistory)
 			api.GET("/servers/:id/current-node", a.proxyOutboundHandler.GetServerCurrentNode)
 			api.POST("/servers/:id/switch-node", a.proxyOutboundHandler.SwitchServerNode)
+			api.GET("/servers/:id/blocked-nodes", a.proxyOutboundHandler.GetServerBlockedNodes)
+			api.POST("/servers/:id/block-node", a.proxyOutboundHandler.BlockServerNode)
+			api.POST("/servers/:id/unblock-node", a.proxyOutboundHandler.UnblockServerNode)
 		}
 
 		// Session endpoints
