@@ -66,7 +66,7 @@
       <n-space vertical>
         <n-input v-model:value="form.player_name" placeholder="玩家名" />
         <n-input v-model:value="form.reason" placeholder="原因" />
-        <n-space size="6" wrap>
+        <n-space :size="6" wrap>
           <n-button v-for="reason in reasonOptions" :key="reason" size="small" secondary @click="form.reason = reason">{{ reason }}</n-button>
         </n-space>
         <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />

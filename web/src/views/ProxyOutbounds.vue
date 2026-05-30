@@ -269,7 +269,7 @@
             <n-descriptions-item label="分组">{{ selectedProxyHistoryOutbound.group || '-' }}</n-descriptions-item>
             <n-descriptions-item label="服务器">{{ selectedProxyHistoryOutbound.server }}:{{ selectedProxyHistoryOutbound.port }}</n-descriptions-item>
             <n-descriptions-item label="状态">
-              <n-space size="4" wrap>
+              <n-space :size="4" wrap>
                 <n-tag :type="selectedProxyHistoryOutbound.enabled ? 'success' : 'default'" size="small" bordered="false">
                   {{ selectedProxyHistoryOutbound.enabled ? '启用中' : '已禁用' }}
                 </n-tag>
@@ -280,7 +280,7 @@
             </n-descriptions-item>
             <n-descriptions-item label="最后检测">{{ selectedProxyHistoryOutbound.last_check ? formatHistoryDateTime(selectedProxyHistoryOutbound.last_check, true) : '-' }}</n-descriptions-item>
             <n-descriptions-item label="当前质量" :span="3">
-              <n-space size="6" wrap>
+              <n-space :size="6" wrap>
                 <n-tag size="small" bordered="false">TCP {{ selectedProxyHistoryOutbound.latency_ms > 0 ? `${selectedProxyHistoryOutbound.latency_ms}ms` : '-' }}</n-tag>
                 <n-tag size="small" bordered="false">HTTP {{ selectedProxyHistoryOutbound.http_latency_ms > 0 ? `${selectedProxyHistoryOutbound.http_latency_ms}ms` : '-' }}</n-tag>
                 <n-tag size="small" bordered="false">UDP {{ selectedProxyHistoryOutbound.udp_available === true ? (selectedProxyHistoryOutbound.udp_latency_ms > 0 ? `${selectedProxyHistoryOutbound.udp_latency_ms}ms` : '可用') : (selectedProxyHistoryOutbound.udp_available === false ? '失败' : '-') }}</n-tag>
@@ -463,7 +463,7 @@
           <n-form-item label="原因">
             <n-input v-model:value="autoSelectBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
           </n-form-item>
-          <n-space size="6" wrap>
+          <n-space :size="6" wrap>
             <n-button v-for="reason in autoSelectBlockReasonOptions" :key="reason" size="small" secondary @click="autoSelectBlockForm.reason = reason">{{ reason }}</n-button>
           </n-space>
           <n-form-item label="时长" style="margin-top: 8px">

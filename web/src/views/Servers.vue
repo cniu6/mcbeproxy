@@ -245,7 +245,7 @@
                   <n-form-item label="原因">
                     <n-input v-model:value="currentNodeBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
                   </n-form-item>
-                  <n-space size="6" wrap>
+                  <n-space :size="6" wrap>
                     <n-button v-for="reason in nodeBlockReasonOptions" :key="reason" size="small" secondary @click="currentNodeBlockForm.reason = reason">{{ reason }}</n-button>
                   </n-space>
                   <n-form-item label="时长" style="margin-top: 8px">
@@ -255,7 +255,7 @@
                     <n-date-picker v-model:value="currentNodeBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
                   </n-form-item>
                   <n-form-item label="作用范围">
-                    <n-space align="center" size="8">
+                    <n-space align="center" :size="8">
                       <n-switch v-model:value="currentNodeBlockForm.global" />
                       <span style="font-size: 13px;">{{ currentNodeBlockForm.global ? '全局封禁（影响所有引用该节点的服务器）' : '仅当前服务器（不影响其他服务器）' }}</span>
                     </n-space>
@@ -1063,7 +1063,7 @@
           <n-form-item label="原因">
             <n-input v-model:value="serverNodeBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
           </n-form-item>
-          <n-space size="6" wrap>
+          <n-space :size="6" wrap>
             <n-button v-for="reason in nodeBlockReasonOptions" :key="`server-node-reason-${reason}`" size="small" secondary @click="serverNodeBlockForm.reason = reason">{{ reason }}</n-button>
           </n-space>
           <n-form-item label="时长" style="margin-top: 8px">
@@ -1073,7 +1073,7 @@
             <n-date-picker v-model:value="serverNodeBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
           </n-form-item>
           <n-form-item label="作用范围">
-            <n-space align="center" size="8">
+            <n-space align="center" :size="8">
               <n-switch v-model:value="serverNodeBlockForm.global" />
               <span style="font-size: 13px;">{{ serverNodeBlockForm.global ? '全局封禁（影响所有引用该节点的服务器）' : '仅当前服务器（不影响其他服务器）' }}</span>
             </n-space>
