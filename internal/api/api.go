@@ -30,6 +30,7 @@ import (
 	"mcpeserverproxy/internal/acl"
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/db"
+	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/session"
 )
@@ -220,6 +221,7 @@ func (a *APIServer) setupRoutes() {
 	public := a.router.Group("/api/public")
 	{
 		public.GET("/status", a.getPublicStatus)
+		public.GET("/version", a.getVersion)
 	}
 
 	// Public web status page (no auth)
@@ -1086,6 +1088,17 @@ func (a *APIServer) getSystemStats(c *gin.Context) {
 	}
 
 	respondSuccess(c, stats)
+}
+
+// getVersion returns the build version information (version, build time, git
+// commit). No authentication required so the dashboard can show it anywhere.
+// GET /api/public/version
+func (a *APIServer) getVersion(c *gin.Context) {
+	respondSuccess(c, map[string]interface{}{
+		"version":    logger.Version,
+		"build_time": logger.BuildTime,
+		"git_commit": logger.GitCommit,
+	})
 }
 
 // getPublicStatus returns a consolidated status snapshot without authentication.
