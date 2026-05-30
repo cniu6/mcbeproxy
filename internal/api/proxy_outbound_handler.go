@@ -40,6 +40,7 @@ type ProxyOutboundHandler struct {
 	subService             *subscription.Service
 	activityProvider       proxyOutboundUsageActivityProvider
 	subscriptionUpdateHook func(string)
+	outboundReloadHook     func(string)
 }
 
 type proxyOutboundUsageActivityProvider interface {
@@ -98,6 +99,26 @@ func (h *ProxyOutboundHandler) triggerSubscriptionUpdateHook(reason string) {
 		reason = "subscription update"
 	}
 	h.subscriptionUpdateHook(reason)
+}
+
+// SetOutboundReloadHook injects a callback invoked after a single proxy outbound
+// node is edited, so that running servers/ports referencing it get reloaded.
+func (h *ProxyOutboundHandler) SetOutboundReloadHook(hook func(string)) {
+	if h == nil {
+		return
+	}
+	h.outboundReloadHook = hook
+}
+
+func (h *ProxyOutboundHandler) triggerOutboundReloadHook(name string) {
+	if h == nil || h.outboundReloadHook == nil {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	h.outboundReloadHook(name)
 }
 
 // ProxyOutboundDTO represents the API response for a proxy outbound.
@@ -1103,6 +1124,9 @@ func (h *ProxyOutboundHandler) UpdateProxyOutbound(c *gin.Context) {
 		}
 	}
 
+	// Reload running servers/ports that reference this node so edits take effect immediately.
+	h.triggerOutboundReloadHook(name)
+
 	respondSuccess(c, h.toDTO(cfg))
 }
 
@@ -1993,6 +2017,9 @@ func (h *ProxyOutboundHandler) UpdateProxyOutboundByBody(c *gin.Context) {
 			// Log but don't fail - config is saved
 		}
 	}
+
+	// Reload running servers/ports that reference this node so edits take effect immediately.
+	h.triggerOutboundReloadHook(req.Name)
 
 	respondSuccess(c, h.toDTO(cfg))
 }
@@ -3402,6 +3429,44 @@ func (h *ProxyOutboundHandler) listServerCandidateNodes(serverCfg *config.Server
 		}
 	} else if serverCfg.IsMultiNodeSelection() {
 		for _, name := range serverCfg.GetNodeList() {
+			if name == "" {
+				continue
+			}
+			o, exists := h.configMgr.GetOutbound(name)
+			if !exists || o == nil || !o.Enabled {
+				continue
+			}
+			candidateNodes = append(candidateNodes, name)
+		}
+	} else {
+		o, exists := h.configMgr.GetOutbound(proxyOutbound)
+		if exists && o != nil && o.Enabled {
+			candidateNodes = append(candidateNodes, proxyOutbound)
+		}
+	}
+	return candidateNodes
+}
+
+// listPortCandidateNodes resolves the proxy outbound node names a proxy port references.
+func (h *ProxyOutboundHandler) listPortCandidateNodes(portCfg *config.ProxyPortConfig) []string {
+	if h == nil || h.configMgr == nil || portCfg == nil {
+		return nil
+	}
+	proxyOutbound := strings.TrimSpace(portCfg.ProxyOutbound)
+	if proxyOutbound == "" || proxyOutbound == proxy.DirectNodeName {
+		return nil
+	}
+	candidateNodes := make([]string, 0)
+	if portCfg.IsGroupSelection() {
+		groupName := portCfg.GetGroupName()
+		outbounds := h.configMgr.GetByGroup(groupName)
+		for _, o := range outbounds {
+			if o != nil && o.Enabled {
+				candidateNodes = append(candidateNodes, o.Name)
+			}
+		}
+	} else if portCfg.IsMultiNodeSelection() {
+		for _, name := range portCfg.GetNodeList() {
 			if name == "" {
 				continue
 			}

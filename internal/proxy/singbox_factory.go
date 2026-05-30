@@ -184,6 +184,10 @@ func CreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) 
 		err = outbound.initHysteria2(cfg)
 	case config.ProtocolAnyTLS:
 		err = outbound.initAnyTLS(cfg)
+	case config.ProtocolSOCKS5:
+		err = outbound.initSOCKS5(cfg)
+	case config.ProtocolHTTP:
+		err = outbound.initHTTP(cfg)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, cfg.Type)
 	}
@@ -768,6 +772,10 @@ func (s *SingboxOutbound) ListenPacket(ctx context.Context, destination string) 
 		return s.dialHysteria2UDP(ctx, serverAddr, dest)
 	case config.ProtocolAnyTLS:
 		return s.dialAnyTLSUDP(ctx, serverAddr, dest)
+	case config.ProtocolSOCKS5:
+		return s.dialSOCKS5UDP(ctx, serverAddr, dest)
+	case config.ProtocolHTTP:
+		return nil, fmt.Errorf("%w: HTTP proxies do not support UDP relay", ErrUnsupportedProtocol)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, s.config.Type)
 	}
@@ -2611,6 +2619,10 @@ func (d *SingboxDialer) DialContext(ctx context.Context, network, address string
 		return d.dialHysteria2TCP(ctx, serverAddr, dest)
 	case config.ProtocolAnyTLS:
 		return d.dialAnyTLSTCP(ctx, serverAddr, dest)
+	case config.ProtocolSOCKS5:
+		return d.dialSOCKS5TCP(ctx, serverAddr, dest)
+	case config.ProtocolHTTP:
+		return d.dialHTTPTCP(ctx, serverAddr, dest)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, d.config.Type)
 	}

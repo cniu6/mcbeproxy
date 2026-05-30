@@ -113,6 +113,51 @@ func (a *APIServer) buildBlacklistKickMessage(playerName, serverID, reason strin
 	return fmt.Sprintf("黑名单用户\n§7玩家名字：%s\n§7原因：%s", playerName, resolvedReason)
 }
 
+// reloadServersUsingOutbound reloads running servers and proxy ports that reference
+// the edited proxy outbound node, so a single-node edit takes effect without a manual restart.
+func (a *APIServer) reloadServersUsingOutbound(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" || a.proxyController == nil || a.proxyOutboundHandler == nil {
+		return
+	}
+
+	if a.configMgr != nil {
+		for _, serverCfg := range a.configMgr.GetAllServers() {
+			if serverCfg == nil {
+				continue
+			}
+			if !a.proxyController.IsServerRunning(serverCfg.ID) {
+				continue
+			}
+			if !containsString(a.proxyOutboundHandler.listServerCandidateNodes(serverCfg), name) {
+				continue
+			}
+			_ = a.proxyController.ReloadServer(serverCfg.ID)
+		}
+	}
+
+	if a.proxyPortConfigMgr != nil {
+		for _, portCfg := range a.proxyPortConfigMgr.GetAllPorts() {
+			if portCfg == nil || !portCfg.Enabled {
+				continue
+			}
+			if containsString(a.proxyOutboundHandler.listPortCandidateNodes(portCfg), name) {
+				_ = a.proxyController.ReloadProxyPorts()
+				break
+			}
+		}
+	}
+}
+
+func containsString(list []string, target string) bool {
+	for _, v := range list {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
 // NewAPIServer creates a new API server instance.
 func NewAPIServer(
 	globalConfig *config.GlobalConfig,
@@ -153,6 +198,10 @@ func NewAPIServer(
 		proxyOutboundHandler: proxyOutboundHandler,
 		proxyPortConfigMgr:   proxyPortConfigMgr,
 		serverLatencyHistory: newServerLatencyHistoryStore(globalConfig),
+	}
+
+	if api.proxyOutboundHandler != nil {
+		api.proxyOutboundHandler.SetOutboundReloadHook(api.reloadServersUsingOutbound)
 	}
 
 	api.setupRoutes()
