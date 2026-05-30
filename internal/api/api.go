@@ -248,8 +248,12 @@ func (a *APIServer) setupRoutes() {
 		api.POST("/servers/:id/start", a.startServer)
 		api.POST("/servers/:id/stop", a.stopServer)
 		api.POST("/servers/:id/reload", a.reloadServer)
-		api.POST("/servers/:id/disable", a.disableServer)
-		api.POST("/servers/:id/enable", a.enableServer)
+		api.POST("/servers/:id/hide", a.hideServer)
+		api.POST("/servers/:id/show", a.showServer)
+		// Backward-compatible aliases: the old disable/enable toggle now only
+		// controls visibility on the public status page (display-only).
+		api.POST("/servers/:id/disable", a.hideServer)
+		api.POST("/servers/:id/enable", a.showServer)
 		api.GET("/servers/:id/latency", a.getServerLatency)
 		api.GET("/servers/:id/latency-history", a.getWebServerLatencyHistory)
 		if a.proxyOutboundHandler != nil {
@@ -730,29 +734,23 @@ func (a *APIServer) reloadServer(c *gin.Context) {
 	respondSuccess(c, map[string]string{"status": status})
 }
 
-// disableServer disables a server (rejects new connections while keeping listener running).
-// POST /api/servers/:id/disable
-func (a *APIServer) disableServer(c *gin.Context) {
-	serverID := c.Param("id")
-
-	serverCfg, exists := a.configMgr.GetServer(serverID)
-	if !exists {
-		respondError(c, http.StatusNotFound, "Server not found", "No server found with the specified ID")
-		return
-	}
-
-	serverCfg.Disabled = true
-	if err := a.configMgr.UpdateServer(serverID, serverCfg); err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to disable server", err.Error())
-		return
-	}
-
-	respondSuccess(c, map[string]bool{"disabled": true})
+// hideServer hides a server from the public status page (/api/web/index).
+// This is display-only: it does NOT affect the listener, running state, or
+// client connections. Use start/stop/reload (or the "enabled" flag) to
+// actually control the server.
+// POST /api/servers/:id/hide   (alias: POST /api/servers/:id/disable)
+func (a *APIServer) hideServer(c *gin.Context) {
+	a.setServerHidden(c, true)
 }
 
-// enableServer enables a server (allows new connections).
-// POST /api/servers/:id/enable
-func (a *APIServer) enableServer(c *gin.Context) {
+// showServer shows a server on the public status page (/api/web/index).
+// POST /api/servers/:id/show   (alias: POST /api/servers/:id/enable)
+func (a *APIServer) showServer(c *gin.Context) {
+	a.setServerHidden(c, false)
+}
+
+// setServerHidden toggles whether a server appears on the public status page.
+func (a *APIServer) setServerHidden(c *gin.Context, hidden bool) {
 	serverID := c.Param("id")
 
 	serverCfg, exists := a.configMgr.GetServer(serverID)
@@ -761,13 +759,13 @@ func (a *APIServer) enableServer(c *gin.Context) {
 		return
 	}
 
-	serverCfg.Disabled = false
+	serverCfg.Hidden = hidden
 	if err := a.configMgr.UpdateServer(serverID, serverCfg); err != nil {
-		respondError(c, http.StatusInternalServerError, "Failed to enable server", err.Error())
+		respondError(c, http.StatusInternalServerError, "Failed to update server visibility", err.Error())
 		return
 	}
 
-	respondSuccess(c, map[string]bool{"disabled": false})
+	respondSuccess(c, map[string]bool{"hidden": hidden})
 }
 
 // buildServerLatencyInfo builds latency/MOTD info for a server without writing a response.

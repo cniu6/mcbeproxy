@@ -116,14 +116,18 @@ func normalizeLatencyMode(mode string) string {
 
 // ServerConfig represents a proxy target server configuration.
 type ServerConfig struct {
-	ID                  string            `json:"id"`
-	Name                string            `json:"name"`
-	Target              string            `json:"target"`
-	Port                int               `json:"port"`
-	ListenAddr          string            `json:"listen_addr"`
-	Protocol            string            `json:"protocol"`
-	Enabled             bool              `json:"enabled"`  // Whether to start the proxy listener
-	Disabled            bool              `json:"disabled"` // Whether to reject new connections (when enabled=true)
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Target     string `json:"target"`
+	Port       int    `json:"port"`
+	ListenAddr string `json:"listen_addr"`
+	Protocol   string `json:"protocol"`
+	Enabled    bool   `json:"enabled"` // Whether to start the proxy listener
+	Hidden     bool   `json:"hidden"`  // Whether to hide this server from the public status page (/api/web/index); does NOT affect connections
+	// LegacyDisabled is the deprecated "disabled" field. It is read only for
+	// backward compatibility with old config files and migrated to Hidden in
+	// Normalize(); it is never written back (omitempty + cleared to nil).
+	LegacyDisabled      *bool             `json:"disabled,omitempty"`
 	UDPSpeeder          *UDPSpeederConfig `json:"udp_speeder,omitempty"`
 	SendRealIP          bool              `json:"send_real_ip"`
 	ResolveInterval     int               `json:"resolve_interval"`       // seconds
@@ -276,6 +280,15 @@ func (sc *ServerConfig) GetProxyMode() string {
 func (sc *ServerConfig) Normalize() {
 	if sc == nil {
 		return
+	}
+	// Migrate the deprecated "disabled" field to "hidden". The old flag meant
+	// "reject new connections" but only worked in passthrough mode, so it has
+	// been repurposed into a display-only toggle for the public status page.
+	if sc.LegacyDisabled != nil {
+		if *sc.LegacyDisabled {
+			sc.Hidden = true
+		}
+		sc.LegacyDisabled = nil
 	}
 	sc.Protocol = normalizeProtocol(sc.Protocol)
 	sc.ProxyOutbound = normalizeProxyOutboundValue(sc.ProxyOutbound)
@@ -436,7 +449,7 @@ type ServerConfigDTO struct {
 	ListenAddr          string               `json:"listen_addr"`
 	Protocol            string               `json:"protocol"`
 	Enabled             bool                 `json:"enabled"`
-	Disabled            bool                 `json:"disabled"` // Whether to reject new connections
+	Hidden              bool                 `json:"hidden"` // Whether this server is hidden from the public status page (/api/web/index)
 	UDPSpeeder          *UDPSpeederConfigDTO `json:"udp_speeder,omitempty"`
 	SendRealIP          bool                 `json:"send_real_ip"`
 	ResolveInterval     int                  `json:"resolve_interval"`
@@ -460,8 +473,8 @@ type ServerConfigDTO struct {
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval
-	LastAutoPingAt               int64  `json:"last_auto_ping_at,omitempty"`
-	NextAutoPingAt               int64  `json:"next_auto_ping_at,omitempty"`
+	LastAutoPingAt                int64  `json:"last_auto_ping_at,omitempty"`
+	NextAutoPingAt                int64  `json:"next_auto_ping_at,omitempty"`
 	AutoPingTopCandidates         int    `json:"auto_ping_top_candidates"`
 	AutoPingFullScanMode          string `json:"auto_ping_full_scan_mode,omitempty"`
 	AutoPingFullScanTime          string `json:"auto_ping_full_scan_time,omitempty"`
@@ -478,7 +491,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		ListenAddr:                    sc.ListenAddr,
 		Protocol:                      normalizeProtocol(sc.Protocol),
 		Enabled:                       sc.Enabled,
-		Disabled:                      sc.Disabled,
+		Hidden:                        sc.Hidden,
 		UDPSpeeder:                    sc.UDPSpeeder.ToDTO(),
 		SendRealIP:                    sc.SendRealIP,
 		ResolveInterval:               sc.ResolveInterval,

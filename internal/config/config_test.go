@@ -608,3 +608,48 @@ func TestProperty3_LoadBalanceSortDefault(t *testing.T) {
 
 	properties.TestingRun(t)
 }
+
+// TestServerConfig_LegacyDisabledMigratesToHidden verifies that an old config
+// file using the deprecated "disabled" field is migrated to "hidden" on load,
+// and that the legacy field is never written back out.
+func TestServerConfig_LegacyDisabledMigratesToHidden(t *testing.T) {
+	raw := []byte(`{
+		"id": "srv1",
+		"name": "srv1",
+		"target": "127.0.0.1",
+		"port": 19132,
+		"listen_addr": "0.0.0.0:19132",
+		"protocol": "raknet",
+		"enabled": true,
+		"disabled": true
+	}`)
+
+	var sc ServerConfig
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	sc.Normalize()
+
+	if !sc.Hidden {
+		t.Errorf("legacy disabled=true should migrate to Hidden=true, got Hidden=%v", sc.Hidden)
+	}
+	if sc.LegacyDisabled != nil {
+		t.Errorf("LegacyDisabled should be cleared after migration, got %v", *sc.LegacyDisabled)
+	}
+
+	// Re-marshalling must emit "hidden" and must NOT emit the deprecated "disabled".
+	out, err := json.Marshal(&sc)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	var generic map[string]interface{}
+	if err := json.Unmarshal(out, &generic); err != nil {
+		t.Fatalf("re-unmarshal failed: %v", err)
+	}
+	if _, ok := generic["disabled"]; ok {
+		t.Errorf("output must not contain deprecated 'disabled' field: %s", out)
+	}
+	if v, ok := generic["hidden"].(bool); !ok || !v {
+		t.Errorf("output must contain 'hidden': true, got %s", out)
+	}
+}

@@ -557,46 +557,6 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		return
 	}
 
-	// Check if server is disabled (reject new connections)
-	if serverCfg.Disabled {
-		// We need to complete the handshake before sending disconnect
-		// Set deadline for initial handshake
-		clientConn.SetDeadline(time.Now().Add(10 * time.Second))
-
-		// Read NetworkSettings request
-		if _, err := clientConn.ReadPacket(); err != nil {
-			return
-		}
-
-		// Send NetworkSettings response
-		netSettingsPk := &packet.NetworkSettings{
-			CompressionThreshold: 512,
-			CompressionAlgorithm: packet.CompressionAlgorithmFlate,
-		}
-		if err := p.sendPacketUncompressed(clientConn, netSettingsPk); err != nil {
-			return
-		}
-
-		// Read Login packet
-		loginBytes, err := clientConn.ReadPacket()
-		if err != nil {
-			return
-		}
-		compression := compressionFromGamePacket(loginBytes)
-		connInf.kickMu.Lock()
-		connInf.compression = compression
-		connInf.kickMu.Unlock()
-
-		// Send disconnect with custom message
-		disabledMsg := serverCfg.DisabledMessage
-		if disabledMsg == "" {
-			disabledMsg = "服务器暂时关闭，请稍后再试"
-		}
-		p.sendDisconnect(clientConn, "§c"+disabledMsg, compression)
-		logger.Info("Connection rejected (server disabled): client=%s, server=%s", clientAddr, p.serverID)
-		return
-	}
-
 	// Set deadline for initial handshake
 	clientConn.SetDeadline(time.Now().Add(10 * time.Second))
 
