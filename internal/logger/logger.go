@@ -389,8 +389,48 @@ func LogStartup(config *StartupConfig) {
 		Info("  Max Access Log Records: %d", config.MaxAccessLogRecords)
 		Info("  Log Directory: %s", config.LogDir)
 		Info("  Log Retention: %d days", config.LogRetentionDays)
+		logAccessEntries(config)
 	}
 	Info("=================================================")
+}
+
+// logAccessEntries prints the dashboard / public-status access URLs so the
+// operator can immediately find where to log in after startup.
+func logAccessEntries(config *StartupConfig) {
+	hosts := config.AccessHosts
+	if len(hosts) == 0 {
+		hosts = []string{"127.0.0.1"}
+	}
+	entry := normalizeEntryPath(config.APIEntryPath)
+
+	Info("-------------------------------------------------")
+	Info("管理后台入口 (Admin Dashboard):")
+	for _, host := range hosts {
+		Info("  http://%s:%d%s", host, config.APIPort, entry)
+	}
+	Info("公开状态页 (Public Status):")
+	for _, host := range hosts {
+		Info("  http://%s:%d/api/web/index", host, config.APIPort)
+	}
+	if config.APIKeyConfigured {
+		Info("访问鉴权: 已配置 API Key (需在后台或 X-API-Key 请求头中提供)")
+	} else {
+		Info("访问鉴权: 未配置 API Key —— 后台当前为开放访问, 建议尽快设置")
+	}
+}
+
+// normalizeEntryPath ensures the admin entry path has a leading slash and a
+// single trailing slash (the dashboard is served at <entry>/).
+func normalizeEntryPath(entry string) string {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		entry = "/mcpe-admin"
+	}
+	if !strings.HasPrefix(entry, "/") {
+		entry = "/" + entry
+	}
+	entry = strings.TrimRight(entry, "/")
+	return entry + "/"
 }
 
 // StartupConfig holds configuration information for startup logging.
@@ -402,6 +442,9 @@ type StartupConfig struct {
 	MaxAccessLogRecords int
 	LogDir              string
 	LogRetentionDays    int
+	APIEntryPath        string
+	APIKeyConfigured    bool
+	AccessHosts         []string
 }
 
 // LogPlayerConnect logs a player connection event.
