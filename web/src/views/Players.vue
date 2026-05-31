@@ -85,14 +85,21 @@ const deletePlayer = async (name) => {
   else message.error(res.msg || '删除失败')
 }
 
+const toTimestamp = (val) => {
+  if (val === null || val === undefined || val === '') return 0
+  const t = new Date(val).getTime()
+  return Number.isFinite(t) ? t : 0
+}
+const compareStr = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), 'zh-CN')
+
 const columns = [
-  { title: '玩家名', key: 'display_name', width: 120 },
-  { title: 'UUID', key: 'uuid', ellipsis: { tooltip: true }, width: 260 },
-  { title: 'XUID', key: 'xuid', width: 150 },
-  { title: '首次登录', key: 'first_seen', render: r => formatTime(r.first_seen), width: 150 },
-  { title: '最后登录', key: 'last_seen', render: r => formatTime(r.last_seen), width: 150 },
-  { title: '游戏时长', key: 'total_playtime_seconds', render: r => formatDuration(r.total_playtime_seconds), width: 90 },
-  { title: '总流量', key: 'total_bytes', render: r => formatBytes(r.total_bytes), width: 80 },
+  { title: '玩家名', key: 'display_name', width: 120, sorter: (a, b) => compareStr(a.display_name, b.display_name) },
+  { title: 'UUID', key: 'uuid', ellipsis: { tooltip: true }, width: 260, sorter: (a, b) => compareStr(a.uuid, b.uuid) },
+  { title: 'XUID', key: 'xuid', width: 150, sorter: (a, b) => compareStr(a.xuid, b.xuid) },
+  { title: '首次登录', key: 'first_seen', render: r => formatTime(r.first_seen), width: 150, sorter: (a, b) => toTimestamp(a.first_seen) - toTimestamp(b.first_seen) },
+  { title: '最后登录', key: 'last_seen', render: r => formatTime(r.last_seen), width: 150, defaultSortOrder: 'descend', sorter: (a, b) => toTimestamp(a.last_seen) - toTimestamp(b.last_seen) },
+  { title: '游戏时长', key: 'total_playtime_seconds', render: r => formatDuration(r.total_playtime_seconds), width: 90, sorter: (a, b) => (Number(a.total_playtime_seconds) || 0) - (Number(b.total_playtime_seconds) || 0) },
+  { title: '总流量', key: 'total_bytes', render: r => formatBytes(r.total_bytes), width: 80, sorter: (a, b) => (Number(a.total_bytes) || 0) - (Number(b.total_bytes) || 0) },
   {
     title: '操作', key: 'actions', width: 210,
     render: r => h(NSpace, { size: 'small' }, () => [

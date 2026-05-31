@@ -122,7 +122,7 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 	}
 
 	// Fetch pings concurrently
-	pings := a.collectServerPings(servers)
+	pings := a.collectServerPings(servers, shouldExposeServerLatencyOverview)
 
 	wg.Wait()
 

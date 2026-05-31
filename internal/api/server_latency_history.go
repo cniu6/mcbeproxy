@@ -240,15 +240,30 @@ func (a *APIServer) getServerLatencyOverview(c *gin.Context) {
 	respondSuccess(c, a.buildServerLatencyOverview(servers, limit))
 }
 
+// shouldExposeServerLatencyOverview gates which servers expose latency on the
+// PUBLIC status page (/api/web/index). Kept tied to auto-ping to preserve the
+// public page's existing behavior.
 func shouldExposeServerLatencyOverview(server config.ServerConfigDTO) bool {
 	return server.AutoPingEnabled
 }
 
+// serverLatencyOverviewRunning gates the ADMIN latency overview. Every running
+// server gets a latency/history readout regardless of node-selection mode
+// (direct / single-node / multi-node / group), so direct and single-node
+// servers are no longer stuck without ping history.
+func serverLatencyOverviewRunning(server config.ServerConfigDTO) bool {
+	return strings.EqualFold(strings.TrimSpace(server.Status), "running")
+}
+
+// serverPingConcurrency bounds the number of concurrent upstream pings so that
+// exposing latency for every running server cannot trigger a fan-out burst.
+const serverPingConcurrency = 16
+
 func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO, historyLimit int) map[string]interface{} {
-	pings := a.collectServerPings(servers)
+	pings := a.collectServerPings(servers, serverLatencyOverviewRunning)
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
-		if !shouldExposeServerLatencyOverview(server) {
+		if !serverLatencyOverviewRunning(server) {
 			continue
 		}
 		serverIDs = append(serverIDs, server.ID)
@@ -261,9 +276,12 @@ func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO,
 	}
 }
 
-func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO) map[string]map[string]interface{} {
+func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO, eligible func(config.ServerConfigDTO) bool) map[string]map[string]interface{} {
 	if len(servers) == 0 {
 		return map[string]map[string]interface{}{}
+	}
+	if eligible == nil {
+		eligible = serverLatencyOverviewRunning
 	}
 	type pingResult struct {
 		id   string
@@ -271,17 +289,20 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO) map[str
 	}
 	eligibleServers := make([]config.ServerConfigDTO, 0, len(servers))
 	for _, server := range servers {
-		if shouldExposeServerLatencyOverview(server) {
+		if eligible(server) {
 			eligibleServers = append(eligibleServers, server)
 		}
 	}
 	results := make(chan pingResult, len(eligibleServers))
+	budget := make(chan struct{}, serverPingConcurrency)
 	var pingWG sync.WaitGroup
 	for _, srv := range eligibleServers {
 		server := srv
 		pingWG.Add(1)
 		go func() {
 			defer pingWG.Done()
+			budget <- struct{}{}
+			defer func() { <-budget }()
 			results <- pingResult{id: server.ID, info: a.buildServerPingFromConfig(server)}
 		}()
 	}
@@ -295,6 +316,22 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO) map[str
 		pings[result.id] = result.info
 	}
 	return pings
+}
+
+// lastKnownServerLatency returns the most recent recorded latency sample with a
+// positive value, used as a fallback when a live ping is online but cannot
+// produce a fresh latency reading.
+func (a *APIServer) lastKnownServerLatency(serverID string) (int64, bool) {
+	if a == nil || a.serverLatencyHistory == nil {
+		return 0, false
+	}
+	samples := a.serverLatencyHistory.History(serverID)
+	for i := len(samples) - 1; i >= 0; i-- {
+		if samples[i].LatencyMs > 0 {
+			return samples[i].LatencyMs, true
+		}
+	}
+	return 0, false
 }
 
 func (a *APIServer) buildServerLatencyHistorySnapshot(serverIDs []string, limit int) map[string][]ServerLatencyHistorySample {
@@ -354,7 +391,43 @@ func (a *APIServer) RecordServerLatency(serverID string, timestampMs int64, late
 	}, a.latencyHistoryMinIntervalOverrideMs(serverID, source))
 }
 
+// recordServerLatencyInfo persists a live ping result into the latency history
+// store so that direct/single-node servers (which are not covered by the
+// load-balance auto-ping scheduler) accrue a trend over time. The store's
+// min-interval gating keeps frequent dashboard polls from bloating the series.
 func (a *APIServer) recordServerLatencyInfo(info map[string]interface{}) map[string]interface{} {
+	if a == nil || a.serverLatencyHistory == nil || info == nil {
+		return info
+	}
+	serverID := stringValue(info["server_id"])
+	if serverID == "" {
+		return info
+	}
+	// A latency surfaced purely from history (fallback) is not a fresh
+	// measurement; recording it again would flat-line the trend on stale data.
+	if strings.EqualFold(stringValue(info["latency_source"]), "history") {
+		return info
+	}
+	if boolValue(info["not_found"]) {
+		return info
+	}
+	online := boolValue(info["online"])
+	stopped := boolValue(info["stopped"])
+	latency := int64(-1)
+	if v, ok := int64Value(info["latency"]); ok {
+		latency = v
+	}
+	// Only record definite observations: a successful measurement
+	// (online + positive latency), or an explicit offline/stopped state.
+	// Skip "online but no latency yet" so we don't store meaningless zeros.
+	if online && latency <= 0 {
+		return info
+	}
+	recordLatency := latency
+	if recordLatency < 0 {
+		recordLatency = 0
+	}
+	a.RecordServerLatency(serverID, time.Now().UnixMilli(), recordLatency, online, stopped, stringValue(info["source"]))
 	return info
 }
 

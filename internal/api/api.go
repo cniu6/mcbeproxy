@@ -785,7 +785,7 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 			if motd != "" {
 				response["parsed_motd"] = parseMOTD(motd)
 			}
-			return a.recordServerLatencyInfo(response)
+			return a.recordServerLatencyInfo(a.applyLastKnownLatency(response))
 		}
 	}
 
@@ -793,12 +793,12 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 	latency, ok := a.proxyController.GetServerLatency(serverID)
 	if ok {
 		online := latency >= 0
-		return a.recordServerLatencyInfo(map[string]interface{}{
+		return a.recordServerLatencyInfo(a.applyLastKnownLatency(map[string]interface{}{
 			"server_id": serverID,
 			"latency":   latency,
 			"online":    online,
 			"source":    "proxy",
-		})
+		}))
 	}
 
 	if a.configMgr != nil {
@@ -1118,7 +1118,7 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)
 	}
 
-	pings := a.collectServerPings(servers)
+	pings := a.collectServerPings(servers, serverLatencyOverviewRunning)
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
 		serverIDs = append(serverIDs, server.ID)
@@ -1173,7 +1173,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 	// Prefer proxy cached latency/MOTD if available.
 	if provider, ok := a.proxyController.(LatencyInfoProvider); ok {
 		latency, online, motd, found := provider.GetServerLatencyInfoRaw(serverID)
-		if found && (latency >= 0 || motd != "") {
+		if found && latency > 0 {
 			info := map[string]interface{}{
 				"server_id": serverID,
 				"latency":   latency,
@@ -1185,6 +1185,19 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 				info["parsed_motd"] = parseMOTD(motd)
 			}
 			return a.recordServerLatencyInfo(info)
+		}
+		// Online via MOTD but no fresh latency reading: surface the last known
+		// latency instead of leaving the UI stuck on "检测中" forever.
+		if found && motd != "" {
+			info := map[string]interface{}{
+				"server_id": serverID,
+				"latency":   latency,
+				"online":    true,
+				"motd":      motd,
+				"source":    "proxy",
+			}
+			info["parsed_motd"] = parseMOTD(motd)
+			return a.recordServerLatencyInfo(a.applyLastKnownLatency(info))
 		}
 	}
 
@@ -1213,7 +1226,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 		if ping.Error != "" {
 			info["error"] = ping.Error
 		}
-		return a.recordServerLatencyInfo(info)
+		return a.recordServerLatencyInfo(a.applyLastKnownLatency(info))
 	}
 
 	return a.recordServerLatencyInfo(map[string]interface{}{
@@ -1222,6 +1235,28 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 		"online":    false,
 		"not_found": true,
 	})
+}
+
+// applyLastKnownLatency fills in the most recent positive latency sample when a
+// ping is online but produced no fresh latency reading, so the dashboard shows
+// the last value instead of being stuck on "检测中". The filled value is tagged
+// with latency_source="history" so it is not re-recorded as a new measurement.
+func (a *APIServer) applyLastKnownLatency(info map[string]interface{}) map[string]interface{} {
+	if info == nil {
+		return info
+	}
+	if !boolValue(info["online"]) {
+		return info
+	}
+	latency, _ := int64Value(info["latency"])
+	if latency > 0 {
+		return info
+	}
+	if last, ok := a.lastKnownServerLatency(stringValue(info["server_id"])); ok {
+		info["latency"] = last
+		info["latency_source"] = "history"
+	}
+	return info
 }
 
 // getConfig returns the global configuration (read-only).

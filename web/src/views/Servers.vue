@@ -1242,7 +1242,10 @@ const supportsServerAutoPing = (server) => {
   return proxyOutbound.split(',').map(v => v.trim()).filter(Boolean).length > 1
 }
 const normalizeServerAutoPingEnabled = (server) => supportsServerAutoPing(server) ? !!server?.auto_ping_enabled : false
-const shouldShowServerLatencyOverview = (server) => normalizeServerAutoPingEnabled(server)
+// Latency/ping history is shown for every running server (direct, single-node,
+// multi-node, group) — not only auto-ping ones. The auto-ping countdown column
+// still keys off normalizeServerAutoPingEnabled separately.
+const shouldShowServerLatencyOverview = (server) => String(server?.status || '').trim() === 'running'
 const normalizeServerForm = (server = {}) => {
   const defaults = makeDefaultForm()
   return {
@@ -2255,7 +2258,7 @@ const openServerLatencyHistoryModal = async (server = form.value) => {
   }
   targetServer.auto_ping_enabled = normalizeServerAutoPingEnabled(targetServer)
   if (!shouldShowServerLatencyOverview(targetServer)) {
-    message.warning('当前服务器未启用自动 Ping，暂无延迟历史')
+    message.warning('当前服务器未运行，暂无延迟历史')
     return
   }
   selectedServerLatencyHistoryServer.value = normalizeServerModalTarget(targetServer)
@@ -2272,7 +2275,7 @@ const refreshServerLatencyHistoryDetail = async () => {}
 
 const formatServerAutoPingCountdown = (server) => {
   if (server?.status !== 'running') return '已停止'
-  if (!shouldShowServerLatencyOverview(server)) return '未启用'
+  if (!normalizeServerAutoPingEnabled(server)) return '未启用'
   const targetAt = Number(server?.next_auto_ping_at || 0)
   if (!targetAt) return '即将'
   const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
@@ -2305,7 +2308,10 @@ const getServerLatencyText = (server) => {
   if (server?.status !== 'running' || ping?.stopped) return '已停止'
   if (!ping) return '检测中...'
   if (!ping.online) return '离线'
-  if (Number(ping.latency || 0) <= 0) return '检测中...'
+  // Online but no fresh latency reading: show '在线' instead of being stuck on
+  // '检测中...' forever (the last-known value, if any, is filled server-side).
+  if (Number(ping.latency || 0) <= 0) return '在线'
+  if (ping.latency_source === 'history') return `${ping.latency}ms (历史)`
   return ping.source === 'proxy' ? `${ping.latency}ms (代理)` : `${ping.latency}ms`
 }
 
@@ -2315,7 +2321,9 @@ const renderServerLatencyCell = (server) => {
   }
   const ping = getServerPing(server.id)
   const tags = []
-  if (server.status === 'running' && ping?.source === 'proxy') {
+  if (server.status === 'running' && ping?.latency_source === 'history') {
+    tags.push(h(NTag, { size: 'small', type: 'default', bordered: false }, () => '历史'))
+  } else if (server.status === 'running' && ping?.source === 'proxy') {
     tags.push(h(NTag, { size: 'small', type: 'success', bordered: false }, () => '代理'))
   } else if (server.status === 'running' && ping?.source === 'direct') {
     tags.push(h(NTag, { size: 'small', type: 'warning', bordered: false }, () => '直连'))
@@ -2963,8 +2971,27 @@ const formGroupOptions = computed(() => {
 })
 
 // 表单过滤后的代理列表
+// Reuse the server's own per-node latency layer (the same data that drives its
+// load balancing) so the edit-server node picker surfaces latency just like the
+// quick-switch dialog, instead of relying only on the global (often-reset)
+// measurements. Server-scoped values override the global ones when present.
+const mergeServerNodeLatency = (outbound) => {
+  const sv = finalServerNodeLatencyMap.value?.[outbound?.name]
+  if (!sv) return outbound
+  const merged = { ...outbound }
+  if (sv.tcp_ok === true && Number(sv.tcp_latency_ms) > 0) merged.latency_ms = Number(sv.tcp_latency_ms)
+  if (sv.http_ok === true && Number(sv.http_latency_ms) > 0) merged.http_latency_ms = Number(sv.http_latency_ms)
+  if (sv.udp_ok === true) {
+    merged.udp_available = true
+    if (Number(sv.udp_latency_ms) > 0) merged.udp_latency_ms = Number(sv.udp_latency_ms)
+  } else if (sv.udp_ok === false) {
+    merged.udp_available = false
+  }
+  return merged
+}
+
 const formFilteredProxyOutbounds = computed(() => {
-  let list = [...allProxyOutbounds.value]
+  let list = allProxyOutbounds.value.map(mergeServerNodeLatency)
   
   // 按分组过滤（支持未分组）
   if (formProxyFilter.value.group) {
@@ -3288,7 +3315,9 @@ const openFormProxySelector = async () => {
 const refreshFormProxyList = async () => {
   formProxySelectorLoading.value = true
   try {
-    await Promise.all([loadProxyOutbounds(), fetchGroupStats()])
+    // refreshFinalServerNodeLatencies no-ops for a brand-new server (no id) and
+    // otherwise loads the per-server node latency reused by the picker.
+    await Promise.all([loadProxyOutbounds(), fetchGroupStats(), refreshFinalServerNodeLatencies()])
   } finally {
     formProxySelectorLoading.value = false
   }

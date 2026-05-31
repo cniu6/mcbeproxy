@@ -164,7 +164,7 @@
               <n-tag size="small" :type="getProxyModeType(s)">{{ getProxyModeLabel(s) }}</n-tag>
               <n-tag size="small" :type="(s.active_sessions || 0) > 0 ? 'info' : 'default'">本地玩家: {{ s.active_sessions || 0 }}</n-tag>
               <n-tag v-if="shouldShowServerLatencyOverview(s)" size="small" :type="getLatencyType(s.id)">{{ getLatencyText(s.id) }}</n-tag>
-              <n-tag v-if="shouldShowServerLatencyOverview(s)" size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
+              <n-tag v-if="serverAutoPingActive(s)" size="small" type="warning">下次检测: {{ getServerLatencyCountdownText(s) }}</n-tag>
               <n-tag v-if="getMotdPlayers(s.id)" size="small" type="info">在线: {{ getMotdPlayers(s.id) }}</n-tag>
               <n-tag v-if="getMotdServerName(s.id)" size="small" type="warning">标题: {{ getMotdServerName(s.id) }}</n-tag>
             </n-space>
@@ -273,7 +273,16 @@ const getProxyModeType = (server) => {
   return typeMap[mode] || 'default'
 }
 
-const shouldShowServerLatencyOverview = (server) => !!server?.auto_ping_enabled
+// Latency/ping history is shown for every running server (direct, single-node,
+// multi-node, group). The auto-ping countdown tag uses serverAutoPingActive.
+const shouldShowServerLatencyOverview = (server) => String(server?.status || '').trim() === 'running'
+const supportsServerAutoPing = (server) => {
+  const po = String(server?.proxy_outbound || '').trim().toLowerCase()
+  if (!po || po === 'direct') return false
+  if (po.startsWith('@')) return true
+  return po.split(',').map(v => v.trim()).filter(Boolean).length > 1
+}
+const serverAutoPingActive = (server) => supportsServerAutoPing(server) && !!server?.auto_ping_enabled
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 
@@ -287,7 +296,7 @@ const formatCountdown = (targetAt) => {
 
 const formatServerAutoPingCountdown = (server) => {
   if (server?.status !== 'running') return '已停止'
-  if (!shouldShowServerLatencyOverview(server)) return '未启用'
+  if (!serverAutoPingActive(server)) return '未启用'
   const targetAt = Number(server?.next_auto_ping_at || 0)
   if (!targetAt) return '即将'
   const seconds = Math.max(0, Math.ceil((targetAt - countdownNow.value) / 1000))
@@ -358,7 +367,8 @@ const getLatencyText = (serverId) => {
   if (!ping) return '检测中...'
   if (ping.stopped) return '已停止'
   if (!ping.online) return '离线'
-  if (ping.latency <= 0) return '检测中...'
+  if (ping.latency <= 0) return '在线'
+  if (ping.latency_source === 'history') return `${ping.latency}ms (历史)`
   return ping.source === 'proxy' ? `${ping.latency}ms (代理)` : `${ping.latency}ms`
 }
 

@@ -181,8 +181,8 @@ type ProxyServer struct {
 	topologyRefreshSeq     uint64
 	topologyRefreshReason  string
 	topologyRefreshSignal  chan struct{}
-	autoPingBootstrapMu   sync.Mutex
-	autoPingBootstrapPos  map[string]int
+	autoPingBootstrapMu    sync.Mutex
+	autoPingBootstrapPos   map[string]int
 }
 
 // NewProxyServer creates a new ProxyServer with all components initialized.
@@ -433,6 +433,22 @@ func (p *ProxyServer) recordServerLatencyFromAutoPing(serverCfg *config.ServerCo
 	p.serverLatencyRecorder.RecordServerLatency(serverCfg.ID, recordedAt.UnixMilli(), latencyMs, online, false, "auto_ping")
 }
 
+// recordServerLatencyPassive records latency history for running servers that
+// are NOT covered by the load-balance auto-ping scheduler (direct / single-node
+// selections). It reads the listener's already-cached latency — refreshed by
+// real client server-list pings or the show-real-latency refresher — so it adds
+// no extra network probes. Servers without a fresh latency reading are skipped.
+func (p *ProxyServer) recordServerLatencyPassive(serverCfg *config.ServerConfig, recordedAt time.Time) {
+	if p == nil || p.serverLatencyRecorder == nil || serverCfg == nil {
+		return
+	}
+	latencyMs, _, _, found := p.GetServerLatencyInfoRaw(serverCfg.ID)
+	if !found || latencyMs <= 0 {
+		return
+	}
+	p.serverLatencyRecorder.RecordServerLatency(serverCfg.ID, recordedAt.UnixMilli(), latencyMs, true, false, "passive")
+}
+
 // GetOutboundManager returns the outbound manager (may be nil if not set).
 func (p *ProxyServer) GetOutboundManager() OutboundManager {
 	return p.outboundMgr
@@ -663,6 +679,7 @@ func (p *ProxyServer) startAutoPingScheduler() {
 		portLastFullScan := make(map[string]time.Time)
 		portLastSwitch := make(map[string]time.Time)
 		observedPortNode := make(map[string]string)
+		passiveLastRun := make(map[string]time.Time)
 
 		for {
 			select {
@@ -688,6 +705,23 @@ func (p *ProxyServer) startAutoPingScheduler() {
 					}
 				}
 				dueServers = append(dueServers, serverCfg)
+			}
+
+			// Passive pass: record latency history for running servers that are
+			// not auto-ping eligible (direct / single-node) using their cached
+			// latency, so they accrue a trend even when the dashboard is closed.
+			for _, serverCfg := range p.configMgr.GetAllServers() {
+				if serverCfg == nil || serverCfg.IsAutoPingEnabled() {
+					continue
+				}
+				intervalMin := p.effectiveServerAutoPingIntervalMinutes(serverCfg)
+				if t, ok := passiveLastRun[serverCfg.ID]; ok {
+					if now.Sub(t) < time.Duration(intervalMin)*time.Minute {
+						continue
+					}
+				}
+				p.recordServerLatencyPassive(serverCfg, now)
+				passiveLastRun[serverCfg.ID] = now
 			}
 
 			var duePorts []*config.ProxyPortConfig
