@@ -29,6 +29,16 @@
             >
               <div class="logo">{{ siderCollapsed ? '🎮' : '🎮 MCPE Proxy' }}</div>
               <n-menu :value="currentPage" :options="menuOptions" :collapsed="siderCollapsed" :collapsed-width="64" :collapsed-icon-size="22" @update:value="navigateTo" />
+              <div v-if="!siderCollapsed" class="version-info">
+                <n-tooltip trigger="hover" placement="top">
+                  <template #trigger>
+                    <span>{{ versionLabel }}</span>
+                  </template>
+                  <div>版本：{{ versionInfo.version }}</div>
+                  <div>提交：{{ versionInfo.git_commit }}</div>
+                  <div>构建：{{ versionInfo.build_time }}</div>
+                </n-tooltip>
+              </div>
             </n-layout-sider>
             
             <!-- Mobile Drawer -->
@@ -65,6 +75,7 @@
 <script setup>
 import { ref, h, onMounted, onUnmounted, computed, defineAsyncComponent } from 'vue'
 import { darkTheme } from 'naive-ui'
+import { api } from './api'
 import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 
@@ -81,6 +92,13 @@ const Settings = defineAsyncComponent(() => import('./views/Settings.vue'))
 const ProxyOutbounds = defineAsyncComponent(() => import('./views/ProxyOutbounds.vue'))
 const ProxyPorts = defineAsyncComponent(() => import('./views/ProxyPorts.vue'))
 const Debug = defineAsyncComponent(() => import('./views/Debug.vue'))
+
+const versionInfo = ref({ version: 'dev', build_time: 'unknown', git_commit: 'unknown' })
+const versionLabel = computed(() => {
+  const v = versionInfo.value || {}
+  const commit = v.git_commit && v.git_commit !== 'unknown' ? ` (${v.git_commit})` : ''
+  return `${v.version || 'dev'}${commit}`
+})
 
 const currentPage = ref('dashboard')
 const searchParam = ref('')
@@ -224,6 +242,9 @@ onMounted(() => {
   if (!window.location.hash) {
     window.location.hash = buildHash(currentPage.value, searchParam.value, highlightParam.value)
   }
+  api('/api/public/version').then(res => {
+    if (res && res.success && res.data) versionInfo.value = res.data
+  }).catch(() => {})
 })
 
 onUnmounted(() => {
@@ -235,4 +256,5 @@ onUnmounted(() => {
 
 <style scoped>
 .logo { padding: 16px; font-size: 16px; font-weight: bold; color: #63e2b7; border-bottom: 1px solid #333; }
+.version-info { position: absolute; bottom: 0; left: 0; right: 0; padding: 8px 16px; font-size: 12px; color: #888; border-top: 1px solid #333; text-align: center; cursor: default; }
 </style>
