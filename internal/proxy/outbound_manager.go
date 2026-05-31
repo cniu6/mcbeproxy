@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -836,11 +837,19 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 		bestName, bestLatency = m.GetBestNodeForServer(serverID, groupOrName, sortBy)
 	}
 
+	// Whether the recorded pin should short-circuit selection for this strategy.
+	// A manual pin (图2, operator explicitly picked a node) is always honored so
+	// the temporary switch sticks. An automatic pin only represents the
+	// auto-selected "best" node, which is meaningful for least-latency; for
+	// round-robin / random / least-connections it must NOT override the
+	// configured strategy, otherwise load balancing never rotates.
+	honorPin := manual || strategy == config.LoadBalanceLeastLatency
+
 	// If a pinned node is set and not excluded, prefer it. A node banned for this
 	// server (图1) is never honored even when pinned. A manually-selected node
 	// (图2) is honored regardless of latency, so a temporary test switch sticks
 	// until automatic selection reverts it.
-	if pinnedName, ok := m.GetServerSelectedNode(serverID); ok && !blocked[pinnedName] {
+	if pinnedName, ok := m.GetServerSelectedNode(serverID); honorPin && ok && !blocked[pinnedName] {
 		excluded := false
 		for _, ex := range excludeNodes {
 			if ex == pinnedName {
@@ -1032,6 +1041,10 @@ func (m *outboundManagerImpl) selectFromGroupForServer(serverID, groupName, stra
 		}
 		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
 	}
+
+	// Map iteration order is random, so sort by name to give round-robin a
+	// stable rotation order across calls.
+	sort.Slice(healthyNodes, func(i, j int) bool { return healthyNodes[i].Name < healthyNodes[j].Name })
 
 	if strategy == config.LoadBalanceLeastLatency {
 		selected := m.selectLeastLatencyForServer(serverID, healthyNodes, sortBy)
@@ -2192,6 +2205,10 @@ func (m *outboundManagerImpl) selectFromGroup(groupName, strategy, sortBy string
 		}
 		return nil, fmt.Errorf("%w: in group '@%s'", ErrNoHealthyNodes, groupName)
 	}
+
+	// Map iteration order is random, so sort by name to give round-robin a
+	// stable rotation order across calls.
+	sort.Slice(healthyNodes, func(i, j int) bool { return healthyNodes[i].Name < healthyNodes[j].Name })
 
 	// Use load balancer to select a node
 	selected := loadBalancer.Select(healthyNodes, strategy, sortBy, groupName)
