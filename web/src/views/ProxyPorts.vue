@@ -81,30 +81,36 @@
           :scroll-x="1860"
           :loading="loading"
         />
-        <div v-if="newPortDraft" class="port-new-draft">
-          <n-space align="center" style="margin-bottom: 8px">
-            <n-tag type="primary" size="small">新增草稿</n-tag>
-            <n-text depth="2" style="font-size: 12px">填写后点"保存"即可写入配置</n-text>
-          </n-space>
-          <PortEditForm
-            :port="newPortDraft"
-            :is-mobile="isMobile"
-            :proxy-type-options="proxyTypeOptions"
-            :load-balance-options="loadBalanceOptions"
-            :load-balance-sort-options="loadBalanceSortOptions"
-            :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
-            :needs-load-balance="needsLoadBalance"
-            :get-proxy-outbound-display="getProxyOutboundDisplay"
-            :show-runtime-info="false"
-            @open-proxy-selector="openFormProxySelector(newPortDraft)"
-            @clear-proxy="clearProxySelection(newPortDraft)"
-          />
-          <n-space justify="end" style="margin-top: 8px">
-            <n-button size="small" @click="newPortDraft = null">取消</n-button>
-            <n-button size="small" type="primary" :loading="newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
-          </n-space>
-        </div>
       </n-card>
+
+      <n-modal
+        :show="!!newPortDraft"
+        preset="card"
+        title="新增代理端口"
+        style="width: 760px; max-width: 95vw"
+        @update:show="(v) => { if (!v) newPortDraft = null }"
+      >
+        <PortEditForm
+          v-if="newPortDraft"
+          :port="newPortDraft"
+          :is-mobile="isMobile"
+          :proxy-type-options="proxyTypeOptions"
+          :load-balance-options="loadBalanceOptions"
+          :load-balance-sort-options="loadBalanceSortOptions"
+          :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
+          :needs-load-balance="needsLoadBalance"
+          :get-proxy-outbound-display="getProxyOutboundDisplay"
+          :show-runtime-info="false"
+          @open-proxy-selector="openFormProxySelector(newPortDraft)"
+          @clear-proxy="clearProxySelection(newPortDraft)"
+        />
+        <template #footer>
+          <n-space justify="end">
+            <n-button size="small" @click="newPortDraft = null">取消</n-button>
+            <n-button size="small" type="primary" :loading="newPortDraft && newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
+          </n-space>
+        </template>
+      </n-modal>
     </n-space>
 
     <n-modal v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: 520px; max-width: 95vw">
@@ -2233,14 +2239,6 @@ onBeforeUnmount(() => {
   font-size: 11px;
   color: var(--n-text-color-3);
   line-height: 1.35;
-}
-
-.port-new-draft {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px dashed var(--n-primary-color);
-  border-radius: 8px;
-  background: rgba(24, 160, 88, 0.04);
 }
 
 .port-row-expand {
