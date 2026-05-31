@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -118,6 +119,9 @@ func main() {
 		MaxAccessLogRecords: globalConfig.MaxAccessLogRecords,
 		LogDir:              globalConfig.LogDir,
 		LogRetentionDays:    globalConfig.LogRetentionDays,
+		APIEntryPath:        globalConfig.APIEntryPath,
+		APIKeyConfigured:    globalConfig.APIKey != "",
+		AccessHosts:         localAccessHosts(),
 	})
 
 	proxyServer, err := proxy.NewProxyServer(globalConfig, configMgr, database)
@@ -201,6 +205,41 @@ func main() {
 
 	logger.Close()
 	logger.Info("Shutdown complete")
+}
+
+// localAccessHosts returns host candidates for building access URLs at startup:
+// loopback first, followed by any non-loopback IPv4 LAN addresses so the
+// operator can copy a reachable URL directly from the logs.
+func localAccessHosts() []string {
+	hosts := []string{"127.0.0.1"}
+	seen := map[string]bool{"127.0.0.1": true}
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return hosts
+	}
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue
+		}
+		s := ip4.String()
+		if !seen[s] {
+			seen[s] = true
+			hosts = append(hosts, s)
+		}
+	}
+	return hosts
 }
 
 func ensureJSONFile(path string, defaultContent []byte, desc string) {
