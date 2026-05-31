@@ -1015,7 +1015,7 @@ const fetchGroupStats = async () => {
 }
 
 // 新增端口: 不直接写入 ports 数组, 而是把草稿放在 newPortDraft,
-// 让用户在表格下方的 dashed-border 面板里填写. 保存时走 POST 再重拉.
+// 弹出「新增代理端口」弹窗让用户填写. 保存时走 POST 再重拉.
 // 这样刷新 / 批量操作都不会碰到这个尚未提交的草稿.
 const addPort = () => {
   if (newPortDraft.value) {
@@ -1079,14 +1079,11 @@ const filteredPorts = computed(() => {
 })
 
 // ----- 表格行 props -----
-// 行内展开模式下, 不再整行点击触发编辑 (那会和展开列交互混淆).
-// 保留 cursor 视觉提示留空, 避免用户误以为整行可点.
+// 点击「编辑」进入行内编辑, 不用整行点击触发.
 const portTableRowProps = () => ({})
 
 // ----- 表格列 -----
-// 相比原来多了: 展开按钮列, 认证(账号)列, 白名单摘要列.
-// 每一行展开后下方直接渲染 PortEditForm, 速度比侧边抽屉快得多,
-// 并且支持同时展开多行做对比编辑.
+// 点「编辑」后该行单元格就地变为可编辑控件, 操作列变为 保存/取消.
 const renderAuthCell = (row) => {
   if (!row.username && !row.password) {
     return h(NTag, { size: 'small', type: 'default', bordered: false }, () => '无')
@@ -2241,9 +2238,4 @@ onBeforeUnmount(() => {
   line-height: 1.35;
 }
 
-.port-row-expand {
-  padding: 8px 12px 4px 12px;
-  background: rgba(0, 0, 0, 0.015);
-  border-left: 3px solid var(--n-primary-color);
-}
 </style>
