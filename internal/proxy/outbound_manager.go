@@ -223,8 +223,17 @@ type OutboundManager interface {
 	GetServerSelectedNode(serverID string) (string, bool)
 
 	// SetServerSelectedNode pins a specific node as the active node for a server.
-	// Set nodeName="" to clear.
+	// Set nodeName="" to clear. This also clears any manual-override flag.
 	SetServerSelectedNode(serverID, nodeName string)
+
+	// SetServerSelectedNodeManual pins a node chosen explicitly by an operator.
+	// The pin is honored for new connections even when a lower-latency node
+	// exists, until automatic selection reverts it. Set nodeName="" to clear.
+	SetServerSelectedNodeManual(serverID, nodeName string)
+
+	// IsServerNodeManual reports whether the server's pinned node was set by an
+	// explicit manual switch (as opposed to automatic selection).
+	IsServerNodeManual(serverID string) bool
 
 	// GetBestNodeForServer determines the best node for a server based on cached latency.
 	// Returns the best node name and its latency, or ("", 0) if no data.
@@ -263,6 +272,7 @@ type outboundManagerImpl struct {
 	outboundHistory     map[outboundLatencyKey]*outboundLatencyHistory
 	serverSelectedMu    sync.RWMutex
 	serverSelectedNode  map[string]string // serverID -> pinned node name
+	serverManualNode    map[string]bool   // serverID -> pinned by explicit manual switch
 }
 
 type ServerNodeLatencySample struct {
@@ -365,6 +375,7 @@ func NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater ServerCon
 		serverNodeHistory:   make(map[serverNodeLatencyKey]*serverNodeLatencyHistory),
 		outboundHistory:     make(map[outboundLatencyKey]*outboundLatencyHistory),
 		serverSelectedNode:  make(map[string]string),
+		serverManualNode:    make(map[string]bool),
 	}
 }
 
@@ -584,7 +595,44 @@ func (m *outboundManagerImpl) SetServerSelectedNode(serverID, nodeName string) {
 	} else {
 		m.serverSelectedNode[serverID] = nodeName
 	}
+	// An automatic (re)selection always clears any manual override so normal
+	// auto-switching resumes.
+	delete(m.serverManualNode, serverID)
 	m.serverSelectedMu.Unlock()
+}
+
+// SetServerSelectedNodeManual pins a node chosen explicitly by an operator (图2).
+// A manual pin is honored for new connections even when a lower-latency node is
+// available, until automatic selection reverts it (e.g. once active sessions
+// drain to zero, maybeAutoSwitchServerNode calls SetServerSelectedNode which
+// clears the manual flag). Set nodeName="" to clear.
+func (m *outboundManagerImpl) SetServerSelectedNodeManual(serverID, nodeName string) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return
+	}
+	m.serverSelectedMu.Lock()
+	if nodeName == "" {
+		delete(m.serverSelectedNode, serverID)
+		delete(m.serverManualNode, serverID)
+	} else {
+		m.serverSelectedNode[serverID] = nodeName
+		m.serverManualNode[serverID] = true
+	}
+	m.serverSelectedMu.Unlock()
+}
+
+// IsServerNodeManual reports whether the server's currently pinned node was set
+// by an explicit manual switch.
+func (m *outboundManagerImpl) IsServerNodeManual(serverID string) bool {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return false
+	}
+	m.serverSelectedMu.RLock()
+	manual := m.serverManualNode[serverID]
+	m.serverSelectedMu.RUnlock()
+	return manual
 }
 
 func (m *outboundManagerImpl) isSelectableOutboundLocked(outbound *config.ProxyOutbound) bool {
@@ -600,12 +648,42 @@ func (m *outboundManagerImpl) isSelectableOutboundLocked(outbound *config.ProxyO
 	return true
 }
 
+// blockedNodesForServer returns the set of node names that are banned from THIS
+// server's automatic selection (the per-server ban from 图1). It is safe to call
+// while holding m.mu because it locks the server config manager separately and
+// never calls back into the outbound manager. Returns nil when there are none.
+func (m *outboundManagerImpl) blockedNodesForServer(serverID string) map[string]bool {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" || m.serverConfigUpdater == nil {
+		return nil
+	}
+	getter, ok := m.serverConfigUpdater.(serverConfigGetter)
+	if !ok {
+		return nil
+	}
+	serverCfg, exists := getter.GetServer(serverID)
+	if !exists || serverCfg == nil {
+		return nil
+	}
+	active := serverCfg.ActiveBlockedNodes()
+	if len(active) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(active))
+	for name := range active {
+		set[name] = true
+	}
+	return set
+}
+
 func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy string) (string, int64) {
 	serverID = strings.TrimSpace(serverID)
 	sortBy = normalizeSortBy(sortBy)
 	if serverID == "" || groupOrName == "" {
 		return "", 0
 	}
+
+	blocked := m.blockedNodesForServer(serverID)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -614,7 +692,7 @@ func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy
 	if strings.HasPrefix(groupOrName, "@") {
 		groupName := strings.TrimPrefix(groupOrName, "@")
 		for _, o := range m.outbounds {
-			if m.isSelectableOutboundLocked(o) && outboundSupportsSort(o, sortBy) && (o.Group == groupName) {
+			if m.isSelectableOutboundLocked(o) && !blocked[o.Name] && outboundSupportsSort(o, sortBy) && (o.Group == groupName) {
 				nodeNames = append(nodeNames, o.Name)
 			}
 		}
@@ -622,6 +700,9 @@ func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy
 		for _, n := range strings.Split(groupOrName, ",") {
 			n = strings.TrimSpace(n)
 			if n == "" {
+				continue
+			}
+			if blocked[n] {
 				continue
 			}
 			if n == DirectNodeName {
@@ -633,6 +714,9 @@ func (m *outboundManagerImpl) GetBestNodeForServer(serverID, groupOrName, sortBy
 			}
 		}
 	} else {
+		if blocked[groupOrName] {
+			return "", 0
+		}
 		if groupOrName == DirectNodeName {
 			if latency, ok := m.GetServerNodeLatency(serverID, DirectNodeName, sortBy); ok {
 				return DirectNodeName, latency
@@ -744,13 +828,19 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 	if serverID == "" {
 		return m.SelectOutboundWithFailover(groupOrName, strategy, sortBy, excludeNodes)
 	}
+	blocked := m.blockedNodesForServer(serverID)
+	manual := m.IsServerNodeManual(serverID)
+
 	bestName, bestLatency := "", int64(0)
 	if strategy == config.LoadBalanceLeastLatency {
 		bestName, bestLatency = m.GetBestNodeForServer(serverID, groupOrName, sortBy)
 	}
 
-	// If a pinned node is set and not excluded, prefer it.
-	if pinnedName, ok := m.GetServerSelectedNode(serverID); ok {
+	// If a pinned node is set and not excluded, prefer it. A node banned for this
+	// server (图1) is never honored even when pinned. A manually-selected node
+	// (图2) is honored regardless of latency, so a temporary test switch sticks
+	// until automatic selection reverts it.
+	if pinnedName, ok := m.GetServerSelectedNode(serverID); ok && !blocked[pinnedName] {
 		excluded := false
 		for _, ex := range excludeNodes {
 			if ex == pinnedName {
@@ -761,7 +851,7 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 		if !excluded {
 			if pinnedName == DirectNodeName && selectorIncludesSelection(groupOrName, DirectNodeName, "") {
 				usePinned := true
-				if strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
+				if !manual && strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
 					pinnedLatency, ok := m.GetServerNodeLatency(serverID, pinnedName, sortBy)
 					if !ok || shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency) {
 						usePinned = false
@@ -778,7 +868,7 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 				isHealthy := o.GetHealthy()
 				if isHealthy || lastCheck.IsZero() || !hasError || time.Since(lastCheck) >= 30*time.Second {
 					usePinned := true
-					if strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
+					if !manual && strategy == config.LoadBalanceLeastLatency && bestName != "" && bestName != pinnedName {
 						pinnedLatency, ok := m.GetServerNodeLatency(serverID, pinnedName, sortBy)
 						if !ok || shouldPreferBestNodeOverPinned(pinnedLatency, bestLatency) {
 							usePinned = false
@@ -809,7 +899,11 @@ func (m *outboundManagerImpl) SelectOutboundWithFailoverForServer(serverID, grou
 		return m.selectFromNodeListForServer(serverID, groupOrName, strategy, sortBy, excludeNodes)
 	}
 
-	// Single node selection
+	// Single node selection. A node banned for this server (图1) yields no
+	// healthy candidate.
+	if m.blockedNodesForServer(serverID)[groupOrName] {
+		return nil, fmt.Errorf("%w: node blocked for this server", ErrNoHealthyNodes)
+	}
 	return m.selectSingleNode(groupOrName, excludeNodes)
 }
 
@@ -819,9 +913,13 @@ func (m *outboundManagerImpl) selectFromNodeListForServer(serverID, nodeListStr,
 	// Parse the comma-separated node list
 	nodeNames := strings.Split(nodeListStr, ",")
 
-	// Build exclusion set for O(1) lookup
+	// Build exclusion set for O(1) lookup. Per-server bans (图1) are treated as
+	// exclusions so the node is never auto-selected for this server.
 	excludeSet := make(map[string]bool)
 	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+	for name := range m.blockedNodesForServer(serverID) {
 		excludeSet[name] = true
 	}
 
@@ -893,9 +991,13 @@ func (m *outboundManagerImpl) selectFromNodeListForServer(serverID, nodeListStr,
 // selectFromGroupForServer selects a healthy node from a group with per-server latency preference.
 // Must be called with read lock held.
 func (m *outboundManagerImpl) selectFromGroupForServer(serverID, groupName, strategy, sortBy string, excludeNodes []string) (*config.ProxyOutbound, error) {
-	// Build exclusion set for O(1) lookup
+	// Build exclusion set for O(1) lookup. Per-server bans (图1) are treated as
+	// exclusions so the node is never auto-selected for this server.
 	excludeSet := make(map[string]bool)
 	for _, name := range excludeNodes {
+		excludeSet[name] = true
+	}
+	for name := range m.blockedNodesForServer(serverID) {
 		excludeSet[name] = true
 	}
 

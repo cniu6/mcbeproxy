@@ -394,6 +394,161 @@ func TestSelectOutboundWithFailoverForServerKeepsPinnedDirectWhenImprovementIsSm
 	}
 }
 
+// makeBlockedServerManager builds a manager whose server config getter reports
+// the given per-server auto-select bans for serverID.
+func makeManagerWithServerBans(t *testing.T, serverID, proxyOutbound string, banned ...string) *outboundManagerImpl {
+	t.Helper()
+	updater := newMockServerConfigUpdater()
+	cfg := &config.ServerConfig{ID: serverID, ProxyOutbound: proxyOutbound}
+	if len(banned) > 0 {
+		cfg.AutoSelectBlockedNodes = make(map[string]*config.NodeAutoSelectBlock, len(banned))
+		for _, name := range banned {
+			cfg.AutoSelectBlockedNodes[name] = &config.NodeAutoSelectBlock{BlockedAt: time.Now()}
+		}
+	}
+	updater.AddServer(cfg)
+	mgr, ok := NewOutboundManager(updater).(*outboundManagerImpl)
+	if !ok {
+		t.Fatalf("expected *outboundManagerImpl")
+	}
+	return mgr
+}
+
+// 图1: a node banned for one server must be excluded from THAT server's auto
+// selection, while a different server (no ban) still picks it.
+func TestPerServerBanExcludesNodeOnlyForThatServer(t *testing.T) {
+	updater := newMockServerConfigUpdater()
+	updater.AddServer(&config.ServerConfig{
+		ID:            "srvA",
+		ProxyOutbound: "@g1",
+		AutoSelectBlockedNodes: map[string]*config.NodeAutoSelectBlock{
+			"node1": {BlockedAt: time.Now()},
+		},
+	})
+	updater.AddServer(&config.ServerConfig{ID: "srvB", ProxyOutbound: "@g1"})
+
+	manager := NewOutboundManager(updater)
+	node1 := &config.ProxyOutbound{Name: "node1", Type: config.ProtocolShadowsocks, Server: "n1.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	node2 := &config.ProxyOutbound{Name: "node2", Type: config.ProtocolShadowsocks, Server: "n2.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	if err := manager.AddOutbound(node1); err != nil {
+		t.Fatalf("AddOutbound node1 failed: %v", err)
+	}
+	if err := manager.AddOutbound(node2); err != nil {
+		t.Fatalf("AddOutbound node2 failed: %v", err)
+	}
+
+	// node1 is the clearly faster node for both servers.
+	for _, srv := range []string{"srvA", "srvB"} {
+		manager.SetServerNodeLatency(srv, "node1", config.LoadBalanceSortUDP, 10)
+		manager.SetServerNodeLatency(srv, "node2", config.LoadBalanceSortUDP, 200)
+	}
+
+	// srvA banned node1 -> must fall back to node2.
+	bestA, _ := manager.GetBestNodeForServer("srvA", "@g1", config.LoadBalanceSortUDP)
+	if bestA != "node2" {
+		t.Fatalf("srvA: expected node2 (node1 banned), got %q", bestA)
+	}
+	selA, err := manager.SelectOutboundWithFailoverForServer("srvA", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || selA == nil || selA.Name != "node2" {
+		t.Fatalf("srvA select: expected node2, got %+v err=%v", selA, err)
+	}
+
+	// srvB has no ban -> still picks the faster node1.
+	bestB, _ := manager.GetBestNodeForServer("srvB", "@g1", config.LoadBalanceSortUDP)
+	if bestB != "node1" {
+		t.Fatalf("srvB: expected node1 (not banned), got %q", bestB)
+	}
+	selB, err := manager.SelectOutboundWithFailoverForServer("srvB", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || selB == nil || selB.Name != "node1" {
+		t.Fatalf("srvB select: expected node1, got %+v err=%v", selB, err)
+	}
+}
+
+// 图1: banning a node in a comma-separated node list excludes it for that server.
+func TestPerServerBanExcludesNodeFromNodeList(t *testing.T) {
+	manager := makeManagerWithServerBans(t, "srv1", "node1,node2", "node1")
+	node1 := &config.ProxyOutbound{Name: "node1", Type: config.ProtocolShadowsocks, Server: "n1.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	node2 := &config.ProxyOutbound{Name: "node2", Type: config.ProtocolShadowsocks, Server: "n2.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	if err := manager.AddOutbound(node1); err != nil {
+		t.Fatalf("AddOutbound node1: %v", err)
+	}
+	if err := manager.AddOutbound(node2); err != nil {
+		t.Fatalf("AddOutbound node2: %v", err)
+	}
+	manager.SetServerNodeLatency("srv1", "node1", config.LoadBalanceSortUDP, 10)
+	manager.SetServerNodeLatency("srv1", "node2", config.LoadBalanceSortUDP, 200)
+
+	sel, err := manager.SelectOutboundWithFailoverForServer("srv1", "node1,node2", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || sel == nil || sel.Name != "node2" {
+		t.Fatalf("expected node2 (node1 banned), got %+v err=%v", sel, err)
+	}
+}
+
+// 图1: banning the only single node makes auto selection fail for that server.
+func TestPerServerBanSingleNodeYieldsNoCandidate(t *testing.T) {
+	manager := makeManagerWithServerBans(t, "srv1", "node1", "node1")
+	node1 := &config.ProxyOutbound{Name: "node1", Type: config.ProtocolShadowsocks, Server: "n1.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test"}
+	if err := manager.AddOutbound(node1); err != nil {
+		t.Fatalf("AddOutbound node1: %v", err)
+	}
+	if _, err := manager.SelectOutboundWithFailoverForServer("srv1", "node1", config.LoadBalanceRoundRobin, config.LoadBalanceSortUDP, nil); err == nil {
+		t.Fatalf("expected error when the only node is banned")
+	}
+	if name, _ := manager.GetBestNodeForServer("srv1", "node1", config.LoadBalanceSortUDP); name != "" {
+		t.Fatalf("expected no best node when banned, got %q", name)
+	}
+}
+
+// 图2: a manual switch is honored for new connections even when a clearly faster
+// node exists (it is not overridden by least-latency preference).
+func TestManualSwitchHonoredOverFasterNode(t *testing.T) {
+	manager := NewOutboundManager(nil)
+	fast := &config.ProxyOutbound{Name: "fast", Type: config.ProtocolShadowsocks, Server: "fast.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	slow := &config.ProxyOutbound{Name: "slow", Type: config.ProtocolShadowsocks, Server: "slow.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	if err := manager.AddOutbound(fast); err != nil {
+		t.Fatalf("AddOutbound fast: %v", err)
+	}
+	if err := manager.AddOutbound(slow); err != nil {
+		t.Fatalf("AddOutbound slow: %v", err)
+	}
+	manager.SetServerNodeLatency("srv1", "fast", config.LoadBalanceSortUDP, 10)
+	manager.SetServerNodeLatency("srv1", "slow", config.LoadBalanceSortUDP, 500)
+
+	// Manual switch to the slow node.
+	manager.SetServerSelectedNodeManual("srv1", "slow")
+	sel, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || sel == nil || sel.Name != "slow" {
+		t.Fatalf("manual switch: expected slow honored, got %+v err=%v", sel, err)
+	}
+
+	// An automatic (re)selection clears the manual flag, so least-latency wins again.
+	manager.SetServerSelectedNode("srv1", "fast")
+	sel, err = manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || sel == nil || sel.Name != "fast" {
+		t.Fatalf("after auto reselect: expected fast, got %+v err=%v", sel, err)
+	}
+}
+
+// 图1 + 图2: a per-server ban beats even a manual pin (a banned node is never used).
+func TestPerServerBanOverridesManualPin(t *testing.T) {
+	manager := makeManagerWithServerBans(t, "srv1", "@g1", "slow")
+	fast := &config.ProxyOutbound{Name: "fast", Type: config.ProtocolShadowsocks, Server: "fast.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	slow := &config.ProxyOutbound{Name: "slow", Type: config.ProtocolShadowsocks, Server: "slow.example.com", Port: 443, Enabled: true, Method: "aes-256-gcm", Password: "test", Group: "g1"}
+	if err := manager.AddOutbound(fast); err != nil {
+		t.Fatalf("AddOutbound fast: %v", err)
+	}
+	if err := manager.AddOutbound(slow); err != nil {
+		t.Fatalf("AddOutbound slow: %v", err)
+	}
+	manager.SetServerNodeLatency("srv1", "fast", config.LoadBalanceSortUDP, 30)
+
+	manager.SetServerSelectedNodeManual("srv1", "slow")
+	sel, err := manager.SelectOutboundWithFailoverForServer("srv1", "@g1", config.LoadBalanceLeastLatency, config.LoadBalanceSortUDP, nil)
+	if err != nil || sel == nil || sel.Name != "fast" {
+		t.Fatalf("expected fast (slow banned despite manual pin), got %+v err=%v", sel, err)
+	}
+}
+
 func TestSelectOutboundWithFailoverForServerLeastLatency_IgnoresZeroLatencyFailures(t *testing.T) {
 	manager := NewOutboundManager(nil)
 

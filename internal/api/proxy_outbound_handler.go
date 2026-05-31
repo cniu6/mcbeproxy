@@ -367,6 +367,33 @@ type BatchProxyOutboundAutoSelectBlockRequest struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
+// ServerNodeBlockRequest is the body for the per-server auto-select block/unblock
+// endpoints. It accepts either a single "name" or a batch "names".
+type ServerNodeBlockRequest struct {
+	Name      string     `json:"name,omitempty"`
+	Names     []string   `json:"names,omitempty"`
+	Reason    string     `json:"reason,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+func (r *ServerNodeBlockRequest) nodeNames() []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(r.Names)+1)
+	add := func(n string) {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			return
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	add(r.Name)
+	for _, n := range r.Names {
+		add(n)
+	}
+	return out
+}
+
 type BatchProxyTestRequest struct {
 	Names       []string           `json:"names" binding:"required"`
 	Type        string             `json:"type" binding:"required"`
@@ -3682,21 +3709,23 @@ func (h *ProxyOutboundHandler) GetServerCurrentNode(c *gin.Context) {
 	}
 
 	respondSuccess(c, map[string]interface{}{
-		"server_id":    serverID,
-		"current_node": nodeName,
-		"has_node":     hasNode,
-		"tcp_ms":       tcpMs,
-		"udp_ms":       udpMs,
-		"http_ms":      httpMs,
-		"has_tcp":      hasTcp,
-		"has_udp":      hasUdp,
-		"has_http":     hasHttp,
-		"best_node":    bestNode,
-		"best_latency": bestLatency,
-		"best_tcp":     bestTcp,
-		"best_udp":     bestUdp,
-		"best_http":    bestHttp,
-		"sort_by":      sortBy,
+		"server_id":     serverID,
+		"current_node":  nodeName,
+		"has_node":      hasNode,
+		"manual":        hasNode && h.outboundMgr.IsServerNodeManual(serverID),
+		"tcp_ms":        tcpMs,
+		"udp_ms":        udpMs,
+		"http_ms":       httpMs,
+		"has_tcp":       hasTcp,
+		"has_udp":       hasUdp,
+		"has_http":      hasHttp,
+		"best_node":     bestNode,
+		"best_latency":  bestLatency,
+		"best_tcp":      bestTcp,
+		"best_udp":      bestUdp,
+		"best_http":     bestHttp,
+		"sort_by":       sortBy,
+		"blocked_nodes": serverCfg.ActiveBlockedNodes(),
 	})
 }
 
@@ -3727,21 +3756,59 @@ func (h *ProxyOutboundHandler) SwitchServerNode(c *gin.Context) {
 
 	sortBy := serverCfg.GetLoadBalanceSort()
 	strategy := serverCfg.GetLoadBalance()
-	bestNode, bestLatency := h.outboundMgr.GetBestNodeForServer(serverID, proxyOutbound, sortBy)
 
-	// If no latency data, fall back to dynamic selection
-	if bestNode == "" {
-		selected, err := h.outboundMgr.SelectOutboundWithFailoverForServer(serverID, proxyOutbound, strategy, sortBy, nil)
-		if err != nil || selected == nil {
-			respondError(c, http.StatusBadRequest, "暂无可用节点，请确认代理节点配置正确且已启用", "")
+	// Optional request body: {"node": "<name>"} forces a temporary switch to a
+	// specific node (even one with high latency or no sample). Automatic
+	// selection / auto-switch keeps running afterwards, so the manual choice is
+	// a one-off override, not a permanent pin.
+	var req struct {
+		Node string `json:"node"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	requestedNode := strings.TrimSpace(req.Node)
+
+	var bestNode string
+	var bestLatency int64
+	if requestedNode != "" {
+		// Validate the requested node is one of this server's configured candidates.
+		candidates := h.listServerCandidateNodes(serverCfg)
+		allowed := false
+		for _, name := range candidates {
+			if name == requestedNode {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			respondError(c, http.StatusBadRequest, "节点不在该服务器的候选列表中", "")
 			return
 		}
-		bestNode = selected.Name
-		bestLatency = 0
+		bestNode = requestedNode
+		if lat, ok := h.outboundMgr.GetServerNodeLatency(serverID, requestedNode, sortBy); ok {
+			bestLatency = lat
+		}
+	} else {
+		bestNode, bestLatency = h.outboundMgr.GetBestNodeForServer(serverID, proxyOutbound, sortBy)
+		// If no latency data, fall back to dynamic selection
+		if bestNode == "" {
+			selected, err := h.outboundMgr.SelectOutboundWithFailoverForServer(serverID, proxyOutbound, strategy, sortBy, nil)
+			if err != nil || selected == nil {
+				respondError(c, http.StatusBadRequest, "暂无可用节点，请确认代理节点配置正确且已启用", "")
+				return
+			}
+			bestNode = selected.Name
+			bestLatency = 0
+		}
 	}
 
 	oldNode, _ := h.outboundMgr.GetServerSelectedNode(serverID)
-	h.outboundMgr.SetServerSelectedNode(serverID, bestNode)
+	if requestedNode != "" {
+		// Manual switch: honor this node for new connections regardless of
+		// latency, until automatic selection reverts it.
+		h.outboundMgr.SetServerSelectedNodeManual(serverID, bestNode)
+	} else {
+		h.outboundMgr.SetServerSelectedNode(serverID, bestNode)
+	}
 
 	respondSuccess(c, map[string]interface{}{
 		"server_id":  serverID,
@@ -3749,6 +3816,157 @@ func (h *ProxyOutboundHandler) SwitchServerNode(c *gin.Context) {
 		"new_node":   bestNode,
 		"latency_ms": bestLatency,
 		"sort_by":    sortBy,
+		"manual":     requestedNode != "",
+	})
+}
+
+// GetServerBlockedNodes returns the per-server auto-select bans for a server.
+// GET /api/servers/:id/blocked-nodes
+func (h *ProxyOutboundHandler) GetServerBlockedNodes(c *gin.Context) {
+	if h == nil || h.serverConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Server config manager not initialized", "")
+		return
+	}
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	active := serverCfg.ActiveBlockedNodes()
+	blocked := make(map[string]interface{}, len(active))
+	for name, b := range active {
+		if b == nil {
+			continue
+		}
+		entry := map[string]interface{}{"reason": b.Reason}
+		if !b.BlockedAt.IsZero() {
+			entry["blocked_at"] = b.BlockedAt
+		}
+		if b.ExpiresAt != nil {
+			entry["expires_at"] = b.ExpiresAt
+		}
+		blocked[name] = entry
+	}
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"blocked":   blocked,
+	})
+}
+
+// BlockServerNode adds a per-server auto-select ban (current server only) for one
+// or more nodes. Unlike the global /api/proxy-outbounds/block-auto-select endpoint,
+// this does NOT affect other servers that reference the same node.
+// POST /api/servers/:id/block-node
+func (h *ProxyOutboundHandler) BlockServerNode(c *gin.Context) {
+	if h == nil || h.serverConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Server config manager not initialized", "")
+		return
+	}
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+	var req ServerNodeBlockRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "expires_at must be in the future")
+		return
+	}
+	names := req.nodeNames()
+	if len(names) == 0 {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "name or names is required")
+		return
+	}
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	// Copy-on-write: build a fresh map so concurrent readers holding the old
+	// shallow copy are unaffected.
+	updated := make(map[string]*config.NodeAutoSelectBlock, len(serverCfg.AutoSelectBlockedNodes)+len(names))
+	for k, v := range serverCfg.AutoSelectBlockedNodes {
+		updated[k] = v
+	}
+	reason := strings.TrimSpace(req.Reason)
+	now := time.Now()
+	for _, name := range names {
+		block := &config.NodeAutoSelectBlock{Reason: reason, BlockedAt: now}
+		if req.ExpiresAt != nil {
+			value := *req.ExpiresAt
+			block.ExpiresAt = &value
+		}
+		updated[name] = block
+	}
+	serverCfg.AutoSelectBlockedNodes = updated
+	if err := h.serverConfigMgr.UpdateServer(serverID, serverCfg); err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update server", err.Error())
+		return
+	}
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"blocked":   names,
+	})
+}
+
+// UnblockServerNode removes a per-server auto-select ban for one or more nodes.
+// POST /api/servers/:id/unblock-node
+func (h *ProxyOutboundHandler) UnblockServerNode(c *gin.Context) {
+	if h == nil || h.serverConfigMgr == nil {
+		respondError(c, http.StatusInternalServerError, "Server config manager not initialized", "")
+		return
+	}
+	serverID := strings.TrimSpace(c.Param("id"))
+	if serverID == "" {
+		respondError(c, http.StatusBadRequest, "Invalid request", "server id is required")
+		return
+	}
+	var req ServerNodeBlockRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+		return
+	}
+	names := req.nodeNames()
+	if len(names) == 0 {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "name or names is required")
+		return
+	}
+	serverCfg, ok := h.serverConfigMgr.GetServer(serverID)
+	if !ok || serverCfg == nil {
+		respondError(c, http.StatusNotFound, "Server not found", "")
+		return
+	}
+	if len(serverCfg.AutoSelectBlockedNodes) == 0 {
+		respondSuccess(c, map[string]interface{}{"server_id": serverID, "unblocked": names})
+		return
+	}
+	updated := make(map[string]*config.NodeAutoSelectBlock, len(serverCfg.AutoSelectBlockedNodes))
+	for k, v := range serverCfg.AutoSelectBlockedNodes {
+		updated[k] = v
+	}
+	for _, name := range names {
+		delete(updated, name)
+	}
+	if len(updated) == 0 {
+		updated = nil
+	}
+	serverCfg.AutoSelectBlockedNodes = updated
+	if err := h.serverConfigMgr.UpdateServer(serverID, serverCfg); err != nil {
+		respondError(c, http.StatusBadRequest, "Failed to update server", err.Error())
+		return
+	}
+	respondSuccess(c, map[string]interface{}{
+		"server_id": serverID,
+		"unblocked": names,
 	})
 }
 
