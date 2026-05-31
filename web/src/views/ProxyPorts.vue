@@ -75,37 +75,42 @@
           size="small"
           :row-key="r => r.id"
           v-model:checked-row-keys="selectedPortIds"
-          v-model:expanded-row-keys="expandedPortIds"
           :row-props="portTableRowProps"
           :pagination="portTablePagination"
           :max-height="720"
           :scroll-x="1860"
           :loading="loading"
         />
-        <div v-if="newPortDraft" class="port-new-draft">
-          <n-space align="center" style="margin-bottom: 8px">
-            <n-tag type="primary" size="small">新增草稿</n-tag>
-            <n-text depth="2" style="font-size: 12px">填写后点"保存"即可写入配置</n-text>
-          </n-space>
-          <PortEditForm
-            :port="newPortDraft"
-            :is-mobile="isMobile"
-            :proxy-type-options="proxyTypeOptions"
-            :load-balance-options="loadBalanceOptions"
-            :load-balance-sort-options="loadBalanceSortOptions"
-            :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
-            :needs-load-balance="needsLoadBalance"
-            :get-proxy-outbound-display="getProxyOutboundDisplay"
-            :show-runtime-info="false"
-            @open-proxy-selector="openFormProxySelector(newPortDraft)"
-            @clear-proxy="clearProxySelection(newPortDraft)"
-          />
-          <n-space justify="end" style="margin-top: 8px">
-            <n-button size="small" @click="newPortDraft = null">取消</n-button>
-            <n-button size="small" type="primary" :loading="newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
-          </n-space>
-        </div>
       </n-card>
+
+      <n-modal
+        :show="!!newPortDraft"
+        preset="card"
+        title="新增代理端口"
+        style="width: 760px; max-width: 95vw"
+        @update:show="(v) => { if (!v) newPortDraft = null }"
+      >
+        <PortEditForm
+          v-if="newPortDraft"
+          :port="newPortDraft"
+          :is-mobile="isMobile"
+          :proxy-type-options="proxyTypeOptions"
+          :load-balance-options="loadBalanceOptions"
+          :load-balance-sort-options="loadBalanceSortOptions"
+          :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
+          :needs-load-balance="needsLoadBalance"
+          :get-proxy-outbound-display="getProxyOutboundDisplay"
+          :show-runtime-info="false"
+          @open-proxy-selector="openFormProxySelector(newPortDraft)"
+          @clear-proxy="clearProxySelection(newPortDraft)"
+        />
+        <template #footer>
+          <n-space justify="end">
+            <n-button size="small" @click="newPortDraft = null">取消</n-button>
+            <n-button size="small" type="primary" :loading="newPortDraft && newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
+          </n-space>
+        </template>
+      </n-modal>
     </n-space>
 
     <n-modal v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: 520px; max-width: 95vw">
@@ -408,7 +413,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick, watch, h } from 'vue'
-import { useMessage, NTag, NButton, NSpace } from 'naive-ui'
+import { useMessage, NTag, NButton, NSpace, NInput, NSelect, NSwitch, NInputNumber, NDynamicTags, NPopover } from 'naive-ui'
 import { api } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
 import PortEditForm from './components/PortEditForm.vue'
@@ -499,10 +504,41 @@ const filterState = reactive({
   proxyMode: null
 })
 
-// 表格内联展开编辑: 展开某一行直接在行下方显示完整编辑表单,
-// 比侧边抽屉快很多 (无过渡动画/无焦点切换), 且多行可同时展开对比.
-// expandedPortIds 是当前展开的端口 id 数组.
-const expandedPortIds = ref([])
+// 表格行内编辑: editingRowIds 是当前处于"编辑态"的端口 id 数组.
+// 进入编辑态后, 该行的各单元格直接渲染成可编辑控件 (名称/监听地址/类型/
+// 节点/负载均衡等), 点"保存"写入后端、"取消"还原快照, 不再使用展开行.
+const editingRowIds = ref([])
+// 进入编辑时为每行保存一份字段快照, 取消时还原.
+const editSnapshots = new Map()
+const editableFields = [
+  'name', 'listen_addr', 'type', 'enabled', 'username', 'password',
+  'proxy_outbound', 'load_balance', 'load_balance_sort',
+  'auto_ping_enabled', 'auto_ping_interval_minutes', 'auto_ping_top_candidates',
+  'auto_ping_full_scan_mode', 'auto_ping_full_scan_time', 'auto_ping_full_scan_interval_hours',
+  'allow_list'
+]
+const isEditingPort = (row) => editingRowIds.value.includes(row.id)
+const startEditPort = (port) => {
+  if (!port || isEditingPort(port)) return
+  const snap = {}
+  editableFields.forEach(f => { snap[f] = Array.isArray(port[f]) ? [...port[f]] : port[f] })
+  editSnapshots.set(port.id, snap)
+  editingRowIds.value = [...editingRowIds.value, port.id]
+  refreshPortRuntime(port)
+}
+const finishEditPort = (port) => {
+  editSnapshots.delete(port.id)
+  editingRowIds.value = editingRowIds.value.filter(id => id !== port.id)
+}
+const cancelEditPort = (port) => {
+  const snap = editSnapshots.get(port.id)
+  if (snap) editableFields.forEach(f => { port[f] = Array.isArray(snap[f]) ? [...snap[f]] : snap[f] })
+  finishEditPort(port)
+}
+const saveEditPort = async (port) => {
+  const ok = await savePort(port)
+  if (ok) finishEditPort(port)
+}
 
 // 新增端口时的草稿: 显示在表格下方的 dashed-border 卡片内,
 // 不污染 ports 数组, 取消不留痕迹, 保存后才追加到 ports.
@@ -953,10 +989,10 @@ const stopExpandedPortRuntimePolling = () => {
 
 const scheduleExpandedPortRuntimePolling = () => {
   stopExpandedPortRuntimePolling()
-  if (expandedPortIds.value.length === 0) return
+  if (editingRowIds.value.length === 0) return
   expandedPortRuntimeTimer = setTimeout(async () => {
-    const expandedPorts = ports.value.filter(port => expandedPortIds.value.includes(port.id) && !port._new)
-    await Promise.all(expandedPorts.map(port => refreshPortRuntime(port)))
+    const editingPorts = ports.value.filter(port => editingRowIds.value.includes(port.id) && !port._new)
+    await Promise.all(editingPorts.map(port => refreshPortRuntime(port)))
     scheduleExpandedPortRuntimePolling()
   }, 3000)
 }
@@ -979,7 +1015,7 @@ const fetchGroupStats = async () => {
 }
 
 // 新增端口: 不直接写入 ports 数组, 而是把草稿放在 newPortDraft,
-// 让用户在表格下方的 dashed-border 面板里填写. 保存时走 POST 再重拉.
+// 弹出「新增代理端口」弹窗让用户填写. 保存时走 POST 再重拉.
 // 这样刷新 / 批量操作都不会碰到这个尚未提交的草稿.
 const addPort = () => {
   if (newPortDraft.value) {
@@ -1003,21 +1039,6 @@ const addPort = () => {
     allow_list: ['0.0.0.0/0']
   })
   newPortDraft.value._new = true
-}
-
-// 展开某行进入编辑态; 已经展开则收起.
-const openEditPort = (port) => {
-  if (!port) return
-  const idx = expandedPortIds.value.indexOf(port.id)
-  if (idx >= 0) {
-    expandedPortIds.value = [
-      ...expandedPortIds.value.slice(0, idx),
-      ...expandedPortIds.value.slice(idx + 1)
-    ]
-  } else {
-    expandedPortIds.value = [...expandedPortIds.value, port.id]
-    refreshPortRuntime(port)
-  }
 }
 
 const saveNewPortDraft = async () => {
@@ -1058,14 +1079,11 @@ const filteredPorts = computed(() => {
 })
 
 // ----- 表格行 props -----
-// 行内展开模式下, 不再整行点击触发编辑 (那会和展开列交互混淆).
-// 保留 cursor 视觉提示留空, 避免用户误以为整行可点.
+// 点击「编辑」进入行内编辑, 不用整行点击触发.
 const portTableRowProps = () => ({})
 
 // ----- 表格列 -----
-// 相比原来多了: 展开按钮列, 认证(账号)列, 白名单摘要列.
-// 每一行展开后下方直接渲染 PortEditForm, 速度比侧边抽屉快得多,
-// 并且支持同时展开多行做对比编辑.
+// 点「编辑」后该行单元格就地变为可编辑控件, 操作列变为 保存/取消.
 const renderAuthCell = (row) => {
   if (!row.username && !row.password) {
     return h(NTag, { size: 'small', type: 'default', bordered: false }, () => '无')
@@ -1125,87 +1143,123 @@ const renderPortRuntimeCell = (row) => {
   ])
 }
 
+// 行内编辑: 自动测速(自动 Ping)高级设置, 收纳进一个 popover 避免单元格过宽.
+const renderAutoPingPopover = (row) => h(NPopover, { trigger: 'click', placement: 'bottom-start' }, {
+  trigger: () => h(NButton, {
+    size: 'tiny',
+    type: row.auto_ping_enabled ? 'success' : 'default',
+    ghost: true
+  }, () => '自动测速'),
+  default: () => h('div', { style: 'display:flex;flex-direction:column;gap:8px;width:240px' }, [
+    h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+      h('span', { style: 'font-size:12px' }, '自动 Ping'),
+      h(NSwitch, { value: !!row.auto_ping_enabled, size: 'small', onUpdateValue: v => { row.auto_ping_enabled = v } })
+    ]),
+    h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+      h('span', { style: 'font-size:12px' }, 'Ping 间隔(分)'),
+      h(NInputNumber, { value: row.auto_ping_interval_minutes, min: 1, size: 'tiny', style: 'width:110px', onUpdateValue: v => { row.auto_ping_interval_minutes = v } })
+    ]),
+    h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+      h('span', { style: 'font-size:12px' }, 'Top N 候选'),
+      h(NInputNumber, { value: row.auto_ping_top_candidates, min: 1, size: 'tiny', style: 'width:110px', onUpdateValue: v => { row.auto_ping_top_candidates = v } })
+    ]),
+    h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+      h('span', { style: 'font-size:12px' }, '全量扫描'),
+      h(NSelect, { value: row.auto_ping_full_scan_mode, size: 'tiny', options: autoPingFullScanModeOptions, style: 'width:110px', consistentMenuWidth: false, onUpdateValue: v => { row.auto_ping_full_scan_mode = v } })
+    ]),
+    row.auto_ping_full_scan_mode === 'daily'
+      ? h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+          h('span', { style: 'font-size:12px' }, '扫描时间'),
+          h(NInput, { value: row.auto_ping_full_scan_time, size: 'tiny', style: 'width:110px', placeholder: '04:00', onUpdateValue: v => { row.auto_ping_full_scan_time = v } })
+        ])
+      : null,
+    row.auto_ping_full_scan_mode === 'interval'
+      ? h(NSpace, { align: 'center', justify: 'space-between' }, () => [
+          h('span', { style: 'font-size:12px' }, '扫描间隔(时)'),
+          h(NInputNumber, { value: row.auto_ping_full_scan_interval_hours, min: 1, size: 'tiny', style: 'width:110px', onUpdateValue: v => { row.auto_ping_full_scan_interval_hours = v } })
+        ])
+      : null
+  ])
+})
+
+// 行内编辑: 代理目标单元格 — 选择节点 + (多节点/分组时) 负载均衡/排序 + 自动测速.
+const renderProxyTargetEdit = (row) => {
+  const children = [
+    h(NSpace, { size: 4, align: 'center', wrap: true }, () => [
+      h(NTag, { size: 'small', bordered: false }, () => getProxyOutboundDisplay(row.proxy_outbound)),
+      h(NButton, { size: 'tiny', onClick: () => openFormProxySelector(row) }, () => '选择'),
+      row.proxy_outbound
+        ? h(NButton, { size: 'tiny', quaternary: true, onClick: () => clearProxySelection(row) }, () => '清除')
+        : null
+    ])
+  ]
+  if (needsLoadBalance(row.proxy_outbound)) {
+    children.push(h(NSpace, { size: 4, align: 'center', wrap: true, style: 'margin-top:4px' }, () => [
+      h(NSelect, { value: row.load_balance, size: 'tiny', options: loadBalanceOptions, style: 'width:118px', consistentMenuWidth: false, onUpdateValue: v => { row.load_balance = v } }),
+      h(NSelect, { value: row.load_balance_sort, size: 'tiny', options: loadBalanceSortOptions, style: 'width:82px', consistentMenuWidth: false, onUpdateValue: v => { row.load_balance_sort = v } }),
+      renderAutoPingPopover(row)
+    ]))
+  }
+  return h('div', {}, children)
+}
+
+const renderProxyTargetDisplay = (row) => {
+  const mode = detectProxyMode(row.proxy_outbound)
+  const display = getProxyOutboundDisplay(row.proxy_outbound)
+  const typeMap = { direct: 'default', single: 'success', multi: 'warning', group: 'primary' }
+  return h('div', { style: 'display: flex; flex-direction: column; gap: 2px' }, [
+    h(NTag, { size: 'small', type: typeMap[mode] || 'default', bordered: false }, () => display),
+    row.load_balance
+      ? h('span', { style: 'font-size: 11px; color: var(--n-text-color-3)' },
+          `${getLoadBalanceLabel(row.load_balance)} · ${getLoadBalanceSortLabel(row.load_balance_sort) || ''}`)
+      : null
+  ])
+}
+
 const portTableColumns = computed(() => [
   { type: 'selection', width: 36, fixed: 'left' },
-  {
-    type: 'expand',
-    // 展开时整行渲染 PortEditForm + 底部操作按钮.
-    // 表单直接绑 row 本身, 用户改完点"保存" / "关闭" 即可.
-    renderExpand: (row) => h('div', { class: 'port-row-expand' }, [
-      h(PortEditForm, {
-        port: row,
-        isMobile: isMobile.value,
-        proxyTypeOptions,
-        loadBalanceOptions,
-        loadBalanceSortOptions,
-        autoPingFullScanModeOptions,
-        needsLoadBalance,
-        getProxyOutboundDisplay,
-        showRuntimeInfo: !row._new,
-        canRefreshRuntime: !row._new,
-        runtimeRefreshing: !!row._runtimeRefreshing,
-        onOpenProxySelector: () => openFormProxySelector(row),
-        onClearProxy: () => clearProxySelection(row),
-        onRefreshRuntime: () => refreshPortRuntime(row)
-      }),
-      h(NSpace, { justify: 'end', style: 'margin-top: 8px' }, () => [
-        h(NButton, {
-          size: 'small',
-          onClick: () => openEditPort(row)
-        }, () => '关闭'),
-        h(NButton, {
-          size: 'small',
-          type: 'primary',
-          loading: !!row._saving,
-          onClick: () => savePort(row)
-        }, () => '保存修改')
-      ])
-    ])
-  },
   {
     title: '名称',
     key: 'name',
     minWidth: 160,
     ellipsis: { tooltip: true },
-    render: row => h('span', { style: 'font-weight: 500' }, row.name || `(未命名) ${row.id}`)
+    render: row => isEditingPort(row)
+      ? h(NInput, { value: row.name, size: 'small', placeholder: '名称', onUpdateValue: v => { row.name = v } })
+      : h('span', { style: 'font-weight: 500' }, row.name || `(未命名) ${row.id}`)
   },
   {
     title: '监听地址',
     key: 'listen_addr',
-    width: 150,
+    width: 160,
     ellipsis: { tooltip: true },
-    render: row => row.listen_addr || '-'
+    render: row => isEditingPort(row)
+      ? h(NInput, { value: row.listen_addr, size: 'small', placeholder: '0.0.0.0:1080', onUpdateValue: v => { row.listen_addr = v } })
+      : (row.listen_addr || '-')
   },
   {
     title: '类型',
     key: 'type',
-    width: 80,
-    render: row => h(NTag, { size: 'small', type: 'info', bordered: false }, () => (row.type || '').toUpperCase() || '-')
+    width: 116,
+    render: row => isEditingPort(row)
+      ? h(NSelect, { value: row.type, size: 'small', options: proxyTypeOptions, consistentMenuWidth: false, onUpdateValue: v => { row.type = v } })
+      : h(NTag, { size: 'small', type: 'info', bordered: false }, () => (row.type || '').toUpperCase() || '-')
   },
   {
     title: '认证',
     key: 'auth',
-    width: 150,
-    ellipsis: { tooltip: true },
-    render: renderAuthCell
+    width: 180,
+    render: row => isEditingPort(row)
+      ? h('div', { style: 'display:flex;flex-direction:column;gap:4px' }, [
+          h(NInput, { value: row.username, size: 'small', placeholder: '账号(可选)', clearable: true, onUpdateValue: v => { row.username = v } }),
+          h(NInput, { value: row.password, type: 'password', showPasswordOn: 'click', size: 'small', placeholder: '密码(可选)', clearable: true, onUpdateValue: v => { row.password = v } })
+        ])
+      : renderAuthCell(row)
   },
   {
     title: '代理目标',
     key: 'proxy_outbound',
-    minWidth: 220,
-    ellipsis: { tooltip: true },
-    render: row => {
-      const mode = detectProxyMode(row.proxy_outbound)
-      const display = getProxyOutboundDisplay(row.proxy_outbound)
-      const typeMap = { direct: 'default', single: 'success', multi: 'warning', group: 'primary' }
-      return h('div', { style: 'display: flex; flex-direction: column; gap: 2px' }, [
-        h(NTag, { size: 'small', type: typeMap[mode] || 'default', bordered: false }, () => display),
-        row.load_balance
-          ? h('span', { style: 'font-size: 11px; color: var(--n-text-color-3)' },
-              `${getLoadBalanceLabel(row.load_balance)} · ${getLoadBalanceSortLabel(row.load_balance_sort) || ''}`)
-          : null
-      ])
-    }
+    minWidth: 240,
+    render: row => isEditingPort(row) ? renderProxyTargetEdit(row) : renderProxyTargetDisplay(row)
   },
   {
     title: '当前使用',
@@ -1216,20 +1270,21 @@ const portTableColumns = computed(() => [
   {
     title: '白名单',
     key: 'allow_list',
-    width: 120,
-    ellipsis: { tooltip: true },
-    render: renderAllowListCell
+    width: 180,
+    render: row => isEditingPort(row)
+      ? h(NDynamicTags, { value: Array.isArray(row.allow_list) ? row.allow_list : [], size: 'small', onUpdateValue: v => { row.allow_list = v } })
+      : renderAllowListCell(row)
   },
   {
     title: '启用',
     key: 'enabled',
-    width: 70,
-    render: row => h('span', {}, [
-      h('span', {
-        class: ['status-dot', row.enabled ? 'status-on' : 'status-off']
-      }),
-      h('span', { style: 'margin-left: 6px; font-size: 12px' }, row.enabled ? '启用' : '停用')
-    ])
+    width: 80,
+    render: row => isEditingPort(row)
+      ? h(NSwitch, { value: !!row.enabled, size: 'small', onUpdateValue: v => { row.enabled = v } })
+      : h('span', {}, [
+          h('span', { class: ['status-dot', row.enabled ? 'status-on' : 'status-off'] }),
+          h('span', { style: 'margin-left: 6px; font-size: 12px' }, row.enabled ? '启用' : '停用')
+        ])
   },
   {
     title: '测试结果',
@@ -1242,30 +1297,35 @@ const portTableColumns = computed(() => [
     key: 'actions',
     width: 220,
     fixed: 'right',
-    render: row => h(NSpace, { size: 'small' }, () => [
-      h(NButton, {
-        size: 'tiny',
-        type: 'info',
-        ghost: true,
-        loading: testResults[row.id]?.status === 'running',
-        onClick: () => runSinglePortTest(row)
-      }, () => '测试'),
-      h(NButton, {
-        size: 'tiny',
-        onClick: () => togglePortEnabled(row)
-      }, () => row.enabled ? '停用' : '启用'),
-      h(NButton, {
-        size: 'tiny',
-        type: 'primary',
-        onClick: () => openEditPort(row)
-      }, () => expandedPortIds.value.includes(row.id) ? '收起' : '编辑'),
-      h(NButton, {
-        size: 'tiny',
-        type: 'error',
-        ghost: true,
-        onClick: () => confirmDeletePort(row)
-      }, () => '删除')
-    ])
+    render: row => isEditingPort(row)
+      ? h(NSpace, { size: 'small' }, () => [
+          h(NButton, { size: 'tiny', type: 'primary', loading: !!row._saving, onClick: () => saveEditPort(row) }, () => '保存'),
+          h(NButton, { size: 'tiny', onClick: () => cancelEditPort(row) }, () => '取消')
+        ])
+      : h(NSpace, { size: 'small' }, () => [
+          h(NButton, {
+            size: 'tiny',
+            type: 'info',
+            ghost: true,
+            loading: testResults[row.id]?.status === 'running',
+            onClick: () => runSinglePortTest(row)
+          }, () => '测试'),
+          h(NButton, {
+            size: 'tiny',
+            onClick: () => togglePortEnabled(row)
+          }, () => row.enabled ? '停用' : '启用'),
+          h(NButton, {
+            size: 'tiny',
+            type: 'primary',
+            onClick: () => startEditPort(row)
+          }, () => '编辑'),
+          h(NButton, {
+            size: 'tiny',
+            type: 'error',
+            ghost: true,
+            onClick: () => confirmDeletePort(row)
+          }, () => '删除')
+        ])
   }
 ])
 
@@ -1583,9 +1643,10 @@ const savePort = async (port) => {
     if (res.success) {
       message.success('已保存')
       await loadPorts()
-    } else {
-      message.error(res.msg || '保存失败')
+      return true
     }
+    message.error(res.msg || '保存失败')
+    return false
   } finally {
     port._saving = false
   }
@@ -2011,7 +2072,7 @@ const formatLatency = (latency) => {
   return `${latency}ms`
 }
 
-watch(expandedPortIds, () => {
+watch(editingRowIds, () => {
   scheduleExpandedPortRuntimePolling()
 }, { deep: true })
 
@@ -2177,17 +2238,4 @@ onBeforeUnmount(() => {
   line-height: 1.35;
 }
 
-.port-new-draft {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px dashed var(--n-primary-color);
-  border-radius: 8px;
-  background: rgba(24, 160, 88, 0.04);
-}
-
-.port-row-expand {
-  padding: 8px 12px 4px 12px;
-  background: rgba(0, 0, 0, 0.015);
-  border-left: 3px solid var(--n-primary-color);
-}
 </style>
