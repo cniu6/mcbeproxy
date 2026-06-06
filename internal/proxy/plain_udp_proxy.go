@@ -118,7 +118,9 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		clientInfo.targetConn.SetWriteDeadline(time.Now().Add(plainUDPWriteTimeout))
 		_, err = writePacketConn(clientInfo.targetConn, (*buf)[:n], clientInfo.targetAddr)
 		p.bufferPool.Put(buf)
-		if err != nil && !isTimeoutError(err) {
+		// A transient ICMP-induced error on a connected/direct UDP socket
+		// (e.g. connection refused) must not drop the session; skip the datagram.
+		if err != nil && !isTimeoutError(err) && !isRecoverableConnError(err) {
 			logger.Debug("PlainUDPProxy: write to target failed for %s: %v", clientAddr.String(), err)
 			p.removeClientIfMatch(clientAddr.String(), clientInfo)
 		}
@@ -275,6 +277,15 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 				return
 			}
 			if !isTimeoutError(err) {
+				// Transient ICMP-induced error on a connected/direct UDP socket:
+				// keep the session and rely on the idle reaper for dead peers.
+				if isRecoverableConnError(err) {
+					lastSeen := time.Unix(0, clientInfo.lastSeen.Load())
+					if time.Since(lastSeen) > p.idleTimeout {
+						return
+					}
+					continue
+				}
 				if !strings.Contains(err.Error(), "use of closed") {
 					logger.Debug("PlainUDPProxy: read from target failed for %s: %v", clientInfo.clientAddr.String(), err)
 				}
