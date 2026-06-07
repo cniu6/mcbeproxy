@@ -136,6 +136,7 @@ type rawUDPClientInfo struct {
 	playerXUID           string
 	proxyNode            string                        // Name of the proxy node used (empty if direct)
 	loginParsed          atomic.Bool                   // Whether we've tried to parse login
+	sessionCreated       atomic.Bool                   // Whether a SessionManager entry exists for this client
 	sessionID            string                        // Session ID for session manager
 	splitPackets         map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
 	compressionID        atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
@@ -577,6 +578,14 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			clientInfo.bytesUp.Add(int64(n))
 			clientInfo.packetCount.Add(1)
 
+			// Once the client sends a reliable frame the RakNet connection is
+			// established; make sure a session exists so the player is tracked
+			// (online status + traffic + playtime) even if the Login packet can
+			// never be decoded. Identity is back-filled later when login parses.
+			if n > 0 && buffer[0] >= 0x80 && buffer[0] <= 0x8f {
+				p.ensureSession(clientInfo)
+			}
+
 			// Update session stats
 			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
 				sess.AddBytesUp(int64(n))
@@ -715,6 +724,23 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 	go p.forwardResponses(clientAddr, clientInfo)
 
 	return clientInfo, true
+}
+
+// ensureSession creates a SessionManager entry for this client once a real
+// RakNet connection has been established, independent of whether the Login
+// packet could be parsed. Raw UDP forwards bytes regardless of our ability to
+// decode the player's Login, so without this a player whose Login packet is
+// split/encrypted/uses an unknown compression would be in-game yet invisible on
+// the panel, with zero tracked traffic/playtime. Player identity is enriched
+// later by handlePacketWithLoginCheck when available.
+func (p *RawUDPProxy) ensureSession(clientInfo *rawUDPClientInfo) {
+	if clientInfo == nil || clientInfo.sessionCreated.Load() {
+		return
+	}
+	if _, created := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); created {
+		logger.Debug("RawUDP: session %s created on RakNet connection establishment (pre-login)", clientInfo.sessionID)
+	}
+	clientInfo.sessionCreated.Store(true)
 }
 
 // dialThroughProxy creates a PacketConn through the proxy outbound
@@ -1096,15 +1122,17 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 					playerXUID := clientInfo.playerXUID
 					clientInfo.mu.Unlock()
 
-					if clientInfo.loginParsed.Load() && playerName != "" {
-						sess, exists := p.sessionMgr.Get(clientInfo.sessionID)
-						if !exists {
-							sess, _ = p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
-							if sess != nil {
-								sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
-							}
+					// Keep the session alive for still-connected clients during
+					// traffic lulls and back-fill identity once the Login parses.
+					if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+						if playerName != "" && sess.GetDisplayName() == "" {
+							sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 						}
-						if sess != nil {
+						sess.UpdateLastSeen()
+					} else if clientInfo.loginParsed.Load() && playerName != "" {
+						if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
+							clientInfo.sessionCreated.Store(true)
+							sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 							sess.UpdateLastSeen()
 						}
 					}
@@ -1429,9 +1457,10 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 	clientInfo.loginParsed.Store(true)
 	clientInfo.compressionID.Store(uint32(gamePacket[1]))
 
-	// Create session NOW (only after Login packet is parsed with player info)
+	// Create (or reuse a pre-login) session and attach the parsed player info.
 	sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
 	if sess != nil {
+		clientInfo.sessionCreated.Store(true)
 		sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 		sess.UpdateLastSeen()
 		logger.Debug("Created session %s with player info: name=%s", clientInfo.sessionID, playerName)

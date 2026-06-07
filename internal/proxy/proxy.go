@@ -471,6 +471,16 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 	endTime := time.Now()
 	snap := sess.Snapshot()
 	duration := endTime.Sub(snap.StartTime)
+
+	// A session can be created the moment a RakNet connection is established
+	// (so the player shows online even if their Login can't be decoded). If we
+	// never learned any identity, there is no player to attribute the record to;
+	// skip persistence so transient pre-login probes don't pollute history.
+	if snap.DisplayName == "" && snap.UUID == "" {
+		logger.LogSessionEnded(snap.ClientAddr, snap.ServerID, duration)
+		return
+	}
+
 	// Determine connection status
 	status := snap.DisconnectStatus
 	if status == "" {
