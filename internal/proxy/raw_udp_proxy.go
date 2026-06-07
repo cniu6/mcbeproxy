@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -619,6 +621,11 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			}
 
 			if err != nil {
+				// A transient ICMP-induced write error on a connected/direct
+				// UDP socket should only drop this datagram, not the session.
+				if isRecoverableConnError(err) {
+					continue
+				}
 				if !isTimeoutError(err) {
 					logger.Debug("Write to target failed for %s: %v", clientAddr.String(), err)
 				}
@@ -813,6 +820,16 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					return
 				}
 				if !isTimeoutError(err) {
+					// Transient ICMP-induced error on a connected/direct UDP
+					// socket (e.g. connection refused): keep the session alive
+					// and let the inactivity reaper handle truly dead peers.
+					if isRecoverableConnError(err) {
+						lastSeenNano := clientInfo.lastSeen.Load()
+						if time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
+							return
+						}
+						continue
+					}
 					// Only log if not kicked
 					if !strings.Contains(err.Error(), "use of closed") {
 						logger.Debug("Read from target failed for %s: %v", clientAddr.String(), err)
@@ -1210,6 +1227,45 @@ func (p *RawUDPProxy) GetConfig() *config.ServerConfig {
 // isTimeoutError checks if an error is a timeout error
 func isTimeoutError(err error) bool {
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+// isRecoverableConnError reports whether err is a transient, per-datagram
+// network error that must NOT tear down a long-lived UDP session.
+//
+// Direct connections use a connected UDP socket (net.DialUDP). On Linux such a
+// socket surfaces ICMP "port/host/network unreachable" as ECONNREFUSED /
+// EHOSTUNREACH / ENETUNREACH (and sometimes ECONNRESET) on the *next* Read or
+// Write. A single such ICMP — caused by a brief blip on the path or the game
+// server momentarily not having a socket bound — would otherwise kill the whole
+// player session even though the link is healthy. The reliable RakNet layer
+// retransmits, so we swallow these and let the inactivity reaper remove
+// genuinely dead peers. Connections through a proxy outbound use an unconnected
+// PacketConn and never see these, which is why only direct connections "drop by
+// themselves".
+func isRecoverableConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	// Fallback string match for wrapped errors or platforms that don't expose
+	// the errno directly.
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection refused"),
+		strings.Contains(msg, "no route to host"),
+		strings.Contains(msg, "host is unreachable"),
+		strings.Contains(msg, "host unreachable"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "network unreachable"),
+		strings.Contains(msg, "connection reset"):
 		return true
 	}
 	return false
