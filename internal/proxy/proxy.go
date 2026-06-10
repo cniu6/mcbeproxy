@@ -467,9 +467,16 @@ func (p *ProxyServer) GetProxyPortConfigManager() *config.ProxyPortConfigManager
 // persistSession saves session data to the database when a session ends.
 // Uses retry logic for database operations per requirement 9.3.
 func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, playerRepo *db.PlayerRepository, errorHandler *proxyerrors.ErrorHandler) {
-	// Create session record
-	endTime := time.Now()
 	snap := sess.Snapshot()
+	// The session usually ends some time AFTER the player actually left: the
+	// idle reaper only fires minutes later, and a shutdown flush can persist
+	// hours after the last packet. Using time.Now() here inflated playtime by
+	// up to the idle timeout. LastSeen marks the last real traffic, which is
+	// the player's actual departure time.
+	endTime := snap.LastSeen
+	if endTime.IsZero() || endTime.Before(snap.StartTime) {
+		endTime = time.Now()
+	}
 	duration := endTime.Sub(snap.StartTime)
 
 	// A session can be created the moment a RakNet connection is established

@@ -44,6 +44,13 @@ const (
 	// PassthroughClientInactiveTimeout is the default for passthrough raw-compat mode.
 	// Shorter timeout helps remove offline players promptly without relying on RakNet close.
 	PassthroughClientInactiveTimeout = 30 * time.Second
+	// rawUDPSilenceDisconnectTimeout caps how long a totally silent client is
+	// still considered online. RakNet exchanges connected pings/ACKs every few
+	// seconds in both directions even for AFK players, so silence this long
+	// means the connection is gone; the raw forwarder can't see the
+	// encapsulated DisconnectNotification and would otherwise keep the player
+	// "online" until the (much longer) configured idle timeout expires.
+	rawUDPSilenceDisconnectTimeout = 30 * time.Second
 	// RawUDPPingRefreshInterval throttles expensive proxy pings (QUIC handshakes).
 	RawUDPPingRefreshInterval = 60 * time.Second
 	// RawUDPUnconnectedPingMinIntervalPerIP rate-limits server-list pings to reduce CPU under scanning.
@@ -130,6 +137,8 @@ type rawUDPClientInfo struct {
 	lastSeen             atomic.Int64   // Unix nano timestamp for lock-free access
 	bytesUp              atomic.Int64   // Lock-free counter
 	bytesDown            atomic.Int64   // Lock-free counter
+	bytesUpSynced        atomic.Int64   // Portion of bytesUp already credited to a session
+	bytesDownSynced      atomic.Int64   // Portion of bytesDown already credited to a session
 	packetCount          atomic.Int64   // Lock-free counter
 	playerName           string         // Extracted from Login packet
 	playerUUID           string
@@ -150,6 +159,31 @@ type rawUDPClientInfo struct {
 	pendingACKSeqs       []uint32
 	mu                   sync.Mutex // Only for splitPackets and player info writes
 	kickMessage          string
+}
+
+// syncBytesUpToSession credits any not-yet-credited upload bytes to the
+// session. Sessions are created lazily (and can be re-created if removed
+// externally), so per-packet incremental counting used to silently drop the
+// handshake bytes plus everything sent during any window without a session.
+// Delta-syncing against the authoritative clientInfo counter makes the session
+// totals match the real traffic regardless of when the session appeared.
+// Safe for the single Listen-loop writer; CAS guards rare concurrent callers.
+func (c *rawUDPClientInfo) syncBytesUpToSession(sess *session.Session) {
+	total := c.bytesUp.Load()
+	prev := c.bytesUpSynced.Load()
+	if total > prev && c.bytesUpSynced.CompareAndSwap(prev, total) {
+		sess.AddBytesUp(total - prev)
+	}
+}
+
+// syncBytesDownToSession is the download-direction counterpart of
+// syncBytesUpToSession (single forwardResponses-goroutine writer).
+func (c *rawUDPClientInfo) syncBytesDownToSession(sess *session.Session) {
+	total := c.bytesDown.Load()
+	prev := c.bytesDownSynced.Load()
+	if total > prev && c.bytesDownSynced.CompareAndSwap(prev, total) {
+		sess.AddBytesDown(total - prev)
+	}
 }
 
 // initSplitPackets initializes the split packet map if needed
@@ -593,9 +627,10 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				p.ensureSession(clientInfo)
 			}
 
-			// Update session stats
+			// Update session stats (delta sync so bytes received before the
+			// session existed are credited too instead of being lost)
 			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
-				sess.AddBytesUp(int64(n))
+				clientInfo.syncBytesUpToSession(sess)
 				sess.UpdateLastSeen()
 			}
 
@@ -749,8 +784,14 @@ func (p *RawUDPProxy) ensureSession(clientInfo *rawUDPClientInfo) {
 	if clientInfo == nil || clientInfo.sessionCreated.Load() {
 		return
 	}
-	if _, created := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); created {
+	sess, created := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
+	if created {
 		logger.Debug("RawUDP: session %s created on RakNet connection establishment (pre-login)", clientInfo.sessionID)
+	}
+	if sess != nil {
+		// The session is registered lazily; align its start with the moment
+		// the client actually connected so playtime isn't undercounted.
+		sess.BackdateStartTime(clientInfo.startTime)
 	}
 	clientInfo.sessionCreated.Store(true)
 }
@@ -901,9 +942,10 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 
 			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
 
-			// Update session stats
+			// Update session stats (delta sync so no download bytes are lost
+			// to windows where the session didn't exist yet)
 			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
-				sess.AddBytesDown(int64(n))
+				clientInfo.syncBytesDownToSession(sess)
 				sess.UpdateLastSeen()
 			}
 
@@ -1073,6 +1115,13 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
 	}
 
+	// Credit any bytes not yet delta-synced before the session is persisted,
+	// otherwise the tail of the connection's traffic is lost from statistics.
+	if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+		clientInfo.syncBytesUpToSession(sess)
+		clientInfo.syncBytesDownToSession(sess)
+	}
+
 	if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
 		if !strings.Contains(err.Error(), "session not found") {
 			logger.Debug("Failed to remove session for %s: %v", clientKey, err)
@@ -1123,13 +1172,23 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 				p.maybeRefreshPingCacheAsync(false)
 			}
 			now := time.Now()
+			// A live RakNet link is never silent: connected pings/ACKs flow
+			// every couple of seconds in both directions even when the player
+			// is AFK. So total silence beyond a short window means the player
+			// already left; waiting the full configured idle timeout (often
+			// minutes) only delayed exit detection, kept ghosts in the online
+			// list and inflated session end times.
+			disconnectTimeout := p.clientInactiveTimeout
+			if disconnectTimeout > rawUDPSilenceDisconnectTimeout {
+				disconnectTimeout = rawUDPSilenceDisconnectTimeout
+			}
 			p.clients.Range(func(key, value interface{}) bool {
 				clientInfo := value.(*rawUDPClientInfo)
 				lastSeenNano := clientInfo.lastSeen.Load()
-				inactive := now.Sub(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout
+				inactive := now.Sub(time.Unix(0, lastSeenNano)) > disconnectTimeout
 
 				if inactive {
-					logger.Info("RawUDP session closed (idle timeout %v): client=%s", p.clientInactiveTimeout, key.(string))
+					logger.Info("RawUDP session closed (idle timeout %v): client=%s", disconnectTimeout, key.(string))
 					p.removeClient(key.(string))
 				} else {
 					// Clean up stale split packets for active clients
@@ -1142,11 +1201,13 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 
 					// Keep the session alive for still-connected clients during
 					// traffic lulls and back-fill identity once the Login parses.
+					// LastSeen is advanced from the real traffic timestamp (not
+					// "now") so the recorded exit time stays accurate.
 					if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
 						if playerName != "" && sess.GetDisplayName() == "" {
 							sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 						}
-						sess.UpdateLastSeen()
+						sess.AdvanceLastSeen(time.Unix(0, lastSeenNano))
 					} else if clientInfo.loginParsed.Load() && playerName != "" {
 						if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
 							clientInfo.sessionCreated.Store(true)
@@ -1497,6 +1558,9 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 	// Create (or reuse a pre-login) session and attach the parsed player info.
 	sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
 	if sess != nil {
+		if !clientInfo.sessionCreated.Load() {
+			sess.BackdateStartTime(clientInfo.startTime)
+		}
 		clientInfo.sessionCreated.Store(true)
 		sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 		sess.UpdateLastSeen()

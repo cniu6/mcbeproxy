@@ -92,6 +92,37 @@ func (s *Session) UpdateLastSeen() {
 	s.LastSeen = time.Now()
 }
 
+// AdvanceLastSeen moves LastSeen forward to t if t is later than the current
+// value. Unlike UpdateLastSeen it never fabricates activity "now": callers
+// pass the timestamp of real traffic, so the persisted session end time
+// reflects when the player actually left.
+func (s *Session) AdvanceLastSeen(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t.After(s.LastSeen) {
+		s.LastSeen = t
+	}
+}
+
+// BackdateStartTime moves StartTime earlier to t. Sessions can be registered
+// lazily (e.g. raw_udp creates the session only once the first reliable RakNet
+// frame or the Login packet is seen), so without backdating the persisted
+// playtime systematically loses the connection handshake period.
+// No-op when t is zero or not earlier than the current StartTime.
+func (s *Session) BackdateStartTime(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t.Before(s.StartTime) {
+		s.StartTime = t
+	}
+}
+
 func (s *Session) AddBytesUpAndUpdateLastSeen(n int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
