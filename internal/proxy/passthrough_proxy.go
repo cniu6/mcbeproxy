@@ -607,7 +607,11 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 		}
 	} else {
 		logger.Debug("Using direct connection to %s", targetAddr)
-		remoteConn, err = raknet.Dial(targetAddr)
+		// Use an upstream dialer so the direct UDP socket gets the same tuning
+		// as other direct paths (notably SIO_UDP_CONNRESET=FALSE on Windows so
+		// ICMP unreachable cannot surface as fatal read errors mid-session).
+		directDialer := raknet.Dialer{UpstreamDialer: &directUpstreamDialer{cfg: serverCfg}}
+		remoteConn, err = directDialer.Dial(targetAddr)
 	}
 
 	if err != nil {

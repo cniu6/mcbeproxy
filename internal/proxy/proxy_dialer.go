@@ -107,7 +107,12 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	if d.shouldUseDirect() {
 		logger.Debug("ProxyDialer: Using direct connection for %s", address)
 		dialer := &net.Dialer{Timeout: d.timeout}
-		return dialer.DialContext(ctx, network, address)
+		conn, err := dialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		tuneDirectNetConn(conn, d.serverConfig, "proxy_dialer_direct:"+address)
+		return conn, nil
 	}
 	if d.outboundMgr == nil {
 		return nil, errors.New("proxy dial failed: outbound manager unavailable")
@@ -233,6 +238,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 			directDialer := &net.Dialer{Timeout: d.timeout}
 			directConn, directErr := directDialer.DialContext(ctx, network, address)
 			if directErr == nil {
+				tuneDirectNetConn(directConn, d.serverConfig, "proxy_dialer_direct:"+address)
 				d.setSelectedNode(DirectNodeName)
 				return directConn, nil
 			}

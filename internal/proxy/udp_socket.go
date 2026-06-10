@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -100,6 +101,12 @@ func tuneUDPSocketForServer(conn *net.UDPConn, cfg *config.ServerConfig, label s
 	if conn == nil {
 		return
 	}
+	// Windows: stop the kernel from surfacing ICMP unreachable as fatal
+	// WSAECONNRESET on later reads/writes (no-op on other platforms). This is
+	// the root cause of "direct connections randomly drop after a while while
+	// proxied ones don't": only direct sockets exchange datagrams with the
+	// game server itself and therefore receive its ICMP errors.
+	disableUDPConnResetNotifications(conn, label)
 	aggressive := cfg.IsAggressiveLatency()
 	requested := 0
 	if cfg != nil {
@@ -113,4 +120,29 @@ func tuneUDPSocketForServer(conn *net.UDPConn, cfg *config.ServerConfig, label s
 			logger.Debug("DSCP EF not applied for %s: %v (best-effort, safe to ignore)", label, err)
 		}
 	}
+}
+
+// tuneDirectNetConn applies the same UDP socket tuning to a direct net.Conn
+// obtained from net.Dialer (which returns *net.UDPConn for "udp" networks).
+// Non-UDP conns are left untouched.
+func tuneDirectNetConn(conn net.Conn, cfg *config.ServerConfig, label string) {
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		tuneUDPSocketForServer(udpConn, cfg, label)
+	}
+}
+
+// directUpstreamDialer implements raknet.UpstreamDialer for direct (no proxy
+// node) connections, ensuring the underlying UDP socket gets the standard
+// tuning before go-raknet starts using it.
+type directUpstreamDialer struct {
+	cfg *config.ServerConfig
+}
+
+func (d *directUpstreamDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	tuneDirectNetConn(conn, d.cfg, "direct_upstream:"+address)
+	return conn, nil
 }

@@ -73,6 +73,13 @@ func TestIsRecoverableConnError_Classification(t *testing.T) {
 		errString("read udp: host is unreachable"),
 		errString("write udp: network is unreachable"),
 		errString("read: connection reset by peer"),
+		// Linux: netfilter drop (e.g. nf_conntrack table full) surfaces as
+		// EPERM on sendto; must drop the datagram, not the player session.
+		errString("write udp 1.2.3.4:5000->5.6.7.8:19132: sendto: operation not permitted"),
+		// Linux: transient qdisc/sndbuf exhaustion under burst.
+		errString("write udp: no buffer space available"),
+		// Linux: cached path-MTU ICMP for this flow.
+		errString("write udp: message too long"),
 	}
 	for _, e := range recoverable {
 		if !isRecoverableConnError(e) {

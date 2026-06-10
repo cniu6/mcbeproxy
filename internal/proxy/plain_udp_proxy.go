@@ -302,6 +302,11 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 		p.listener.SetWriteDeadline(time.Now().Add(plainUDPWriteTimeout))
 		_, err = p.listener.WriteToUDP(buffer[:n], clientInfo.clientAddr)
 		if err != nil && !isTimeoutError(err) {
+			// Transient ICMP-induced error on the shared listener socket:
+			// drop this datagram only, keep the session.
+			if isRecoverableConnError(err) {
+				continue
+			}
 			if !strings.Contains(err.Error(), "use of closed") {
 				logger.Debug("PlainUDPProxy: write to client failed for %s: %v", clientInfo.clientAddr.String(), err)
 			}

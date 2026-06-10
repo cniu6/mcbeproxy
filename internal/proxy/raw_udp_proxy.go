@@ -541,6 +541,11 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				if isTimeoutError(err) {
 					continue
 				}
+				// Transient ICMP-induced errors on the shared listener socket
+				// must not stall the hot loop for all clients.
+				if isRecoverableConnError(err) {
+					continue
+				}
 				logger.Debug("Read UDP error: %v", err)
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -556,7 +561,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Check if this is a RakNet disconnect notification from client
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
 				clientKey := clientAddr.String()
-				logger.Debug("Received RakNet disconnect from client %s", clientKey)
+				if _, known := p.clients.Load(clientKey); known {
+					logger.Info("RawUDP session closed (client sent RakNet disconnect): client=%s", clientKey)
+				}
 				p.removeClient(clientKey)
 				continue
 			}
@@ -635,9 +642,14 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				if isRecoverableConnError(err) {
 					continue
 				}
-				if !isTimeoutError(err) {
-					logger.Debug("Write to target failed for %s: %v", clientAddr.String(), err)
+				// A blocking write that hits the 5s deadline means transient
+				// local congestion (full sndbuf/qdisc); dropping the session
+				// would force a reconnect for no reason — drop the datagram.
+				if isTimeoutError(err) {
+					logger.Debug("Write to target timed out for %s, dropping datagram", clientAddr.String())
+					continue
 				}
+				logger.Info("RawUDP session closed (write to target failed): client=%s err=%v", clientAddr.String(), err)
 				p.removeClient(clientAddr.String())
 				continue
 			}
@@ -858,7 +870,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					}
 					// Only log if not kicked
 					if !strings.Contains(err.Error(), "use of closed") {
-						logger.Debug("Read from target failed for %s: %v", clientAddr.String(), err)
+						logger.Info("RawUDP session closed (read from target failed): client=%s err=%v", clientAddr.String(), err)
 					}
 					return
 				}
@@ -873,7 +885,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 
 			// Check if this is a RakNet disconnect notification from server
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
-				logger.Debug("Received RakNet disconnect from server for client %s", clientAddr.String())
+				logger.Info("RawUDP session closed (server sent RakNet disconnect): client=%s", clientAddr.String())
 				// Forward to client and then close
 				p.listener.WriteToUDP(buffer[:n], clientAddr)
 				return
@@ -899,8 +911,14 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 			_, err = p.listener.WriteToUDP(buffer[:n], clientAddr)
 			if err != nil {
+				// ICMP from the client side (NAT rebinding, brief unreachable)
+				// surfaces here on the shared listener socket; drop only this
+				// datagram, not the whole session.
+				if isRecoverableConnError(err) {
+					continue
+				}
 				if !isTimeoutError(err) {
-					logger.Debug("Write to client %s failed: %v", clientAddr.String(), err)
+					logger.Info("RawUDP session closed (write to client failed): client=%s err=%v", clientAddr.String(), err)
 				}
 				return
 			}
@@ -1111,7 +1129,7 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 				inactive := now.Sub(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout
 
 				if inactive {
-					logger.Debug("Cleaning up inactive client: %s", key.(string))
+					logger.Info("RawUDP session closed (idle timeout %v): client=%s", p.clientInactiveTimeout, key.(string))
 					p.removeClient(key.(string))
 				} else {
 					// Clean up stale split packets for active clients
@@ -1277,10 +1295,26 @@ func isRecoverableConnError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Platform-specific cases first: on Windows the WSA error codes
+	// (e.g. WSAECONNRESET=10054) do NOT match the unix-style syscall.E*
+	// sentinels below, and the error strings are localized, so without this
+	// check direct UDP sessions on Windows are torn down by a single ICMP.
+	if isPlatformRecoverableConnError(err) {
+		return true
+	}
 	if errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.EHOSTUNREACH) ||
 		errors.Is(err, syscall.ENETUNREACH) ||
-		errors.Is(err, syscall.ECONNRESET) {
+		errors.Is(err, syscall.ECONNRESET) ||
+		// EPERM: netfilter dropped the datagram (e.g. nf_conntrack table
+		// full, rate-limit rules). Happens probabilistically on busy Linux
+		// hosts and only affects per-player direct UDP flows — proxied
+		// traffic shares one long-lived tunnel conntrack entry.
+		errors.Is(err, syscall.EPERM) ||
+		// ENOBUFS: qdisc/socket send queue momentarily full under burst.
+		errors.Is(err, syscall.ENOBUFS) ||
+		// EMSGSIZE: path-MTU ICMP cached by the kernel for this flow.
+		errors.Is(err, syscall.EMSGSIZE) {
 		return true
 	}
 	// Fallback string match for wrapped errors or platforms that don't expose
@@ -1293,7 +1327,10 @@ func isRecoverableConnError(err error) bool {
 		strings.Contains(msg, "host unreachable"),
 		strings.Contains(msg, "network is unreachable"),
 		strings.Contains(msg, "network unreachable"),
-		strings.Contains(msg, "connection reset"):
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "operation not permitted"),
+		strings.Contains(msg, "no buffer space"),
+		strings.Contains(msg, "message too long"):
 		return true
 	}
 	return false
