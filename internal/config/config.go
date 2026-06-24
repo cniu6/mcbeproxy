@@ -1540,6 +1540,7 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 	go func() {
 		defer cm.closeWatcher()
 
+		var debounceTimer *time.Timer
 		for {
 			select {
 			case <-ctx.Done():
@@ -1548,23 +1549,38 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				// Reload on write or create events
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create {
-					// Small delay to ensure file write is complete
-					time.Sleep(100 * time.Millisecond)
-					if err := cm.Reload(); err != nil {
-						// Log error but continue watching
-						// In production, this would use a proper logger
-						fmt.Printf("config reload error: %v\n", err)
+				// Reload on write, create, or rename events.
+				// atomicWriteFile uses os.Rename which triggers Rename,
+				// not Write. Without handling Rename, external atomic
+				// writes (and even our own saveToFile on some platforms)
+				// would be silently missed.
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+					// Debounce: coalesce rapid events into a single reload
+					if debounceTimer != nil {
+						debounceTimer.Stop()
 					}
+					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+						if err := cm.Reload(); err != nil {
+								logger.Error("Config reload error: %v", err)
+						}
+						// Re-add file to watcher after reload.
+						// After atomicWriteFile replaces the file via rename,
+						// the watcher may be tracking the old inode (Linux)
+						// or lose the watch (Windows Remove+Create).
+						// Re-adding ensures subsequent changes are detected.
+						cm.watcherMu.Lock()
+						if cm.watcher != nil {
+							_ = cm.watcher.Add(cm.configPath)
+						}
+						cm.watcherMu.Unlock()
+					})
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
 				// Log error but continue watching
-				fmt.Printf("config watcher error: %v\n", err)
+				logger.Error("Config watcher error: %v", err)
 			}
 		}
 	}()

@@ -3,7 +3,7 @@ package errors
 
 import (
 	"fmt"
-	"log"
+	"mcpeserverproxy/internal/logger"
 	"time"
 )
 
@@ -150,13 +150,13 @@ func (h *ErrorHandler) WithRetryDelay(d time.Duration) *ErrorHandler {
 // HandlePacketForwardError handles packet forwarding errors.
 // Per requirement 9.1: log the error and continue processing.
 func (h *ErrorHandler) HandlePacketForwardError(err error, clientAddr, direction string) {
-	log.Printf("[WARN] Packet forward error (%s -> %s): %v", clientAddr, direction, err)
+	logger.Warn("Packet forward error (%s -> %s): %v", clientAddr, direction, err)
 }
 
 // HandleRemoteUnreachable handles remote server unreachable errors.
 // Per requirement 9.2: mark affected sessions and attempt reconnection.
 func (h *ErrorHandler) HandleRemoteUnreachable(err error, serverID, clientAddr string) {
-	log.Printf("[ERROR] Remote server unreachable (server=%s, client=%s): %v", serverID, clientAddr, err)
+	logger.Error("Remote server unreachable (server=%s, client=%s): %v", serverID, clientAddr, err)
 }
 
 // RetryOperation retries a database operation up to maxRetries times.
@@ -169,7 +169,7 @@ func (h *ErrorHandler) RetryOperation(op string, fn func() error) error {
 		if err := fn(); err != nil {
 			lastErr = err
 			if attempt < h.maxRetries {
-				log.Printf("[WARN] %s failed (attempt %d/%d): %v, retrying in %v",
+				logger.Warn("%s failed (attempt %d/%d): %v, retrying in %v",
 					op, attempt, h.maxRetries, err, delay)
 				time.Sleep(delay)
 				delay = time.Duration(float64(delay) * h.retryBackoff)
@@ -179,14 +179,14 @@ func (h *ErrorHandler) RetryOperation(op string, fn func() error) error {
 		}
 	}
 
-	log.Printf("[ERROR] %s failed after %d attempts: %v", op, h.maxRetries, lastErr)
+	logger.Error("%s failed after %d attempts: %v", op, h.maxRetries, lastErr)
 	return fmt.Errorf("%s failed after %d retries: %w", op, h.maxRetries, lastErr)
 }
 
 // LogAndContinue logs an error and returns nil to allow continuation.
 func LogAndContinue(op string, err error) error {
 	if err != nil {
-		log.Printf("[WARN] %s: %v (continuing)", op, err)
+		logger.Warn("%s: %v (continuing)", op, err)
 	}
 	return nil
 }

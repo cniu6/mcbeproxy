@@ -44,13 +44,6 @@ const (
 	// PassthroughClientInactiveTimeout is the default for passthrough raw-compat mode.
 	// Shorter timeout helps remove offline players promptly without relying on RakNet close.
 	PassthroughClientInactiveTimeout = 30 * time.Second
-	// rawUDPSilenceDisconnectTimeout caps how long a totally silent client is
-	// still considered online. RakNet exchanges connected pings/ACKs every few
-	// seconds in both directions even for AFK players, so silence this long
-	// means the connection is gone; the raw forwarder can't see the
-	// encapsulated DisconnectNotification and would otherwise keep the player
-	// "online" until the (much longer) configured idle timeout expires.
-	rawUDPSilenceDisconnectTimeout = 30 * time.Second
 	// RawUDPPingRefreshInterval throttles expensive proxy pings (QUIC handshakes).
 	RawUDPPingRefreshInterval = 60 * time.Second
 	// RawUDPUnconnectedPingMinIntervalPerIP rate-limits server-list pings to reduce CPU under scanning.
@@ -62,7 +55,33 @@ const (
 	// rawUDPKickCooldown is the cooldown period after kicking a client
 	rawUDPKickCooldown     = 3 * time.Second
 	rawUDPKickCleanupDelay = 350 * time.Millisecond
+	// MaxRawUDPStaleTimeout is the absolute maximum staleness before a client
+	// is forcibly removed, even when idle_timeout=-1. This prevents permanent
+	// goroutine/connection leaks when a client disappears without sending a
+	// RakNet DisconnectNotification (e.g., NAT timeout, crash, kill -9).
+	MaxRawUDPStaleTimeout = 24 * time.Hour
 )
+
+// rawUDPBufferPool reduces GC pressure by reusing UDP packet buffers.
+// Each buffer is MaxUDPPacketSize (8192) bytes. forwardResponses goroutines
+// get/put buffers from this pool instead of allocating per-client.
+var rawUDPBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, MaxUDPPacketSize)
+		return &b
+	},
+}
+
+func getRawUDPBuffer() []byte {
+	return *(rawUDPBufferPool.Get().(*[]byte))
+}
+
+func putRawUDPBuffer(b []byte) {
+	if cap(b) >= MaxUDPPacketSize {
+		b = b[:MaxUDPPacketSize]
+		rawUDPBufferPool.Put(&b)
+	}
+}
 
 // RakNet packet IDs
 const (
@@ -595,8 +614,15 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Check if this is a RakNet disconnect notification from client
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
 				clientKey := clientAddr.String()
-				if _, known := p.clients.Load(clientKey); known {
+				if val, ok := p.clients.Load(clientKey); ok {
 					logger.Info("RawUDP session closed (client sent RakNet disconnect): client=%s", clientKey)
+					// Forward disconnect to upstream so intermediate proxies and
+					// the real server can clean up promptly. Without this, a
+					// multi-level chain with idle_timeout=-1 would leak the
+					// upstream connection forever.
+					ci := val.(*rawUDPClientInfo)
+					ci.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
+					_, _ = writePacketConn(ci.targetConn, buffer[:n], ci.targetAddr)
 				}
 				p.removeClient(clientKey)
 				continue
@@ -871,7 +897,8 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 		p.removeClientIfMatch(clientAddr.String(), clientInfo)
 	}()
 
-	buffer := make([]byte, MaxUDPPacketSize)
+	buffer := getRawUDPBuffer()
+	defer putRawUDPBuffer(buffer)
 
 	for {
 		select {
@@ -904,7 +931,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// and let the inactivity reaper handle truly dead peers.
 					if isRecoverableConnError(err) {
 						lastSeenNano := clientInfo.lastSeen.Load()
-						if time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
+						if p.clientInactiveTimeout > 0 && time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
 							return
 						}
 						continue
@@ -916,8 +943,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					return
 				}
 				// Check if client is still active (lock-free)
+				// Skip inactivity check when clientInactiveTimeout=0 (idle_timeout=-1)
 				lastSeenNano := clientInfo.lastSeen.Load()
-				if time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
+				if p.clientInactiveTimeout > 0 && time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
 					logger.Debug("Client %s inactive, closing connection", clientAddr.String())
 					return
 				}
@@ -1172,23 +1200,22 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 				p.maybeRefreshPingCacheAsync(false)
 			}
 			now := time.Now()
-			// A live RakNet link is never silent: connected pings/ACKs flow
-			// every couple of seconds in both directions even when the player
-			// is AFK. So total silence beyond a short window means the player
-			// already left; waiting the full configured idle timeout (often
-			// minutes) only delayed exit detection, kept ghosts in the online
-			// list and inflated session end times.
+			// Use the full configured idle_timeout. RakNet has its own
+			// keepalive (connected ping/pong) and disconnect mechanism
+			// (DisconnectNotification), so the proxy does not need to
+			// aggressively guess whether a connection is dead based on
+			// silence alone. When idle_timeout=-1 (clientInactiveTimeout=0),
+			// skip inactivity cleanup entirely — never disconnect.
 			disconnectTimeout := p.clientInactiveTimeout
-			if disconnectTimeout > rawUDPSilenceDisconnectTimeout {
-				disconnectTimeout = rawUDPSilenceDisconnectTimeout
-			}
 			p.clients.Range(func(key, value interface{}) bool {
 				clientInfo := value.(*rawUDPClientInfo)
 				lastSeenNano := clientInfo.lastSeen.Load()
-				inactive := now.Sub(time.Unix(0, lastSeenNano)) > disconnectTimeout
 
-				if inactive {
+				if disconnectTimeout > 0 && now.Sub(time.Unix(0, lastSeenNano)) > disconnectTimeout {
 					logger.Info("RawUDP session closed (idle timeout %v): client=%s", disconnectTimeout, key.(string))
+					p.removeClient(key.(string))
+				} else if disconnectTimeout == 0 && now.Sub(time.Unix(0, lastSeenNano)) > MaxRawUDPStaleTimeout {
+					logger.Info("RawUDP session closed (max stale timeout %v): client=%s", MaxRawUDPStaleTimeout, key.(string))
 					p.removeClient(key.(string))
 				} else {
 					// Clean up stale split packets for active clients
@@ -1234,6 +1261,14 @@ func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
 }
 
 func (p *RawUDPProxy) updateTimeouts() {
+	// idle_timeout = -1 means never disconnect due to inactivity.
+	// RakNet has its own keepalive (connected ping/pong) and disconnect
+	// mechanism (DisconnectNotification), so the proxy does not need to
+	// aggressively guess whether a connection is dead.
+	if p.config != nil && p.config.IdleTimeout == -1 {
+		p.clientInactiveTimeout = 0 // 0 = never timeout
+		return
+	}
 	timeout := DefaultClientInactiveTimeout
 	if p.config != nil && strings.EqualFold(p.config.GetProxyMode(), "passthrough") && p.passthroughIdleTimeoutOverride > 0 {
 		// passthrough 全局覆盖优先
@@ -2942,7 +2977,8 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	}
 
 	// Wait for pong
-	buffer := make([]byte, MaxUDPPacketSize)
+	buffer := getRawUDPBuffer()
+	defer putRawUDPBuffer(buffer)
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err := conn.ReadFrom(buffer)
 	if err != nil {

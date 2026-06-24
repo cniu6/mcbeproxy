@@ -41,7 +41,12 @@ func (sm *SessionManager) SetIdleTimeoutFunc(fn func(session *Session) time.Dura
 
 func (sm *SessionManager) getIdleTimeout(session *Session) time.Duration {
 	if sm.idleTimeoutFunc != nil {
-		if v := sm.idleTimeoutFunc(session); v > 0 {
+		v := sm.idleTimeoutFunc(session)
+		if v < 0 {
+			// Negative value means "never disconnect due to inactivity"
+			return 0
+		}
+		if v > 0 {
 			return v
 		}
 	}

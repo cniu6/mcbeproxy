@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -168,7 +167,9 @@ type ProxyServer struct {
 	proxyPortConfigMgr     *config.ProxyPortConfigManager     // Proxy port config manager
 	proxyPortManager       *ProxyPortManager                  // Proxy port runtime manager
 	listeners              map[string]Listener                // serverID -> listener (can be UDPListener or RakNetProxy)
+	listenAddrs            map[string]string                  // serverID -> listen addr (for detecting addr changes during Reload)
 	listenersMu            sync.RWMutex
+	reloadMu               sync.Mutex                         // serializes Reload to prevent concurrent listener start/stop races
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
@@ -214,8 +215,12 @@ func NewProxyServer(
 				return time.Duration(globalConfig.PassthroughIdleTimeout) * time.Second
 			}
 		}
-		if !ok || serverCfg.IdleTimeout <= 0 {
+		if !ok || serverCfg.IdleTimeout == 0 {
 			return 0
+		}
+		if serverCfg.IdleTimeout == -1 {
+			// -1 means never disconnect due to inactivity
+			return -1
 		}
 		return time.Duration(serverCfg.IdleTimeout) * time.Second
 	})
@@ -279,6 +284,7 @@ func NewProxyServer(
 		proxyPortConfigMgr:     proxyPortConfigMgr,
 		proxyPortManager:       proxyPortManager,
 		listeners:              make(map[string]Listener),
+		listenAddrs:            make(map[string]string),
 		serverAutoPingLastRun:  make(map[string]time.Time),
 		topologyRefreshSignal:  make(chan struct{}, 1),
 		autoPingBootstrapPos:   make(map[string]int),
@@ -604,20 +610,19 @@ func (p *ProxyServer) Start() error {
 	// Start DNS refresh
 	p.configMgr.StartDNSRefresh(p.ctx, 60*time.Second)
 
-	// Start config file watcher
-	if err := p.configMgr.Watch(p.ctx); err != nil {
-		log.Printf("Warning: failed to start config watcher: %v", err)
-	}
+	// Set up config change callbacks BEFORE starting watchers to avoid
+	// a race condition where file changes between Watch() and SetOnChange()
+	// are missed (onChange would be nil during Reload).
 
-	// Start proxy outbound config file watcher
-	// Requirements: 8.2
-	if p.proxyOutboundConfigMgr != nil {
-		if err := p.proxyOutboundConfigMgr.Watch(p.ctx); err != nil {
-			log.Printf("Warning: failed to start proxy outbound config watcher: %v", err)
+	// Set up server config change callback
+	p.configMgr.SetOnChange(func() {
+		if err := p.Reload(); err != nil {
+			logger.Error("Failed to reload after config change: %v", err)
 		}
+	})
 
-		// Set up proxy outbound config change callback
-		// Requirements: 8.2
+	// Set up proxy outbound config change callback
+	if p.proxyOutboundConfigMgr != nil {
 		p.proxyOutboundConfigMgr.SetOnChange(func() {
 			if err := p.reloadProxyOutbounds(); err != nil {
 				logger.Error("Failed to reload proxy outbounds after config change: %v", err)
@@ -625,11 +630,8 @@ func (p *ProxyServer) Start() error {
 		})
 	}
 
-	// Start proxy port config file watcher
+	// Set up proxy port config change callback
 	if p.proxyPortConfigMgr != nil {
-		if err := p.proxyPortConfigMgr.Watch(p.ctx); err != nil {
-			log.Printf("Warning: failed to start proxy port config watcher: %v", err)
-		}
 		p.proxyPortConfigMgr.SetOnChange(func() {
 			if err := p.ReloadProxyPorts(); err != nil {
 				logger.Error("Failed to reload proxy ports after config change: %v", err)
@@ -637,12 +639,22 @@ func (p *ProxyServer) Start() error {
 		})
 	}
 
-	// Set up config change callback
-	p.configMgr.SetOnChange(func() {
-		if err := p.Reload(); err != nil {
-			logger.Error("Failed to reload after config change: %v", err)
+	// Start config file watchers (after callbacks are set)
+	if err := p.configMgr.Watch(p.ctx); err != nil {
+		logger.Error("Failed to start config watcher: %v", err)
+	}
+
+	if p.proxyOutboundConfigMgr != nil {
+		if err := p.proxyOutboundConfigMgr.Watch(p.ctx); err != nil {
+			logger.Error("Failed to start proxy outbound config watcher: %v", err)
 		}
-	})
+	}
+
+	if p.proxyPortConfigMgr != nil {
+		if err := p.proxyPortConfigMgr.Watch(p.ctx); err != nil {
+			logger.Error("Failed to start proxy port config watcher: %v", err)
+		}
+	}
 
 	// Start listeners for all enabled servers
 	servers := p.configMgr.GetAllServers()
@@ -2129,6 +2141,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 
 	// Store listener
 	p.listeners[serverCfg.ID] = listener
+	p.listenAddrs[serverCfg.ID] = serverCfg.ListenAddr
 
 	// Start listening in a goroutine
 	p.wg.Add(1)
@@ -2158,6 +2171,7 @@ func (p *ProxyServer) stopListener(serverID string) error {
 	}
 
 	delete(p.listeners, serverID)
+	delete(p.listenAddrs, serverID)
 	logger.LogServerStopped(serverID)
 	return nil
 }
@@ -2199,6 +2213,7 @@ func (p *ProxyServer) Stop() error {
 		}
 	}
 	p.listeners = make(map[string]Listener)
+	p.listenAddrs = make(map[string]string)
 	p.listenersMu.Unlock()
 
 	// Stop proxy ports
@@ -2238,6 +2253,11 @@ func (p *ProxyServer) Reload() error {
 	}
 	p.runningMu.RUnlock()
 
+	// Serialize reloads: prevent concurrent Reload calls from racing
+	// on listener start/stop decisions (e.g., fsnotify + API call).
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	servers := p.configMgr.GetAllServers()
 	serverMap := make(map[string]*config.ServerConfig)
 	for _, s := range servers {
@@ -2247,8 +2267,12 @@ func (p *ProxyServer) Reload() error {
 	// Get current listeners and their configs
 	p.listenersMu.RLock()
 	currentListeners := make(map[string]Listener)
+	currentListenAddrs := make(map[string]string)
 	for id, listener := range p.listeners {
 		currentListeners[id] = listener
+	}
+	for id, addr := range p.listenAddrs {
+		currentListenAddrs[id] = addr
 	}
 	p.listenersMu.RUnlock()
 
@@ -2274,7 +2298,12 @@ func (p *ProxyServer) Reload() error {
 			} else {
 				existingKind := listenerKind(existingListener)
 				desiredKind := listenerKindFromConfig(serverCfg)
-				if existingKind != desiredKind {
+				oldAddr := currentListenAddrs[serverCfg.ID]
+				addrChanged := oldAddr != "" && oldAddr != serverCfg.ListenAddr
+				if existingKind != desiredKind || addrChanged {
+					if addrChanged {
+						logger.Info("Listen address changed for server %s: %s -> %s, restarting listener", serverCfg.ID, oldAddr, serverCfg.ListenAddr)
+					}
 					if err := p.stopListener(serverCfg.ID); err != nil {
 						logger.Error("Failed to stop listener for server %s during restart: %v", serverCfg.ID, err)
 						continue
@@ -2449,6 +2478,10 @@ func (p *ProxyServer) ReloadServer(serverID string) error {
 		return fmt.Errorf("proxy server is not running")
 	}
 	p.runningMu.RUnlock()
+
+	// Serialize with Reload to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
 
 	// Get the latest config for this server
 	serverCfg, exists := p.configMgr.GetServer(serverID)

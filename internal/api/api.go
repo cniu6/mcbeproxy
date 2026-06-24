@@ -413,7 +413,7 @@ func (a *APIServer) Start(addr string) error {
 
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("API server error: %v\n", err)
+			logger.Error("API server error: %v", err)
 		}
 	}()
 
@@ -538,7 +538,7 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 		// Log access (Requirements 10.4)
 		if err := a.keyRepo.LogAccess(apiKey, c.Request.URL.Path); err != nil {
 			// Log error but don't fail the request
-			fmt.Printf("Failed to log API access: %v\n", err)
+			logger.Error("Failed to log API access: %v", err)
 		}
 
 		// Store key info in context for later use
@@ -619,7 +619,7 @@ func (a *APIServer) createServer(c *gin.Context) {
 		if !a.proxyController.IsServerRunning(serverCfg.ID) {
 			if err := a.proxyController.StartServer(serverCfg.ID); err != nil {
 				// 不阻断创建流程，记到响应里供前端展示
-				fmt.Printf("Warning: failed to start listener for new server %s: %v\n", serverCfg.ID, err)
+				logger.Error("Failed to start listener for new server %s: %v", serverCfg.ID, err)
 			}
 		}
 	}
@@ -655,15 +655,15 @@ func (a *APIServer) updateServer(c *gin.Context) {
 		switch {
 		case running && serverCfg.Enabled:
 			if err := a.proxyController.ReloadServer(serverCfg.ID); err != nil {
-				fmt.Printf("Warning: failed to reload server %s after config update: %v\n", serverCfg.ID, err)
+				logger.Error("Failed to reload server %s after config update: %v", serverCfg.ID, err)
 			}
 		case running && !serverCfg.Enabled:
 			if err := a.proxyController.StopServer(serverCfg.ID); err != nil {
-				fmt.Printf("Warning: failed to stop server %s after disable: %v\n", serverCfg.ID, err)
+				logger.Error("Failed to stop server %s after disable: %v", serverCfg.ID, err)
 			}
 		case !running && serverCfg.Enabled:
 			if err := a.proxyController.StartServer(serverCfg.ID); err != nil {
-				fmt.Printf("Warning: failed to start server %s after enable: %v\n", serverCfg.ID, err)
+				logger.Error("Failed to start server %s after enable: %v", serverCfg.ID, err)
 			}
 		}
 	}
@@ -1462,12 +1462,12 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 	*a.globalConfig = nextConfig
 	if req.MaxSessionRecords > 0 && a.sessionRepo != nil {
 		if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
-			fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
+			logger.Error("Failed to update session repository max records: %v", err)
 		}
 	}
 	if req.ProxyPortsEnabled != nil && a.proxyController != nil {
 		if err := a.proxyController.ReloadProxyPorts(); err != nil {
-			fmt.Printf("Warning: failed to reload proxy ports after config update: %v\n", err)
+			logger.Error("Failed to reload proxy ports after config update: %v", err)
 		}
 	}
 
@@ -1502,6 +1502,11 @@ func (a *APIServer) updateEntryPath(c *gin.Context) {
 	// Update in memory
 	a.globalConfig.APIEntryPath = req.EntryPath
 
+	// Persist to file so the change survives restarts
+	if err := a.globalConfig.Save("config.json"); err != nil {
+		logger.Error("Failed to persist entry path change: %v", err)
+	}
+
 	respondSuccessWithMsg(c, "入口路径已更新为: "+req.EntryPath, map[string]string{
 		"entry_path": req.EntryPath,
 	})
@@ -1533,14 +1538,14 @@ func (a *APIServer) updateMaxSessionRecords(c *gin.Context) {
 
 	// Save config to file (using default path "config.json")
 	if err := a.globalConfig.Save("config.json"); err != nil {
-		fmt.Printf("Warning: failed to save config to file: %v\n", err)
+		logger.Error("Failed to save config to file: %v", err)
 		// Continue anyway - config is updated in memory
 	}
 
 	// Update SessionRepository immediately to apply the new limit
 	if a.sessionRepo != nil {
 		if err := a.sessionRepo.SetMaxRecords(req.MaxSessionRecords); err != nil {
-			fmt.Printf("Warning: failed to update session repository max records: %v\n", err)
+			logger.Error("Failed to update session repository max records: %v", err)
 			respondError(c, http.StatusInternalServerError, "Failed to update session repository", err.Error())
 			return
 		}

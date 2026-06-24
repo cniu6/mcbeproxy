@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"mcpeserverproxy/internal/logger"
 )
 
 // ProxyPortConfigManager manages proxy port configurations with hot reload support.
@@ -277,6 +279,7 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 
 	go func() {
 		defer m.closeWatcher()
+		var debounceTimer *time.Timer
 		for {
 			select {
 			case <-ctx.Done():
@@ -285,18 +288,26 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create {
-					time.Sleep(100 * time.Millisecond)
-					if err := m.Reload(); err != nil {
-						fmt.Printf("proxy port config reload error: %v\n", err)
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+					if debounceTimer != nil {
+						debounceTimer.Stop()
 					}
+					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+						if err := m.Reload(); err != nil {
+							logger.Error("Proxy port config reload error: %v", err)
+						}
+						m.watcherMu.Lock()
+						if m.watcher != nil {
+							_ = m.watcher.Add(m.configPath)
+						}
+						m.watcherMu.Unlock()
+					})
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				fmt.Printf("proxy port config watcher error: %v\n", err)
+				logger.Error("Proxy port config watcher error: %v", err)
 			}
 		}
 	}()

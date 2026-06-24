@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"mcpeserverproxy/internal/logger"
 )
 
 // ProxyOutboundConfigManager manages proxy outbound configurations with hot reload support.
@@ -337,6 +339,7 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 	go func() {
 		defer m.closeWatcher()
 
+		var debounceTimer *time.Timer
 		for {
 			select {
 			case <-ctx.Done():
@@ -345,22 +348,26 @@ func (m *ProxyOutboundConfigManager) Watch(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				// Reload on write or create events
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create {
-					// Small delay to ensure file write is complete
-					time.Sleep(100 * time.Millisecond)
-					if err := m.Reload(); err != nil {
-						// Log error but continue watching
-						fmt.Printf("proxy outbound config reload error: %v\n", err)
+				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+					if debounceTimer != nil {
+						debounceTimer.Stop()
 					}
+					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+						if err := m.Reload(); err != nil {
+							logger.Error("Proxy outbound config reload error: %v", err)
+						}
+						m.watcherMu.Lock()
+						if m.watcher != nil {
+							_ = m.watcher.Add(m.configPath)
+						}
+						m.watcherMu.Unlock()
+					})
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				// Log error but continue watching
-				fmt.Printf("proxy outbound config watcher error: %v\n", err)
+				logger.Error("Proxy outbound config watcher error: %v", err)
 			}
 		}
 	}()

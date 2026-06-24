@@ -1212,10 +1212,10 @@ func (m *outboundManagerImpl) cascadeUpdateServerConfigs(deletedOutboundName str
 		}
 
 		if err := m.serverConfigUpdater.UpdateServerProxyOutbound(server.ID, next); err != nil {
-			fmt.Printf("warning: failed to update server %s proxy_outbound after deleting outbound %s: %v\n",
+			logger.Error("Failed to update server %s proxy_outbound after deleting outbound %s: %v",
 				server.ID, deletedOutboundName, err)
 		} else {
-			fmt.Printf("warning: server %s proxy_outbound updated to '%s' because outbound %s was deleted\n",
+			logger.Info("Server %s proxy_outbound updated to '%s' because outbound %s was deleted",
 				server.ID, next, deletedOutboundName)
 		}
 	}
@@ -1843,7 +1843,7 @@ func (m *outboundManagerImpl) Stop() error {
 	// Close all sing-box outbound connections
 	for name, singboxOutbound := range m.singboxOutbounds {
 		if err := singboxOutbound.Close(); err != nil {
-			fmt.Printf("warning: failed to close sing-box outbound %s: %v\n", name, err)
+			logger.Error("Failed to close sing-box outbound %s: %v", name, err)
 		}
 	}
 
@@ -1882,7 +1882,7 @@ func (m *outboundManagerImpl) Reload() error {
 				cfg.SetHealthy(false)
 				cfg.SetLastError(fmt.Sprintf("failed to create outbound: %v", err))
 				cfg.SetLastCheck(time.Now())
-				fmt.Printf("warning: failed to recreate sing-box outbound %s: %v\n", name, err)
+				logger.Error("Failed to recreate sing-box outbound %s: %v", name, err)
 				continue
 			}
 			m.singboxOutbounds[name] = singboxOutbound
