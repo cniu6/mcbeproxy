@@ -122,7 +122,17 @@ func (d *directDialer) DialContext(ctx context.Context, network string, destinat
 		}
 		dialer.Deadline = deadline
 	}
-	conn, err := dialer.DialContext(ctx, network, destination.String())
+	// Resolve hostname through filtered DNS resolver to avoid fake-IP pollution
+	// from Clash/Mihomo TUN. Direct system DNS may return 198.18.0.0/15 fake IPs
+	// which cause TLS handshake timeouts when connecting to proxy servers.
+	dialAddr := destination.String()
+	if destination.IsFqdn() {
+		ip, _, err := resolveOutboundServerIP(ctx, destination.Fqdn)
+		if err == nil && ip != nil {
+			dialAddr = net.JoinHostPort(ip.String(), fmt.Sprintf("%d", destination.Port))
+		}
+	}
+	conn, err := dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -1386,7 +1396,14 @@ func (s *SingboxOutbound) dialAnyTLSUDP(ctx context.Context, _, dest M.Socksaddr
 	if s.anytlsUOTClient == nil {
 		return nil, errors.New("anytls client not initialized")
 	}
-	return s.anytlsUOTClient.ListenPacket(ctx, dest)
+	logger.Debug("dialAnyTLSUDP: dest=%s uotVersion=%d", dest, s.anytlsUOTClient.Version)
+	conn, err := s.anytlsUOTClient.ListenPacket(ctx, dest)
+	if err != nil {
+		logger.Debug("dialAnyTLSUDP: ListenPacket failed dest=%s err=%v", dest, err)
+		return nil, err
+	}
+	logger.Debug("dialAnyTLSUDP: success dest=%s connType=%T", dest, conn)
+	return conn, nil
 }
 
 // dialVLESSUDP creates a UDP connection through VLESS using sing-vmess/vless library.

@@ -3307,6 +3307,8 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 		Target: address,
 	}
 
+	logger.Info("MCBE UDP test: node=%s type=%s target=%s", cfg.Name, cfg.Type, address)
+
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -3314,9 +3316,12 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 	if err != nil {
 		result.Success = false
 		result.Error = fmt.Sprintf("Failed to create UDP connection: %v", err)
+		logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v", cfg.Name, cfg.Type, err)
 		return result
 	}
 	defer cleanup()
+
+	logger.Debug("MCBE UDP test PacketConn type: node=%s type=%s packetConn=%T", cfg.Name, cfg.Type, packetConn)
 
 	// Parse address
 	host, portStr, err := net.SplitHostPort(address)

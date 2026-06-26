@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/logger"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -277,6 +278,31 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 		return nil, err
 	}
 
+	// Resolve FQDN to IP before creating the PacketConn. Many SOCKS5 servers
+	// (especially Xray/V2Ray-based) only support IP-address (ATYP=0x01/0x04)
+	// in UDP datagrams and silently drop datagrams with domain ATYP=0x03.
+	// Resolving locally via the filtered resolver avoids fake-IP TUN pollution.
+	resolvedDest := dest
+	if dest.IsFqdn() {
+		lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ip, _, resolveErr := resolveOutboundServerIP(lookupCtx, dest.Fqdn)
+		cancel()
+		if resolveErr != nil {
+			ctrl.Close()
+			return nil, fmt.Errorf("socks5: failed to resolve target %s: %w", dest.Fqdn, resolveErr)
+		}
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			ctrl.Close()
+			return nil, fmt.Errorf("socks5: failed to convert resolved IP %s for target %s", ip, dest.Fqdn)
+		}
+		resolvedDest = M.SocksaddrFromNetIP(netip.AddrPortFrom(addr, dest.Port))
+		logger.Debug("SOCKS5 UDP: resolved %s -> %s for IP-based UDP relay", dest.Fqdn, resolvedDest.Addr.String())
+	}
+
+	logger.Info("SOCKS5 UDP ASSOCIATE: server=%s bnd=%s relay=%s",
+		ctrl.RemoteAddr(), bnd, relayAddr)
+
 	udpConn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		ctrl.Close()
@@ -285,11 +311,14 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	_ = udpConn.SetReadBuffer(2 * 1024 * 1024)
 	_ = udpConn.SetWriteBuffer(2 * 1024 * 1024)
 
+	logger.Debug("SOCKS5 UDP ASSOCIATE: relay=%s localUDP=%s dest=%s\n",
+		relayAddr, udpConn.LocalAddr(), resolvedDest)
+
 	return &socks5UDPPacketConn{
 		udpConn:     udpConn,
 		ctrlConn:    ctrl,
 		relayAddr:   relayAddr,
-		destination: dest,
+		destination: resolvedDest,
 	}, nil
 }
 
@@ -331,9 +360,12 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	datagram := make([]byte, 0, len(header)+len(p))
 	datagram = append(datagram, header...)
 	datagram = append(datagram, p...)
-	if _, err := c.udpConn.WriteToUDP(datagram, c.relayAddr); err != nil {
+	_, err := c.udpConn.WriteToUDP(datagram, c.relayAddr)
+	if err != nil {
+		logger.Debug("SOCKS5 UDP write failed: relay=%s err=%v", c.relayAddr, err)
 		return 0, err
 	}
+	logger.Debug("SOCKS5 UDP sent %d bytes to relay=%s", len(p), c.relayAddr)
 	return len(p), nil
 }
 
@@ -342,6 +374,8 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	for {
 		n, err := c.udpConn.Read(buf)
 		if err != nil {
+			logger.Debug("SOCKS5 UDP read failed: local=%s relay=%s err=%v",
+				c.udpConn.LocalAddr(), c.relayAddr, err)
 			return 0, nil, err
 		}
 		if n < 3 {
