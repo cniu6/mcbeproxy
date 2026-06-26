@@ -984,7 +984,7 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 	defer r.wg.Done()
 	buf := make([]byte, 65535)
 
-	// Idle cleanup ticker
+	// Idle cleanup ticker — removes stale upstream connections and empty sessions
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -995,15 +995,19 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			case <-ticker.C:
 				r.mu.Lock()
 				now := time.Now()
-				for _, session := range r.clients {
+				for sKey, session := range r.clients {
 					session.mu.Lock()
 					for key, uc := range session.conns {
-						if now.Sub(uc.lastSeen) > 5*time.Minute {
+						if now.Sub(uc.lastSeen) > 2*time.Minute {
 							uc.pc.Close()
 							delete(session.conns, key)
 						}
 					}
+					empty := len(session.conns) == 0
 					session.mu.Unlock()
+					if empty {
+						delete(r.clients, sKey)
+					}
 				}
 				r.mu.Unlock()
 			}
@@ -1122,7 +1126,9 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 
 // removeSessionByIP closes all upstream connections and removes sessions
 // whose UDP source IP matches the given IP. Called when a TCP control
-// connection closes — the client's UDP source IP should match its TCP remote IP.
+// connection closes. This is necessary for chained proxy scenarios where
+// the upstream PacketConn wraps a TCP control connection to the next proxy
+// layer — without closing it, the downstream layer's io.Copy blocks indefinitely.
 func (r *sharedUDPRelay) removeSessionByIP(ip string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1168,12 +1174,11 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 		relayLocalAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
 	// Keep the control connection open until client disconnects.
-	// The shared relay's read loop auto-creates a session when the
-	// first UDP packet arrives from this client's UDP source address.
 	io.Copy(io.Discard, conn)
 
 	// Client disconnected — close all upstream connections for this client's IP.
-	// The UDP source IP should match the TCP remote IP.
+	// Necessary for chained proxy: upstream PacketConn wraps a TCP control
+	// connection to the next layer that must be closed to unblock downstream.
 	clientIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	relay.removeSessionByIP(clientIP)
 }
