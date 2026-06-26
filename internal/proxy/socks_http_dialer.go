@@ -374,8 +374,10 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	for {
 		n, err := c.udpConn.Read(buf)
 		if err != nil {
-			logger.Debug("SOCKS5 UDP read failed: local=%s relay=%s err=%v",
-				c.udpConn.LocalAddr(), c.relayAddr, err)
+			if !isTimeoutError(err) {
+				logger.Debug("SOCKS5 UDP read failed: local=%s relay=%s err=%v",
+					c.udpConn.LocalAddr(), c.relayAddr, err)
+			}
 			return 0, nil, err
 		}
 		if n < 3 {
