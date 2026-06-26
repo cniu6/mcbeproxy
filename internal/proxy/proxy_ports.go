@@ -897,7 +897,7 @@ type udpClientSession struct {
 // which is essential for cloud VPS firewalls that only allow specific ports.
 type sharedUDPRelay struct {
 	conn    *net.UDPConn
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	clients map[string]*udpClientSession // clientAddr.String() -> session
 	wg      sync.WaitGroup
 	stopCh  chan struct{}
@@ -1032,7 +1032,10 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			if n < off+4+2 {
 				continue
 			}
-			destHost = net.IP(buf[off : off+4]).String()
+			destHost = strconv.Itoa(int(buf[off])) + "." +
+				strconv.Itoa(int(buf[off+1])) + "." +
+				strconv.Itoa(int(buf[off+2])) + "." +
+				strconv.Itoa(int(buf[off+3]))
 			off += 4
 		case 0x03:
 			if n < off+1 {
@@ -1060,20 +1063,26 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		destPort := int(buf[off])<<8 | int(buf[off+1])
 		off += 2
 		payload := buf[off:n]
-		destAddr := net.JoinHostPort(destHost, fmt.Sprintf("%d", destPort))
+		destAddr := destHost + ":" + strconv.Itoa(destPort)
 
-		// Find or auto-create client session by source address
-		r.mu.Lock()
-		session, exists := r.clients[clientAddr.String()]
+		// Find or auto-create client session by source address (fast path: RLock)
+		clientKey := clientAddr.String()
+		r.mu.RLock()
+		session, exists := r.clients[clientKey]
+		r.mu.RUnlock()
 		if !exists {
-			session = &udpClientSession{
-				clientAddr: &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port},
-				conns:      make(map[string]*upstreamConn),
+			r.mu.Lock()
+			session, exists = r.clients[clientKey]
+			if !exists {
+				session = &udpClientSession{
+					clientAddr: &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port},
+					conns:      make(map[string]*upstreamConn),
+				}
+				r.clients[clientKey] = session
+				logger.Debug("SOCKS5 UDP relay: new session for %s (proxy_port=%s)", clientAddr, r.cfgID)
 			}
-			r.clients[clientAddr.String()] = session
-			logger.Debug("SOCKS5 UDP relay: new session for %s (proxy_port=%s)", clientAddr, r.cfgID)
+			r.mu.Unlock()
 		}
-		r.mu.Unlock()
 
 		// Get or create upstream connection for this dest
 		session.mu.Lock()
@@ -1104,16 +1113,24 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
 				defer session.wg.Done()
 				respBuf := make([]byte, 65535)
+				// Pre-allocate header prefix; write payload directly after it
 				for {
-					n, _, err := pc.ReadFrom(respBuf)
+					n, _, err := pc.ReadFrom(respBuf[10:])
 					if err != nil {
 						return
 					}
-					header := []byte{0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-					datagram := make([]byte, 0, len(header)+n)
-					datagram = append(datagram, header...)
-					datagram = append(datagram, respBuf[:n]...)
-					_, _ = r.conn.WriteToUDP(datagram, clientAddr)
+					// SOCKS5 UDP header: RSV(2)+FRAG(1)+ATYP(1)+ADDR(4)+PORT(2) = 10 bytes
+					respBuf[0] = 0x00
+					respBuf[1] = 0x00
+					respBuf[2] = 0x00
+					respBuf[3] = 0x01
+					respBuf[4] = 0
+					respBuf[5] = 0
+					respBuf[6] = 0
+					respBuf[7] = 0
+					respBuf[8] = 0
+					respBuf[9] = 0
+					_, _ = r.conn.WriteToUDP(respBuf[:10+n], clientAddr)
 				}
 			}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
 		}
