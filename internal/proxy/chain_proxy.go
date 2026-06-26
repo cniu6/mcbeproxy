@@ -315,7 +315,7 @@ func (f *ChainFactory) resolveChain(cfg *config.ProxyOutbound) ([]*config.ProxyO
 	visited := make(map[string]bool)
 	visited[cfg.Name] = true
 
-	chainConfigs := make([]*config.ProxyOutbound, 0, len(chainNames)+1)
+	chainConfigs := make([]*config.ProxyOutbound, 0, len(chainNames))
 	for _, name := range chainNames {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -327,8 +327,9 @@ func (f *ChainFactory) resolveChain(cfg *config.ProxyOutbound) ([]*config.ProxyO
 		}
 		chainConfigs = append(chainConfigs, expanded...)
 	}
-	// Add the node itself as the final hop
-	chainConfigs = append(chainConfigs, cfg.Clone())
+	if len(chainConfigs) == 0 {
+		return nil, fmt.Errorf("chain: no valid hops configured for %s", cfg.Name)
+	}
 	return chainConfigs, nil
 }
 

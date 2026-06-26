@@ -140,6 +140,13 @@ func (p *ProxyOutbound) Validate() error {
 	if p.Type == "" {
 		return errors.New("missing required field: type")
 	}
+
+	// Chain proxy nodes are containers — their own Server/Port are not used.
+	// Skip protocol-specific validation for chain proxies.
+	if p.IsChainProxy() {
+		return nil
+	}
+
 	if p.Server == "" {
 		return errors.New("missing required field: server")
 	}

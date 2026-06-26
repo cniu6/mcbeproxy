@@ -114,26 +114,6 @@
               </div>
             </div>
 
-            <!-- Arrow to final node -->
-            <div class="chain-arrow">
-              <svg width="24" height="40" viewBox="0 0 24 40">
-                <path d="M12 0 L12 30 M6 24 L12 32 L18 24" stroke="var(--n-text-color-3)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </div>
-
-            <!-- Final node (the node being edited) -->
-            <div class="chain-final-card">
-              <div class="chain-node-order final">★</div>
-              <div class="chain-node-icon" :style="{ background: getProtocolColor(finalNodeType) }">
-                {{ getProtocolIcon(finalNodeType) }}
-              </div>
-              <div class="chain-node-info">
-                <div class="chain-node-name">{{ finalNodeName }}</div>
-                <div class="chain-node-meta">{{ finalNodeType.toUpperCase() }} · {{ finalNodeServer }}:{{ finalNodePort }}</div>
-              </div>
-              <n-tag type="success" size="small" :bordered="false">出口节点</n-tag>
-            </div>
-
             <!-- Arrow to target -->
             <div class="chain-arrow">
               <svg width="24" height="40" viewBox="0 0 24 40">
@@ -176,8 +156,6 @@
             <span class="flow-node" :style="{ borderColor: getProtocolColor(node.type) }">{{ node.name }}</span>
             <span class="flow-arrow">→</span>
           </template>
-          <span class="flow-final">{{ finalNodeName }}</span>
-          <span class="flow-arrow">→</span>
           <span class="flow-target">目标</span>
         </div>
       </div>

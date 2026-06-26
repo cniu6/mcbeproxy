@@ -477,8 +477,6 @@
                     <span class="chain-flow-node">{{ name }}</span>
                   </template>
                   <span class="chain-flow-arrow">→</span>
-                  <span class="chain-flow-final">{{ form.name || '当前节点' }}</span>
-                  <span class="chain-flow-arrow">→</span>
                   <span class="chain-flow-target">目标</span>
                 </div>
               </n-space>
