@@ -1120,16 +1120,32 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 	}
 }
 
+// removeSessionByIP closes all upstream connections and removes sessions
+// whose UDP source IP matches the given IP. Called when a TCP control
+// connection closes — the client's UDP source IP should match its TCP remote IP.
+func (r *sharedUDPRelay) removeSessionByIP(ip string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, session := range r.clients {
+		sessionIP, _, _ := net.SplitHostPort(key)
+		if sessionIP == ip {
+			session.mu.Lock()
+			for _, uc := range session.conns {
+				uc.pc.Close()
+			}
+			session.conns = make(map[string]*upstreamConn)
+			session.mu.Unlock()
+			delete(r.clients, key)
+			logger.Debug("SOCKS5 UDP relay: session removed for %s (proxy_port=%s)", key, r.cfgID)
+		}
+	}
+}
+
 // handleSocks5UDPAssociate handles the SOCKS5 UDP ASSOCIATE command.
 // It uses a shared UDP relay socket (one per proxy port) so that multiple
 // clients can use UDP ASSOCIATE without port conflicts. The shared socket
 // is bound to the same port as the TCP listener when possible, so cloud
 // VPS firewalls only need to open one port for both TCP+UDP.
-//
-// Sessions are auto-created in the readLoop when the first UDP packet
-// arrives from a new client source address. The TCP control connection
-// only keeps the association alive; when it closes, idle cleanup will
-// eventually remove stale sessions.
 func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	relay, err := l.getOrCreateUDPRelay()
 	if err != nil {
@@ -1152,9 +1168,14 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 		relayLocalAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
 	// Keep the control connection open until client disconnects.
-	// The shared relay's read loop will auto-create a session when the
+	// The shared relay's read loop auto-creates a session when the
 	// first UDP packet arrives from this client's UDP source address.
 	io.Copy(io.Discard, conn)
+
+	// Client disconnected — close all upstream connections for this client's IP.
+	// The UDP source IP should match the TCP remote IP.
+	clientIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	relay.removeSessionByIP(clientIP)
 }
 
 func secureStringEqual(a, b string) bool {
