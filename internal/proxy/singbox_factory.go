@@ -1915,6 +1915,7 @@ func parseDestination(destination string) (M.Socksaddr, error) {
 
 	// Try to parse as IP address first
 	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.Unmap()
 		return M.SocksaddrFromNetIP(netip.AddrPortFrom(ip, uint16(port))), nil
 	}
 
