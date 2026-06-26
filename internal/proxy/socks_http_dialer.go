@@ -361,20 +361,11 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	datagram := make([]byte, 0, len(header)+len(p))
 	datagram = append(datagram, header...)
 	datagram = append(datagram, p...)
-	atyp := byte(0x00)
-	if c.destination.IsFqdn() {
-		atyp = 0x03
-	} else if c.destination.Addr.Is4() {
-		atyp = 0x01
-	} else {
-		atyp = 0x04
-	}
 	_, err := c.udpConn.WriteToUDP(datagram, c.relayAddr)
 	if err != nil {
 		logger.Debug("SOCKS5 UDP write failed: relay=%s err=%v", c.relayAddr, err)
 		return 0, err
 	}
-	logger.Debug("SOCKS5 UDP sent %d bytes to relay=%s atyp=0x%02x dest=%s", len(p), c.relayAddr, atyp, c.destination.String())
 	return len(p), nil
 }
 
@@ -400,7 +391,6 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		data := buf[3+dataOffset : n]
 		copied := copy(p, data)
-		logger.Debug("SOCKS5 UDP recv %d bytes from relay=%s", copied, c.relayAddr)
 		return copied, c.destination.UDPAddr(), nil
 	}
 }
