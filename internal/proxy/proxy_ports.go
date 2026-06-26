@@ -867,16 +867,13 @@ func containsByte(list []byte, v byte) bool {
 // It creates a UDP relay socket, tells the client its address, and relays
 // UDP datagrams between the client and the upstream proxy outbound.
 func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
-	// Determine bind IP: use the TCP connection's local IP so the UDP relay
-	// is reachable on the same address the client connected to.
-	bindIP := net.IPv4zero
-	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcpAddr.IP.To4() != nil {
-		bindIP = tcpAddr.IP.To4()
-	}
-
-	// Create UDP relay socket
-	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP, Port: 0})
+	// Bind UDP relay to 0.0.0.0 so it works on NAT/cloud environments (e.g. GCP)
+	// where the external IP is not bound to any local interface.
+	// Per RFC 1928, BND.ADDR=0.0.0.0 tells the client to use the same IP
+	// as the TCP connection's server address.
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
+		logger.Error("SOCKS5 UDP ASSOCIATE: failed to create relay socket: %v (proxy_port=%s)", err, l.cfg.ID)
 		writeSocks5Reply(conn, 0x01) // general failure
 		return
 	}
@@ -886,23 +883,17 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	_ = relayConn.SetWriteBuffer(2 * 1024 * 1024)
 
 	// Build the BND.ADDR/BND.PORT reply
+	// Use 0.0.0.0 as BND.ADDR so the client uses the TCP server's IP
 	relayAddr := relayConn.LocalAddr().(*net.UDPAddr)
-	var ipBytes []byte
-	if relayAddr.IP.To4() != nil {
-		ipBytes = relayAddr.IP.To4()
-	} else {
-		ipBytes = []byte{0, 0, 0, 0}
-	}
-
-	reply := []byte{0x05, 0x00, 0x00, 0x01}
-	reply = append(reply, ipBytes...)
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0}
 	reply = append(reply, byte(relayAddr.Port>>8), byte(relayAddr.Port&0xFF))
 	if _, err := conn.Write(reply); err != nil {
 		return
 	}
 	clearProxyConnDeadline(conn)
 
-	logger.Info("SOCKS5 UDP ASSOCIATE: relay=%s for client=%s (proxy_port=%s)", relayAddr, conn.RemoteAddr(), l.cfg.ID)
+	logger.Info("SOCKS5 UDP ASSOCIATE: relay=0.0.0.0:%d for client=%s (proxy_port=%s)",
+		relayAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
 	// Map of client+dest key -> upstream connection
 	type upstreamConn struct {
