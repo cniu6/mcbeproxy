@@ -2941,7 +2941,30 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// Client GUID (8 bytes)
 	binary.Write(&pingPacket, binary.BigEndian, uint64(12345678901234567))
 
-	// Create connection for ping
+	// If there are active clients, skip the standalone ping.
+	// Creating a new SOCKS5 UDP ASSOCIATE for ping may get a random relay
+	// port that the remote server's firewall blocks, causing a false
+	// timeout. The active game connection already proves the server is
+	// reachable, and forwardResponses keeps lastSeen fresh.
+	hasActiveClient := false
+	p.clients.Range(func(key, value interface{}) bool {
+		ci := value.(*rawUDPClientInfo)
+		if ci.kicked.Load() {
+			return true
+		}
+		lastSeenNano := ci.lastSeen.Load()
+		if time.Since(time.Unix(0, lastSeenNano)) <= UDPReadTimeout {
+			hasActiveClient = true
+			return false
+		}
+		return true
+	})
+	if hasActiveClient {
+		// Keep existing cached latency; don't overwrite with -1.
+		return p.getCachedLatencyNoRefresh()
+	}
+
+	// No active client — create a new connection
 	var conn net.PacketConn
 	var err error
 	var selectedNode string
