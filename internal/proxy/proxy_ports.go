@@ -238,6 +238,8 @@ type proxyPortListener struct {
 	wg          sync.WaitGroup
 	allowList   []*net.IPNet
 	activeConns atomic.Int64
+	udpRelay    *sharedUDPRelay
+	udpRelayMu  sync.Mutex
 }
 
 func newProxyPortListener(cfg *config.ProxyPortConfig, outboundMgr OutboundManager, dialerPool *proxyPortDialerPool) *proxyPortListener {
@@ -284,6 +286,16 @@ func (l *proxyPortListener) StopWithWait(wait bool) {
 	if l.listener != nil {
 		_ = l.listener.Close()
 	}
+	l.udpRelayMu.Lock()
+	if l.udpRelay != nil {
+		close(l.udpRelay.stopCh)
+		l.udpRelay.conn.Close()
+		if wait {
+			l.udpRelay.wg.Wait()
+		}
+		l.udpRelay = nil
+	}
+	l.udpRelayMu.Unlock()
 	if wait {
 		l.wg.Wait()
 	}
@@ -864,19 +876,43 @@ func containsByte(list []byte, v byte) bool {
 	return false
 }
 
-// handleSocks5UDPAssociate handles the SOCKS5 UDP ASSOCIATE command.
-// It creates a UDP relay socket, tells the client its address, and relays
-// UDP datagrams between the client and the upstream proxy outbound.
-func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
-	// Bind UDP relay to 0.0.0.0 so it works on NAT/cloud environments (e.g. GCP)
-	// where the external IP is not bound to any local interface.
-	// Per RFC 1928, BND.ADDR=0.0.0.0 tells the client to use the same IP
-	// as the TCP connection's server address.
-	//
-	// On cloud VPS (GCP/AWS/Azure), the firewall typically only allows the
-	// TCP port the user explicitly opened. A random UDP port would be blocked.
-	// To fix this, we try to bind the UDP relay to the SAME port as the TCP
-	// listener. This way the user only needs to open one port for both TCP+UDP.
+// upstreamConn represents a single upstream UDP connection for a client+dest pair.
+type upstreamConn struct {
+	pc       net.PacketConn
+	writeFn  func([]byte) (int, error)
+	lastSeen time.Time
+}
+
+// udpClientSession holds the state for a single SOCKS5 UDP ASSOCIATE client.
+type udpClientSession struct {
+	clientAddr *net.UDPAddr
+	conns      map[string]*upstreamConn // destAddr -> upstream
+	mu         sync.Mutex
+	wg         sync.WaitGroup
+}
+
+// sharedUDPRelay manages a single UDP socket shared by all SOCKS5 UDP ASSOCIATE
+// clients on the same proxy port. This avoids port conflicts when multiple
+// clients connect and allows binding to the same port as the TCP listener,
+// which is essential for cloud VPS firewalls that only allow specific ports.
+type sharedUDPRelay struct {
+	conn    *net.UDPConn
+	mu      sync.Mutex
+	clients map[string]*udpClientSession // clientAddr.String() -> session
+	wg      sync.WaitGroup
+	stopCh  chan struct{}
+	cfgID   string
+}
+
+// getOrCreateUDPRelay lazily creates the shared UDP relay socket, binding it
+// to the same port as the TCP listener when possible.
+func (l *proxyPortListener) getOrCreateUDPRelay() (*sharedUDPRelay, error) {
+	l.udpRelayMu.Lock()
+	defer l.udpRelayMu.Unlock()
+	if l.udpRelay != nil {
+		return l.udpRelay, nil
+	}
+
 	relayAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 	if l.listener != nil {
 		if _, portStr, err := net.SplitHostPort(l.listener.Addr().String()); err == nil {
@@ -886,28 +922,225 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 		}
 	}
 
-	relayConn, err := net.ListenUDP("udp", relayAddr)
+	conn, err := net.ListenUDP("udp", relayAddr)
 	if err != nil && relayAddr.Port > 0 {
-		// Fallback: the TCP port might already be in use for UDP, or
-		// the OS doesn't allow binding the same port for both protocols.
-		// Use a random port as fallback.
-		logger.Warn("SOCKS5 UDP ASSOCIATE: failed to bind relay to TCP port %d, using random port: %v (proxy_port=%s)",
+		logger.Warn("SOCKS5 UDP: failed to bind relay to TCP port %d, using random port: %v (proxy_port=%s)",
 			relayAddr.Port, err, l.cfg.ID)
-		relayConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
 	if err != nil {
+		return nil, err
+	}
+
+	_ = conn.SetReadBuffer(2 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
+
+	r := &sharedUDPRelay{
+		conn:    conn,
+		clients: make(map[string]*udpClientSession),
+		stopCh:  make(chan struct{}),
+		cfgID:   l.cfg.ID,
+	}
+
+	r.wg.Add(1)
+	go r.readLoop(l)
+
+	l.udpRelay = r
+	return r, nil
+}
+
+// dialUDPUpstream creates an upstream UDP connection for the given destination.
+func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, error) {
+	if l.cfg.IsDirectConnection() {
+		udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
+		if err != nil {
+			return nil, err
+		}
+		return net.DialUDP("udp", nil, udpAddr)
+	}
+	if l.outboundMgr == nil {
+		return nil, fmt.Errorf("no outbound manager")
+	}
+	selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(
+		proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if IsDirectSelection(selected) {
+		udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
+		if err != nil {
+			return nil, err
+		}
+		return net.DialUDP("udp", nil, udpAddr)
+	}
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dialCancel()
+	return l.outboundMgr.DialPacketConn(dialCtx, selected.Name, destAddr)
+}
+
+// readLoop reads UDP datagrams from the shared relay socket and dispatches
+// them to the appropriate client session based on the source address.
+func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
+	defer r.wg.Done()
+	buf := make([]byte, 65535)
+
+	// Idle cleanup ticker
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.stopCh:
+				return
+			case <-ticker.C:
+				r.mu.Lock()
+				now := time.Now()
+				for _, session := range r.clients {
+					session.mu.Lock()
+					for key, uc := range session.conns {
+						if now.Sub(uc.lastSeen) > 5*time.Minute {
+							uc.pc.Close()
+							delete(session.conns, key)
+						}
+					}
+					session.mu.Unlock()
+				}
+				r.mu.Unlock()
+			}
+		}
+	}()
+
+	for {
+		n, clientAddr, err := r.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if n < 4 || buf[2] != 0x00 {
+			continue
+		}
+
+		// Parse SOCKS5 UDP header
+		atyp := buf[3]
+		off := 4
+		var destHost string
+		switch atyp {
+		case 0x01:
+			if n < off+4+2 {
+				continue
+			}
+			destHost = net.IP(buf[off : off+4]).String()
+			off += 4
+		case 0x03:
+			if n < off+1 {
+				continue
+			}
+			dlen := int(buf[off])
+			off++
+			if n < off+dlen+2 {
+				continue
+			}
+			destHost = string(buf[off : off+dlen])
+			off += dlen
+		case 0x04:
+			if n < off+16+2 {
+				continue
+			}
+			destHost = net.IP(buf[off : off+16]).String()
+			off += 16
+		default:
+			continue
+		}
+		if n < off+2 {
+			continue
+		}
+		destPort := int(buf[off])<<8 | int(buf[off+1])
+		off += 2
+		payload := buf[off:n]
+		destAddr := net.JoinHostPort(destHost, fmt.Sprintf("%d", destPort))
+
+		// Find or auto-create client session by source address
+		r.mu.Lock()
+		session, exists := r.clients[clientAddr.String()]
+		if !exists {
+			session = &udpClientSession{
+				clientAddr: &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port},
+				conns:      make(map[string]*upstreamConn),
+			}
+			r.clients[clientAddr.String()] = session
+			logger.Debug("SOCKS5 UDP relay: new session for %s (proxy_port=%s)", clientAddr, r.cfgID)
+		}
+		r.mu.Unlock()
+
+		// Get or create upstream connection for this dest
+		session.mu.Lock()
+		uc, exists := session.conns[destAddr]
+		if !exists {
+			logger.Debug("SOCKS5 UDP relay: first packet from %s to %s, creating upstream (proxy_port=%s)",
+				clientAddr, destAddr, r.cfgID)
+			pc, err := l.dialUDPUpstream(destAddr)
+			if err != nil {
+				logger.Warn("SOCKS5 UDP relay: failed to dial upstream for %s: %v (proxy_port=%s)", destAddr, err, r.cfgID)
+				session.mu.Unlock()
+				continue
+			}
+
+			writeFn := func(data []byte) (int, error) {
+				return pc.WriteTo(data, nil)
+			}
+			if udpConn, ok := pc.(*net.UDPConn); ok {
+				writeFn = udpConn.Write
+			}
+
+			uc = &upstreamConn{pc: pc, writeFn: writeFn, lastSeen: time.Now()}
+			session.conns[destAddr] = uc
+			logger.Debug("SOCKS5 UDP relay: upstream created for %s -> %s (proxy_port=%s)", clientAddr, destAddr, r.cfgID)
+
+			// Start response goroutine: upstream -> client via shared relay socket
+			session.wg.Add(1)
+			go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
+				defer session.wg.Done()
+				respBuf := make([]byte, 65535)
+				for {
+					n, _, err := pc.ReadFrom(respBuf)
+					if err != nil {
+						return
+					}
+					header := []byte{0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+					datagram := make([]byte, 0, len(header)+n)
+					datagram = append(datagram, header...)
+					datagram = append(datagram, respBuf[:n]...)
+					_, _ = r.conn.WriteToUDP(datagram, clientAddr)
+				}
+			}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
+		}
+		uc.lastSeen = time.Now()
+		session.mu.Unlock()
+
+		_, _ = uc.writeFn(payload)
+	}
+}
+
+// handleSocks5UDPAssociate handles the SOCKS5 UDP ASSOCIATE command.
+// It uses a shared UDP relay socket (one per proxy port) so that multiple
+// clients can use UDP ASSOCIATE without port conflicts. The shared socket
+// is bound to the same port as the TCP listener when possible, so cloud
+// VPS firewalls only need to open one port for both TCP+UDP.
+//
+// Sessions are auto-created in the readLoop when the first UDP packet
+// arrives from a new client source address. The TCP control connection
+// only keeps the association alive; when it closes, idle cleanup will
+// eventually remove stale sessions.
+func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
+	relay, err := l.getOrCreateUDPRelay()
+	if err != nil {
 		logger.Error("SOCKS5 UDP ASSOCIATE: failed to create relay socket: %v (proxy_port=%s)", err, l.cfg.ID)
-		writeSocks5Reply(conn, 0x01) // general failure
+		writeSocks5Reply(conn, 0x01)
 		return
 	}
-	defer relayConn.Close()
 
-	_ = relayConn.SetReadBuffer(2 * 1024 * 1024)
-	_ = relayConn.SetWriteBuffer(2 * 1024 * 1024)
+	relayLocalAddr := relay.conn.LocalAddr().(*net.UDPAddr)
 
-	// Build the BND.ADDR/BND.PORT reply
-	// Use 0.0.0.0 as BND.ADDR so the client uses the TCP server's IP
-	relayLocalAddr := relayConn.LocalAddr().(*net.UDPAddr)
+	// Reply with the shared relay address (0.0.0.0:port)
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0}
 	reply = append(reply, byte(relayLocalAddr.Port>>8), byte(relayLocalAddr.Port&0xFF))
 	if _, err := conn.Write(reply); err != nil {
@@ -918,208 +1151,10 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	logger.Info("SOCKS5 UDP ASSOCIATE: relay=0.0.0.0:%d for client=%s (proxy_port=%s)",
 		relayLocalAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
-	// Map of client+dest key -> upstream connection
-	type upstreamConn struct {
-		pc       net.PacketConn
-		writeFn  func([]byte) (int, error)
-		lastSeen time.Time
-	}
-	var mu sync.Mutex
-	conns := make(map[string]*upstreamConn)
-	var wg sync.WaitGroup
-
-	// Cleanup idle upstream connections
-	stopCleanup := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopCleanup:
-				return
-			case <-ticker.C:
-				mu.Lock()
-				now := time.Now()
-				for key, uc := range conns {
-					if now.Sub(uc.lastSeen) > 5*time.Minute {
-						uc.pc.Close()
-						delete(conns, key)
-					}
-				}
-				mu.Unlock()
-			}
-		}
-	}()
-
-	// Relay loop: read from client UDP, parse SOCKS5 header, forward to upstream
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 65535)
-		for {
-			n, clientAddr, err := relayConn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			if n < 4 {
-				continue
-			}
-			// SOCKS5 UDP header: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT
-			if buf[2] != 0x00 { // Drop fragmented datagrams
-				continue
-			}
-			atyp := buf[3]
-			off := 4
-			var destHost string
-			switch atyp {
-			case 0x01: // IPv4
-				if n < off+4+2 {
-					continue
-				}
-				destHost = net.IP(buf[off : off+4]).String()
-				off += 4
-			case 0x03: // Domain
-				if n < off+1 {
-					continue
-				}
-				dlen := int(buf[off])
-				off++
-				if n < off+dlen+2 {
-					continue
-				}
-				destHost = string(buf[off : off+dlen])
-				off += dlen
-			case 0x04: // IPv6
-				if n < off+16+2 {
-					continue
-				}
-				destHost = net.IP(buf[off : off+16]).String()
-				off += 16
-			default:
-				continue
-			}
-			if n < off+2 {
-				continue
-			}
-			destPort := int(buf[off])<<8 | int(buf[off+1])
-			off += 2
-			payload := buf[off:n]
-			destAddr := net.JoinHostPort(destHost, fmt.Sprintf("%d", destPort))
-
-			// Get or create upstream connection for this client+dest pair
-			connKey := clientAddr.String() + "->" + destAddr
-			mu.Lock()
-			uc, exists := conns[connKey]
-			if !exists {
-				logger.Debug("SOCKS5 UDP relay: first packet from %s to %s, creating upstream (proxy_port=%s)",
-					clientAddr, destAddr, l.cfg.ID)
-				// Dial upstream through outbound manager
-				var pc net.PacketConn
-				if l.cfg.IsDirectConnection() {
-					udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
-					if err != nil {
-						logger.Warn("SOCKS5 UDP relay: failed to resolve %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
-						mu.Unlock()
-						continue
-					}
-					pc, err = net.DialUDP("udp", nil, udpAddr)
-					if err != nil {
-						logger.Warn("SOCKS5 UDP relay: failed to dial direct %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
-						mu.Unlock()
-						continue
-					}
-				} else if l.outboundMgr != nil {
-					selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(
-						proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), nil)
-					if err != nil {
-						logger.Warn("SOCKS5 UDP relay: no outbound selected for %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
-						mu.Unlock()
-						continue
-					}
-					if IsDirectSelection(selected) {
-						udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
-						if err != nil {
-							logger.Warn("SOCKS5 UDP relay: failed to resolve %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
-							mu.Unlock()
-							continue
-						}
-						pc, err = net.DialUDP("udp", nil, udpAddr)
-						if err != nil {
-							logger.Warn("SOCKS5 UDP relay: failed to dial direct %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
-							mu.Unlock()
-							continue
-						}
-					} else {
-						dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
-						pc, err = l.outboundMgr.DialPacketConn(dialCtx, selected.Name, destAddr)
-						dialCancel()
-						if err != nil {
-							logger.Warn("SOCKS5 UDP relay: failed to dial outbound %s for %s: %v (proxy_port=%s)", selected.Name, destAddr, err, l.cfg.ID)
-							mu.Unlock()
-							continue
-						}
-					}
-				} else {
-					mu.Unlock()
-					continue
-				}
-
-				// Determine write function: connected sockets (DialUDP) use Write,
-				// unconnected sockets (outbound PacketConn) use WriteTo with nil addr
-				writeFn := func(data []byte) (int, error) {
-					return pc.WriteTo(data, nil)
-				}
-				if udpConn, ok := pc.(*net.UDPConn); ok {
-					writeFn = udpConn.Write
-				}
-
-				uc = &upstreamConn{pc: pc, writeFn: writeFn, lastSeen: time.Now()}
-				conns[connKey] = uc
-				logger.Debug("SOCKS5 UDP relay: upstream created for %s -> %s (proxy_port=%s)", clientAddr, destAddr, l.cfg.ID)
-
-				// Start relay goroutine for responses: upstream -> client
-				wg.Add(1)
-				go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
-					defer wg.Done()
-					respBuf := make([]byte, 65535)
-					for {
-						n, _, err := pc.ReadFrom(respBuf)
-						if err != nil {
-							return
-						}
-						// Wrap response in SOCKS5 UDP header
-						// ATYP=0x01 (IPv4), ADDR=0.0.0.0, PORT=0 (origin unknown)
-						header := []byte{0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-						datagram := make([]byte, 0, len(header)+n)
-						datagram = append(datagram, header...)
-						datagram = append(datagram, respBuf[:n]...)
-						_, _ = relayConn.WriteToUDP(datagram, clientAddr)
-					}
-				}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
-			}
-			uc.lastSeen = time.Now()
-			mu.Unlock()
-
-			// Forward payload to upstream
-			_, _ = uc.writeFn(payload)
-		}
-	}()
-
-	// Keep the control connection open until client disconnects
+	// Keep the control connection open until client disconnects.
+	// The shared relay's read loop will auto-create a session when the
+	// first UDP packet arrives from this client's UDP source address.
 	io.Copy(io.Discard, conn)
-	close(stopCleanup)
-
-	// Close all upstream connections
-	mu.Lock()
-	for _, uc := range conns {
-		uc.pc.Close()
-	}
-	conns = make(map[string]*upstreamConn)
-	mu.Unlock()
-
-	wg.Wait()
 }
 
 func secureStringEqual(a, b string) bool {
