@@ -296,6 +296,7 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 			ctrl.Close()
 			return nil, fmt.Errorf("socks5: failed to convert resolved IP %s for target %s", ip, dest.Fqdn)
 		}
+		addr = addr.Unmap()
 		resolvedDest = M.SocksaddrFromNetIP(netip.AddrPortFrom(addr, dest.Port))
 		logger.Debug("SOCKS5 UDP: resolved %s -> %s for IP-based UDP relay", dest.Fqdn, resolvedDest.Addr.String())
 	}
