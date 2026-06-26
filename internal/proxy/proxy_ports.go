@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -871,7 +872,29 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	// where the external IP is not bound to any local interface.
 	// Per RFC 1928, BND.ADDR=0.0.0.0 tells the client to use the same IP
 	// as the TCP connection's server address.
-	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	//
+	// On cloud VPS (GCP/AWS/Azure), the firewall typically only allows the
+	// TCP port the user explicitly opened. A random UDP port would be blocked.
+	// To fix this, we try to bind the UDP relay to the SAME port as the TCP
+	// listener. This way the user only needs to open one port for both TCP+UDP.
+	relayAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if l.listener != nil {
+		if _, portStr, err := net.SplitHostPort(l.listener.Addr().String()); err == nil {
+			if port, err := strconv.Atoi(portStr); err == nil && port > 0 {
+				relayAddr.Port = port
+			}
+		}
+	}
+
+	relayConn, err := net.ListenUDP("udp", relayAddr)
+	if err != nil && relayAddr.Port > 0 {
+		// Fallback: the TCP port might already be in use for UDP, or
+		// the OS doesn't allow binding the same port for both protocols.
+		// Use a random port as fallback.
+		logger.Warn("SOCKS5 UDP ASSOCIATE: failed to bind relay to TCP port %d, using random port: %v (proxy_port=%s)",
+			relayAddr.Port, err, l.cfg.ID)
+		relayConn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
 	if err != nil {
 		logger.Error("SOCKS5 UDP ASSOCIATE: failed to create relay socket: %v (proxy_port=%s)", err, l.cfg.ID)
 		writeSocks5Reply(conn, 0x01) // general failure
@@ -884,16 +907,16 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 
 	// Build the BND.ADDR/BND.PORT reply
 	// Use 0.0.0.0 as BND.ADDR so the client uses the TCP server's IP
-	relayAddr := relayConn.LocalAddr().(*net.UDPAddr)
+	relayLocalAddr := relayConn.LocalAddr().(*net.UDPAddr)
 	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0}
-	reply = append(reply, byte(relayAddr.Port>>8), byte(relayAddr.Port&0xFF))
+	reply = append(reply, byte(relayLocalAddr.Port>>8), byte(relayLocalAddr.Port&0xFF))
 	if _, err := conn.Write(reply); err != nil {
 		return
 	}
 	clearProxyConnDeadline(conn)
 
 	logger.Info("SOCKS5 UDP ASSOCIATE: relay=0.0.0.0:%d for client=%s (proxy_port=%s)",
-		relayAddr.Port, conn.RemoteAddr(), l.cfg.ID)
+		relayLocalAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
 	// Map of client+dest key -> upstream connection
 	type upstreamConn struct {
@@ -990,16 +1013,20 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 			mu.Lock()
 			uc, exists := conns[connKey]
 			if !exists {
+				logger.Debug("SOCKS5 UDP relay: first packet from %s to %s, creating upstream (proxy_port=%s)",
+					clientAddr, destAddr, l.cfg.ID)
 				// Dial upstream through outbound manager
 				var pc net.PacketConn
 				if l.cfg.IsDirectConnection() {
 					udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
 					if err != nil {
+						logger.Warn("SOCKS5 UDP relay: failed to resolve %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
 						mu.Unlock()
 						continue
 					}
 					pc, err = net.DialUDP("udp", nil, udpAddr)
 					if err != nil {
+						logger.Warn("SOCKS5 UDP relay: failed to dial direct %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
 						mu.Unlock()
 						continue
 					}
@@ -1007,17 +1034,20 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 					selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(
 						proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), nil)
 					if err != nil {
+						logger.Warn("SOCKS5 UDP relay: no outbound selected for %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
 						mu.Unlock()
 						continue
 					}
 					if IsDirectSelection(selected) {
 						udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
 						if err != nil {
+							logger.Warn("SOCKS5 UDP relay: failed to resolve %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
 							mu.Unlock()
 							continue
 						}
 						pc, err = net.DialUDP("udp", nil, udpAddr)
 						if err != nil {
+							logger.Warn("SOCKS5 UDP relay: failed to dial direct %s: %v (proxy_port=%s)", destAddr, err, l.cfg.ID)
 							mu.Unlock()
 							continue
 						}
@@ -1026,6 +1056,7 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 						pc, err = l.outboundMgr.DialPacketConn(dialCtx, selected.Name, destAddr)
 						dialCancel()
 						if err != nil {
+							logger.Warn("SOCKS5 UDP relay: failed to dial outbound %s for %s: %v (proxy_port=%s)", selected.Name, destAddr, err, l.cfg.ID)
 							mu.Unlock()
 							continue
 						}
@@ -1046,6 +1077,7 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 
 				uc = &upstreamConn{pc: pc, writeFn: writeFn, lastSeen: time.Now()}
 				conns[connKey] = uc
+				logger.Debug("SOCKS5 UDP relay: upstream created for %s -> %s (proxy_port=%s)", clientAddr, destAddr, l.cfg.ID)
 
 				// Start relay goroutine for responses: upstream -> client
 				wg.Add(1)
