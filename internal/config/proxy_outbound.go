@@ -119,6 +119,12 @@ type ProxyOutbound struct {
 	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
 	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
 
+	// Chain proxy: ordered list of outbound names forming a proxy chain.
+	// When non-empty, traffic is routed through each proxy in order:
+	//   chain[0] → chain[1] → ... → chain[len-1] → target
+	// The node's own Server/Port are used as the final hop before the target.
+	Chain []string `json:"chain,omitempty"`
+
 	// Runtime state (not serialized)
 	mu            sync.RWMutex          `json:"-"`
 	runtime       *proxyOutboundRuntime `json:"-"`
@@ -324,6 +330,10 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		HTTPLatencyMs:            p.HTTPLatencyMs,
 		UDPLatencyMs:             p.UDPLatencyMs,
 		runtime:                  p.runtimeState(),
+	}
+	if len(p.Chain) > 0 {
+		clone.Chain = make([]string, len(p.Chain))
+		copy(clone.Chain, p.Chain)
 	}
 	if p.UDPAvailable != nil {
 		udp := *p.UDPAvailable
@@ -630,4 +640,23 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.XHTTPMode == other.XHTTPMode &&
 		p.GRPCServiceName == other.GRPCServiceName &&
 		p.GRPCAuthority == other.GRPCAuthority
+}
+
+// IsChainProxy returns true if this outbound has a chain configuration.
+func (p *ProxyOutbound) IsChainProxy() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.Chain) > 0
+}
+
+// GetChain returns a copy of the chain proxy list.
+func (p *ProxyOutbound) GetChain() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.Chain) == 0 {
+		return nil
+	}
+	chain := make([]string, len(p.Chain))
+	copy(chain, p.Chain)
+	return chain
 }

@@ -38,6 +38,10 @@ func NewPlainTCPProxy(serverID string, cfg *config.ServerConfig) *PlainTCPProxy 
 
 func (p *PlainTCPProxy) SetOutboundManager(outboundMgr OutboundManager) {
 	p.outboundMgr = outboundMgr
+	// Replace dialer pool with one that supports chain proxy outbounds
+	if outboundMgr != nil {
+		p.dialerPool = newProxyPortDialerPool(NewChainFactory(NewSingboxCoreFactory(), outboundMgr))
+	}
 }
 
 func (p *PlainTCPProxy) UpdateConfig(cfg *config.ServerConfig) {

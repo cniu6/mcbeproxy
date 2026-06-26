@@ -5,7 +5,8 @@
 ## 核心特性
 
 ### 🚀 高性能代理
-- **多协议支持**: Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS
+- **多协议支持**: Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / SOCKS5 / HTTP
+- **链式代理**: 支持多级代理嵌套（A → B → C），自动展开嵌套链，内置循环引用检测
 - **智能负载均衡**: 支持按组/节点列表做负载均衡与自动故障切换
 - **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm
 - **实时延迟检测**: 自动选择最优节点，确保最佳游戏体验
@@ -378,6 +379,8 @@ flowchart TD
 | `trojan` | Trojan 协议 | server, port, password |
 | `hysteria2` | Hysteria2 协议 | server, port, password |
 | `anytls` | AnyTLS 协议 | server, port, password |
+| `socks5` | SOCKS5 协议（支持 TCP CONNECT + UDP ASSOCIATE） | server, port |
+| `http` | HTTP CONNECT 协议（仅 TCP） | server, port |
 
 #### 配置字段说明
 
@@ -389,6 +392,7 @@ flowchart TD
 | `port` | int | ✅ | 节点端口 |
 | `enabled` | bool | ✅ | 是否启用此节点 |
 | `group` | string | ⚪ | 节点分组名称 |
+| `username` | string | ⚪ | 用户名（SOCKS5/HTTP 认证） |
 | `password` | string | ⚪ | 密码（部分协议需要） |
 | `uuid` | string | ⚪ | UUID（VMess/VLESS 需要） |
 | `method` | string | ⚪ | 加密方法（Shadowsocks 需要） |
@@ -396,6 +400,7 @@ flowchart TD
 | `tls` | bool | ⚪ | 是否启用 TLS |
 | `sni` | string | ⚪ | TLS SNI |
 | `insecure` | bool | ⚪ | 是否跳过证书验证 |
+| `chain` | array | ⚪ | 链式代理跳板列表（如 `["node-A", "node-B"]`，流量依次经过） |
 | `udp_available` | bool | ⚪ | 是否支持 UDP |
 | `udp_latency_ms` | int | ⚪ | UDP 延迟（毫秒） |
 | `tcp_latency_ms` | int | ⚪ | TCP 延迟（毫秒） |
@@ -692,6 +697,49 @@ flowchart TD
 - `"@group"`: 从组里选择
 - `"node1,node2,node3"`: 从列表里选择
 
+### 链式代理（Chain Proxy）
+
+支持将多个代理节点串联，实现多级跳转。流量路径：客户端 → 跳板1 → 跳板2 → ... → 目标服务器。
+
+**配置方式**：在 `proxy_outbounds.json` 中为节点设置 `chain` 字段：
+
+```json
+[
+  {
+    "name": "入口节点",
+    "type": "socks5",
+    "server": "entry.example.com",
+    "port": 1080,
+    "enabled": true,
+    "chain": ["中间节点", "落地节点"]
+  },
+  {
+    "name": "中间节点",
+    "type": "trojan",
+    "server": "mid.example.com",
+    "port": 443,
+    "password": "mid-pass",
+    "enabled": true
+  },
+  {
+    "name": "落地节点",
+    "type": "socks5",
+    "server": "landing.example.com",
+    "port": 1080,
+    "enabled": true
+  }
+]
+```
+
+上述配置的流量路径为：客户端 → 落地节点 → 中间节点 → 入口节点 → 目标服务器。
+
+**特性**：
+- ✅ 支持嵌套链（链中的节点本身也可以是链式代理）
+- ✅ 自动循环引用检测（A → B → A 会被拒绝）
+- ✅ 支持 TCP 和 UDP 流量
+- ✅ 在 Dashboard 中可视化链式代理拓扑
+- ✅ 链式代理节点可用于服务器代理和本地代理端口
+
 ## 本地代理端口（proxy_ports）
 
 可选功能：在本机开启 HTTP / SOCKS5 / SOCKS4（或 mixed）代理端口，转发走指定上游节点。
@@ -704,6 +752,20 @@ flowchart TD
 - `username`/`password`: 可选鉴权
 - `allow_list`: CIDR 白名单（例如仅允许本机：`127.0.0.1/32`）
 - `proxy_outbound`: 与 server 的规则一致（direct / node / @group / node list）
+
+### SOCKS5 UDP ASSOCIATE 支持
+
+SOCKS5 和 mixed 类型的代理端口支持完整的 UDP ASSOCIATE 命令，可用于 UDP 代理转发（如 DNS、游戏 UDP 流量等）。
+
+**工作原理**：
+1. 客户端通过 TCP 连接发送 UDP ASSOCIATE 请求
+2. 代理端口创建 UDP relay socket 并返回其地址
+3. 客户端将 SOCKS5 封装的 UDP 数据包发送到 relay 地址
+4. 代理端口解析 SOCKS5 UDP 头，提取目标地址和 payload
+5. 通过 outbound manager 建立上游 UDP 连接（支持直连、单节点、链式代理）
+6. 上游响应自动封装 SOCKS5 UDP 头返回客户端
+
+**注意**：HTTP 类型代理端口仅支持 TCP CONNECT，不支持 UDP。如需 UDP 代理请使用 SOCKS5 或 mixed 类型。
 
 ## API 与 Dashboard
 
@@ -1217,7 +1279,7 @@ go tool pprof cpu.prof
 
 ### Q6: 支持哪些代理协议？
 
-**A**: 支持 Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS。
+**A**: 支持 Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / SOCKS5 / HTTP。其中 SOCKS5 支持 TCP CONNECT 和 UDP ASSOCIATE，HTTP 仅支持 TCP CONNECT。
 
 ### Q7: 如何备份配置和数据？
 
@@ -1306,6 +1368,16 @@ go run cmd/mcpeserverproxy/main.go -debug
 ---
 
 ## 版本历史
+
+### v2.4.0 (2026-06-26)
+- ✨ **链式代理（Chain Proxy）**: 支持多级代理嵌套，自动展开嵌套链，内置循环引用检测
+- ✨ **SOCKS5/HTTP 节点类型**: 新增 SOCKS5 和 HTTP CONNECT 作为上游节点协议
+- ✨ **SOCKS5 UDP ASSOCIATE**: 代理端口 SOCKS5 服务器完整支持 UDP ASSOCIATE 命令，支持 UDP 代理转发
+- ✨ **链式代理可视化**: Dashboard 新增 ChainProxyVisualizer 组件，可视化链式代理拓扑
+- ✨ **API 链式代理支持**: 创建/更新节点 API 支持 `chain` 字段
+- 🐛 修复代理端口 SOCKS5 服务器不支持 UDP ASSOCIATE 导致 reply code 1 的问题
+- 🐛 修复链式代理中 connected UDP socket 的 WriteTo(nil) 失败问题
+- 🐛 修复同一客户端发往不同目标的 UDP 包复用同一 upstream 连接的问题
 
 ### v1.0.0 (2024-01-01)
 - 🎉 初始版本发布

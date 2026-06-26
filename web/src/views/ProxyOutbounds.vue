@@ -444,10 +444,62 @@
               <n-gi :span="2"><n-form-item label="gRPC Authority"><n-input v-model:value="form.grpc_authority" placeholder="可选，覆盖 :authority / Host" /></n-form-item></n-gi>
             </template>
           </template>
+
+          <!-- 链式代理设置 -->
+          <n-gi :span="2"><n-divider style="margin: 8px 0">链式代理</n-divider></n-gi>
+          <n-gi :span="2">
+            <n-alert type="info" style="margin-bottom: 8px">
+              选择一个或多个节点作为前置代理，流量将按顺序经过这些节点后再通过当前节点到达目标。支持嵌套链式（可选择已有的链式节点），自动检测循环引用。
+            </n-alert>
+          </n-gi>
+          <n-gi :span="2">
+            <n-form-item label="链式节点">
+              <n-space vertical :size="8" style="width: 100%">
+                <n-space :size="8" align="center">
+                  <n-select
+                    v-model:value="form.chain"
+                    multiple
+                    filterable
+                    :options="chainProxyOptions"
+                    placeholder="选择前置代理节点（可选）"
+                    clearable
+                    style="flex: 1; min-width: 300px"
+                  />
+                  <n-button type="success" secondary @click="openChainVisualizer">
+                    可视化编辑
+                  </n-button>
+                </n-space>
+                <div v-if="form.chain && form.chain.length > 0" class="chain-flow-preview">
+                  <span class="chain-flow-label">链路：</span>
+                  <span class="chain-flow-client">客户端</span>
+                  <template v-for="(name, idx) in form.chain" :key="name">
+                    <span class="chain-flow-arrow">→</span>
+                    <span class="chain-flow-node">{{ name }}</span>
+                  </template>
+                  <span class="chain-flow-arrow">→</span>
+                  <span class="chain-flow-final">{{ form.name || '当前节点' }}</span>
+                  <span class="chain-flow-arrow">→</span>
+                  <span class="chain-flow-target">目标</span>
+                </div>
+              </n-space>
+            </n-form-item>
+          </n-gi>
         </n-grid>
       </n-form>
       <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveOutbound">保存</n-button></n-space></template>
     </n-modal>
+
+    <!-- 链式代理可视化编辑器 -->
+    <ChainProxyVisualizer
+      v-model:show="showChainVisualizer"
+      :poolNodes="chainVisualizerPoolNodes"
+      :initialChain="form.chain || []"
+      :finalNodeName="form.name || ''"
+      :finalNodeType="form.type || 'socks5'"
+      :finalNodeServer="form.server || ''"
+      :finalNodePort="form.port || 0"
+      @save="onChainVisualizerSave"
+    />
 
     <n-modal v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
       <n-space vertical>
@@ -765,6 +817,7 @@ import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
+import ChainProxyVisualizer from '../components/ChainProxyVisualizer.vue'
 import { useDragSelect } from '../composables/useDragSelect'
 
 const props = defineProps({
@@ -777,6 +830,7 @@ const outbounds = ref([])
 const loading = ref(false)
 const highlightName = ref('')
 const showEditModal = ref(false)
+const showChainVisualizer = ref(false)
 const showAutoSelectBlockModal = ref(false)
 const showImportModal = ref(false)
 const showTestOptionsModal = ref(false)
@@ -995,6 +1049,28 @@ const groupAutoCompleteOptions = computed(() => {
   })
   return Array.from(groups).sort()
 })
+
+// 链式代理可选节点（排除当前编辑的节点本身，防止自引用；允许选择已有链式节点实现嵌套）
+const chainProxyOptions = computed(() => {
+  return outbounds.value
+    .filter(o => o.name !== editingName.value)
+    .map(o => ({ label: `${o.name} (${o.type})${o.chain && o.chain.length > 0 ? ' [链式]' : ''}`, value: o.name }))
+})
+
+// 链式可视化编辑器的可用节点池（带完整信息）
+const chainVisualizerPoolNodes = computed(() => {
+  return outbounds.value
+    .filter(o => o.name !== editingName.value)
+    .map(o => ({ name: o.name, type: o.type, server: o.server, port: o.port, chain: o.chain }))
+})
+
+const openChainVisualizer = () => {
+  showChainVisualizer.value = true
+}
+
+const onChainVisualizerSave = (chainNames) => {
+  form.value.chain = chainNames
+}
 
 // 协议筛选选项
 const protocolFilterOptions = [
@@ -1276,7 +1352,8 @@ const defaultForm = {
   idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
   reality: false, reality_public_key: '', reality_short_id: '',
   network: '', ws_path: '', ws_host: '', xhttp_mode: '', grpc_service_name: '', grpc_authority: '',
-  auto_select_blocked: false, auto_select_block_reason: '', auto_select_block_expires_at: null
+  auto_select_blocked: false, auto_select_block_reason: '', auto_select_block_expires_at: null,
+  chain: []
 }
 const form = ref({ ...defaultForm })
 
@@ -1791,7 +1868,8 @@ const columns = computed(() => {
         h(NSpace, { size: 4, wrap: true }, () => [
           row.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => row.group) : null,
           row.subscription_name ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => `订阅: ${row.subscription_name}`) : null,
-          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null
+          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null,
+          row.chain && row.chain.length > 0 ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => `链式 ${row.chain.length}跳`) : null
         ])
       ])
     }
@@ -3698,5 +3776,44 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 
 .stat-value.latency-bad {
   color: #ef4444;
+}
+
+/* Chain flow preview in edit modal */
+.chain-flow-preview {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 6px 10px;
+  background: var(--n-color-embedded);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.chain-flow-label {
+  color: var(--n-text-color-3);
+  flex-shrink: 0;
+}
+.chain-flow-client {
+  font-weight: 600;
+  color: var(--n-text-color-2);
+}
+.chain-flow-node {
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--n-color);
+  border: 1px solid var(--n-border-color);
+}
+.chain-flow-final {
+  font-weight: 700;
+  color: #63e2b7;
+}
+.chain-flow-target {
+  font-weight: 600;
+  color: var(--n-text-color-3);
+}
+.chain-flow-arrow {
+  color: var(--n-text-color-3);
+  font-size: 11px;
 }
 </style>

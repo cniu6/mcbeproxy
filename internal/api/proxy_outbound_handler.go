@@ -177,6 +177,9 @@ type ProxyOutboundDTO struct {
 	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
 	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
 	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
+
+	// Chain proxy: ordered list of outbound names forming the proxy chain
+	Chain []string `json:"chain,omitempty"`
 }
 
 // toDTO converts a ProxyOutbound to ProxyOutboundDTO with health status.
@@ -220,6 +223,10 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 		XHTTPMode:       cfg.XHTTPMode,
 		GRPCServiceName: cfg.GRPCServiceName,
 		GRPCAuthority:   cfg.GRPCAuthority,
+	}
+	if chain := cfg.GetChain(); len(chain) > 0 {
+		dto.Chain = make([]string, len(chain))
+		copy(dto.Chain, chain)
 	}
 	blocked, blockReason, blockExpiresAt := cfg.GetEffectiveAutoSelectBlock()
 	dto.AutoSelectBlocked = blocked
@@ -293,11 +300,14 @@ type CreateProxyOutboundRequest struct {
 	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
 	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
 	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
+
+	// Chain proxy: ordered list of outbound names forming the proxy chain
+	Chain []string `json:"chain,omitempty"`
 }
 
 // toProxyOutbound converts the request to a ProxyOutbound config.
 func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
-	return &config.ProxyOutbound{
+	result := &config.ProxyOutbound{
 		Name:         r.Name,
 		Type:         r.Type,
 		Server:       r.Server,
@@ -340,6 +350,11 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		AutoSelectBlockReason:    r.AutoSelectBlockReason,
 		AutoSelectBlockExpiresAt: r.AutoSelectBlockExpiresAt,
 	}
+	if len(r.Chain) > 0 {
+		result.Chain = make([]string, len(r.Chain))
+		copy(result.Chain, r.Chain)
+	}
+	return result
 }
 
 // TestResult represents the result of a proxy connection test.

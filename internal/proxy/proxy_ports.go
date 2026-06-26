@@ -44,12 +44,14 @@ func NewProxyPortManagerWithSingboxFactory(configMgr *config.ProxyPortConfigMana
 	if factory == nil {
 		factory = NewSingboxCoreFactory()
 	}
+	// Wrap with ChainFactory so chain proxy outbounds work for TCP/HTTP proxy ports
+	chainFactory := NewChainFactory(factory, outboundMgr)
 	return &ProxyPortManager{
 		configMgr:      configMgr,
 		outboundMgr:    outboundMgr,
-		singboxFactory: factory,
+		singboxFactory: chainFactory,
 		listeners:      make(map[string]*proxyPortListener),
-		dialerPool:     newProxyPortDialerPool(factory),
+		dialerPool:     newProxyPortDialerPool(chainFactory),
 	}
 }
 
@@ -454,23 +456,30 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 	if err := l.handleSocks5Handshake(conn, reader); err != nil {
 		return
 	}
-	target, err := readSocks5Request(reader)
+	cmd, target, err := readSocks5RequestEx(reader)
 	if err != nil {
 		writeSocks5Reply(conn, 0x01)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
-	remote, _, err := l.dialOutbound(ctx, target)
-	cancel()
-	if err != nil {
-		writeSocks5Reply(conn, 0x05)
-		return
+	switch cmd {
+	case 0x01: // CONNECT
+		ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
+		remote, _, err := l.dialOutbound(ctx, target)
+		cancel()
+		if err != nil {
+			writeSocks5Reply(conn, 0x05)
+			return
+		}
+		clearProxyConnDeadline(conn)
+		writeSocks5Reply(conn, 0x00)
+		defer remote.Close()
+		relayStream(conn, reader, remote)
+	case 0x03: // UDP ASSOCIATE
+		l.handleSocks5UDPAssociate(conn)
+	default:
+		writeSocks5Reply(conn, 0x07) // Command not supported
 	}
-	clearProxyConnDeadline(conn)
-	writeSocks5Reply(conn, 0x00)
-	defer remote.Close()
-	relayStream(conn, reader, remote)
 }
 
 func (l *proxyPortListener) handleSocks5Handshake(conn net.Conn, reader *bufio.Reader) error {
@@ -544,22 +553,24 @@ func (l *proxyPortListener) handleSocks5Auth(conn net.Conn, reader *bufio.Reader
 	return nil
 }
 
-func readSocks5Request(reader *bufio.Reader) (string, error) {
+// readSocks5RequestEx reads a SOCKS5 request and returns the command byte
+// (0x01=CONNECT, 0x03=UDP ASSOCIATE) and the target address string.
+func readSocks5RequestEx(reader *bufio.Reader) (byte, string, error) {
 	ver, err := reader.ReadByte()
 	if err != nil || ver != 0x05 {
-		return "", fmt.Errorf("invalid request version")
+		return 0, "", fmt.Errorf("invalid request version")
 	}
 	cmd, err := reader.ReadByte()
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
-	if cmd != 0x01 {
-		return "", fmt.Errorf("unsupported command")
+	if cmd != 0x01 && cmd != 0x03 {
+		return cmd, "", fmt.Errorf("unsupported command %d", cmd)
 	}
-	_, _ = reader.ReadByte()
+	_, _ = reader.ReadByte() // RSV
 	atyp, err := reader.ReadByte()
 	if err != nil {
-		return "", err
+		return cmd, "", err
 	}
 
 	host := ""
@@ -567,35 +578,42 @@ func readSocks5Request(reader *bufio.Reader) (string, error) {
 	case 0x01:
 		buf := make([]byte, 4)
 		if _, err := io.ReadFull(reader, buf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = net.IP(buf).String()
 	case 0x03:
 		l, err := reader.ReadByte()
 		if err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		buf := make([]byte, int(l))
 		if _, err := io.ReadFull(reader, buf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = string(buf)
 	case 0x04:
 		buf := make([]byte, 16)
 		if _, err := io.ReadFull(reader, buf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = net.IP(buf).String()
 	default:
-		return "", fmt.Errorf("invalid atyp")
+		return cmd, "", fmt.Errorf("invalid atyp")
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(reader, portBuf); err != nil {
-		return "", err
+		return cmd, "", err
 	}
 	port := int(portBuf[0])<<8 | int(portBuf[1])
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+	return cmd, net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+}
+
+// readSocks5Request reads a SOCKS5 CONNECT request and returns the target address.
+// Kept for backward compatibility.
+func readSocks5Request(reader *bufio.Reader) (string, error) {
+	_, target, err := readSocks5RequestEx(reader)
+	return target, err
 }
 
 func writeSocks5Reply(conn net.Conn, rep byte) {
@@ -843,6 +861,242 @@ func containsByte(list []byte, v byte) bool {
 		}
 	}
 	return false
+}
+
+// handleSocks5UDPAssociate handles the SOCKS5 UDP ASSOCIATE command.
+// It creates a UDP relay socket, tells the client its address, and relays
+// UDP datagrams between the client and the upstream proxy outbound.
+func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
+	// Determine bind IP: use the TCP connection's local IP so the UDP relay
+	// is reachable on the same address the client connected to.
+	bindIP := net.IPv4zero
+	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcpAddr.IP.To4() != nil {
+		bindIP = tcpAddr.IP.To4()
+	}
+
+	// Create UDP relay socket
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP, Port: 0})
+	if err != nil {
+		writeSocks5Reply(conn, 0x01) // general failure
+		return
+	}
+	defer relayConn.Close()
+
+	_ = relayConn.SetReadBuffer(2 * 1024 * 1024)
+	_ = relayConn.SetWriteBuffer(2 * 1024 * 1024)
+
+	// Build the BND.ADDR/BND.PORT reply
+	relayAddr := relayConn.LocalAddr().(*net.UDPAddr)
+	var ipBytes []byte
+	if relayAddr.IP.To4() != nil {
+		ipBytes = relayAddr.IP.To4()
+	} else {
+		ipBytes = []byte{0, 0, 0, 0}
+	}
+
+	reply := []byte{0x05, 0x00, 0x00, 0x01}
+	reply = append(reply, ipBytes...)
+	reply = append(reply, byte(relayAddr.Port>>8), byte(relayAddr.Port&0xFF))
+	if _, err := conn.Write(reply); err != nil {
+		return
+	}
+	clearProxyConnDeadline(conn)
+
+	logger.Info("SOCKS5 UDP ASSOCIATE: relay=%s for client=%s (proxy_port=%s)", relayAddr, conn.RemoteAddr(), l.cfg.ID)
+
+	// Map of client+dest key -> upstream connection
+	type upstreamConn struct {
+		pc       net.PacketConn
+		writeFn  func([]byte) (int, error)
+		lastSeen time.Time
+	}
+	var mu sync.Mutex
+	conns := make(map[string]*upstreamConn)
+	var wg sync.WaitGroup
+
+	// Cleanup idle upstream connections
+	stopCleanup := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCleanup:
+				return
+			case <-ticker.C:
+				mu.Lock()
+				now := time.Now()
+				for key, uc := range conns {
+					if now.Sub(uc.lastSeen) > 5*time.Minute {
+						uc.pc.Close()
+						delete(conns, key)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	// Relay loop: read from client UDP, parse SOCKS5 header, forward to upstream
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			n, clientAddr, err := relayConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 4 {
+				continue
+			}
+			// SOCKS5 UDP header: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT
+			if buf[2] != 0x00 { // Drop fragmented datagrams
+				continue
+			}
+			atyp := buf[3]
+			off := 4
+			var destHost string
+			switch atyp {
+			case 0x01: // IPv4
+				if n < off+4+2 {
+					continue
+				}
+				destHost = net.IP(buf[off : off+4]).String()
+				off += 4
+			case 0x03: // Domain
+				if n < off+1 {
+					continue
+				}
+				dlen := int(buf[off])
+				off++
+				if n < off+dlen+2 {
+					continue
+				}
+				destHost = string(buf[off : off+dlen])
+				off += dlen
+			case 0x04: // IPv6
+				if n < off+16+2 {
+					continue
+				}
+				destHost = net.IP(buf[off : off+16]).String()
+				off += 16
+			default:
+				continue
+			}
+			if n < off+2 {
+				continue
+			}
+			destPort := int(buf[off])<<8 | int(buf[off+1])
+			off += 2
+			payload := buf[off:n]
+			destAddr := net.JoinHostPort(destHost, fmt.Sprintf("%d", destPort))
+
+			// Get or create upstream connection for this client+dest pair
+			connKey := clientAddr.String() + "->" + destAddr
+			mu.Lock()
+			uc, exists := conns[connKey]
+			if !exists {
+				// Dial upstream through outbound manager
+				var pc net.PacketConn
+				if l.cfg.IsDirectConnection() {
+					udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
+					if err != nil {
+						mu.Unlock()
+						continue
+					}
+					pc, err = net.DialUDP("udp", nil, udpAddr)
+					if err != nil {
+						mu.Unlock()
+						continue
+					}
+				} else if l.outboundMgr != nil {
+					selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(
+						proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), nil)
+					if err != nil {
+						mu.Unlock()
+						continue
+					}
+					if IsDirectSelection(selected) {
+						udpAddr, err := net.ResolveUDPAddr("udp", destAddr)
+						if err != nil {
+							mu.Unlock()
+							continue
+						}
+						pc, err = net.DialUDP("udp", nil, udpAddr)
+						if err != nil {
+							mu.Unlock()
+							continue
+						}
+					} else {
+						dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+						pc, err = l.outboundMgr.DialPacketConn(dialCtx, selected.Name, destAddr)
+						dialCancel()
+						if err != nil {
+							mu.Unlock()
+							continue
+						}
+					}
+				} else {
+					mu.Unlock()
+					continue
+				}
+
+				// Determine write function: connected sockets (DialUDP) use Write,
+				// unconnected sockets (outbound PacketConn) use WriteTo with nil addr
+				writeFn := func(data []byte) (int, error) {
+					return pc.WriteTo(data, nil)
+				}
+				if udpConn, ok := pc.(*net.UDPConn); ok {
+					writeFn = udpConn.Write
+				}
+
+				uc = &upstreamConn{pc: pc, writeFn: writeFn, lastSeen: time.Now()}
+				conns[connKey] = uc
+
+				// Start relay goroutine for responses: upstream -> client
+				wg.Add(1)
+				go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
+					defer wg.Done()
+					respBuf := make([]byte, 65535)
+					for {
+						n, _, err := pc.ReadFrom(respBuf)
+						if err != nil {
+							return
+						}
+						// Wrap response in SOCKS5 UDP header
+						// ATYP=0x01 (IPv4), ADDR=0.0.0.0, PORT=0 (origin unknown)
+						header := []byte{0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+						datagram := make([]byte, 0, len(header)+n)
+						datagram = append(datagram, header...)
+						datagram = append(datagram, respBuf[:n]...)
+						_, _ = relayConn.WriteToUDP(datagram, clientAddr)
+					}
+				}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
+			}
+			uc.lastSeen = time.Now()
+			mu.Unlock()
+
+			// Forward payload to upstream
+			_, _ = uc.writeFn(payload)
+		}
+	}()
+
+	// Keep the control connection open until client disconnects
+	io.Copy(io.Discard, conn)
+	close(stopCleanup)
+
+	// Close all upstream connections
+	mu.Lock()
+	for _, uc := range conns {
+		uc.pc.Close()
+	}
+	conns = make(map[string]*upstreamConn)
+	mu.Unlock()
+
+	wg.Wait()
 }
 
 func secureStringEqual(a, b string) bool {

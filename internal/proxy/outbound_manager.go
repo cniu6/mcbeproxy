@@ -365,7 +365,7 @@ func NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater ServerCon
 	if factory == nil {
 		factory = NewSingboxCoreFactory()
 	}
-	return &outboundManagerImpl{
+	m := &outboundManagerImpl{
 		globalConfig:        globalConfig,
 		outbounds:           make(map[string]*config.ProxyOutbound),
 		singboxOutbounds:    make(map[string]singboxcore.UDPOutbound),
@@ -378,6 +378,10 @@ func NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater ServerCon
 		serverSelectedNode:  make(map[string]string),
 		serverManualNode:    make(map[string]bool),
 	}
+	// Wrap with ChainFactory so that outbounds with Chain config are routed
+	// through the chain instead of a single hop.
+	m.singboxFactory = NewChainFactory(factory, m)
+	return m
 }
 
 func (m *outboundManagerImpl) latencyHistoryRetention() time.Duration {
