@@ -181,12 +181,74 @@ var _ singboxcore.Dialer = (*chainDialer)(nil)
 // chainUDPOutbound implements singboxcore.UDPOutbound for a chain of proxies.
 // It establishes the UDP connection through the last hop, which itself dials
 // through all previous hops.
+//
+// To avoid re-establishing the full chain (TCP handshake through every hop +
+// SOCKS5/protocol handshake + UDP ASSOCIATE) on every ListenPacket call,
+// completed PacketConns are cached by destination and reused. A background
+// goroutine closes idle entries after 2 minutes.
 type chainUDPOutbound struct {
 	hops     []*config.ProxyOutbound
 	outbound *SingboxOutbound // the last hop's outbound (with chained dialer)
 	closed   bool
 	mu       sync.Mutex
+
+	// UDP connection cache
+	cacheMu    sync.Mutex
+	cache      map[string]*cachedChainConn // destination -> cached conn
+	cacheStop  chan struct{}
+	cacheOnce  sync.Once
 }
+
+// cachedChainConn wraps a PacketConn for reuse. Close() does NOT close the
+// underlying connection — it just marks lastUsed so the idle sweeper can
+// clean it up later.
+type cachedChainConn struct {
+	pc       net.PacketConn
+	dest     string
+	lastUsed time.Time
+	mu       sync.Mutex
+}
+
+// chainConnWrapper is returned to callers of ListenPacket. It forwards
+// reads/writes to the cached underlying conn but Close() is a no-op —
+// the actual cleanup is done by the idle sweeper.
+type chainConnWrapper struct {
+	cached *cachedChainConn
+}
+
+func (w *chainConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := w.cached.pc.ReadFrom(p)
+	if err == nil {
+		w.cached.mu.Lock()
+		w.cached.lastUsed = time.Now()
+		w.cached.mu.Unlock()
+	}
+	return n, addr, err
+}
+
+func (w *chainConnWrapper) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := w.cached.pc.WriteTo(p, addr)
+	if err == nil {
+		w.cached.mu.Lock()
+		w.cached.lastUsed = time.Now()
+		w.cached.mu.Unlock()
+	}
+	return n, err
+}
+
+func (w *chainConnWrapper) LocalAddr() net.Addr { return w.cached.pc.LocalAddr() }
+
+func (w *chainConnWrapper) SetDeadline(t time.Time) error      { return w.cached.pc.SetDeadline(t) }
+func (w *chainConnWrapper) SetReadDeadline(t time.Time) error  { return w.cached.pc.SetReadDeadline(t) }
+func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error { return w.cached.pc.SetWriteDeadline(t) }
+
+func (w *chainConnWrapper) Close() error {
+	// No-op: the underlying conn is cached for reuse.
+	// The idle sweeper will close it after 2 minutes of inactivity.
+	return nil
+}
+
+var _ net.PacketConn = (*chainConnWrapper)(nil)
 
 // CreateChainUDPOutbound creates a UDP outbound that routes through a chain of proxies.
 // chainConfigs is ordered: chainConfigs[0] is the first hop, chainConfigs[len-1] is the last.
@@ -227,19 +289,73 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	}
 
 	return &chainUDPOutbound{
-		hops:     chainConfigs,
-		outbound: finalOutbound,
+		hops:      chainConfigs,
+		outbound:  finalOutbound,
+		cache:     make(map[string]*cachedChainConn),
+		cacheStop: make(chan struct{}),
 	}, nil
 }
 
 func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string) (net.PacketConn, error) {
+	// Try cache first
+	c.cacheMu.Lock()
+	if cached, ok := c.cache[destination]; ok {
+		c.cacheMu.Unlock()
+		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s via %d-hop chain", destination, len(c.hops))
+		return &chainConnWrapper{cached: cached}, nil
+	}
+	c.cacheMu.Unlock()
+
 	logger.Debug("ChainUDPOutbound: establishing UDP to %s via %d-hop chain", destination, len(c.hops))
 	conn, err := c.outbound.ListenPacket(ctx, destination)
 	if err != nil {
 		return nil, fmt.Errorf("chain UDP outbound failed: %w", err)
 	}
 	logger.Debug("ChainUDPOutbound: UDP connection established to %s via chain", destination)
-	return conn, nil
+
+	cached := &cachedChainConn{
+		pc:       conn,
+		dest:     destination,
+		lastUsed: time.Now(),
+	}
+
+	c.cacheMu.Lock()
+	c.cache[destination] = cached
+	c.cacheMu.Unlock()
+
+	// Start idle sweeper once
+	c.cacheOnce.Do(func() {
+		go c.idleSweeper()
+	})
+
+	return &chainConnWrapper{cached: cached}, nil
+}
+
+// idleSweeper periodically closes cached UDP connections that have been idle
+// for more than 2 minutes.
+func (c *chainUDPOutbound) idleSweeper() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.cacheStop:
+			return
+		case <-ticker.C:
+			c.cacheMu.Lock()
+			now := time.Now()
+			for dest, cached := range c.cache {
+				cached.mu.Lock()
+				idle := now.Sub(cached.lastUsed)
+				cached.mu.Unlock()
+				if idle > 2*time.Minute {
+					cached.pc.Close()
+					delete(c.cache, dest)
+					logger.Debug("ChainUDPOutbound: closed idle cached UDP conn for %s (idle %s)", dest, idle)
+				}
+			}
+			c.cacheMu.Unlock()
+		}
+	}
 }
 
 func (c *chainUDPOutbound) Close() error {
@@ -249,6 +365,16 @@ func (c *chainUDPOutbound) Close() error {
 		return nil
 	}
 	c.closed = true
+
+	// Stop idle sweeper and close all cached connections
+	close(c.cacheStop)
+	c.cacheMu.Lock()
+	for dest, cached := range c.cache {
+		cached.pc.Close()
+		delete(c.cache, dest)
+	}
+	c.cacheMu.Unlock()
+
 	return c.outbound.Close()
 }
 

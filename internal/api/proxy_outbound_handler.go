@@ -2730,7 +2730,10 @@ func shouldReuseCachedUDPTestOutbound(cfg *config.ProxyOutbound) bool {
 	case config.ProtocolAnyTLS, config.ProtocolHysteria2:
 		return true
 	default:
-		return false
+		// Chain proxies benefit from reusing the cached outbound because
+		// the chainUDPOutbound internally caches UDP PacketConns by
+		// destination, avoiding a full chain re-establishment per test.
+		return cfg.IsChainProxy()
 	}
 }
 
