@@ -219,13 +219,24 @@ type chainConnWrapper struct {
 }
 
 // evictOnFatalError removes the cached entry and closes the underlying conn
-// when a non-timeout error occurs, so the next ListenPacket creates a fresh
-// connection instead of reusing a dead one.
+// when an error occurs. Non-timeout errors always evict. Timeout errors only
+// evict if the connection has been idle for more than 30 seconds (likely a
+// dead connection whose TCP control link was silently dropped).
 func (w *chainConnWrapper) evictOnFatalError(err error) {
-	if err == nil || isTimeoutError(err) {
+	if err == nil {
 		return
 	}
-	logger.Debug("ChainUDPOutbound: evicting dead cached conn for %s: %v", w.dest, err)
+	if isTimeoutError(err) {
+		w.cached.mu.Lock()
+		idle := time.Since(w.cached.lastUsed)
+		w.cached.mu.Unlock()
+		if idle < 30*time.Second {
+			return
+		}
+		logger.Debug("ChainUDPOutbound: evicting stale cached conn for %s (idle %s, timeout)", w.dest, idle)
+	} else {
+		logger.Debug("ChainUDPOutbound: evicting dead cached conn for %s: %v", w.dest, err)
+	}
 	w.parent.cacheMu.Lock()
 	if cached, ok := w.parent.cache[w.dest]; ok && cached == w.cached {
 		cached.pc.Close()
@@ -335,12 +346,16 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 }
 
 func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string) (net.PacketConn, error) {
+	// Normalize cache key: resolve domain to IP so that "mco.cubecraft.net:19132"
+	// and "176.116.126.224:19132" share the same cache entry.
+	cacheKey := normalizeCacheKey(destination)
+
 	// Try cache first
 	c.cacheMu.Lock()
-	if cached, ok := c.cache[destination]; ok {
+	if cached, ok := c.cache[cacheKey]; ok {
 		c.cacheMu.Unlock()
-		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s via %d-hop chain", destination, len(c.hops))
-		return &chainConnWrapper{cached: cached, parent: c, dest: destination}, nil
+		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
+		return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 	}
 	c.cacheMu.Unlock()
 
@@ -353,12 +368,12 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 
 	cached := &cachedChainConn{
 		pc:       conn,
-		dest:     destination,
+		dest:     cacheKey,
 		lastUsed: time.Now(),
 	}
 
 	c.cacheMu.Lock()
-	c.cache[destination] = cached
+	c.cache[cacheKey] = cached
 	c.cacheMu.Unlock()
 
 	// Start idle sweeper once
@@ -366,13 +381,37 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		go c.idleSweeper()
 	})
 
-	return &chainConnWrapper{cached: cached, parent: c, dest: destination}, nil
+	return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
+}
+
+// normalizeCacheKey resolves the host part of a host:port address to an IP
+// address so that the same server accessed by domain or IP shares a single
+// cache entry. If resolution fails, the original string is used as-is.
+func normalizeCacheKey(destination string) string {
+	host, port, err := net.SplitHostPort(destination)
+	if err != nil {
+		return destination
+	}
+	if net.ParseIP(host) != nil {
+		return destination // already an IP
+	}
+	// Try quick DNS resolution
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return destination
+	}
+	return net.JoinHostPort(ips[0].IP.String(), port)
 }
 
 // idleSweeper periodically closes cached UDP connections that have been idle
-// for more than 2 minutes.
+// for more than 45 seconds. The aggressive timeout is intentional: SOCKS5 UDP
+// ASSOCIATE relies on a TCP control connection that can be silently dropped by
+// the server or NAT, and a stale cached connection is worse than creating a
+// fresh one.
 func (c *chainUDPOutbound) idleSweeper() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -385,7 +424,7 @@ func (c *chainUDPOutbound) idleSweeper() {
 				cached.mu.Lock()
 				idle := now.Sub(cached.lastUsed)
 				cached.mu.Unlock()
-				if idle > 2*time.Minute {
+				if idle > 45*time.Second {
 					cached.pc.Close()
 					delete(c.cache, dest)
 					logger.Debug("ChainUDPOutbound: closed idle cached UDP conn for %s (idle %s)", dest, idle)

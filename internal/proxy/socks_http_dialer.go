@@ -273,6 +273,10 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	}
 	_ = ctrl.SetDeadline(time.Time{})
 
+	// Enable TCP keepalive so the OS detects silently dropped connections
+	// (e.g. server restart, NAT timeout) within ~30s instead of hanging forever.
+	enableTCPKeepalive(ctrl, 10*time.Second)
+
 	relayAddr, err := socks5RelayUDPAddr(ctrl, bnd)
 	if err != nil {
 		ctrl.Close()
@@ -477,6 +481,28 @@ func (c *socks5UDPPacketConn) Close() error {
 }
 
 var _ net.PacketConn = (*socks5UDPPacketConn)(nil)
+
+// enableTCPKeepalive enables TCP keepalive on the underlying TCP connection,
+// even if wrapped by TLS. This is critical for SOCKS5 UDP ASSOCIATE: without
+// keepalive, a silently dropped TCP control connection (server restart, NAT
+// timeout, etc.) is never detected, and the UDP relay appears alive while
+// silently dropping all traffic.
+func enableTCPKeepalive(conn net.Conn, interval time.Duration) {
+	var tcpConn *net.TCPConn
+	switch c := conn.(type) {
+	case *net.TCPConn:
+		tcpConn = c
+	case interface{ NetConn() net.Conn }: // crypto/tls.Conn
+		inner := c.NetConn()
+		if tc, ok := inner.(*net.TCPConn); ok {
+			tcpConn = tc
+		}
+	}
+	if tcpConn != nil {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(interval)
+	}
+}
 
 // initSOCKS5 initializes a SOCKS5 outbound. No persistent state is required; the
 // association is established per ListenPacket call.
