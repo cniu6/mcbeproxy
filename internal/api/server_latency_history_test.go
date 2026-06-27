@@ -93,12 +93,14 @@ func TestServerLatencyOverviewRunningGatesAllRunningServers(t *testing.T) {
 			t.Fatalf("serverLatencyOverviewRunning(status=%q)=%v, want %v", tc.status, got, tc.want)
 		}
 	}
-	// Public-page gate stays tied to auto-ping regardless of run state.
-	if shouldExposeServerLatencyOverview(config.ServerConfigDTO{Status: "running", AutoPingEnabled: false}) {
-		t.Fatalf("shouldExposeServerLatencyOverview should be false when auto-ping disabled")
+	// Public-page gate now includes all running servers (including direct
+	// and non-raknet protocol servers) so they display online status via
+	// TCP connect probe.
+	if !shouldExposeServerLatencyOverview(config.ServerConfigDTO{Status: "running", AutoPingEnabled: false}) {
+		t.Fatalf("shouldExposeServerLatencyOverview should be true for running servers regardless of auto-ping")
 	}
-	if !shouldExposeServerLatencyOverview(config.ServerConfigDTO{Status: "stopped", AutoPingEnabled: true}) {
-		t.Fatalf("shouldExposeServerLatencyOverview should follow auto-ping flag")
+	if shouldExposeServerLatencyOverview(config.ServerConfigDTO{Status: "stopped", AutoPingEnabled: true}) {
+		t.Fatalf("shouldExposeServerLatencyOverview should be false for stopped servers")
 	}
 }
 

@@ -241,10 +241,11 @@ func (a *APIServer) getServerLatencyOverview(c *gin.Context) {
 }
 
 // shouldExposeServerLatencyOverview gates which servers expose latency on the
-// PUBLIC status page (/api/web/index). Kept tied to auto-ping to preserve the
-// public page's existing behavior.
+// PUBLIC status page (/api/web/index). All running servers are included so
+// that direct and non-raknet protocol servers (tcp/tcp_udp/udp) also display
+// online status and latency via TCP connect probe.
 func shouldExposeServerLatencyOverview(server config.ServerConfigDTO) bool {
-	return server.AutoPingEnabled
+	return strings.EqualFold(strings.TrimSpace(server.Status), "running")
 }
 
 // serverLatencyOverviewRunning gates the ADMIN latency overview. Every running

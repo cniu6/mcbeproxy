@@ -1228,6 +1228,26 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 			}
 			address = net.JoinHostPort(host, strconv.Itoa(port))
 		}
+
+		// For non-raknet protocols (tcp/tcp_udp/udp), the target is typically
+		// a plain TCP/UDP service (SSH, SOCKS5, etc.), not a MCBE server.
+		// RakNet ping will always fail for those, so use a TCP connect probe
+		// to measure real latency and online status instead.
+		protocol := strings.TrimSpace(strings.ToLower(server.Protocol))
+		if protocol == "tcp" || protocol == "tcp_udp" || protocol == "udp" {
+			tcpLatency, tcpOnline := tcpConnectProbe(address, publicPingTimeout)
+			info := map[string]interface{}{
+				"server_id": serverID,
+				"latency":   tcpLatency,
+				"online":    tcpOnline,
+				"source":    "tcp_connect",
+			}
+			if !tcpOnline {
+				info["error"] = "tcp connect failed"
+			}
+			return a.recordServerLatencyInfo(a.applyLastKnownLatency(info))
+		}
+
 		ping := a.doPingWithTimeout(address, publicPingTimeout)
 		info := map[string]interface{}{
 			"server_id": serverID,
@@ -2292,6 +2312,22 @@ func ensurePingAddress(address string) string {
 	}
 
 	return net.JoinHostPort(address, "19132")
+}
+
+// tcpConnectProbe measures latency by establishing a TCP connection to the
+// given address. Returns latency in milliseconds and online status. This is
+// used for non-raknet protocol servers (tcp/tcp_udp/udp) where the target is
+// a plain TCP/UDP service rather than a Minecraft Bedrock server.
+func tcpConnectProbe(address string, timeout time.Duration) (int64, bool) {
+	dialer := net.Dialer{Timeout: timeout}
+	start := time.Now()
+	conn, err := dialer.Dial("tcp", address)
+	if err != nil {
+		return -1, false
+	}
+	latency := time.Since(start).Milliseconds()
+	_ = conn.Close()
+	return latency, true
 }
 
 // doPing performs the actual ping operation.
