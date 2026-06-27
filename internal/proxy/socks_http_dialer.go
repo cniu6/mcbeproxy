@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -337,9 +338,10 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 func (c *socks5UDPPacketConn) monitorCtrlConn() {
 	buf := make([]byte, 128)
 	_, err := c.ctrlConn.Read(buf)
-	if err != nil {
-		// TCP control connection closed by server or error — kill UDP socket
-		logger.Debug("SOCKS5 UDP: TCP control connection closed: local=%s relay=%s err=%v",
+	if err != nil && !c.closed.Load() {
+		// TCP control connection closed by server or network — kill UDP socket.
+		// Suppress log if Close() was called intentionally.
+		logger.Debug("SOCKS5 UDP: TCP control connection closed by remote: local=%s relay=%s err=%v",
 			c.udpConn.LocalAddr(), c.relayAddr, err)
 	}
 	c.udpConn.Close()
@@ -377,6 +379,7 @@ type socks5UDPPacketConn struct {
 	relayAddr   *net.UDPAddr
 	destination M.Socksaddr
 	closeOnce   sync.Once
+	closed      atomic.Bool // set by Close() to suppress monitor log
 }
 
 func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -471,6 +474,7 @@ func (c *socks5UDPPacketConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *socks5UDPPacketConn) Close() error {
+	c.closed.Store(true)
 	c.closeOnce.Do(func() {
 		c.udpConn.Close()
 		if c.ctrlConn != nil {

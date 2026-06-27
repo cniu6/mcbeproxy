@@ -2717,8 +2717,12 @@ func shouldFallbackToConnectedPacketWrite(err error) bool {
 //     spurious "QUIC handshake timed out" failures. Caching keeps the QUIC
 //     connection alive across tests of the same node, which also removes
 //     handshake packet-loss sensitivity on loaded links.
+//   - SOCKS5: each ListenPacket establishes a TCP control connection + UDP
+//     ASSOCIATE handshake. Caching avoids repeated TCP+SOCKS5 handshakes per
+//     test, which is especially important for chain proxies where each hop
+//     adds latency.
 //
-// For the other tunneled protocols (VMess/Trojan/VLESS/Shadowsocks/SOCKS5)
+// For the other tunneled protocols (VMess/Trojan/VLESS/Shadowsocks)
 // each ListenPacket establishes a short-lived per-call TCP session, so
 // caching the outbound saves only a tiny amount of config setup and isn't
 // worth the extra coupling.
@@ -2727,7 +2731,7 @@ func shouldReuseCachedUDPTestOutbound(cfg *config.ProxyOutbound) bool {
 		return false
 	}
 	switch cfg.Type {
-	case config.ProtocolAnyTLS, config.ProtocolHysteria2:
+	case config.ProtocolAnyTLS, config.ProtocolHysteria2, config.ProtocolSOCKS5:
 		return true
 	default:
 		// Chain proxies benefit from reusing the cached outbound because
