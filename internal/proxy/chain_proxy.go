@@ -235,7 +235,7 @@ func (w *chainConnWrapper) evictOnFatalError(err error) {
 		w.cached.mu.Lock()
 		idle := time.Since(w.cached.lastUsed)
 		w.cached.mu.Unlock()
-		if idle < 30*time.Second {
+		if idle < 60*time.Second {
 			return
 		}
 		// Don't evict if other users are actively using this conn
@@ -290,11 +290,15 @@ func (w *chainConnWrapper) SetReadDeadline(t time.Time) error  { return w.cached
 func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error { return w.cached.pc.SetWriteDeadline(t) }
 
 func (w *chainConnWrapper) Close() error {
-	// Reset deadlines so the cached conn is clean for the next user.
-	w.cached.pc.SetDeadline(time.Time{})
-	// Decrement active user count so the idle sweeper can close this conn
-	// when no one is using it and it's been idle long enough.
-	atomic.AddInt32(&w.cached.activeUsers, -1)
+	// Decrement active user count first
+	remaining := atomic.AddInt32(&w.cached.activeUsers, -1)
+	if remaining <= 0 {
+		// No more active users — set a very short read deadline to unblock
+		// any pending ReadFrom calls on this wrapper (e.g. forwardResponses
+		// goroutine in RawUDPProxy.Stop()). The idle sweeper or next user
+		// will reset the deadline as needed.
+		w.cached.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	}
 	return nil
 }
 
@@ -409,11 +413,14 @@ func normalizeCacheKey(destination string) string {
 }
 
 // idleSweeper periodically closes cached UDP connections that have been idle
-// for more than 45 seconds AND have no active users. Connections with active
+// for more than 120 seconds AND have no active users. Connections with active
 // users (e.g. a player connected through the chain proxy) are never closed,
-// even if traffic is momentarily idle.
+// even if traffic is momentarily idle. The 120s timeout is chosen to be longer
+// than the 60s ping interval so periodic pings can reuse cached connections.
+// Dead connections are detected by TCP keepalive (~30s) or evictOnFatalError,
+// not by the idle sweeper.
 func (c *chainUDPOutbound) idleSweeper() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -429,7 +436,7 @@ func (c *chainUDPOutbound) idleSweeper() {
 				cached.mu.Lock()
 				idle := now.Sub(cached.lastUsed)
 				cached.mu.Unlock()
-				if idle > 45*time.Second {
+				if idle > 120*time.Second {
 					cached.pc.Close()
 					delete(c.cache, dest)
 					logger.Debug("ChainUDPOutbound: closed idle cached UDP conn for %s (idle %s)", dest, idle)

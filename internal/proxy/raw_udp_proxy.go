@@ -3067,7 +3067,16 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	targetPacketAddr := p.effectiveTargetPacketAddr()
 
 	if p.shouldUseProxy() {
-		conn, selectedNode, err = p.dialThroughProxyForPing(8 * time.Second)
+		// Chain proxies need more time: each hop adds TCP handshake + protocol
+		// handshake latency. A 1-hop chain to a distant server can easily take
+		// 6-10s just for the SOCKS5 auth response through the tunnel.
+		pingTimeout := 8 * time.Second
+		if p.outboundMgr != nil {
+			if cfg, ok := p.outboundMgr.GetOutbound(p.config.GetProxyOutbound()); ok && cfg.IsChainProxy() {
+				pingTimeout = 15 * time.Second
+			}
+		}
+		conn, selectedNode, err = p.dialThroughProxyForPing(pingTimeout)
 	} else {
 		conn, err = net.DialUDP("udp", nil, p.targetAddr)
 	}
