@@ -221,30 +221,35 @@ type chainConnWrapper struct {
 }
 
 // evictOnFatalError removes the cached entry and closes the underlying conn
-// when an error occurs. Non-timeout errors always evict (the conn is dead).
-// Timeout errors only evict if the connection has been idle for more than 30
-// seconds (likely a dead connection whose TCP control link was silently
-// dropped). If other active users are using the same conn, eviction is skipped
-// to avoid killing their connection — the dead conn will be cleaned up when
-// all users close their wrappers or by the idle sweeper.
+// when a non-timeout error occurs (the conn is dead). Timeout errors never
+// evict if there are any active users — the player's forwardResponses will
+// handle timeouts via its own clientInactiveTimeout check, and the idle
+// sweeper will clean up the conn when all users have closed their wrappers.
+// This prevents disconnects during loading screens or other brief idle
+// periods where the server sends no data for 60+ seconds.
 func (w *chainConnWrapper) evictOnFatalError(err error) {
 	if err == nil {
 		return
 	}
 	if isTimeoutError(err) {
+		// Never evict on timeout if anyone is actively using this conn.
+		// The idle sweeper will clean up when activeUsers == 0.
+		if atomic.LoadInt32(&w.cached.activeUsers) > 0 {
+			return
+		}
+		// No active users — check if the conn has been idle long enough
+		// to be considered dead (TCP control link silently dropped).
 		w.cached.mu.Lock()
 		idle := time.Since(w.cached.lastUsed)
 		w.cached.mu.Unlock()
 		if idle < 60*time.Second {
 			return
 		}
-		// Don't evict if other users are actively using this conn
-		if atomic.LoadInt32(&w.cached.activeUsers) > 1 {
-			return
-		}
 		logger.Debug("ChainUDPOutbound: evicting stale cached conn for %s (idle %s, timeout)", w.dest, idle)
 	} else {
-		// Don't evict if other users are actively using this conn
+		// Non-timeout error — the conn is dead. Don't evict if other users
+		// are actively using this conn; they'll get the same error and
+		// close on their own.
 		if atomic.LoadInt32(&w.cached.activeUsers) > 1 {
 			logger.Debug("ChainUDPOutbound: skipping eviction for %s (other active users), err=%v", w.dest, err)
 			return
@@ -293,11 +298,21 @@ func (w *chainConnWrapper) Close() error {
 	// Decrement active user count first
 	remaining := atomic.AddInt32(&w.cached.activeUsers, -1)
 	if remaining <= 0 {
-		// No more active users — set a very short read deadline to unblock
-		// any pending ReadFrom calls on this wrapper (e.g. forwardResponses
-		// goroutine in RawUDPProxy.Stop()). The idle sweeper or next user
-		// will reset the deadline as needed.
-		w.cached.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		// No more active users. Check if this conn is still the cached one.
+		w.parent.cacheMu.Lock()
+		if cached, ok := w.parent.cache[w.dest]; !ok || cached != w.cached {
+			// This conn is no longer in the cache (was replaced by a newer
+			// one while it was in use). Close it now to prevent a resource
+			// leak — the idle sweeper can't reach it since it's not cached.
+			w.cached.pc.Close()
+		} else {
+			// Still in cache — set a very short read deadline to unblock
+			// any pending ReadFrom calls (e.g. forwardResponses in
+			// RawUDPProxy.Stop()). The idle sweeper will close it when
+			// it's been idle long enough.
+			w.cached.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+		w.parent.cacheMu.Unlock()
 	}
 	return nil
 }
@@ -355,11 +370,17 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	// and "176.116.126.224:19132" share the same cache entry.
 	cacheKey := normalizeCacheKey(destination)
 
-	// Try cache first
+	// Try cache first — but ONLY if no one else is actively using it.
+	// Multiple concurrent readers on the same SOCKS5 UDP socket would steal
+	// each other's datagrams (UDP ReadFrom returns complete datagrams to
+	// whichever reader wakes up first). They would also overwrite each
+	// other's read deadlines on the shared socket. So we only allow
+	// sequential reuse: when the previous user has closed their wrapper
+	// (activeUsers == 0), the next user can take over.
 	c.cacheMu.Lock()
-	if cached, ok := c.cache[cacheKey]; ok {
-		c.cacheMu.Unlock()
+	if cached, ok := c.cache[cacheKey]; ok && atomic.LoadInt32(&cached.activeUsers) == 0 {
 		atomic.AddInt32(&cached.activeUsers, 1)
+		c.cacheMu.Unlock()
 		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
 		return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 	}
@@ -378,6 +399,9 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		lastUsed: time.Now(),
 	}
 
+	// Cache this new conn. If the old cached conn is still in use by someone
+	// else, it will be closed when its last user calls Close() (since it's
+	// no longer in the cache at that point).
 	c.cacheMu.Lock()
 	c.cache[cacheKey] = cached
 	c.cacheMu.Unlock()
