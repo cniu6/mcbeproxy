@@ -63,6 +63,13 @@ func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundCo
 	if factory == nil {
 		factory = proxy.NewSingboxCoreFactory()
 	}
+	// Wrap with ChainFactory so that chain proxy outbounds are routed through
+	// the full chain (matching the outbound manager's behavior). Without this,
+	// MCBE UDP tests and other handler-level operations bypass chain hops and
+	// connect directly to the node's own server, producing misleading results.
+	if _, ok := factory.(*proxy.ChainFactory); !ok {
+		factory = proxy.NewChainFactory(factory, outboundMgr)
+	}
 	return &ProxyOutboundHandler{
 		configMgr:       configMgr,
 		subConfigMgr:    subConfigMgr,
