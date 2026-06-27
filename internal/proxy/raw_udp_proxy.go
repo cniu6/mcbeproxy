@@ -886,6 +886,46 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 	return conn, proxyOutbound, err
 }
 
+// dialThroughProxyForPing is like dialThroughProxyWithTimeout but uses
+// DialPacketConnForPing to avoid marking the outbound unhealthy on failure.
+// This prevents transient SOCKS5 UDP relay failures (firewalled random ports)
+// from cascading into unhealthy outbound status and breaking active game connections.
+func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.PacketConn, string, error) {
+	if p == nil || p.config == nil {
+		return nil, "", fmt.Errorf("raw udp proxy configuration is nil")
+	}
+	if p.outboundMgr == nil {
+		return nil, "", fmt.Errorf("proxy outbound manager unavailable for raw udp server %s", p.serverID)
+	}
+
+	baseCtx := p.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	defer cancel()
+
+	proxyOutbound := p.config.GetProxyOutbound()
+	targetAddr := p.config.GetTargetAddr()
+
+	// For ping, use single-node path only (group selection for ping is handled
+	// separately by the auto-ping candidate logic). Use the ping dialer
+	// interface to avoid health marking.
+	logger.Info("RawUDPProxy: Using single node '%s' for %s (ping)", proxyOutbound, targetAddr)
+
+	if pingDialer, ok := p.outboundMgr.(outboundPacketConnPingDialer); ok {
+		conn, err := pingDialer.DialPacketConnForPing(ctx, proxyOutbound, targetAddr)
+		return conn, proxyOutbound, err
+	}
+	// Fallback: use NoRetry if available, otherwise standard DialPacketConn
+	if noRetry, ok := p.outboundMgr.(outboundPacketConnNoRetryDialer); ok {
+		conn, err := noRetry.DialPacketConnNoRetry(ctx, proxyOutbound, targetAddr)
+		return conn, proxyOutbound, err
+	}
+	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, targetAddr)
+	return conn, proxyOutbound, err
+}
+
 // forwardResponses forwards responses from target back to client
 func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawUDPClientInfo) {
 	defer p.wg.Done()
@@ -2993,7 +3033,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	targetPacketAddr := p.effectiveTargetPacketAddr()
 
 	if p.shouldUseProxy() {
-		conn, selectedNode, err = p.dialThroughProxyWithTimeout(8 * time.Second)
+		conn, selectedNode, err = p.dialThroughProxyForPing(8 * time.Second)
 	} else {
 		conn, err = net.DialUDP("udp", nil, p.targetAddr)
 	}

@@ -1435,6 +1435,18 @@ func (m *outboundManagerImpl) DialPacketConnNoRetry(ctx context.Context, outboun
 	return m.dialPacketConnOnce(ctx, outboundName, destination)
 }
 
+// DialPacketConnForPing dials a UDP PacketConn without marking the outbound
+// unhealthy on failure. This is used by pingTargetServer so that transient
+// SOCKS5 UDP relay failures (e.g. firewalled random relay ports) don't
+// cascade into marking the outbound unhealthy and breaking active game
+// connections.
+func (m *outboundManagerImpl) DialPacketConnForPing(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	if err := m.prepareDialPacketConn(outboundName); err != nil {
+		return nil, err
+	}
+	return m.dialPacketConnOnceNoHealthMark(ctx, outboundName, destination)
+}
+
 // dialWithRetry implements exponential backoff retry logic for DialPacketConn.
 // Requirements: 6.1, 6.2
 func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
@@ -1498,6 +1510,16 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 
 // dialPacketConnOnce performs a single connection attempt without retry.
 func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	return m.dialPacketConnOnceInternal(ctx, outboundName, destination, true)
+}
+
+// dialPacketConnOnceNoHealthMark is like dialPacketConnOnce but does not mark
+// the outbound unhealthy on failure. Used for ping-only dials.
+func (m *outboundManagerImpl) dialPacketConnOnceNoHealthMark(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	return m.dialPacketConnOnceInternal(ctx, outboundName, destination, false)
+}
+
+func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, outboundName string, destination string, markHealth bool) (net.PacketConn, error) {
 	m.mu.RLock()
 	// Get the outbound configuration
 	cfg, exists := m.outbounds[outboundName]
@@ -1509,10 +1531,11 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 	// Get or create sing-box outbound instance
 	singboxOutbound, err := m.getOrCreateSingboxOutbound(cfg)
 	if err != nil {
-		// Mark as unhealthy on creation failure
-		cfg.SetHealthy(false)
-		cfg.SetLastError(err.Error())
-		cfg.SetLastCheck(time.Now())
+		if markHealth {
+			cfg.SetHealthy(false)
+			cfg.SetLastError(err.Error())
+			cfg.SetLastCheck(time.Now())
+		}
 		return nil, fmt.Errorf("failed to create outbound: %w", err)
 	}
 
@@ -1527,14 +1550,17 @@ func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundNa
 					goto success
 				}
 			}
-			cfg.SetLastCheck(time.Now())
+			if markHealth {
+				cfg.SetLastCheck(time.Now())
+			}
 			return nil, fmt.Errorf("failed to dial packet connection: %w", err)
 		}
 
-		// Mark as unhealthy on connection failure for other protocols or permanent errors
-		cfg.SetHealthy(false)
-		cfg.SetLastError(err.Error())
-		cfg.SetLastCheck(time.Now())
+		if markHealth {
+			cfg.SetHealthy(false)
+			cfg.SetLastError(err.Error())
+			cfg.SetLastCheck(time.Now())
+		}
 		return nil, fmt.Errorf("failed to dial packet connection: %w", err)
 	}
 
@@ -1542,12 +1568,12 @@ success:
 
 	m.mu.Lock()
 	if cfg, ok := m.outbounds[outboundName]; ok {
-		// Increment connection count
 		cfg.IncrConnCount()
-		// Mark as healthy on success
-		cfg.SetHealthy(true)
-		cfg.SetLastError("")
-		cfg.SetLastCheck(time.Now())
+		if markHealth {
+			cfg.SetHealthy(true)
+			cfg.SetLastError("")
+			cfg.SetLastCheck(time.Now())
+		}
 		m.mu.Unlock()
 	} else {
 		m.mu.Unlock()
@@ -1557,7 +1583,6 @@ success:
 		return nil, ErrOutboundNotFound
 	}
 
-	// Wrap connection to track when it's closed
 	return &trackedPacketConn{
 		PacketConn: conn,
 		cfg:        cfg,

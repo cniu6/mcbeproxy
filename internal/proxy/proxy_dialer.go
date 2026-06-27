@@ -18,6 +18,10 @@ type outboundPacketConnNoRetryDialer interface {
 	DialPacketConnNoRetry(ctx context.Context, outboundName string, destination string) (net.PacketConn, error)
 }
 
+type outboundPacketConnPingDialer interface {
+	DialPacketConnForPing(ctx context.Context, outboundName string, destination string) (net.PacketConn, error)
+}
+
 type proxySelectionConfig interface {
 	IsGroupSelection() bool
 	IsMultiNodeSelection() bool
