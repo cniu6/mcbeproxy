@@ -2946,22 +2946,44 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// port that the remote server's firewall blocks, causing a false
 	// timeout. The active game connection already proves the server is
 	// reachable, and forwardResponses keeps lastSeen fresh.
-	hasActiveClient := false
-	p.clients.Range(func(key, value interface{}) bool {
-		ci := value.(*rawUDPClientInfo)
-		if ci.kicked.Load() {
+	//
+	// Use the same liveness threshold as forwardResponses (clientInactiveTimeout)
+	// rather than UDPReadTimeout, so we don't create new ASSOCIATE connections
+	// during short idle periods (loading screens, etc.) that are well within
+	// the connection's actual lifetime. When clientInactiveTimeout=0
+	// (idle_timeout=-1), clients never time out, so always skip.
+	activeThreshold := p.clientInactiveTimeout
+	if activeThreshold == 0 {
+		// idle_timeout=-1: clients never expire
+		hasAny := false
+		p.clients.Range(func(key, value interface{}) bool {
+			ci := value.(*rawUDPClientInfo)
+			if !ci.kicked.Load() {
+				hasAny = true
+				return false
+			}
 			return true
+		})
+		if hasAny {
+			return p.getCachedLatencyNoRefresh()
 		}
-		lastSeenNano := ci.lastSeen.Load()
-		if time.Since(time.Unix(0, lastSeenNano)) <= UDPReadTimeout {
-			hasActiveClient = true
-			return false
+	} else {
+		hasActiveClient := false
+		p.clients.Range(func(key, value interface{}) bool {
+			ci := value.(*rawUDPClientInfo)
+			if ci.kicked.Load() {
+				return true
+			}
+			lastSeenNano := ci.lastSeen.Load()
+			if time.Since(time.Unix(0, lastSeenNano)) <= activeThreshold {
+				hasActiveClient = true
+				return false
+			}
+			return true
+		})
+		if hasActiveClient {
+			return p.getCachedLatencyNoRefresh()
 		}
-		return true
-	})
-	if hasActiveClient {
-		// Keep existing cached latency; don't overwrite with -1.
-		return p.getCachedLatencyNoRefresh()
 	}
 
 	// No active client — create a new connection
