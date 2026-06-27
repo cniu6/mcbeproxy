@@ -308,9 +308,11 @@ func (w *chainConnWrapper) Close() error {
 		} else {
 			// Still in cache — set a very short read deadline to unblock
 			// any pending ReadFrom calls (e.g. forwardResponses in
-			// RawUDPProxy.Stop()). The idle sweeper will close it when
-			// it's been idle long enough.
+			// RawUDPProxy.Stop()). Also reset the write deadline to zero
+			// so that the next user doesn't inherit an expired write
+			// deadline from a previous ping or game session.
 			w.cached.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			w.cached.pc.SetWriteDeadline(time.Time{})
 		}
 		w.parent.cacheMu.Unlock()
 	}
@@ -413,6 +415,11 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		} else {
 			atomic.AddInt32(&cached.activeUsers, 1)
 			c.cacheMu.Unlock()
+			// Reset all deadlines on the underlying conn so the new user
+			// doesn't inherit expired read/write deadlines from a previous
+			// user (e.g. pingTargetServer sets 2s write + 3s read deadlines;
+			// if those expire before reuse, all I/O fails with i/o timeout).
+			_ = cached.pc.SetDeadline(time.Time{})
 			logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
 			return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 		}

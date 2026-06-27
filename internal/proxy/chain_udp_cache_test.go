@@ -720,3 +720,86 @@ func TestChainUDPCache_StressMultipleClients(t *testing.T) {
 	}
 	t.Logf("All %d concurrent clients completed successfully", numClients)
 }
+
+// TestChainUDPCache_WriteDeadlineResetAfterPing verifies that after
+// pingTargetServer sets a short write deadline and closes the wrapper,
+// a subsequent reuse of the cached conn can still write successfully.
+// This is a regression test for the write deadline leak that caused
+// "i/o timeout" on all writes when MCBE test reused a cached conn after ping.
+func TestChainUDPCache_WriteDeadlineResetAfterPing(t *testing.T) {
+	realServer, stopReal := startFakeRakNetServer(t)
+	defer stopReal()
+
+	socks5A := startSOCKS5Server(t, "", "")
+	socks5AHost, socks5APort := splitHostPort(t, socks5A.String())
+
+	chainOutbound, err := CreateChainUDPOutbound([]*config.ProxyOutbound{
+		{
+			Name:    "hop1-deadline",
+			Type:    config.ProtocolSOCKS5,
+			Server:  socks5AHost,
+			Port:    socks5APort,
+			Enabled: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create chain outbound: %v", err)
+	}
+	defer chainOutbound.Close()
+
+	dest := realServer.String()
+	ctx := context.Background()
+
+	// First call — simulates pingTargetServer
+	pc1, err := chainOutbound.ListenPacket(ctx, dest)
+	if err != nil {
+		t.Fatalf("first ListenPacket: %v", err)
+	}
+
+	// Simulate what pingTargetServer does: set short write + read deadlines
+	_ = pc1.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = pc1.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	// Send and receive (simulating a successful ping)
+	ping := []byte{0x01, 0x02, 0x03, 0x04}
+	if _, err := pc1.WriteTo(ping, realServer); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	buf := make([]byte, 2048)
+	n, _, err := pc1.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	t.Logf("Ping: %d bytes echoed", n)
+
+	// Close the wrapper (simulates defer conn.Close() in pingTargetServer)
+	pc1.Close()
+
+	// Wait for the write deadline to expire (3 seconds > 2s deadline)
+	t.Log("Waiting 3s for write deadline to expire...")
+	time.Sleep(3 * time.Second)
+
+	// Second call — simulates MCBE test reusing the cached conn.
+	// Before the fix, this would fail with "i/o timeout" on write
+	// because the expired write deadline was never reset.
+	pc2, err := chainOutbound.ListenPacket(ctx, dest)
+	if err != nil {
+		t.Fatalf("second ListenPacket: %v", err)
+	}
+	defer pc2.Close()
+
+	// This write should succeed — the deadline should have been reset
+	if _, err := pc2.WriteTo(ping, realServer); err != nil {
+		t.Fatalf("second write after deadline expiry: %v (write deadline was not reset)", err)
+	}
+
+	_ = pc2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err = pc2.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("second read after deadline expiry: %v", err)
+	}
+	if n != len(ping) {
+		t.Fatalf("expected %d bytes, got %d", len(ping), n)
+	}
+	t.Logf("Reuse after deadline expiry: %d bytes echoed (write deadline correctly reset)", n)
+}
