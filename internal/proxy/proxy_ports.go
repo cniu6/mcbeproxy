@@ -887,12 +887,13 @@ func containsByte(list []byte, v byte) bool {
 // different clients are dispatched to their respective upstream connections.
 // Stale upstreams are cleaned up by an idle timeout.
 type sharedUDPRelay struct {
-	conn     *net.UDPConn
-	mu       sync.Mutex
-	clients  map[string]*udpClientEntry // clientAddr.String() -> entry
-	wg       sync.WaitGroup
-	stopCh   chan struct{}
-	cfgID    string
+	conn      *net.UDPConn
+	mu        sync.Mutex
+	clients   map[string]*udpClientEntry // clientAddr.String() -> entry
+	activeIPs sync.Map                  // net.IP.String() -> struct{} (TCP control conn active)
+	wg        sync.WaitGroup
+	stopCh    chan struct{}
+	cfgID     string
 }
 
 // udpClientEntry holds per-client upstream connections.
@@ -953,6 +954,45 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 	return r, nil
 }
 
+// registerClientIP marks a TCP control connection's remote IP as active,
+// allowing UDP datagrams from that IP to be accepted by the shared relay.
+func (r *sharedUDPRelay) registerClientIP(ip net.IP) {
+	r.activeIPs.Store(ip.String(), struct{}{})
+}
+
+// unregisterClientIP removes a TCP control connection's remote IP and cleans
+// up all UDP client entries matching that IP. Called when the TCP control
+// connection closes to prevent stale upstream connections from leaking.
+func (r *sharedUDPRelay) unregisterClientIP(ip net.IP) {
+	r.activeIPs.Delete(ip.String())
+
+	r.mu.Lock()
+	for clientKey, entry := range r.clients {
+		// Parse the client UDP address to check if the IP matches
+		udpAddr, err := net.ResolveUDPAddr("udp", clientKey)
+		if err != nil {
+			continue
+		}
+		if udpAddr.IP.Equal(ip) {
+			entry.mu.Lock()
+			for _, uc := range entry.upstreams {
+				uc.pc.Close()
+			}
+			entry.mu.Unlock()
+			delete(r.clients, clientKey)
+			logger.Debug("SOCKS5 UDP relay: cleaned up client %s on TCP disconnect (proxy_port=%s)", clientKey, r.cfgID)
+		}
+	}
+	r.mu.Unlock()
+}
+
+// isClientIPActive checks whether a UDP datagram from the given IP should be
+// accepted (i.e., there is an active TCP control connection from that IP).
+func (r *sharedUDPRelay) isClientIPActive(ip net.IP) bool {
+	_, ok := r.activeIPs.Load(ip.String())
+	return ok
+}
+
 // dialUDPUpstream creates an upstream UDP connection for the given destination.
 func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, error) {
 	if l.cfg.IsDirectConnection() {
@@ -993,7 +1033,7 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		}
 		return net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
 	}
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(l.ctx, 15*time.Second)
 	defer dialCancel()
 	return l.outboundMgr.DialPacketConn(dialCtx, selected.Name, destAddr)
 }
@@ -1008,7 +1048,9 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 	buf := make([]byte, 65535)
 
 	// Idle cleanup ticker
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -1042,6 +1084,12 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			return
 		}
 		if n < 4 || buf[2] != 0x00 {
+			continue
+		}
+
+		// Validate source IP: only accept UDP from IPs with active TCP control connections
+		if !r.isClientIPActive(clientAddr.IP) {
+			logger.Debug("SOCKS5 UDP relay: dropping datagram from unregistered IP %s (proxy_port=%s)", clientAddr.IP, r.cfgID)
 			continue
 		}
 
@@ -1183,6 +1231,15 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 		return
 	}
 
+	// Extract client IP from TCP control connection for UDP source validation
+	var clientIP net.IP
+	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		clientIP = tcpAddr.IP
+	} else {
+		host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		clientIP = net.ParseIP(host)
+	}
+
 	relayLocalAddr := relay.conn.LocalAddr().(*net.UDPAddr)
 
 	// Reply with the relay address (0.0.0.0:port)
@@ -1193,13 +1250,22 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	}
 	clearProxyConnDeadline(conn)
 
+	// Register this client IP so the shared relay accepts its UDP datagrams
+	if clientIP != nil {
+		relay.registerClientIP(clientIP)
+	}
+
 	logger.Info("SOCKS5 UDP ASSOCIATE: relay=0.0.0.0:%d for client=%s (proxy_port=%s)",
 		relayLocalAddr.Port, conn.RemoteAddr(), l.cfg.ID)
 
 	// Keep the control connection open until client disconnects.
-	// The shared relay socket stays open across clients; cleanup of
-	// per-client upstreams is handled by the idle timeout in readLoop.
+	// The shared relay socket stays open across clients.
 	io.Copy(io.Discard, conn)
+
+	// Client disconnected — unregister and clean up per-client upstreams
+	if clientIP != nil {
+		relay.unregisterClientIP(clientIP)
+	}
 
 	logger.Debug("SOCKS5 UDP ASSOCIATE: control connection closed for client=%s (proxy_port=%s)",
 		conn.RemoteAddr(), l.cfg.ID)

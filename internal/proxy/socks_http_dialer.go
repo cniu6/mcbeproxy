@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sync"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -370,7 +371,9 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	buf := make([]byte, len(p)+512)
+	buf := socks5UDPBufPool.Get().([]byte)
+	defer socks5UDPBufPool.Put(buf)
+
 	for {
 		n, err := c.udpConn.Read(buf)
 		if err != nil {
@@ -395,6 +398,10 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		copied := copy(p, data)
 		return copied, c.destination.UDPAddr(), nil
 	}
+}
+
+var socks5UDPBufPool = sync.Pool{
+	New: func() interface{} { return make([]byte, 65535) },
 }
 
 // socks5UDPHeaderLen returns the length of the ATYP/ADDR/PORT portion of a SOCKS5
