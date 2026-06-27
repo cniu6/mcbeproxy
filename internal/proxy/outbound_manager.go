@@ -1771,6 +1771,17 @@ func shouldRecreateSingboxUDPOutbound(cfg *config.ProxyOutbound, err error) bool
 			strings.Contains(errText, "broken pipe") ||
 			strings.Contains(errText, "reset by peer")
 	}
+	if cfg.Type == config.ProtocolSOCKS5 {
+		return strings.Contains(errText, "connection closed") ||
+			strings.Contains(errText, "closed") ||
+			strings.Contains(errText, "eof") ||
+			strings.Contains(errText, "reset by peer") ||
+			strings.Contains(errText, "broken pipe") ||
+			strings.Contains(errText, "refused") ||
+			strings.Contains(errText, "timeout") ||
+			strings.Contains(errText, "no route") ||
+			strings.Contains(errText, "chain udp outbound failed")
+	}
 	return false
 }
 

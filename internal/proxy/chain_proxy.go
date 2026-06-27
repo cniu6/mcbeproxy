@@ -365,24 +365,57 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	}, nil
 }
 
+// isConnAlive checks whether a cached PacketConn is still usable before reuse.
+// It checks for protocol-specific liveness flags (e.g. SOCKS5 remoteClosed)
+// and falls back to a non-blocking read probe for unknown types.
+func isConnAlive(pc net.PacketConn) bool {
+	// Check SOCKS5-specific liveness flag
+	if s5, ok := pc.(*socks5UDPPacketConn); ok {
+		return !s5.IsRemoteClosed()
+	}
+	// For other protocols, try a zero-length read with immediate deadline.
+	// A timeout means the conn is alive; a non-timeout error means it's dead.
+	// Use a 1ms deadline to avoid blocking.
+	_ = pc.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, _, err := pc.ReadFrom(buf)
+	if err == nil {
+		// Got data — conn is alive (but we consumed a byte; this is a
+		// last-resort path that shouldn't happen for well-behaved protocols)
+		return true
+	}
+	if isTimeoutError(err) {
+		return true
+	}
+	return false
+}
+
 func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string) (net.PacketConn, error) {
 	// Normalize cache key: resolve domain to IP so that "mco.cubecraft.net:19132"
 	// and "176.116.126.224:19132" share the same cache entry.
 	cacheKey := normalizeCacheKey(destination)
 
-	// Try cache first — but ONLY if no one else is actively using it.
-	// Multiple concurrent readers on the same SOCKS5 UDP socket would steal
-	// each other's datagrams (UDP ReadFrom returns complete datagrams to
-	// whichever reader wakes up first). They would also overwrite each
-	// other's read deadlines on the shared socket. So we only allow
-	// sequential reuse: when the previous user has closed their wrapper
-	// (activeUsers == 0), the next user can take over.
+	// Try cache first — but ONLY if no one else is actively using it AND it's
+	// still alive. Multiple concurrent readers on the same SOCKS5 UDP socket
+	// would steal each other's datagrams (UDP ReadFrom returns complete
+	// datagrams to whichever reader wakes up first). They would also
+	// overwrite each other's read deadlines on the shared socket. So we only
+	// allow sequential reuse: when the previous user has closed their wrapper
+	// (activeUsers == 0) and the conn is still alive, the next user can take
+	// over. Dead cached conns are evicted immediately.
 	c.cacheMu.Lock()
 	if cached, ok := c.cache[cacheKey]; ok && atomic.LoadInt32(&cached.activeUsers) == 0 {
-		atomic.AddInt32(&cached.activeUsers, 1)
-		c.cacheMu.Unlock()
-		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
-		return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
+		if !isConnAlive(cached.pc) {
+			// Cached conn is dead — evict and create a new one
+			cached.pc.Close()
+			delete(c.cache, cacheKey)
+			logger.Debug("ChainUDPOutbound: evicted dead cached conn for %s before reuse", cacheKey)
+		} else {
+			atomic.AddInt32(&cached.activeUsers, 1)
+			c.cacheMu.Unlock()
+			logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
+			return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
+		}
 	}
 	c.cacheMu.Unlock()
 
@@ -418,6 +451,15 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 // normalizeCacheKey resolves the host part of a host:port address to an IP
 // address so that the same server accessed by domain or IP shares a single
 // cache entry. If resolution fails, the original string is used as-is.
+// DNS results are cached for 5 minutes to avoid repeated lookups.
+var dnsCacheMu sync.Mutex
+var dnsCache = make(map[string]dnsCacheEntry)
+
+type dnsCacheEntry struct {
+	ip        string
+	expiresAt time.Time
+}
+
 func normalizeCacheKey(destination string) string {
 	host, port, err := net.SplitHostPort(destination)
 	if err != nil {
@@ -426,6 +468,15 @@ func normalizeCacheKey(destination string) string {
 	if net.ParseIP(host) != nil {
 		return destination // already an IP
 	}
+
+	// Check DNS cache first
+	dnsCacheMu.Lock()
+	if entry, ok := dnsCache[host]; ok && time.Now().Before(entry.expiresAt) {
+		dnsCacheMu.Unlock()
+		return net.JoinHostPort(entry.ip, port)
+	}
+	dnsCacheMu.Unlock()
+
 	// Try quick DNS resolution
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -433,7 +484,23 @@ func normalizeCacheKey(destination string) string {
 	if err != nil || len(ips) == 0 {
 		return destination
 	}
-	return net.JoinHostPort(ips[0].IP.String(), port)
+	ipStr := ips[0].IP.String()
+
+	// Cache the result
+	dnsCacheMu.Lock()
+	dnsCache[host] = dnsCacheEntry{ip: ipStr, expiresAt: time.Now().Add(5 * time.Minute)}
+	// Clean expired entries occasionally
+	if len(dnsCache) > 100 {
+		now := time.Now()
+		for h, e := range dnsCache {
+			if !now.Before(e.expiresAt) {
+				delete(dnsCache, h)
+			}
+		}
+	}
+	dnsCacheMu.Unlock()
+
+	return net.JoinHostPort(ipStr, port)
 }
 
 // idleSweeper periodically closes cached UDP connections that have been idle

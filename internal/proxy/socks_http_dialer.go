@@ -341,11 +341,19 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 	if err != nil && !c.closed.Load() {
 		// TCP control connection closed by server or network — kill UDP socket.
 		// Suppress log if Close() was called intentionally.
+		c.remoteClosed.Store(true)
 		logger.Debug("SOCKS5 UDP: TCP control connection closed by remote: local=%s relay=%s err=%v",
 			c.udpConn.LocalAddr(), c.relayAddr, err)
 	}
 	c.udpConn.Close()
 	c.ctrlConn.Close()
+}
+
+// IsRemoteClosed returns true if the TCP control connection has been closed
+// by the remote server. This allows external caching layers (e.g.
+// chainUDPOutbound) to detect dead cached connections before reuse.
+func (c *socks5UDPPacketConn) IsRemoteClosed() bool {
+	return c.remoteClosed.Load()
 }
 
 // socks5RelayUDPAddr resolves the UDP relay endpoint from the ASSOCIATE reply,
@@ -374,12 +382,13 @@ func socks5RelayUDPAddr(ctrl net.Conn, bnd M.Socksaddr) (*net.UDPAddr, error) {
 // All datagrams are sent to a single baked destination, matching the contract of
 // the other UDP outbound PacketConns in this package.
 type socks5UDPPacketConn struct {
-	udpConn     *net.UDPConn
-	ctrlConn    net.Conn
-	relayAddr   *net.UDPAddr
-	destination M.Socksaddr
-	closeOnce   sync.Once
-	closed      atomic.Bool // set by Close() to suppress monitor log
+	udpConn      *net.UDPConn
+	ctrlConn     net.Conn
+	relayAddr    *net.UDPAddr
+	destination  M.Socksaddr
+	closeOnce    sync.Once
+	closed       atomic.Bool // set by Close() to suppress monitor log
+	remoteClosed atomic.Bool // set by monitorCtrlConn when remote closes TCP
 }
 
 func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
