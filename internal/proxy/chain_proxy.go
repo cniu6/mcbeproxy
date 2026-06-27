@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -203,10 +204,11 @@ type chainUDPOutbound struct {
 // underlying connection — it just marks lastUsed so the idle sweeper can
 // clean it up later.
 type cachedChainConn struct {
-	pc       net.PacketConn
-	dest     string
-	lastUsed time.Time
-	mu       sync.Mutex
+	pc          net.PacketConn
+	dest        string
+	lastUsed    time.Time
+	mu          sync.Mutex
+	activeUsers int32 // atomic: number of chainConnWrappers currently using this conn
 }
 
 // chainConnWrapper is returned to callers of ListenPacket. It forwards
@@ -219,9 +221,12 @@ type chainConnWrapper struct {
 }
 
 // evictOnFatalError removes the cached entry and closes the underlying conn
-// when an error occurs. Non-timeout errors always evict. Timeout errors only
-// evict if the connection has been idle for more than 30 seconds (likely a
-// dead connection whose TCP control link was silently dropped).
+// when an error occurs. Non-timeout errors always evict (the conn is dead).
+// Timeout errors only evict if the connection has been idle for more than 30
+// seconds (likely a dead connection whose TCP control link was silently
+// dropped). If other active users are using the same conn, eviction is skipped
+// to avoid killing their connection — the dead conn will be cleaned up when
+// all users close their wrappers or by the idle sweeper.
 func (w *chainConnWrapper) evictOnFatalError(err error) {
 	if err == nil {
 		return
@@ -233,8 +238,17 @@ func (w *chainConnWrapper) evictOnFatalError(err error) {
 		if idle < 30*time.Second {
 			return
 		}
+		// Don't evict if other users are actively using this conn
+		if atomic.LoadInt32(&w.cached.activeUsers) > 1 {
+			return
+		}
 		logger.Debug("ChainUDPOutbound: evicting stale cached conn for %s (idle %s, timeout)", w.dest, idle)
 	} else {
+		// Don't evict if other users are actively using this conn
+		if atomic.LoadInt32(&w.cached.activeUsers) > 1 {
+			logger.Debug("ChainUDPOutbound: skipping eviction for %s (other active users), err=%v", w.dest, err)
+			return
+		}
 		logger.Debug("ChainUDPOutbound: evicting dead cached conn for %s: %v", w.dest, err)
 	}
 	w.parent.cacheMu.Lock()
@@ -277,9 +291,10 @@ func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error { return w.cached
 
 func (w *chainConnWrapper) Close() error {
 	// Reset deadlines so the cached conn is clean for the next user.
-	// Without this, an expired read deadline from the previous user causes
-	// all subsequent reads to immediately time out.
 	w.cached.pc.SetDeadline(time.Time{})
+	// Decrement active user count so the idle sweeper can close this conn
+	// when no one is using it and it's been idle long enough.
+	atomic.AddInt32(&w.cached.activeUsers, -1)
 	return nil
 }
 
@@ -340,6 +355,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	c.cacheMu.Lock()
 	if cached, ok := c.cache[cacheKey]; ok {
 		c.cacheMu.Unlock()
+		atomic.AddInt32(&cached.activeUsers, 1)
 		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
 		return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 	}
@@ -367,6 +383,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		go c.idleSweeper()
 	})
 
+	atomic.AddInt32(&cached.activeUsers, 1)
 	return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 }
 
@@ -392,10 +409,9 @@ func normalizeCacheKey(destination string) string {
 }
 
 // idleSweeper periodically closes cached UDP connections that have been idle
-// for more than 45 seconds. The aggressive timeout is intentional: SOCKS5 UDP
-// ASSOCIATE relies on a TCP control connection that can be silently dropped by
-// the server or NAT, and a stale cached connection is worse than creating a
-// fresh one.
+// for more than 45 seconds AND have no active users. Connections with active
+// users (e.g. a player connected through the chain proxy) are never closed,
+// even if traffic is momentarily idle.
 func (c *chainUDPOutbound) idleSweeper() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -407,6 +423,9 @@ func (c *chainUDPOutbound) idleSweeper() {
 			c.cacheMu.Lock()
 			now := time.Now()
 			for dest, cached := range c.cache {
+				if atomic.LoadInt32(&cached.activeUsers) > 0 {
+					continue
+				}
 				cached.mu.Lock()
 				idle := now.Sub(cached.lastUsed)
 				cached.mu.Unlock()
