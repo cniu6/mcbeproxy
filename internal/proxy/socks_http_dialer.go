@@ -316,12 +316,30 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	logger.Debug("SOCKS5 UDP ASSOCIATE: relay=%s localUDP=%s dest=%s\n",
 		relayAddr, udpConn.LocalAddr(), resolvedDest)
 
-	return &socks5UDPPacketConn{
+	pc := &socks5UDPPacketConn{
 		udpConn:     udpConn,
 		ctrlConn:    ctrl,
 		relayAddr:   relayAddr,
 		destination: resolvedDest,
-	}, nil
+	}
+	go pc.monitorCtrlConn()
+
+	return pc, nil
+}
+
+// monitorCtrlConn blocks reading from the TCP control connection. When the
+// server closes it (EOF or error), the UDP relay is dead — so we close the
+// local UDP socket to unblock any pending ReadFrom on it.
+func (c *socks5UDPPacketConn) monitorCtrlConn() {
+	buf := make([]byte, 128)
+	_, err := c.ctrlConn.Read(buf)
+	if err != nil {
+		// TCP control connection closed by server or error — kill UDP socket
+		logger.Debug("SOCKS5 UDP: TCP control connection closed: local=%s relay=%s err=%v",
+			c.udpConn.LocalAddr(), c.relayAddr, err)
+	}
+	c.udpConn.Close()
+	c.ctrlConn.Close()
 }
 
 // socks5RelayUDPAddr resolves the UDP relay endpoint from the ASSOCIATE reply,
@@ -354,6 +372,7 @@ type socks5UDPPacketConn struct {
 	ctrlConn    net.Conn
 	relayAddr   *net.UDPAddr
 	destination M.Socksaddr
+	closeOnce   sync.Once
 }
 
 func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -448,11 +467,13 @@ func (c *socks5UDPPacketConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *socks5UDPPacketConn) Close() error {
-	err := c.udpConn.Close()
-	if c.ctrlConn != nil {
-		_ = c.ctrlConn.Close()
-	}
-	return err
+	c.closeOnce.Do(func() {
+		c.udpConn.Close()
+		if c.ctrlConn != nil {
+			c.ctrlConn.Close()
+		}
+	})
+	return nil
 }
 
 var _ net.PacketConn = (*socks5UDPPacketConn)(nil)

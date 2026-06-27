@@ -214,11 +214,31 @@ type cachedChainConn struct {
 // the actual cleanup is done by the idle sweeper.
 type chainConnWrapper struct {
 	cached *cachedChainConn
+	parent *chainUDPOutbound
+	dest   string
+}
+
+// evictOnFatalError removes the cached entry and closes the underlying conn
+// when a non-timeout error occurs, so the next ListenPacket creates a fresh
+// connection instead of reusing a dead one.
+func (w *chainConnWrapper) evictOnFatalError(err error) {
+	if err == nil || isTimeoutError(err) {
+		return
+	}
+	logger.Debug("ChainUDPOutbound: evicting dead cached conn for %s: %v", w.dest, err)
+	w.parent.cacheMu.Lock()
+	if cached, ok := w.parent.cache[w.dest]; ok && cached == w.cached {
+		cached.pc.Close()
+		delete(w.parent.cache, w.dest)
+	}
+	w.parent.cacheMu.Unlock()
 }
 
 func (w *chainConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := w.cached.pc.ReadFrom(p)
-	if err == nil {
+	if err != nil {
+		w.evictOnFatalError(err)
+	} else {
 		w.cached.mu.Lock()
 		w.cached.lastUsed = time.Now()
 		w.cached.mu.Unlock()
@@ -228,7 +248,9 @@ func (w *chainConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (w *chainConnWrapper) WriteTo(p []byte, addr net.Addr) (int, error) {
 	n, err := w.cached.pc.WriteTo(p, addr)
-	if err == nil {
+	if err != nil {
+		w.evictOnFatalError(err)
+	} else {
 		w.cached.mu.Lock()
 		w.cached.lastUsed = time.Now()
 		w.cached.mu.Unlock()
@@ -318,7 +340,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	if cached, ok := c.cache[destination]; ok {
 		c.cacheMu.Unlock()
 		logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s via %d-hop chain", destination, len(c.hops))
-		return &chainConnWrapper{cached: cached}, nil
+		return &chainConnWrapper{cached: cached, parent: c, dest: destination}, nil
 	}
 	c.cacheMu.Unlock()
 
@@ -344,7 +366,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		go c.idleSweeper()
 	})
 
-	return &chainConnWrapper{cached: cached}, nil
+	return &chainConnWrapper{cached: cached, parent: c, dest: destination}, nil
 }
 
 // idleSweeper periodically closes cached UDP connections that have been idle
