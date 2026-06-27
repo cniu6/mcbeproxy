@@ -243,8 +243,24 @@ func (w *chainConnWrapper) SetReadDeadline(t time.Time) error  { return w.cached
 func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error { return w.cached.pc.SetWriteDeadline(t) }
 
 func (w *chainConnWrapper) Close() error {
-	// No-op: the underlying conn is cached for reuse.
-	// The idle sweeper will close it after 2 minutes of inactivity.
+	// Reset deadlines so the cached conn is clean for the next user.
+	// Without this, a expired read deadline from the previous user causes
+	// all subsequent reads to immediately time out.
+	w.cached.pc.SetDeadline(time.Time{})
+
+	// Drain any stale datagrams left in the socket buffer so the next user
+	// doesn't receive a response to the previous user's request.
+	go func() {
+		buf := make([]byte, 2048)
+		w.cached.pc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		for {
+			if _, _, err := w.cached.pc.ReadFrom(buf); err != nil {
+				break
+			}
+		}
+		w.cached.pc.SetReadDeadline(time.Time{})
+	}()
+
 	return nil
 }
 
