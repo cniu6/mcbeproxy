@@ -908,9 +908,43 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 	proxyOutbound := p.config.GetProxyOutbound()
 	targetAddr := p.config.GetTargetAddr()
 
-	// For ping, use single-node path only (group selection for ping is handled
-	// separately by the auto-ping candidate logic). Use the ping dialer
-	// interface to avoid health marking.
+	// Check if this is a group or multi-node selection
+	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
+		strategy := p.config.GetLoadBalance()
+		sortBy := p.config.GetLoadBalanceSort()
+
+		selectedOutbound, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil)
+		if err != nil {
+			return nil, "", fmt.Errorf("no healthy nodes available for ping: %w", err)
+		}
+
+		logger.Info("RawUDPProxy: Selected node '%s' for %s (ping)", selectedOutbound.Name, targetAddr)
+		if IsDirectSelection(selectedOutbound) {
+			udpAddr := p.targetAddr
+			if udpAddr == nil {
+				resolved, rerr := resolveUDPAddrWithContext(ctx, targetAddr)
+				if rerr != nil {
+					return nil, "", rerr
+				}
+				udpAddr = resolved
+			}
+			conn, err := net.DialUDP("udp", nil, udpAddr)
+			return conn, DirectNodeName, err
+		}
+		// Use ping dialer for the selected node to avoid health marking
+		if pingDialer, ok := p.outboundMgr.(outboundPacketConnPingDialer); ok {
+			conn, err := pingDialer.DialPacketConnForPing(ctx, selectedOutbound.Name, targetAddr)
+			return conn, selectedOutbound.Name, err
+		}
+		if noRetry, ok := p.outboundMgr.(outboundPacketConnNoRetryDialer); ok {
+			conn, err := noRetry.DialPacketConnNoRetry(ctx, selectedOutbound.Name, targetAddr)
+			return conn, selectedOutbound.Name, err
+		}
+		conn, err := p.outboundMgr.DialPacketConn(ctx, selectedOutbound.Name, targetAddr)
+		return conn, selectedOutbound.Name, err
+	}
+
+	// Single node mode
 	logger.Info("RawUDPProxy: Using single node '%s' for %s (ping)", proxyOutbound, targetAddr)
 
 	if pingDialer, ok := p.outboundMgr.(outboundPacketConnPingDialer); ok {
