@@ -307,9 +307,28 @@ func (s *SingboxOutbound) initVLESS(_ *config.ProxyOutbound) error {
 	return nil
 }
 
+// hy2ObfsConfig stores obfuscation parameters for Hysteria2.
+type hy2ObfsConfig struct {
+	obfsType string // "salamander" or ""
+	password string
+}
+
+// wrapObfsConn wraps a PacketConn with the configured obfuscation.
+func wrapObfsConn(conn net.PacketConn, oc *hy2ObfsConfig) (net.PacketConn, error) {
+	if oc == nil || oc.obfsType == "" || oc.password == "" {
+		return conn, nil
+	}
+	switch oc.obfsType {
+	case "salamander":
+		return hy2obfs.WrapPacketConnSalamander(conn, []byte(oc.password))
+	default:
+		return conn, nil
+	}
+}
+
 // hy2ObfsConnFactory wraps a ConnFactory with obfuscation.
 type hy2ObfsConnFactory struct {
-	obfs hy2obfs.Obfuscator
+	obfs *hy2ObfsConfig
 }
 
 func (f *hy2ObfsConnFactory) New(addr net.Addr) (net.PacketConn, error) {
@@ -317,10 +336,12 @@ func (f *hy2ObfsConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if f.obfs != nil {
-		return hy2obfs.WrapPacketConn(conn, f.obfs), nil
+	wrapped, err := wrapObfsConn(conn, f.obfs)
+	if err != nil {
+		conn.Close()
+		return nil, err
 	}
-	return conn, nil
+	return wrapped, nil
 }
 
 // parsePortRange parses a port range string like "20000-55000" into start and end ports.
@@ -354,7 +375,7 @@ type hy2PortHoppingConnFactory struct {
 	portStart   int
 	portEnd     int
 	hopInterval time.Duration
-	obfs        hy2obfs.Obfuscator
+	obfs        *hy2ObfsConfig
 }
 
 // New creates a new port-hopping UDP connection.
@@ -368,7 +389,12 @@ func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	// Wrap with obfuscation if configured
 	var baseConn net.PacketConn = conn
 	if f.obfs != nil {
-		baseConn = hy2obfs.WrapPacketConn(conn, f.obfs)
+		wrapped, err := wrapObfsConn(conn, f.obfs)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		baseConn = wrapped
 	}
 
 	// If port hopping is enabled, wrap with port hopping
@@ -578,12 +604,9 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 	}
 
 	// Parse obfuscation
-	var obfs hy2obfs.Obfuscator
+	var obfs *hy2ObfsConfig
 	if cfg.Obfs == "salamander" && cfg.ObfsPassword != "" {
-		obfs, err = hy2obfs.NewSalamanderObfuscator([]byte(cfg.ObfsPassword))
-		if err != nil {
-			return fmt.Errorf("failed to create obfuscator: %w", err)
-		}
+		obfs = &hy2ObfsConfig{obfsType: "salamander", password: cfg.ObfsPassword}
 		logger.Info("Hysteria2: salamander obfuscation enabled")
 	}
 
@@ -1311,12 +1334,20 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 	}
 	alpn := effectiveTLSALPN(cfg)
 
+	// Auto-detect SNI mismatch: if SNI is set and differs from server hostname,
+	// the server certificate likely won't match the SNI, so skip verification.
+	insecure := cfg.Insecure
+	if !insecure && sni != "" && !strings.EqualFold(sni, cfg.Server) {
+		logger.Debug("TLS: SNI %q differs from server %q, auto-enabling insecure skip verify", sni, cfg.Server)
+		insecure = true
+	}
+
 	// If fingerprint is specified, use uTLS for better compatibility
 	if cfg.Fingerprint != "" {
 		fingerprint := getUTLSFingerprint(cfg.Fingerprint)
 		utlsConfig := &utls.Config{
 			ServerName:         sni,
-			InsecureSkipVerify: cfg.Insecure,
+			InsecureSkipVerify: insecure,
 			NextProtos:         alpn,
 			ClientSessionCache: globalUTLSSessionCache,
 		}
@@ -1331,7 +1362,7 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 	// Standard TLS with session resumption
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: cfg.Insecure,
+		InsecureSkipVerify: insecure,
 		NextProtos:         alpn,
 		ClientSessionCache: globalTLSSessionCache,
 	})
@@ -1522,45 +1553,75 @@ func dialVisionTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound
 // dialRealityTLS establishes a TLS connection with Reality authentication.
 // Reality embeds authentication data in the TLS ClientHello sessionId field.
 // Based on XTLS/Xray-core Reality client implementation.
+//
+// We try the legacy (metacubex/utls) path first with the latest protocol version
+// bytes [26,3,27] because we control the version encoding directly. If that fails,
+// we fall back to xray-core's UClient (which uses its own hardcoded version),
+// then try alternate fingerprints.
 func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
 	primaryFingerprint := strings.TrimSpace(cfg.Fingerprint)
 	if primaryFingerprint == "" {
 		primaryFingerprint = "chrome"
 	}
-	realityConn, err := dialRealityTLSWithFingerprint(ctx, conn, cfg, primaryFingerprint)
-	if err == nil {
-		return realityConn, nil
+
+	// Try legacy path first with the latest protocol version [26, 3, 27].
+	// This gives us full control over the version bytes and MlkemEcdhe fallback.
+	legacyConn, legacyErr := dialRealityTLSLegacy(ctx, conn, cfg)
+	if legacyErr == nil {
+		return legacyConn, nil
 	}
-	if shouldRetryRealityWithAlternateFingerprint(primaryFingerprint, err) {
-		_ = conn.Close()
+	_ = conn.Close()
+
+	// If legacy failed with a non-reality error (e.g. wrong pbk), don't retry.
+	if !shouldFallbackToLegacyReality(legacyErr) && !isRealityAuthError(legacyErr) {
+		return nil, legacyErr
+	}
+
+	logger.Debug("Reality: legacy path failed for %s (%v), trying xray-core UClient", cfg.Server, legacyErr)
+
+	// Fall back to xray-core UClient (uses its own hardcoded version bytes).
+	xrayRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+	if redialErr != nil {
+		return nil, fmt.Errorf("reality legacy failed (%v) and xray-core redial failed: %w", legacyErr, redialErr)
+	}
+	xrayConn, xrayErr := dialRealityTLSWithFingerprint(ctx, xrayRawConn, cfg, primaryFingerprint)
+	if xrayErr == nil {
+		logger.Debug("Reality: xray-core UClient succeeded for %s after legacy failure: %v", cfg.Server, legacyErr)
+		return xrayConn, nil
+	}
+	_ = xrayRawConn.Close()
+
+	// Try alternate fingerprints with xray-core UClient.
+	if shouldRetryRealityWithAlternateFingerprint(primaryFingerprint, xrayErr) {
 		for _, altFingerprint := range realityAlternateFingerprints(primaryFingerprint) {
 			altRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
 			if redialErr != nil {
-				return nil, fmt.Errorf("reality alternate fingerprint %s redial failed after %v: %w", altFingerprint, err, redialErr)
+				return nil, fmt.Errorf("reality alternate fingerprint %s redial failed after legacy=%v xray=%v: %w", altFingerprint, legacyErr, xrayErr, redialErr)
 			}
 			altConn, altErr := dialRealityTLSWithFingerprint(ctx, altRawConn, cfg, altFingerprint)
 			if altErr == nil {
-				logger.Debug("Reality: alternate fingerprint %s succeeded for %s after primary %s failed: %v", altFingerprint, cfg.Server, primaryFingerprint, err)
+				logger.Debug("Reality: alternate fingerprint %s succeeded for %s: legacy=%v xray=%v", altFingerprint, cfg.Server, legacyErr, xrayErr)
 				return altConn, nil
 			}
 			_ = altRawConn.Close()
 		}
 	}
-	if !shouldFallbackToLegacyReality(err) {
-		return nil, err
+
+	// Try alternate fingerprints with legacy path.
+	for _, altFingerprint := range realityAlternateFingerprints(primaryFingerprint) {
+		altRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+		if redialErr != nil {
+			continue
+		}
+		altConn, altErr := dialRealityTLSLegacyWithFingerprint(ctx, altRawConn, cfg, altFingerprint)
+		if altErr == nil {
+			logger.Debug("Reality: legacy alternate fingerprint %s succeeded for %s: legacy=%v xray=%v", altFingerprint, cfg.Server, legacyErr, xrayErr)
+			return altConn, nil
+		}
+		_ = altRawConn.Close()
 	}
-	_ = conn.Close()
-	legacyRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
-	if redialErr != nil {
-		return nil, fmt.Errorf("xray-core reality client rejected connection (%v) and legacy fallback redial failed: %w", err, redialErr)
-	}
-	legacyConn, legacyErr := dialRealityTLSLegacy(ctx, legacyRawConn, cfg)
-	if legacyErr != nil {
-		_ = legacyRawConn.Close()
-		return nil, fmt.Errorf("xray-core reality client rejected connection (%v); legacy fallback failed: %w", err, legacyErr)
-	}
-	logger.Debug("Reality: legacy metacubex fallback succeeded for %s after xray-core rejection: %v", cfg.Server, err)
-	return legacyConn, nil
+
+	return nil, fmt.Errorf("reality handshake failed: legacy (%v); xray-core (%v)", legacyErr, xrayErr)
 }
 
 func dialRealityTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprint string) (net.Conn, error) {
@@ -1621,7 +1682,27 @@ func realityAlternateFingerprints(primaryFingerprint string) []string {
 	return result
 }
 
+// isRealityAuthError returns true if the error is related to Reality authentication
+// (not just a non-reality cert, which could mean the server doesn't recognize the version).
+func isRealityAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "reality") ||
+		strings.Contains(errText, "processed invalid") ||
+		strings.Contains(errText, "non-reality certificate") ||
+		strings.Contains(errText, "invalid certificate signature") ||
+		strings.Contains(errText, "does not support tls 1.3") ||
+		strings.Contains(errText, "shared key") ||
+		strings.Contains(errText, "public key")
+}
+
 func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
+	return dialRealityTLSLegacyWithFingerprint(ctx, conn, cfg, cfg.Fingerprint)
+}
+
+func dialRealityTLSLegacyWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprintName string) (net.Conn, error) {
 	publicKeyBytes, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode reality public key: %w", err)
@@ -1638,7 +1719,7 @@ func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyO
 	if sni == "" {
 		sni = cfg.Server
 	}
-	fingerprint := getUTLSFingerprint(cfg.Fingerprint)
+	fingerprint := getUTLSFingerprint(fingerprintName)
 	utlsConfig := &utls.Config{
 		ServerName:             sni,
 		InsecureSkipVerify:     true,
@@ -1656,15 +1737,12 @@ func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyO
 	}
 	copy(hello.Raw[39:], hello.SessionId)
 
-	const (
-		realityVersionX = 1
-		realityVersionY = 8
-		realityVersionZ = 0
-	)
-	hello.SessionId[0] = realityVersionX
-	hello.SessionId[1] = realityVersionY
-	hello.SessionId[2] = realityVersionZ
-	hello.SessionId[3] = 0
+	// Use the latest xray-core protocol version [26, 3, 27].
+	// Older servers are backwards-compatible with newer version bytes.
+	hello.SessionId[0] = 26 // Version_x
+	hello.SessionId[1] = 3  // Version_y
+	hello.SessionId[2] = 27 // Version_z
+	hello.SessionId[3] = 0  // reserved
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	copy(hello.SessionId[8:], shortID)
 
@@ -1729,7 +1807,7 @@ func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyO
 		_ = utlsConn.Close()
 		return nil, errors.New("reality: invalid certificate signature (check pbk/sid/sni/fp)")
 	}
-	logger.Debug("Reality: legacy metacubex verification passed for %s, fingerprint=%s, shortId=%s", sni, cfg.Fingerprint, cfg.RealityShortID)
+	logger.Debug("Reality: legacy verification passed for %s, fingerprint=%s, shortId=%s", sni, fingerprintName, cfg.RealityShortID)
 	return utlsConn, nil
 }
 

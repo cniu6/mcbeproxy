@@ -887,13 +887,14 @@ func containsByte(list []byte, v byte) bool {
 // different clients are dispatched to their respective upstream connections.
 // Stale upstreams are cleaned up by an idle timeout.
 type sharedUDPRelay struct {
-	conn      *net.UDPConn
-	mu        sync.Mutex
-	clients   map[string]*udpClientEntry // clientAddr.String() -> entry
-	activeIPs sync.Map                  // net.IP.String() -> struct{} (TCP control conn active)
-	wg        sync.WaitGroup
-	stopCh    chan struct{}
-	cfgID     string
+	conn        *net.UDPConn
+	mu          sync.Mutex
+	clients     map[string]*udpClientEntry // clientAddr.String() -> entry
+	activeIPsMu sync.Mutex
+	activeIPs   map[string]int // net.IP.String() -> reference count of active TCP control conns
+	wg          sync.WaitGroup
+	stopCh      chan struct{}
+	cfgID       string
 }
 
 // udpClientEntry holds per-client upstream connections.
@@ -941,10 +942,11 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
 
 	r := &sharedUDPRelay{
-		conn:    conn,
-		clients: make(map[string]*udpClientEntry),
-		stopCh:  make(chan struct{}),
-		cfgID:   l.cfg.ID,
+		conn:      conn,
+		clients:   make(map[string]*udpClientEntry),
+		activeIPs: make(map[string]int),
+		stopCh:    make(chan struct{}),
+		cfgID:     l.cfg.ID,
 	}
 
 	r.wg.Add(1)
@@ -957,40 +959,63 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 // registerClientIP marks a TCP control connection's remote IP as active,
 // allowing UDP datagrams from that IP to be accepted by the shared relay.
 func (r *sharedUDPRelay) registerClientIP(ip net.IP) {
-	r.activeIPs.Store(ip.String(), struct{}{})
+	r.activeIPsMu.Lock()
+	r.activeIPs[ip.String()]++
+	r.activeIPsMu.Unlock()
 }
 
-// unregisterClientIP removes a TCP control connection's remote IP and cleans
-// up all UDP client entries matching that IP. Called when the TCP control
-// connection closes to prevent stale upstream connections from leaking.
+// unregisterClientIP decrements the reference count for a TCP control
+// connection's remote IP. When the count reaches zero (no more active TCP
+// control connections from that IP), the IP is removed from the active set.
+//
+// Upstream connections are NOT closed here. Previously, this function closed
+// all upstreams matching the IP, but that caused a race condition: when a
+// client rapidly reconnected (e.g. after cache eviction), the old connection's
+// cleanup would close the new connection's upstreams. Stale upstreams are now
+// cleaned up by the idle sweeper (30s ticker, 2min timeout) instead.
 func (r *sharedUDPRelay) unregisterClientIP(ip net.IP) {
-	r.activeIPs.Delete(ip.String())
-
-	r.mu.Lock()
-	for clientKey, entry := range r.clients {
-		// Parse the client UDP address to check if the IP matches
-		udpAddr, err := net.ResolveUDPAddr("udp", clientKey)
-		if err != nil {
-			continue
-		}
-		if udpAddr.IP.Equal(ip) {
-			entry.mu.Lock()
-			for _, uc := range entry.upstreams {
-				uc.pc.Close()
-			}
-			entry.mu.Unlock()
-			delete(r.clients, clientKey)
-			logger.Debug("SOCKS5 UDP relay: cleaned up client %s on TCP disconnect (proxy_port=%s)", clientKey, r.cfgID)
-		}
+	r.activeIPsMu.Lock()
+	r.activeIPs[ip.String()]--
+	if r.activeIPs[ip.String()] <= 0 {
+		delete(r.activeIPs, ip.String())
 	}
-	r.mu.Unlock()
+	r.activeIPsMu.Unlock()
 }
 
 // isClientIPActive checks whether a UDP datagram from the given IP should be
 // accepted (i.e., there is an active TCP control connection from that IP).
 func (r *sharedUDPRelay) isClientIPActive(ip net.IP) bool {
-	_, ok := r.activeIPs.Load(ip.String())
+	r.activeIPsMu.Lock()
+	_, ok := r.activeIPs[ip.String()]
+	r.activeIPsMu.Unlock()
 	return ok
+}
+
+// hasRecentActivity checks whether any upstream connection from the given
+// client IP has received UDP traffic within the given duration. This is
+// used to keep TCP control connections alive as long as the client is
+// actively sending UDP keepalives or game traffic, even if no TCP-level
+// data is ever sent.
+func (r *sharedUDPRelay) hasRecentActivity(ip net.IP, maxIdle time.Duration) bool {
+	ipStr := ip.String()
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for clientKey, entry := range r.clients {
+		// clientKey is "IP:Port" — only check entries from this IP
+		if !strings.HasPrefix(clientKey, ipStr+":") {
+			continue
+		}
+		entry.mu.Lock()
+		for _, uc := range entry.upstreams {
+			if now.Sub(uc.lastSeen) < maxIdle {
+				entry.mu.Unlock()
+				return true
+			}
+		}
+		entry.mu.Unlock()
+	}
+	return false
 }
 
 // dialUDPUpstream creates an upstream UDP connection for the given destination.
@@ -1008,7 +1033,14 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		if err != nil {
 			return nil, err
 		}
-		return net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		if err != nil {
+			return nil, err
+		}
+		_ = uc.SetReadBuffer(2 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(2 * 1024 * 1024)
+		disableUDPConnResetNotifications(uc, "socks5-udp-upstream")
+		return uc, nil
 	}
 	if l.outboundMgr == nil {
 		return nil, fmt.Errorf("no outbound manager")
@@ -1031,7 +1063,14 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		if err != nil {
 			return nil, err
 		}
-		return net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		if err != nil {
+			return nil, err
+		}
+		_ = uc.SetReadBuffer(2 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(2 * 1024 * 1024)
+		disableUDPConnResetNotifications(uc, "socks5-udp-upstream")
+		return uc, nil
 	}
 	dialCtx, dialCancel := context.WithTimeout(l.ctx, 15*time.Second)
 	defer dialCancel()
@@ -1063,7 +1102,7 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 				for clientKey, entry := range r.clients {
 					entry.mu.Lock()
 					for ukey, uc := range entry.upstreams {
-						if now.Sub(uc.lastSeen) > 2*time.Minute {
+						if now.Sub(uc.lastSeen) > 120*time.Second {
 							uc.pc.Close()
 							delete(entry.upstreams, ukey)
 						}
@@ -1078,9 +1117,22 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		}
 	}()
 
+	// Set a long read deadline so we don't block forever if the socket
+	// enters an error state. Reset after timeout to check stopCh.
+	r.conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+
 	for {
 		n, clientAddr, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
+			if isTimeoutError(err) {
+				select {
+				case <-r.stopCh:
+					return
+				default:
+					r.conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+					continue
+				}
+			}
 			return
 		}
 		if n < 4 || buf[2] != 0x00 {
@@ -1137,6 +1189,24 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 
 		clientKey := clientAddr.String()
 
+		// For 0-length keepalive payloads, update lastSeen on existing
+		// upstreams so the idle sweeper doesn't close them between pings.
+		// Don't create new upstreams or forward empty datagrams.
+		if len(payload) == 0 {
+			r.mu.Lock()
+			if entry, ok := r.clients[clientKey]; ok {
+				r.mu.Unlock()
+				entry.mu.Lock()
+				if uc, ok := entry.upstreams[destAddr]; ok {
+					uc.lastSeen = time.Now()
+				}
+				entry.mu.Unlock()
+			} else {
+				r.mu.Unlock()
+			}
+			continue
+		}
+
 		// Get or create client entry
 		r.mu.Lock()
 		entry, exists := r.clients[clientKey]
@@ -1168,9 +1238,21 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
 				defer r.wg.Done()
 				respBuf := make([]byte, 65535)
+				// Set read deadline once; reset only after timeout.
+				// This eliminates 1 syscall per response packet.
+				// 30s timeout: MCBE servers may have 10-20s silence bursts;
+				// shorter timeouts cause unnecessary loop iterations.
+				pc.SetReadDeadline(time.Now().Add(30 * time.Second))
 				for {
 					n, _, err := pc.ReadFrom(respBuf[10:])
 					if err != nil {
+						if isTimeoutError(err) {
+							// Check if the upstream is still considered active;
+							// if so, reset deadline and continue waiting.
+							// The idle sweeper will close truly stale ones.
+							pc.SetReadDeadline(time.Now().Add(30 * time.Second))
+							continue
+						}
 						return
 					}
 					// SOCKS5 UDP header: RSV(2)+FRAG(1)+ATYP(1)+ADDR(4)+PORT(2) = 10 bytes
@@ -1184,6 +1266,13 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 					respBuf[7] = 0
 					respBuf[8] = 0
 					respBuf[9] = 0
+					// Set a short write deadline so a slow client doesn't
+					// block response forwarding and cause upstream buffer
+					// overflow (which would drop game packets). 100ms is
+					// enough for a healthy LAN/WAN path; exceeding it means
+					// the client is congested and dropping this packet is
+					// better than stalling the entire upstream read loop.
+					_ = r.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 					_, _ = r.conn.WriteToUDP(respBuf[:10+n], clientAddr)
 				}
 			}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
@@ -1192,12 +1281,16 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		entry.mu.Unlock()
 
 		// Forward payload to upstream via writePacketConn (handles connected PacketConn)
+		// Set a short write deadline so a congested upstream doesn't block the
+		// entire readLoop (which would queue up packets from ALL clients and
+		// cause kernel buffer overflow on the shared relay socket).
 		var destNetAddr net.Addr
 		if ip := net.ParseIP(destHost); ip != nil {
 			destNetAddr = &net.UDPAddr{IP: ip, Port: destPort}
 		} else {
 			destNetAddr = &HostnamePortAddr{Host: destHost, Port: destPort}
 		}
+		_ = uc.pc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 		_, _ = writePacketConn(uc.pc, payload, destNetAddr)
 	}
 }
@@ -1260,7 +1353,40 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 
 	// Keep the control connection open until client disconnects.
 	// The shared relay socket stays open across clients.
-	io.Copy(io.Discard, conn)
+	// Enable TCP keepalive so NAT/middlebox timeouts don't silently kill
+	// the control connection while the UDP relay is still active.
+	enableTCPKeepalive(conn, 10*time.Second)
+
+	// Keep the control connection open as long as the client is actively
+	// sending UDP traffic (keepalive or game data). The client never sends
+	// TCP-level data after the SOCKS5 handshake, so conn.Read only returns
+	// on EOF (client disconnect) or timeout. Instead of a fixed deadline,
+	// we check UDP activity on each timeout: if the client has sent UDP
+	// traffic within the last 5 minutes, reset the deadline and keep
+	// waiting. This makes the TCP connection persistent for active clients
+	// (UDP keepalive at 15s interval keeps it alive indefinitely) while
+	// still cleaning up dead clients within 5 minutes.
+	//
+	// TCP keepalive (10s interval, enabled above) detects network-level
+	// disconnections (server restart, NAT timeout) within ~30s.
+	buf := make([]byte, 128)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		_, err := conn.Read(buf)
+		if err == nil {
+			continue // Unexpected TCP data — ignore
+		}
+		if !isTimeoutError(err) {
+			break // EOF or non-timeout error — client disconnected
+		}
+		// Read timeout — check if client still has recent UDP activity
+		if clientIP != nil && relay.hasRecentActivity(clientIP, 5*time.Minute) {
+			// Client still active via UDP — keep TCP connection alive
+			continue
+		}
+		// No UDP traffic for 5 minutes — client is gone
+		break
+	}
 
 	// Client disconnected — unregister and clean up per-client upstreams
 	if clientIP != nil {

@@ -275,8 +275,9 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	_ = ctrl.SetDeadline(time.Time{})
 
 	// Enable TCP keepalive so the OS detects silently dropped connections
-	// (e.g. server restart, NAT timeout) within ~30s instead of hanging forever.
-	enableTCPKeepalive(ctrl, 10*time.Second)
+	// (e.g. server restart, NAT timeout) within ~15s instead of hanging forever.
+	// 5s interval = 3 probes before typical 15s TCP keepalive timeout.
+	enableTCPKeepalive(ctrl, 5*time.Second)
 
 	relayAddr, err := socks5RelayUDPAddr(ctrl, bnd)
 	if err != nil {
@@ -328,6 +329,7 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 		destination: resolvedDest,
 	}
 	go pc.monitorCtrlConn()
+	go pc.udpKeepalive()
 
 	return pc, nil
 }
@@ -335,15 +337,27 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 // monitorCtrlConn blocks reading from the TCP control connection. When the
 // server closes it (EOF or error), the UDP relay is dead — so we close the
 // local UDP socket to unblock any pending ReadFrom on it.
+//
+// Many SOCKS5 servers (Xray, V2Ray, Clash, etc.) close the TCP control
+// connection after an idle period (typically 5-10 minutes). To prevent
+// this, we send a periodic no-op TCP keepalive ping (a single zero byte
+// that the server will ignore or reset on) — but since SOCKS5 has no
+// defined TCP-level heartbeat, we instead rely on TCP keepalive probes
+// (enabled in dialSOCKS5UDP) and add a UDP-level keepalive that sends
+// a minimal datagram to keep the UDP mapping alive on the server side.
 func (c *socks5UDPPacketConn) monitorCtrlConn() {
 	buf := make([]byte, 128)
 	_, err := c.ctrlConn.Read(buf)
 	if err != nil && !c.closed.Load() {
-		// TCP control connection closed by server or network — kill UDP socket.
-		// Suppress log if Close() was called intentionally.
 		c.remoteClosed.Store(true)
 		logger.Debug("SOCKS5 UDP: TCP control connection closed by remote: local=%s relay=%s err=%v",
 			c.udpConn.LocalAddr(), c.relayAddr, err)
+		// Grace period: wait 2s before closing the UDP socket so any
+		// downstream packets already in flight from the SOCKS5 server
+		// can be delivered to the client via ReadFrom. Without this,
+		// the last batch of game packets (e.g. position updates) is
+		// lost the moment the TCP control connection drops.
+		time.Sleep(2 * time.Second)
 	}
 	c.udpConn.Close()
 	c.ctrlConn.Close()
@@ -354,6 +368,49 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 // chainUDPOutbound) to detect dead cached connections before reuse.
 func (c *socks5UDPPacketConn) IsRemoteClosed() bool {
 	return c.remoteClosed.Load()
+}
+
+// udpKeepalive sends a minimal SOCKS5 UDP datagram every 25 seconds to keep
+// the server-side UDP mapping alive. Many SOCKS5 servers (Xray, V2Ray, Clash)
+// expire UDP mappings after 30-60s of inactivity; without keepalive, a player
+// who doesn't send traffic for 30s (loading screen, AFK) will silently lose
+// their UDP relay and all downstream traffic until the next outgoing packet
+// re-triggers a mapping — but the server may have already closed the TCP
+// control connection by then.
+//
+// The keepalive datagram is a 0-length payload to the destination, which
+// most servers will process (updating the mapping expiry) without forwarding.
+// If the server doesn't support 0-length, the worst case is an ICMP port-
+// unreachable from the target (harmless, handled by recoverable error logic).
+func (c *socks5UDPPacketConn) udpKeepalive() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if c.closed.Load() || c.remoteClosed.Load() {
+				return
+			}
+			// Send a minimal keepalive datagram (RSV+FRAG+ATYP+addr+port, no data)
+			datagramPtr := socks5UDPWritePool.Get().(*[]byte)
+			datagram := (*datagramPtr)[:0]
+			datagram = append(datagram, 0x00, 0x00, 0x00) // RSV(2) + FRAG(1)
+			datagram = appendSocksaddr(datagram, c.destination)
+			_ = c.udpConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, err := c.udpConn.WriteToUDP(datagram, c.relayAddr)
+			*datagramPtr = datagram
+			socks5UDPWritePool.Put(datagramPtr)
+			if err != nil {
+				if c.closed.Load() {
+					return
+				}
+				logger.Debug("SOCKS5 UDP keepalive failed: local=%s relay=%s err=%v",
+					c.udpConn.LocalAddr(), c.relayAddr, err)
+				// If it's a timeout, the relay might be congested — don't kill the conn
+				// If it's a closed error, monitorCtrlConn will handle cleanup
+			}
+		}
+	}
 }
 
 // socks5RelayUDPAddr resolves the UDP relay endpoint from the ASSOCIATE reply,
@@ -391,11 +448,19 @@ type socks5UDPPacketConn struct {
 	remoteClosed atomic.Bool // set by monitorCtrlConn when remote closes TCP
 }
 
+var socks5UDPWritePool = sync.Pool{
+	New: func() interface{} { b := make([]byte, 0, 1024); return &b },
+}
+
 func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	header := []byte{0x00, 0x00, 0x00}
-	header = appendSocksaddr(header, c.destination)
-	datagram := make([]byte, 0, len(header)+len(p))
-	datagram = append(datagram, header...)
+	datagramPtr := socks5UDPWritePool.Get().(*[]byte)
+	datagram := (*datagramPtr)[:0]
+	defer func() {
+		*datagramPtr = datagram
+		socks5UDPWritePool.Put(datagramPtr)
+	}()
+	datagram = append(datagram, 0x00, 0x00, 0x00)
+	datagram = appendSocksaddr(datagram, c.destination)
 	datagram = append(datagram, p...)
 	_, err := c.udpConn.WriteToUDP(datagram, c.relayAddr)
 	if err != nil {

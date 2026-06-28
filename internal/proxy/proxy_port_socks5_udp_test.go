@@ -298,3 +298,137 @@ func TestProxyPortSOCKS5UDPAssociateWithAuth(t *testing.T) {
 
 // Ensure fmt is used
 var _ = fmt.Sprintf
+
+// TestProxyPortSOCKS5UDPRapidReconnect verifies that rapidly disconnecting
+// and reconnecting a SOCKS5 UDP ASSOCIATE from the same IP does not kill the
+// new connection's upstream. This is a regression test for a race condition
+// in unregisterClientIP where the old connection's cleanup would close the
+// new connection's upstreams.
+func TestProxyPortSOCKS5UDPRapidReconnect(t *testing.T) {
+	// Start a UDP echo server as the target
+	udpEcho, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("start UDP echo: %v", err)
+	}
+	defer udpEcho.Close()
+
+	echoAddr := udpEcho.LocalAddr().(*net.UDPAddr)
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, addr, err := udpEcho.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			udpEcho.WriteToUDP(buf[:n], addr)
+		}
+	}()
+
+	listener := newProxyPortListener(&config.ProxyPortConfig{
+		ID:         "test-rapid-reconnect",
+		ListenAddr: "127.0.0.1:0",
+		Type:       config.ProxyPortTypeSocks5,
+		Enabled:    true,
+	}, nil, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	listener.listener = ln
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener.ctx = ctx
+	listener.cancel = cancel
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go listener.handleConn(conn)
+		}
+	}()
+
+	proxyAddr := ln.Addr().String()
+	echoIP := echoAddr.IP.To4()
+	echoPort := echoAddr.Port
+
+	// Perform 6 cycles of connect → ping → disconnect
+	// With reuseCount=3 on the client side, this simulates rapid reconnection
+	// after cache eviction. The server must not close the new upstream when
+	// the old TCP control connection's cleanup runs.
+	for cycle := 0; cycle < 6; cycle++ {
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("cycle %d: dial proxy: %v", cycle, err)
+		}
+
+		// SOCKS5 greeting
+		greeting := []byte{0x05, 0x01, 0x00}
+		if _, err := conn.Write(greeting); err != nil {
+			t.Fatalf("cycle %d: send greeting: %v", cycle, err)
+		}
+		resp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, resp); err != nil {
+			t.Fatalf("cycle %d: read greeting resp: %v", cycle, err)
+		}
+
+		// UDP ASSOCIATE
+		req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+		if _, err := conn.Write(req); err != nil {
+			t.Fatalf("cycle %d: send UDP ASSOCIATE: %v", cycle, err)
+		}
+		reply := make([]byte, 10)
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			t.Fatalf("cycle %d: read UDP ASSOCIATE reply: %v", cycle, err)
+		}
+		if reply[1] != 0x00 {
+			t.Fatalf("cycle %d: UDP ASSOCIATE failed with reply code %d", cycle, reply[1])
+		}
+
+		relayIP := net.IP(reply[4:8])
+		relayPort := int(binary.BigEndian.Uint16(reply[8:10]))
+		if relayIP.IsUnspecified() {
+			relayIP = net.IPv4(127, 0, 0, 1)
+		}
+		relayAddr := &net.UDPAddr{IP: relayIP, Port: relayPort}
+
+		clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			t.Fatalf("cycle %d: listen UDP: %v", cycle, err)
+		}
+
+		testData := []byte("rapid-reconnect-test")
+		udpHeader := []byte{0x00, 0x00, 0x00, 0x01}
+		udpHeader = append(udpHeader, echoIP...)
+		udpHeader = append(udpHeader, byte(echoPort>>8), byte(echoPort&0xFF))
+		datagram := append(udpHeader, testData...)
+
+		_ = clientUDP.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := clientUDP.WriteToUDP(datagram, relayAddr); err != nil {
+			t.Fatalf("cycle %d: write to relay: %v", cycle, err)
+		}
+
+		_ = clientUDP.SetReadDeadline(time.Now().Add(5 * time.Second))
+		respBuf := make([]byte, 65535)
+		n, _, err := clientUDP.ReadFromUDP(respBuf)
+		if err != nil {
+			t.Fatalf("cycle %d: read from relay: %v (upstream may have been killed by old cleanup)", cycle, err)
+		}
+		if n < 10 {
+			t.Fatalf("cycle %d: response too short: %d bytes", cycle, n)
+		}
+		respData := respBuf[10:n]
+		if len(respData) != len(testData) {
+			t.Fatalf("cycle %d: expected %d bytes, got %d", cycle, len(testData), len(respData))
+		}
+
+		clientUDP.Close()
+		conn.Close()
+		t.Logf("Cycle %d: ok", cycle)
+	}
+}

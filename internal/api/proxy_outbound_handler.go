@@ -2813,7 +2813,17 @@ func performMCBEPing(ctx context.Context, packetConn net.PacketConn, destAddr ne
 	expectedTimestamp := binary.BigEndian.Uint64(pingPacket[1:9])
 	startTime := time.Now()
 
+	// Set a write deadline to avoid hanging on a blocked write. This matches
+	// pingTargetServer's 2s write deadline. Without it, a slow SOCKS5 relay
+	// or network issue could cause the write to block until the context
+	// deadline, consuming the entire test budget.
+	writeDeadline := time.Now().Add(2 * time.Second)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(writeDeadline) {
+		writeDeadline = deadline
+	}
+	_ = packetConn.SetWriteDeadline(writeDeadline)
 	_, err := writePacket(packetConn, pingPacket, destAddr)
+	_ = packetConn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		return UDPTestResult{
 			Success:   false,
@@ -3364,8 +3374,10 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 	result = performMCBEPing(ctx, packetConn, destAddr)
 	result.Target = address
 	if !result.Success {
+		logger.Debug("MCBE UDP test failed: node=%s type=%s target=%s latency=%dms err=%s", cfg.Name, cfg.Type, address, result.LatencyMs, result.Error)
 		return result
 	}
+	logger.Debug("MCBE UDP test ok: node=%s type=%s target=%s latency=%dms server=%s players=%s", cfg.Name, cfg.Type, address, result.LatencyMs, result.ServerName, result.Players)
 
 	if shouldMeasureWarmUDPTestLatency(cfg) {
 		warmCtx, warmCancel := context.WithTimeout(ctx, 2*time.Second)

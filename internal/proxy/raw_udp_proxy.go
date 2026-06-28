@@ -190,19 +190,24 @@ type rawUDPClientInfo struct {
 func (c *rawUDPClientInfo) syncBytesUpToSession(sess *session.Session) {
 	total := c.bytesUp.Load()
 	prev := c.bytesUpSynced.Load()
+	delta := int64(0)
 	if total > prev && c.bytesUpSynced.CompareAndSwap(prev, total) {
-		sess.AddBytesUp(total - prev)
+		delta = total - prev
 	}
+	sess.AddBytesUpAndUpdateLastSeen(delta)
 }
 
-// syncBytesDownToSession is the download-direction counterpart of
-// syncBytesUpToSession (single forwardResponses-goroutine writer).
+// syncBytesDownToSession credits any not-yet-credited download bytes to the
+// session and updates LastSeen in a single lock operation. Safe for the
+// single forwardResponses-goroutine writer; CAS guards rare concurrent callers.
 func (c *rawUDPClientInfo) syncBytesDownToSession(sess *session.Session) {
 	total := c.bytesDown.Load()
 	prev := c.bytesDownSynced.Load()
+	delta := int64(0)
 	if total > prev && c.bytesDownSynced.CompareAndSwap(prev, total) {
-		sess.AddBytesDown(total - prev)
+		delta = total - prev
 	}
+	sess.AddBytesDownAndUpdateLastSeen(delta)
 }
 
 // initSplitPackets initializes the split packet map if needed
@@ -576,6 +581,10 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 	// Main packet forwarding loop
 	buffer := make([]byte, MaxUDPPacketSize)
 
+	// Set read deadline once; reset only after timeout to check ctx.Done().
+	// This eliminates 1 syscall per incoming packet.
+	p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -583,15 +592,14 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 		case <-p.ctx.Done():
 			return nil
 		default:
-			// Set read deadline
-			p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-
 			n, clientAddr, err := p.listener.ReadFromUDP(buffer)
 			if err != nil {
 				if p.closed.Load() {
 					return nil
 				}
 				if isTimeoutError(err) {
+					// Reset deadline for next read attempt
+					p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
 					continue
 				}
 				// Transient ICMP-induced errors on the shared listener socket
@@ -657,7 +665,6 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// session existed are credited too instead of being lost)
 			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
 				clientInfo.syncBytesUpToSession(sess)
-				sess.UpdateLastSeen()
 			}
 
 			// Log new connection
@@ -974,6 +981,10 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 	buffer := getRawUDPBuffer()
 	defer putRawUDPBuffer(buffer)
 
+	// Set initial read deadline once; reset only after timeout to check
+	// inactivity. This eliminates 1 syscall per successful packet.
+	clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
+
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -983,9 +994,6 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			if clientInfo.kicked.Load() {
 				return
 			}
-
-			// Set read deadline
-			clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
 
 			n, _, err := clientInfo.targetConn.ReadFrom(buffer)
 			if err != nil {
@@ -1023,6 +1031,8 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					logger.Debug("Client %s inactive, closing connection", clientAddr.String())
 					return
 				}
+				// Reset deadline for next read attempt
+				clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
 				continue
 			}
 
@@ -1038,20 +1048,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				return
 			}
 
-			// Update stats (lock-free)
-			clientInfo.bytesDown.Add(int64(n))
-			clientInfo.lastSeen.Store(time.Now().UnixNano())
-
-			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
-
-			// Update session stats (delta sync so no download bytes are lost
-			// to windows where the session didn't exist yet)
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
-				clientInfo.syncBytesDownToSession(sess)
-				sess.UpdateLastSeen()
-			}
-
-			// Forward to client directly without parsing (parsing causes memory allocation)
+			// Forward to client FIRST — minimizes time between reading from
+			// target and delivering to client, reducing risk of kernel buffer
+			// overflow on the target connection under heavy traffic.
 			p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 			_, err = p.listener.WriteToUDP(buffer[:n], clientAddr)
 			if err != nil {
@@ -1059,12 +1058,26 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				// surfaces here on the shared listener socket; drop only this
 				// datagram, not the whole session.
 				if isRecoverableConnError(err) {
+					// Still update stats even on recoverable error
+					clientInfo.bytesDown.Add(int64(n))
+					clientInfo.lastSeen.Store(time.Now().UnixNano())
 					continue
 				}
 				if !isTimeoutError(err) {
 					logger.Info("RawUDP session closed (write to client failed): client=%s err=%v", clientAddr.String(), err)
 				}
 				return
+			}
+
+			// Update stats AFTER successful forward (non-critical path)
+			clientInfo.bytesDown.Add(int64(n))
+			clientInfo.lastSeen.Store(time.Now().UnixNano())
+
+			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
+
+			// Update session stats with single lock (delta sync)
+			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+				clientInfo.syncBytesDownToSession(sess)
 			}
 		}
 	}

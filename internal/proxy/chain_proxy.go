@@ -209,6 +209,8 @@ type cachedChainConn struct {
 	lastUsed    time.Time
 	mu          sync.Mutex
 	activeUsers int32 // atomic: number of chainConnWrappers currently using this conn
+	hadTimeout  int32 // atomic: set when a read/write timeout occurred — conn may be stale
+	reuseCount  int32 // atomic: number of times this cached conn has been reused via ListenPacket
 }
 
 // chainConnWrapper is returned to callers of ListenPacket. It forwards
@@ -232,6 +234,13 @@ func (w *chainConnWrapper) evictOnFatalError(err error) {
 		return
 	}
 	if isTimeoutError(err) {
+		// Mark the conn as suspect so it's evicted before next reuse.
+		// This is critical for one-shot tests (MCBE UDP test) where a
+		// read timeout means the SOCKS5 relay stopped forwarding —
+		// without this flag, the dead conn stays in cache and poisons
+		// all subsequent users (including periodic pings).
+		atomic.StoreInt32(&w.cached.hadTimeout, 1)
+
 		// Never evict on timeout if anyone is actively using this conn.
 		// The idle sweeper will clean up when activeUsers == 0.
 		if atomic.LoadInt32(&w.cached.activeUsers) > 0 {
@@ -269,6 +278,7 @@ func (w *chainConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		w.evictOnFatalError(err)
 	} else {
+		atomic.StoreInt32(&w.cached.hadTimeout, 0) // clear: conn is healthy
 		w.cached.mu.Lock()
 		w.cached.lastUsed = time.Now()
 		w.cached.mu.Unlock()
@@ -281,6 +291,7 @@ func (w *chainConnWrapper) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		w.evictOnFatalError(err)
 	} else {
+		atomic.StoreInt32(&w.cached.hadTimeout, 0) // clear: conn is healthy
 		w.cached.mu.Lock()
 		w.cached.lastUsed = time.Now()
 		w.cached.mu.Unlock()
@@ -305,13 +316,21 @@ func (w *chainConnWrapper) Close() error {
 			// one while it was in use). Close it now to prevent a resource
 			// leak — the idle sweeper can't reach it since it's not cached.
 			w.cached.pc.Close()
+		} else if atomic.LoadInt32(&w.cached.hadTimeout) != 0 {
+			// Previous user had a read/write timeout — the SOCKS5 relay
+			// may have stopped forwarding. Evict the conn so the next
+			// user gets a fresh connection instead of inheriting a dead
+			// relay session.
+			w.cached.pc.Close()
+			delete(w.parent.cache, w.dest)
+			logger.Debug("ChainUDPOutbound: evicted cached conn for %s on close (had timeout)", w.dest)
 		} else {
-			// Still in cache — set a very short read deadline to unblock
+			// Still in cache — set a short read deadline to unblock
 			// any pending ReadFrom calls (e.g. forwardResponses in
-			// RawUDPProxy.Stop()). Also reset the write deadline to zero
-			// so that the next user doesn't inherit an expired write
-			// deadline from a previous ping or game session.
-			w.cached.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			// RawUDPProxy.Stop()). 1s is long enough for the next user
+			// to start reading before the deadline fires, but short
+			// enough to not block Stop() for too long.
+			w.cached.pc.SetReadDeadline(time.Now().Add(1 * time.Second))
 			w.cached.pc.SetWriteDeadline(time.Time{})
 		}
 		w.parent.cacheMu.Unlock()
@@ -367,6 +386,23 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	}, nil
 }
 
+// drainUDPBuffer discards any pending packets in the UDP socket buffer by
+// performing non-blocking reads until the buffer is empty. This prevents
+// stale packets (e.g. a late pong from a previous MCBE ping) from being
+// returned to the next user of a cached connection, which would cause
+// timestamp mismatches and spurious read timeouts.
+func drainUDPBuffer(pc net.PacketConn) {
+	_ = pc.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+	buf := make([]byte, 1500)
+	for {
+		_, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+	}
+	_ = pc.SetReadDeadline(time.Time{})
+}
+
 // isConnAlive checks whether a cached PacketConn is still usable before reuse.
 // It checks for protocol-specific liveness flags (e.g. SOCKS5 remoteClosed)
 // and falls back to a non-blocking read probe for unknown types.
@@ -396,6 +432,9 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	// Normalize cache key: resolve domain to IP so that "mco.cubecraft.net:19132"
 	// and "176.116.126.224:19132" share the same cache entry.
 	cacheKey := normalizeCacheKey(destination)
+	if cacheKey != destination {
+		logger.Debug("ChainUDPOutbound: normalized cache key dest=%s -> key=%s", destination, cacheKey)
+	}
 
 	// Try cache first — but ONLY if no one else is actively using it AND it's
 	// still alive. Multiple concurrent readers on the same SOCKS5 UDP socket
@@ -405,25 +444,103 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	// allow sequential reuse: when the previous user has closed their wrapper
 	// (activeUsers == 0) and the conn is still alive, the next user can take
 	// over. Dead cached conns are evicted immediately.
+	// maxIdleReuse limits how long an idle cached connection can be reused.
+	// SOCKS5 UDP relay servers typically drop UDP mappings after 30-60s of
+	// idle while keeping the TCP control connection alive, making isConnAlive
+	// pass but the UDP path dead. With UDP keepalive now active (25s interval),
+	// the server-side mapping stays alive longer, so we can safely reuse for
+	// 30s. For other protocols (Hysteria2, AnyTLS, etc.) the session stays
+	// alive longer, so use 60s to allow ping reuse within the 60s ping interval.
+	maxIdleReuse := 60 * time.Second
+	isSocks5LastHop := len(c.hops) > 0 && c.hops[len(c.hops)-1].Type == config.ProtocolSOCKS5
+	if isSocks5LastHop {
+		maxIdleReuse = 30 * time.Second
+	}
 	c.cacheMu.Lock()
-	if cached, ok := c.cache[cacheKey]; ok && atomic.LoadInt32(&cached.activeUsers) == 0 {
+
+	// Wait for the cached conn to become available if it's currently in use.
+	// This prevents creating multiple concurrent SOCKS5 ASSOCIATEs to the same
+	// remote server, which can cause the server to drop packets for the older
+	// association. We wait up to 3s for SOCKS5 (enough for a quick ping to
+	// finish) before falling back to creating a new connection.
+	waitTimeout := 5 * time.Second
+	if isSocks5LastHop {
+		waitTimeout = 3 * time.Second
+	}
+	waitDeadline := time.Now().Add(waitTimeout)
+
+	// SOCKS5 UDP relay servers (especially Xray/V2Ray-based VPS) may stop
+	// forwarding UDP after a certain number of reuses on the same association.
+	// Force a fresh ASSOCIATE after maxReuseCount reuses to avoid stale relays.
+	maxReuseCount := int32(0) // 0 = unlimited
+	if isSocks5LastHop {
+		maxReuseCount = 3
+	}
+
+	for {
+		cached, ok := c.cache[cacheKey]
+		if !ok {
+			break // no cached conn — create new one
+		}
+		if atomic.LoadInt32(&cached.activeUsers) > 0 {
+			// Conn is busy — wait for it to be released.
+			// UDP sockets are not shareable: concurrent ReadFrom callers
+			// would steal each other's datagrams. So we wait for the
+			// active user to finish (e.g. a quick ping test) before reusing.
+			if time.Now().After(waitDeadline) {
+				// Wait timed out — the active user is likely a long-lived
+				// game client, not a stuck ping. Create a new ASSOCIATE;
+				// the old conn stays alive for the active user.
+				//
+				// Per RFC 1928 §7, each UDP ASSOCIATE is independent (tied
+				// to its own TCP control connection). Our VPS shared-relay
+				// model tracks upstreams by client IP:Port, so concurrent
+				// ASSOCIATEs from the same IP to the same dest each get
+				// their own upstream — responses are routed correctly.
+				logger.Debug("ChainUDPOutbound: cached conn for %s still busy after %s wait, creating new conn (old conn preserved for active user)", cacheKey, waitTimeout)
+				break
+			}
+			c.cacheMu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			c.cacheMu.Lock()
+			continue
+		}
+
+		// Conn is available — check if it's still usable
+		cached.mu.Lock()
+		idle := time.Since(cached.lastUsed)
+		cached.mu.Unlock()
 		if !isConnAlive(cached.pc) {
-			// Cached conn is dead — evict and create a new one
 			cached.pc.Close()
 			delete(c.cache, cacheKey)
 			logger.Debug("ChainUDPOutbound: evicted dead cached conn for %s before reuse", cacheKey)
+			break // create new conn
+		} else if idle > maxIdleReuse {
+			cached.pc.Close()
+			delete(c.cache, cacheKey)
+			logger.Debug("ChainUDPOutbound: evicted stale cached conn for %s (idle %s > %s) before reuse", cacheKey, idle, maxIdleReuse)
+			break // create new conn
+		} else if atomic.LoadInt32(&cached.hadTimeout) != 0 {
+			cached.pc.Close()
+			delete(c.cache, cacheKey)
+			logger.Debug("ChainUDPOutbound: evicted cached conn for %s before reuse (had timeout)", cacheKey)
+			break // create new conn
+		} else if maxReuseCount > 0 && atomic.LoadInt32(&cached.reuseCount) >= maxReuseCount {
+			cached.pc.Close()
+			delete(c.cache, cacheKey)
+			logger.Debug("ChainUDPOutbound: evicted cached conn for %s before reuse (reuseCount %d >= %d)", cacheKey, atomic.LoadInt32(&cached.reuseCount), maxReuseCount)
+			break // create new conn
 		} else {
 			atomic.AddInt32(&cached.activeUsers, 1)
+			atomic.AddInt32(&cached.reuseCount, 1)
 			c.cacheMu.Unlock()
-			// Reset all deadlines on the underlying conn so the new user
-			// doesn't inherit expired read/write deadlines from a previous
-			// user (e.g. pingTargetServer sets 2s write + 3s read deadlines;
-			// if those expire before reuse, all I/O fails with i/o timeout).
 			_ = cached.pc.SetDeadline(time.Time{})
+			drainUDPBuffer(cached.pc)
 			logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
 			return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 		}
 	}
+
 	c.cacheMu.Unlock()
 
 	logger.Debug("ChainUDPOutbound: establishing UDP to %s via %d-hop chain", destination, len(c.hops))
@@ -484,14 +601,21 @@ func normalizeCacheKey(destination string) string {
 	}
 	dnsCacheMu.Unlock()
 
-	// Try quick DNS resolution
+	// Use the filtered resolver (resolveOutboundServerIP) instead of
+	// net.DefaultResolver. When a TUN proxy (Clash/Mihomo) is running, the
+	// system resolver returns fake IPs (198.18.0.0/15, 100.64/10, ...) which
+	// would produce a different cache key than the real IP used by
+	// pingTargetServer (which gets resolved IP from config). This mismatch
+	// prevents the MCBE UDP test from reusing the ping's cached SOCKS5 UDP
+	// connection, forcing it to create a new UDP ASSOCIATE that may get a
+	// firewalled relay port — causing the persistent read i/o timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil || len(ips) == 0 {
+	ip, _, err := resolveOutboundServerIP(ctx, host)
+	if err != nil || ip == nil {
 		return destination
 	}
-	ipStr := ips[0].IP.String()
+	ipStr := ip.String()
 
 	// Cache the result
 	dnsCacheMu.Lock()
