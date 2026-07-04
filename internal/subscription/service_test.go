@@ -97,7 +97,7 @@ func TestParseSubscriptionContent_VLESSRealityFingerprintLink(t *testing.T) {
 		t.Fatalf("expected 1 parsed outbound, got %d", len(parsed))
 	}
 	got := parsed[0].Outbound
-	if got.Type != config.ProtocolVLESS || !got.Reality || got.Fingerprint != "chrome" || got.RealityPublicKey == "" || got.RealityShortID != "9f3d2bcc02a2" {
+	if got.Type != config.ProtocolVLESS || !got.Reality || got.Fingerprint != "chrome" || got.RealityPublicKey == "" || got.RealityShortID != "9f3d2bcc02a2" || got.RealitySpiderX != "/" || got.SNI != "download-porter.hoyoverse.com" {
 		t.Fatalf("unexpected vless reality parse result: %+v", got)
 	}
 }

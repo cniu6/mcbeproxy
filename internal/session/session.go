@@ -274,6 +274,21 @@ func (s *Session) IsLoginExtracted() bool {
 	return s.LoginExtracted
 }
 
+// SetLastSeenAt sets LastSeen to the timestamp of the last real packet.
+// Unlike AdvanceLastSeen it can move backwards when a session was created
+// after traffic already flowed (lazy session registration).
+func (s *Session) SetLastSeenAt(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t.Before(s.StartTime) {
+		t = s.StartTime
+	}
+	s.LastSeen = t
+}
+
 // ToDTO converts the session to a DTO for API responses.
 func (s *Session) ToDTO() SessionDTO {
 	s.mu.Lock()

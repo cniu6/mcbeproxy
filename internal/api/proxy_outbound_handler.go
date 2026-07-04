@@ -173,6 +173,7 @@ type ProxyOutboundDTO struct {
 	Reality          bool   `json:"reality,omitempty"`
 	RealityPublicKey string `json:"reality_public_key,omitempty"`
 	RealityShortID   string `json:"reality_short_id,omitempty"`
+	RealitySpiderX   string `json:"reality_spider_x,omitempty"`
 
 	// Transport fields
 	Network                  string     `json:"network,omitempty"`
@@ -223,6 +224,7 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 		Reality:          cfg.Reality,
 		RealityPublicKey: cfg.RealityPublicKey,
 		RealityShortID:   cfg.RealityShortID,
+		RealitySpiderX:   cfg.RealitySpiderX,
 		// Transport
 		Network:         cfg.Network,
 		WSPath:          cfg.WSPath,
@@ -296,6 +298,7 @@ type CreateProxyOutboundRequest struct {
 	Reality          bool   `json:"reality,omitempty"`
 	RealityPublicKey string `json:"reality_public_key,omitempty"`
 	RealityShortID   string `json:"reality_short_id,omitempty"`
+	RealitySpiderX   string `json:"reality_spider_x,omitempty"`
 
 	// Transport fields (WebSocket, gRPC, etc.)
 	Network                  string     `json:"network,omitempty"`
@@ -346,6 +349,7 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		Reality:          r.Reality,
 		RealityPublicKey: r.RealityPublicKey,
 		RealityShortID:   r.RealityShortID,
+		RealitySpiderX:   r.RealitySpiderX,
 		// Transport
 		Network:                  r.Network,
 		WSPath:                   r.WSPath,

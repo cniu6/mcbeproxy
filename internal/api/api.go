@@ -211,8 +211,18 @@ func NewAPIServer(
 
 // setupRoutes configures all API routes.
 func (a *APIServer) setupRoutes() {
-	// Add recovery middleware
-	a.router.Use(gin.Recovery())
+	// Add recovery middleware that logs panic reason to file + crash report
+	a.router.Use(gin.CustomRecoveryWithWriter(gin.DefaultErrorWriter, func(c *gin.Context, err any) {
+		route := c.FullPath()
+		if route == "" {
+			route = c.Request.Method + " " + c.Request.URL.Path
+		}
+		logger.ReportAPIPanic(route, err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "internal server error",
+		})
+	}))
 
 	// Dynamic dashboard routing - checks config on each request
 	a.router.NoRoute(a.dynamicDashboardHandler())

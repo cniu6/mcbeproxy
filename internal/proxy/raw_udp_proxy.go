@@ -207,7 +207,12 @@ func (c *rawUDPClientInfo) syncBytesUpToSession(sess *session.Session) {
 	if total > prev && c.bytesUpSynced.CompareAndSwap(prev, total) {
 		delta = total - prev
 	}
-	sess.AddBytesUpAndUpdateLastSeen(delta)
+	at := c.lastActivityTime()
+	if delta > 0 {
+		sess.AddBytesUpAtTime(delta, at)
+	} else {
+		sess.AdvanceLastSeen(at)
+	}
 }
 
 // syncBytesDownToSession credits any not-yet-credited download bytes to the
@@ -220,7 +225,30 @@ func (c *rawUDPClientInfo) syncBytesDownToSession(sess *session.Session) {
 	if total > prev && c.bytesDownSynced.CompareAndSwap(prev, total) {
 		delta = total - prev
 	}
-	sess.AddBytesDownAndUpdateLastSeen(delta)
+	at := c.lastActivityTime()
+	if delta > 0 {
+		sess.AddBytesDownAtTime(delta, at)
+	} else {
+		sess.AdvanceLastSeen(at)
+	}
+}
+
+func (c *rawUDPClientInfo) lastActivityTime() time.Time {
+	ns := c.lastSeen.Load()
+	if ns == 0 {
+		return time.Now()
+	}
+	return time.Unix(0, ns)
+}
+
+// syncSessionStatsFromClient pushes authoritative client counters into the
+// session so live panel/API stats match real traffic while the player is online.
+func (c *rawUDPClientInfo) syncSessionStatsFromClient(sess *session.Session) {
+	if sess == nil {
+		return
+	}
+	c.syncBytesUpToSession(sess)
+	c.syncBytesDownToSession(sess)
 }
 
 // initSplitPackets initializes the split packet map if needed
@@ -589,7 +617,11 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 	// Start client cleanup goroutine
 	p.wg.Add(1)
-	go p.cleanupInactiveClients()
+	go func() {
+		defer p.wg.Done()
+		defer logger.CapturePanic("raw-udp-cleanup-" + p.serverID)
+		p.cleanupInactiveClients()
+	}()
 
 	// Main packet forwarding loop
 	buffer := make([]byte, MaxUDPPacketSize)
@@ -835,7 +867,10 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 
 	// Start response forwarding goroutine
 	p.wg.Add(1)
-	go p.forwardResponses(clientAddr, clientInfo)
+	go func() {
+		defer logger.CapturePanic(fmt.Sprintf("raw-udp-forwardResponses server=%s client=%s", p.serverID, clientKey))
+		p.forwardResponses(clientAddr, clientInfo)
+	}()
 
 	route := "direct"
 	if selectedNode != "" {
@@ -866,6 +901,7 @@ func (p *RawUDPProxy) ensureSession(clientInfo *rawUDPClientInfo) {
 		// The session is registered lazily; align its start with the moment
 		// the client actually connected so playtime isn't undercounted.
 		sess.BackdateStartTime(clientInfo.startTime)
+		sess.SetLastSeenAt(clientInfo.lastActivityTime())
 	}
 	clientInfo.sessionCreated.Store(true)
 }
@@ -1012,12 +1048,6 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawUDPClientInfo) {
 	defer p.wg.Done()
 	defer func() {
-		if r := recover(); r != nil {
-			logger.Info("RawUDP forwardResponses panic recovered: client=%s err=%v", clientAddr.String(), r)
-			p.removeClientIfMatch(clientAddr.String(), clientInfo)
-		}
-	}()
-	defer func() {
 		if clientInfo.kicked.Load() {
 			p.scheduleKickCleanup(clientInfo)
 			return
@@ -1110,6 +1140,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// Still update stats even on recoverable error
 					clientInfo.bytesDown.Add(int64(n))
 					clientInfo.lastSeen.Store(time.Now().UnixNano())
+					if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+						clientInfo.syncBytesDownToSession(sess)
+					}
 					continue
 				}
 				if isTimeoutError(err) {
@@ -1312,6 +1345,7 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 			clientInfo.bytesDownSynced.Store(downTotal)
 			sess.AddBytesDownAtTime(downTotal-downPrev, lastSeenTime)
 		}
+		sess.SetLastSeenAt(lastSeenTime)
 	}
 
 	if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
@@ -1347,13 +1381,6 @@ func formatBytes(b int64) string {
 
 // cleanupInactiveClients periodically removes inactive clients
 func (p *RawUDPProxy) cleanupInactiveClients() {
-	defer p.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Info("RawUDP cleanupInactiveClients panic recovered: %v", r)
-		}
-	}()
-
 	// Check every 10 seconds for faster cleanup
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -1420,7 +1447,7 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 				if playerName != "" && sess.GetDisplayName() == "" {
 					sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 				}
-				sess.AdvanceLastSeen(time.Unix(0, lastSeenNano))
+				clientInfo.syncSessionStatsFromClient(sess)
 			} else if clientInfo.loginParsed.Load() && playerName != "" {
 				if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
 					clientInfo.sessionCreated.Store(true)
@@ -1563,53 +1590,16 @@ func (p *RawUDPProxy) Stop() error {
 		p.listener.Close()
 	}
 
-	// Close all client connections
+	// Finalize every client through the same path as normal disconnect so bytes
+	// and LastSeen are flushed to the session before persistence.
+	var clientKeys []string
 	p.clients.Range(func(key, value interface{}) bool {
-		clientInfo := value.(*rawUDPClientInfo)
-		clientInfo.targetConn.Close()
-
-		// Read stats (lock-free)
-		bytesUp := clientInfo.bytesUp.Load()
-		bytesDown := clientInfo.bytesDown.Load()
-		kicked := clientInfo.kicked.Load()
-
-		// Read player info and clear splitPackets (needs lock)
-		clientInfo.mu.Lock()
-		playerName := clientInfo.playerName
-		playerUUID := clientInfo.playerUUID
-		// Clear splitPackets to release memory
-		clientInfo.splitPackets = nil
-		clientInfo.mu.Unlock()
-
-		startTime := clientInfo.startTime
-		duration := time.Since(startTime)
-		totalBytes := bytesUp + bytesDown
-
-		// Format duration
-		durationStr := formatDuration(duration)
-
-		// Log with player info if available
-		if playerName != "" {
-			if kicked {
-				logger.Info("Player kicked: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
-					playerName, playerUUID, key.(string), durationStr,
-					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
-			} else {
-				logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
-					playerName, playerUUID, key.(string), durationStr,
-					formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
-			}
-		} else {
-			logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s",
-				key.(string), durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
-		}
-
-		// Remove session
-		if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
-			logger.Debug("Failed to remove session for %s: %v", key.(string), err)
-		}
+		clientKeys = append(clientKeys, key.(string))
 		return true
 	})
+	for _, key := range clientKeys {
+		p.removeClient(key)
+	}
 
 	// Wait for goroutines
 	p.wg.Wait()
@@ -1790,6 +1780,7 @@ func (p *RawUDPProxy) maybeRefreshPingCacheAsync(force bool) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic("raw-udp-ping-" + p.serverID)
 		defer p.pingInFlight.Store(false)
 		if p.closed.Load() {
 			return
@@ -1860,7 +1851,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 		}
 		clientInfo.sessionCreated.Store(true)
 		sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
-		sess.UpdateLastSeen()
+		sess.SetLastSeenAt(clientInfo.lastActivityTime())
 		logger.Debug("Created session %s with player info: name=%s", clientInfo.sessionID, playerName)
 	}
 
@@ -2920,6 +2911,7 @@ func (p *RawUDPProxy) scheduleKickCleanup(clientInfo *rawUDPClientInfo) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic(fmt.Sprintf("raw-udp-kick-cleanup server=%s client=%s", p.serverID, clientInfo.clientAddr.String()))
 		select {
 		case <-p.ctx.Done():
 			return

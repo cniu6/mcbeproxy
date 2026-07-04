@@ -8,115 +8,122 @@ import (
 	"time"
 )
 
-func TestCapturePanic_NoPanic(t *testing.T) {
-	// Should be a no-op when no panic occurs
-	CapturePanic("test-no-panic")
-}
-
-func TestCapturePanic_WithPanic(t *testing.T) {
-	// Configure a temp log dir
-	tmpDir := t.TempDir()
+func configureTestLoggerDir(t *testing.T, dir string) func() {
+	t.Helper()
 	origConfig := defaultLogger.getConfig()
-	defer func() {
-		defaultLogger.mu.Lock()
-		defaultLogger.config = origConfig
-		defaultLogger.mu.Unlock()
-	}()
-
 	defaultLogger.mu.Lock()
 	defaultLogger.config = &LogConfig{
-		LogDir:           tmpDir,
+		LogDir:           dir,
 		RetentionDays:    7,
 		MaxSizeMB:        100,
 		EnableFileLog:    true,
 		EnableConsoleLog: false,
 	}
 	defaultLogger.mu.Unlock()
+	return func() {
+		defaultLogger.mu.Lock()
+		defaultLogger.config = origConfig
+		defaultLogger.mu.Unlock()
+	}
+}
+
+func TestCapturePanic_NoPanic(t *testing.T) {
+	CapturePanic("test-no-panic")
+}
+
+func TestCapturePanic_WithPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := configureTestLoggerDir(t, tmpDir)
+	defer restore()
 
 	func() {
 		defer CapturePanic("test-context")
 		panic("test panic value")
 	}()
 
-	// Give file writes a moment to flush
 	time.Sleep(50 * time.Millisecond)
 
-	// Find the panic file
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		t.Fatalf("failed to read log dir: %v", err)
+	content := readFirstCrashFile(t, tmpDir)
+	if !strings.Contains(content, "test panic value") {
+		t.Fatalf("crash report missing panic value: %s", content)
 	}
+	if !strings.Contains(content, "test-context") {
+		t.Fatalf("crash report missing context: %s", content)
+	}
+	if !strings.Contains(content, "recovered_panic") {
+		t.Fatalf("crash report missing kind: %s", content)
+	}
+	if !strings.Contains(content, "Reason:") {
+		t.Fatalf("crash report missing reason: %s", content)
+	}
+}
 
-	var panicFile string
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "panic_") && strings.HasSuffix(e.Name(), ".txt") {
-			panicFile = filepath.Join(tmpDir, e.Name())
-			break
-		}
-	}
-	if panicFile == "" {
-		t.Fatal("expected a panic_*.txt file in log dir, found none")
-	}
+func TestCapturePanicExit_ReasonWritten(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := configureTestLoggerDir(t, tmpDir)
+	defer restore()
 
-	content, err := os.ReadFile(panicFile)
-	if err != nil {
-		t.Fatalf("failed to read panic file: %v", err)
-	}
+	handleRecoveredPanic("exit-context", "exit panic", true)
+	time.Sleep(50 * time.Millisecond)
 
-	s := string(content)
-	if !strings.Contains(s, "test panic value") {
-		t.Errorf("panic file does not contain panic value: %s", s)
+	content := readFirstCrashFile(t, tmpDir)
+	if !strings.Contains(content, "exit panic") {
+		t.Fatalf("expected exit panic in report, got: %s", content)
 	}
-	if !strings.Contains(s, "test-context") {
-		t.Errorf("panic file does not contain context: %s", s)
-	}
-	if !strings.Contains(s, "Goroutine Stack Dump") {
-		t.Errorf("panic file does not contain stack dump: %s", s)
+	if !strings.Contains(content, "ExitAfterReport: true") {
+		t.Fatalf("expected exit flag in report, got: %s", content)
 	}
 }
 
 func TestSafeGo_WithPanic(t *testing.T) {
 	tmpDir := t.TempDir()
-	origConfig := defaultLogger.getConfig()
-	defer func() {
-		defaultLogger.mu.Lock()
-		defaultLogger.config = origConfig
-		defaultLogger.mu.Unlock()
-	}()
+	restore := configureTestLoggerDir(t, tmpDir)
+	defer restore()
 
-	defaultLogger.mu.Lock()
-	defaultLogger.config = &LogConfig{
-		LogDir:           tmpDir,
-		RetentionDays:    7,
-		MaxSizeMB:        100,
-		EnableFileLog:    true,
-		EnableConsoleLog: false,
-	}
-	defaultLogger.mu.Unlock()
-
-	done := make(chan struct{})
 	SafeGo("safe-go-test", func() {
 		panic("safe-go panic")
 	})
 
-	// Wait for goroutine to finish (it should not crash the process)
 	time.Sleep(100 * time.Millisecond)
-
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		t.Fatalf("failed to read log dir: %v", err)
+	content := readFirstCrashFile(t, tmpDir)
+	if !strings.Contains(content, "safe-go panic") {
+		t.Fatalf("expected safe-go panic in report, got: %s", content)
 	}
+}
 
-	found := false
+func TestReportAPIPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := configureTestLoggerDir(t, tmpDir)
+	defer restore()
+
+	ReportAPIPanic("GET /api/test", "boom")
+	time.Sleep(50 * time.Millisecond)
+
+	content := readFirstCrashFile(t, tmpDir)
+	if !strings.Contains(content, "api_panic") {
+		t.Fatalf("expected api_panic kind, got: %s", content)
+	}
+	if !strings.Contains(content, "boom") {
+		t.Fatalf("expected panic detail, got: %s", content)
+	}
+}
+
+func readFirstCrashFile(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "panic_") {
-			found = true
-			break
+		name := e.Name()
+		if strings.HasSuffix(name, ".txt") && (strings.HasPrefix(name, "recovered_panic_") || strings.HasPrefix(name, "api_panic_") || name == "crash_latest.txt") {
+			content, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("read crash file: %v", err)
+			}
+			return string(content)
 		}
 	}
-	if !found {
-		t.Fatal("expected a panic file from SafeGo, found none")
-	}
-
-	close(done)
+	t.Fatalf("no crash report file found in %s", dir)
+	return ""
 }

@@ -28,8 +28,8 @@ var (
 )
 
 func main() {
-	// Global panic capture — writes stack dump + panic details to a standalone file
-	defer logger.CapturePanic("main")
+	// Global panic capture — logs reason + stack, writes crash report, exits non-zero.
+	defer logger.CapturePanicExit("main")
 
 	flag.Parse()
 
@@ -84,6 +84,7 @@ func main() {
 	if err := logger.Configure(logConfig); err != nil {
 		logger.Error("Failed to configure file logging: %v", err)
 	}
+	logger.InstallCrashHandlers(globalConfig.LogDir)
 
 	configMgr, err := config.NewConfigManager(*serverListPath)
 	if err != nil {
@@ -197,7 +198,11 @@ func main() {
 	subscriptionScheduler.Start(ctx)
 
 	<-ctx.Done()
-	logger.Info("Shutdown signal received, stopping services...")
+	if cause := context.Cause(ctx); cause != nil {
+		logger.Error("Shutdown triggered: reason=%v", cause)
+	} else {
+		logger.Info("Shutdown signal received, stopping services...")
+	}
 
 	if err := apiServer.Stop(); err != nil {
 		logger.Error("Error stopping API server: %v", err)

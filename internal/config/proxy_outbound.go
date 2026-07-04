@@ -101,6 +101,7 @@ type ProxyOutbound struct {
 	Reality          bool   `json:"reality,omitempty"`            // Enable Reality
 	RealityPublicKey string `json:"reality_public_key,omitempty"` // Reality public key (pbk)
 	RealityShortID   string `json:"reality_short_id,omitempty"`   // Reality short ID (sid)
+	RealitySpiderX   string `json:"reality_spider_x,omitempty"`   // Reality spider-x path (spx)
 
 	// Transport fields (WebSocket, gRPC, etc.)
 	Network         string `json:"network,omitempty"`           // Transport type: tcp, ws, grpc, httpupgrade, xhttp
@@ -331,6 +332,7 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		Reality:                  p.Reality,
 		RealityPublicKey:         p.RealityPublicKey,
 		RealityShortID:           p.RealityShortID,
+		RealitySpiderX:           p.RealitySpiderX,
 		Network:                  p.Network,
 		WSPath:                   p.WSPath,
 		WSHost:                   p.WSHost,
@@ -645,6 +647,7 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.Reality == other.Reality &&
 		p.RealityPublicKey == other.RealityPublicKey &&
 		p.RealityShortID == other.RealityShortID &&
+		p.RealitySpiderX == other.RealitySpiderX &&
 		p.Network == other.Network &&
 		p.WSPath == other.WSPath &&
 		p.WSHost == other.WSHost &&

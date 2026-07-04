@@ -632,6 +632,14 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 		outbound.Insecure = true
 		outbound.RealityPublicKey = firstNonEmpty(getString(realityOpts, "public-key"), getString(realityOpts, "public_key"))
 		outbound.RealityShortID = firstNonEmpty(getString(realityOpts, "short-id"), getString(realityOpts, "short_id"))
+		outbound.RealitySpiderX = firstNonEmpty(getString(realityOpts, "spider-x"), getString(realityOpts, "spider_x"), getString(realityOpts, "spx"))
+		if outbound.SNI == "" {
+			outbound.SNI = firstNonEmpty(
+				getString(realityOpts, "servername"),
+				getString(realityOpts, "server-name"),
+				getString(realityOpts, "serverName"),
+			)
+		}
 	}
 	if outbound.Type == config.ProtocolHysteria2 && outbound.SNI == "" {
 		outbound.SNI = server
@@ -988,6 +996,7 @@ func parseAnyTLS(link string) (ParsedOutbound, bool) {
 		outbound.Insecure = true
 		outbound.RealityPublicKey = parsed.Query().Get("pbk")
 		outbound.RealityShortID = parsed.Query().Get("sid")
+		outbound.RealitySpiderX = querySpiderX(parsed.Query())
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -1016,10 +1025,13 @@ func parseVLESS(link string) (ParsedOutbound, bool) {
 		UUID:        parts.Username,
 		Flow:        parts.Query.Get("flow"),
 		TLS:         isTLS,
-		SNI:         firstNonEmpty(parts.Query.Get("sni"), server),
+		SNI:         parts.Query.Get("sni"),
 		ALPN:        parts.Query.Get("alpn"),
 		Fingerprint: queryFingerprint(parts.Query),
 		Enabled:     true,
+	}
+	if !isReality && outbound.SNI == "" {
+		outbound.SNI = server
 	}
 	outbound.Insecure = queryAllowInsecure(parts.Query)
 	if isReality {
@@ -1027,6 +1039,7 @@ func parseVLESS(link string) (ParsedOutbound, bool) {
 		outbound.Insecure = true
 		outbound.RealityPublicKey = parts.Query.Get("pbk")
 		outbound.RealityShortID = parts.Query.Get("sid")
+		outbound.RealitySpiderX = querySpiderX(parts.Query)
 	}
 	switch strings.ToLower(parts.Query.Get("type")) {
 	case "ws":
@@ -1111,6 +1124,7 @@ func computeSourceKey(outbound *config.ProxyOutbound) string {
 		fmt.Sprintf("%t", outbound.Reality),
 		strings.TrimSpace(outbound.RealityPublicKey),
 		strings.TrimSpace(outbound.RealityShortID),
+		strings.TrimSpace(outbound.RealitySpiderX),
 		strings.TrimSpace(outbound.Network),
 		strings.TrimSpace(outbound.WSPath),
 		strings.TrimSpace(outbound.WSHost),
@@ -1276,6 +1290,14 @@ func queryFingerprint(values url.Values) string {
 		queryFirst(values, "fingerprint"),
 		queryFirst(values, "client-fingerprint"),
 		queryFirst(values, "client_fingerprint"),
+	)
+}
+
+func querySpiderX(values url.Values) string {
+	return firstNonEmpty(
+		queryFirst(values, "spx"),
+		queryFirst(values, "spider-x"),
+		queryFirst(values, "spider_x"),
 	)
 }
 

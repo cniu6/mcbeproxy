@@ -178,3 +178,85 @@ func TestSession_BackdateAndAdvanceHelpers(t *testing.T) {
 		t.Fatalf("AdvanceLastSeen moved LastSeen backwards: %v", got)
 	}
 }
+
+func TestRawUDP_SweepKeepsSessionStatsInSync(t *testing.T) {
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "raw-sweep", IdleTimeout: 3600}
+	p := NewRawUDPProxy("raw-sweep", cfg, nil, sm)
+	p.updateTimeouts()
+
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+
+	now := time.Now()
+	client := &rawUDPClientInfo{
+		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 50005},
+		targetConn: targetConn,
+		sessionID:  "10.0.0.5:50005",
+		startTime:  now.Add(-2 * time.Minute),
+	}
+	client.lastSeen.Store(now.UnixNano())
+	client.lastClientPacket.Store(now.UnixNano())
+	client.bytesUp.Store(5000)
+	client.bytesDown.Store(9000)
+	p.clients.Store(client.sessionID, client)
+	p.ensureSession(client)
+
+	p.sweepInactiveClients(now, p.effectiveClientDisconnectTimeout())
+
+	snap := sm.GetAllSessions()[0].Snapshot()
+	if snap.BytesUp != 5000 || snap.BytesDown != 9000 {
+		t.Fatalf("sweep did not sync live stats: up=%d down=%d", snap.BytesUp, snap.BytesDown)
+	}
+}
+
+func TestRawUDP_StopFinalizesSessionStats(t *testing.T) {
+	sm := session.NewSessionManager(time.Hour)
+	var persisted *session.Session
+	sm.OnSessionEnd = func(sess *session.Session) {
+		persisted = sess
+	}
+
+	cfg := &config.ServerConfig{ID: "raw-stop", IdleTimeout: 3600}
+	p := NewRawUDPProxy("raw-stop", cfg, nil, sm)
+	p.updateTimeouts()
+
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+
+	lastSeen := time.Now().Add(-30 * time.Second)
+	client := &rawUDPClientInfo{
+		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 6), Port: 50006},
+		targetConn: targetConn,
+		sessionID:  "10.0.0.6:50006",
+		startTime:  time.Now().Add(-5 * time.Minute),
+	}
+	client.lastSeen.Store(lastSeen.UnixNano())
+	client.lastClientPacket.Store(lastSeen.UnixNano())
+	client.bytesUp.Store(1111)
+	client.bytesDown.Store(2222)
+	client.mu.Lock()
+	client.playerName = "StopPlayer"
+	client.mu.Unlock()
+	p.clients.Store(client.sessionID, client)
+	p.ensureSession(client)
+
+	if err := p.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("Stop() did not persist session via OnSessionEnd")
+	}
+	snap := persisted.Snapshot()
+	if snap.BytesUp != 1111 || snap.BytesDown != 2222 {
+		t.Fatalf("Stop() lost traffic: up=%d down=%d", snap.BytesUp, snap.BytesDown)
+	}
+	if diff := snap.LastSeen.Sub(lastSeen); diff < -2*time.Second || diff > 2*time.Second {
+		t.Fatalf("Stop() LastSeen = %v, want ~%v", snap.LastSeen, lastSeen)
+	}
+}

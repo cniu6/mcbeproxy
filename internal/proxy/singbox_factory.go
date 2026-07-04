@@ -1191,11 +1191,23 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 }
 
 func decodeRealityPublicKeyValue(value string) ([]byte, error) {
-	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	if err == nil {
-		return decoded, nil
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, errors.New("empty reality public key")
 	}
-	return base64.RawStdEncoding.DecodeString(value)
+	decoders := []func(string) ([]byte, error){
+		base64.RawURLEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.StdEncoding.DecodeString,
+	}
+	for _, decode := range decoders {
+		decoded, err := decode(value)
+		if err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid reality public key (expected 32 bytes after base64 decode)")
 }
 
 func decodeRealityShortIDValue(value string) ([]byte, error) {
@@ -1210,6 +1222,46 @@ func decodeRealityShortIDValue(value string) ([]byte, error) {
 		return nil, err
 	}
 	return decoded, nil
+}
+
+func isInvalidRealityServerName(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "" {
+		return true
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	return strings.HasSuffix(host, ".ip6.arpa") ||
+		strings.HasSuffix(host, ".in-addr.arpa") ||
+		strings.HasSuffix(host, ".arpa")
+}
+
+func effectiveRealityServerName(cfg *config.ProxyOutbound) (string, error) {
+	if cfg == nil {
+		return "", errors.New("reality config is nil")
+	}
+	candidates := []string{
+		strings.TrimSpace(cfg.SNI),
+		strings.TrimSpace(cfg.WSHost),
+		strings.TrimSpace(cfg.Server),
+	}
+	for _, candidate := range candidates {
+		if candidate != "" && !isInvalidRealityServerName(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("reality requires a valid SNI (got sni=%q server=%q; encoded server hostnames like ip6.arpa cannot be used as SNI)", cfg.SNI, cfg.Server)
+}
+
+func effectiveRealitySpiderX(cfg *config.ProxyOutbound) string {
+	if cfg == nil {
+		return "/"
+	}
+	if spx := strings.TrimSpace(cfg.RealitySpiderX); spx != "" {
+		return spx
+	}
+	return "/"
 }
 
 func xhttpRequestHost(cfg *config.ProxyOutbound) string {
@@ -1255,9 +1307,9 @@ func buildXHTTPStreamSettings(cfg *config.ProxyOutbound) (*xrayinternet.MemorySt
 		if fingerprint == "" {
 			fingerprint = "chrome"
 		}
-		serverName := strings.TrimSpace(cfg.SNI)
-		if serverName == "" {
-			serverName = strings.TrimSpace(cfg.Server)
+		serverName, err := effectiveRealityServerName(cfg)
+		if err != nil {
+			return nil, err
 		}
 		streamSettings.SecurityType = "reality"
 		streamSettings.SecuritySettings = &xrayreality.Config{
@@ -1265,6 +1317,7 @@ func buildXHTTPStreamSettings(cfg *config.ProxyOutbound) (*xrayinternet.MemorySt
 			ServerName:  serverName,
 			PublicKey:   publicKey,
 			ShortId:     shortID,
+			SpiderX:     effectiveRealitySpiderX(cfg),
 		}
 		return streamSettings, nil
 	}
@@ -1554,77 +1607,74 @@ func dialVisionTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound
 // Reality embeds authentication data in the TLS ClientHello sessionId field.
 // Based on XTLS/Xray-core Reality client implementation.
 //
-// We try the legacy (metacubex/utls) path first with the latest protocol version
-// bytes [26,3,27] because we control the version encoding directly. If that fails,
-// we fall back to xray-core's UClient (which uses its own hardcoded version),
-// then try alternate fingerprints.
+// We prefer xray-core's UClient first, then fall back to the legacy uTLS path,
+// and finally try alternate browser fingerprints when auth verification fails.
 func dialRealityTLS(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
 	primaryFingerprint := strings.TrimSpace(cfg.Fingerprint)
 	if primaryFingerprint == "" {
 		primaryFingerprint = "chrome"
 	}
 
-	// Try legacy path first with the latest protocol version [26, 3, 27].
-	// This gives us full control over the version bytes and MlkemEcdhe fallback.
-	legacyConn, legacyErr := dialRealityTLSLegacy(ctx, conn, cfg)
-	if legacyErr == nil {
-		return legacyConn, nil
+	serverName, err := effectiveRealityServerName(cfg)
+	if err != nil {
+		return nil, err
 	}
-	_ = conn.Close()
+	logger.Debug("Reality: dialing %s:%d sni=%s fp=%s shortId=%s", cfg.Server, cfg.Port, serverName, primaryFingerprint, cfg.RealityShortID)
 
-	// If legacy failed with a non-reality error (e.g. wrong pbk), don't retry.
-	if !shouldFallbackToLegacyReality(legacyErr) && !isRealityAuthError(legacyErr) {
-		return nil, legacyErr
-	}
+	var xrayErr error
+	var legacyErr error
 
-	logger.Debug("Reality: legacy path failed for %s (%v), trying xray-core UClient", cfg.Server, legacyErr)
-
-	// Fall back to xray-core UClient (uses its own hardcoded version bytes).
-	xrayRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
-	if redialErr != nil {
-		return nil, fmt.Errorf("reality legacy failed (%v) and xray-core redial failed: %w", legacyErr, redialErr)
-	}
-	xrayConn, xrayErr := dialRealityTLSWithFingerprint(ctx, xrayRawConn, cfg, primaryFingerprint)
+	xrayConn, xrayErr := dialRealityTLSWithFingerprint(ctx, conn, cfg, primaryFingerprint, serverName)
 	if xrayErr == nil {
-		logger.Debug("Reality: xray-core UClient succeeded for %s after legacy failure: %v", cfg.Server, legacyErr)
 		return xrayConn, nil
 	}
-	_ = xrayRawConn.Close()
+	if !shouldFallbackToLegacyReality(xrayErr) && !isRealityAuthError(xrayErr) {
+		return nil, xrayErr
+	}
+	logger.Debug("Reality: xray-core path failed for %s (%v), trying legacy", cfg.Server, xrayErr)
+	_ = conn.Close()
 
-	// Try alternate fingerprints with xray-core UClient.
-	if shouldRetryRealityWithAlternateFingerprint(primaryFingerprint, xrayErr) {
-		for _, altFingerprint := range realityAlternateFingerprints(primaryFingerprint) {
-			altRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
-			if redialErr != nil {
-				return nil, fmt.Errorf("reality alternate fingerprint %s redial failed after legacy=%v xray=%v: %w", altFingerprint, legacyErr, xrayErr, redialErr)
-			}
-			altConn, altErr := dialRealityTLSWithFingerprint(ctx, altRawConn, cfg, altFingerprint)
-			if altErr == nil {
-				logger.Debug("Reality: alternate fingerprint %s succeeded for %s: legacy=%v xray=%v", altFingerprint, cfg.Server, legacyErr, xrayErr)
-				return altConn, nil
-			}
-			_ = altRawConn.Close()
-		}
+	legacyRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+	if redialErr != nil {
+		return nil, fmt.Errorf("reality xray-core failed (%v) and legacy redial failed: %w", xrayErr, redialErr)
+	}
+	legacyConn, legacyErr := dialRealityTLSLegacyWithFingerprint(ctx, legacyRawConn, cfg, primaryFingerprint, serverName)
+	if legacyErr == nil {
+		logger.Debug("Reality: legacy path succeeded for %s after xray-core failure", cfg.Server)
+		return legacyConn, nil
+	}
+	_ = legacyRawConn.Close()
+
+	if !shouldRetryRealityWithAlternateFingerprint(legacyErr) {
+		return nil, fmt.Errorf("reality handshake failed: xray-core (%v); legacy (%v)", xrayErr, legacyErr)
 	}
 
-	// Try alternate fingerprints with legacy path.
 	for _, altFingerprint := range realityAlternateFingerprints(primaryFingerprint) {
 		altRawConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
 		if redialErr != nil {
 			continue
 		}
-		altConn, altErr := dialRealityTLSLegacyWithFingerprint(ctx, altRawConn, cfg, altFingerprint)
-		if altErr == nil {
-			logger.Debug("Reality: legacy alternate fingerprint %s succeeded for %s: legacy=%v xray=%v", altFingerprint, cfg.Server, legacyErr, xrayErr)
+		if altConn, altErr := dialRealityTLSWithFingerprint(ctx, altRawConn, cfg, altFingerprint, serverName); altErr == nil {
+			logger.Debug("Reality: xray-core alternate fingerprint %s succeeded for %s", altFingerprint, cfg.Server)
 			return altConn, nil
 		}
 		_ = altRawConn.Close()
+
+		altLegacyConn, _, redialErr := DialOutboundServerTCP(ctx, cfg.Server, cfg.Port, 10*time.Second)
+		if redialErr != nil {
+			continue
+		}
+		if altConn, altErr := dialRealityTLSLegacyWithFingerprint(ctx, altLegacyConn, cfg, altFingerprint, serverName); altErr == nil {
+			logger.Debug("Reality: legacy alternate fingerprint %s succeeded for %s", altFingerprint, cfg.Server)
+			return altConn, nil
+		}
+		_ = altLegacyConn.Close()
 	}
 
-	return nil, fmt.Errorf("reality handshake failed: legacy (%v); xray-core (%v)", legacyErr, xrayErr)
+	return nil, fmt.Errorf("reality handshake failed: xray-core (%v); legacy (%v)", xrayErr, legacyErr)
 }
 
-func dialRealityTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprint string) (net.Conn, error) {
+func dialRealityTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprint, serverName string) (net.Conn, error) {
 	publicKey, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode reality public key: %w", err)
@@ -1636,17 +1686,13 @@ func dialRealityTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *conf
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode reality short id: %w", err)
 	}
-	serverName := strings.TrimSpace(cfg.SNI)
-	if serverName == "" {
-		serverName = strings.TrimSpace(cfg.Server)
-	}
 	dest := xraynet.TCPDestination(xraynet.ParseAddress(strings.TrimSpace(cfg.Server)), xraynet.Port(cfg.Port))
 	realityConn, err := xrayreality.UClient(conn, &xrayreality.Config{
 		Fingerprint: fingerprint,
 		ServerName:  serverName,
 		PublicKey:   publicKey,
 		ShortId:     shortID,
-		SpiderX:     "/",
+		SpiderX:     effectiveRealitySpiderX(cfg),
 		SpiderY:     make([]int64, 10),
 	}, ctx, dest)
 	if err != nil {
@@ -1666,8 +1712,8 @@ func shouldFallbackToLegacyReality(err error) bool {
 		strings.Contains(errText, "invalid certificate signature")
 }
 
-func shouldRetryRealityWithAlternateFingerprint(primaryFingerprint string, err error) bool {
-	return strings.EqualFold(strings.TrimSpace(primaryFingerprint), "chrome") && shouldFallbackToLegacyReality(err)
+func shouldRetryRealityWithAlternateFingerprint(err error) bool {
+	return shouldFallbackToLegacyReality(err) || isRealityAuthError(err)
 }
 
 func realityAlternateFingerprints(primaryFingerprint string) []string {
@@ -1699,10 +1745,14 @@ func isRealityAuthError(err error) bool {
 }
 
 func dialRealityTLSLegacy(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound) (net.Conn, error) {
-	return dialRealityTLSLegacyWithFingerprint(ctx, conn, cfg, cfg.Fingerprint)
+	serverName, err := effectiveRealityServerName(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return dialRealityTLSLegacyWithFingerprint(ctx, conn, cfg, cfg.Fingerprint, serverName)
 }
 
-func dialRealityTLSLegacyWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprintName string) (net.Conn, error) {
+func dialRealityTLSLegacyWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.ProxyOutbound, fingerprintName, serverName string) (net.Conn, error) {
 	publicKeyBytes, err := decodeRealityPublicKeyValue(cfg.RealityPublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode reality public key: %w", err)
@@ -1715,13 +1765,9 @@ func dialRealityTLSLegacyWithFingerprint(ctx context.Context, conn net.Conn, cfg
 		return nil, fmt.Errorf("failed to decode reality short id: %w", err)
 	}
 
-	sni := cfg.SNI
-	if sni == "" {
-		sni = cfg.Server
-	}
 	fingerprint := getUTLSFingerprint(fingerprintName)
 	utlsConfig := &utls.Config{
-		ServerName:             sni,
+		ServerName:             serverName,
 		InsecureSkipVerify:     true,
 		SessionTicketsDisabled: true,
 	}
@@ -1807,7 +1853,7 @@ func dialRealityTLSLegacyWithFingerprint(ctx context.Context, conn net.Conn, cfg
 		_ = utlsConn.Close()
 		return nil, errors.New("reality: invalid certificate signature (check pbk/sid/sni/fp)")
 	}
-	logger.Debug("Reality: legacy verification passed for %s, fingerprint=%s, shortId=%s", sni, fingerprintName, cfg.RealityShortID)
+	logger.Debug("Reality: legacy verification passed for %s, fingerprint=%s, shortId=%s", serverName, fingerprintName, cfg.RealityShortID)
 	return utlsConn, nil
 }
 
