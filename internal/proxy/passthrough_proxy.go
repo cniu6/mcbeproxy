@@ -1805,6 +1805,14 @@ func (p *PassthroughProxy) KickPlayer(playerName, reason string) int {
 	return kickedCount
 }
 
+// GetActiveClientCount returns per-client upstream links for raw-compat mode.
+func (p *PassthroughProxy) GetActiveClientCount() int {
+	if p.useRawCompat && p.rawCompat != nil {
+		return p.rawCompat.GetActiveClientCount()
+	}
+	return 0
+}
+
 // Stop closes the passthrough proxy.
 func (p *PassthroughProxy) Stop() error {
 	p.closed.Store(true)

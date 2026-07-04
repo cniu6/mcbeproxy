@@ -129,7 +129,10 @@ func (s *Session) AddBytesUpAndUpdateLastSeen(n int64) {
 	if n > 0 {
 		s.BytesUp += n
 	}
-	s.LastSeen = time.Now()
+	now := time.Now()
+	if now.After(s.LastSeen) {
+		s.LastSeen = now
+	}
 }
 
 func (s *Session) AddBytesDownAndUpdateLastSeen(n int64) {
@@ -138,7 +141,36 @@ func (s *Session) AddBytesDownAndUpdateLastSeen(n int64) {
 	if n > 0 {
 		s.BytesDown += n
 	}
-	s.LastSeen = time.Now()
+	now := time.Now()
+	if now.After(s.LastSeen) {
+		s.LastSeen = now
+	}
+}
+
+// AddBytesUpAtTime adds bytes and advances LastSeen to at if at is later.
+// Used for final sync where time.Now() would inflate the session duration
+// (e.g. idle-timeout removal happens minutes after the last real packet).
+func (s *Session) AddBytesUpAtTime(n int64, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > 0 {
+		s.BytesUp += n
+	}
+	if at.After(s.LastSeen) {
+		s.LastSeen = at
+	}
+}
+
+// AddBytesDownAtTime adds bytes and advances LastSeen to at if at is later.
+func (s *Session) AddBytesDownAtTime(n int64, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > 0 {
+		s.BytesDown += n
+	}
+	if at.After(s.LastSeen) {
+		s.LastSeen = at
+	}
 }
 
 func (s *Session) LockForward() {

@@ -60,6 +60,13 @@ const (
 	// goroutine/connection leaks when a client disappears without sending a
 	// RakNet DisconnectNotification (e.g., NAT timeout, crash, kill -9).
 	MaxRawUDPStaleTimeout = 24 * time.Hour
+	// ClientSilentDisconnectTimeout is the maximum client-side silence before
+	// a client is considered disconnected, regardless of server-to-client
+	// traffic. RakNet connected clients send ping/pong every ~5 seconds, so
+	// 90 seconds of complete client silence is a strong indicator of
+	// disconnect (crash, network loss, NAT timeout). This is capped by the
+	// configured idle_timeout if it is shorter.
+	ClientSilentDisconnectTimeout = 90 * time.Second
 )
 
 // rawUDPBufferPool reduces GC pressure by reusing UDP packet buffers.
@@ -153,7 +160,8 @@ type rawUDPClientInfo struct {
 	targetConn           net.PacketConn // Can be *net.UDPConn or proxy PacketConn
 	targetAddr           net.Addr       // Target address for WriteTo
 	startTime            time.Time      // Connection start time
-	lastSeen             atomic.Int64   // Unix nano timestamp for lock-free access
+	lastSeen             atomic.Int64   // Unix nano timestamp for lock-free access (any direction)
+	lastClientPacket     atomic.Int64   // Unix nano — last packet FROM client (upstream only)
 	bytesUp              atomic.Int64   // Lock-free counter
 	bytesDown            atomic.Int64   // Lock-free counter
 	bytesUpSynced        atomic.Int64   // Portion of bytesUp already credited to a session
@@ -178,6 +186,11 @@ type rawUDPClientInfo struct {
 	pendingACKSeqs       []uint32
 	mu                   sync.Mutex // Only for splitPackets and player info writes
 	kickMessage          string
+
+	// Consecutive write timeout counter — if writes keep timing out the
+	// upstream relay is dead. After a threshold we close the session
+	// instead of silently dropping packets forever.
+	writeTimeoutCount atomic.Int64
 }
 
 // syncBytesUpToSession credits any not-yet-credited upload bytes to the
@@ -649,7 +662,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			}
 
 			// Update stats (lock-free)
-			clientInfo.lastSeen.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			clientInfo.lastSeen.Store(now)
+			clientInfo.lastClientPacket.Store(now)
 			clientInfo.bytesUp.Add(int64(n))
 			clientInfo.packetCount.Add(1)
 
@@ -696,11 +711,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				clientInfo.clearPendingACKSeqs()
 
 				// Forward the packet (whether or not it's a Login packet)
-				clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 				_, err = writePacketConn(clientInfo.targetConn, packetCopy, clientInfo.targetAddr)
 			} else {
 				// Login already parsed, forward directly without copying
-				clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 				_, err = writePacketConn(clientInfo.targetConn, buffer[:n], clientInfo.targetAddr)
 			}
 
@@ -714,13 +727,23 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				// local congestion (full sndbuf/qdisc); dropping the session
 				// would force a reconnect for no reason — drop the datagram.
 				if isTimeoutError(err) {
-					logger.Debug("Write to target timed out for %s, dropping datagram", clientAddr.String())
+					timeoutCount := clientInfo.writeTimeoutCount.Add(1)
+					if timeoutCount >= 3 {
+						logger.Info("RawUDP session closed (3 consecutive write timeouts): client=%s relay=%s",
+							clientAddr.String(), clientInfo.targetConn.LocalAddr())
+						p.removeClient(clientAddr.String())
+						break
+					}
+					logger.Debug("Write to target timed out for %s (consecutive=%d), dropping datagram", clientAddr.String(), timeoutCount)
+					clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 					continue
 				}
 				logger.Info("RawUDP session closed (write to target failed): client=%s err=%v", clientAddr.String(), err)
 				p.removeClient(clientAddr.String())
 				continue
 			}
+			// Successful write — reset consecutive timeout counter
+			clientInfo.writeTimeoutCount.Store(0)
 		}
 	}
 }
@@ -751,6 +774,8 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		}
 	}
 
+	p.cleanupStaleSameIPClients(clientAddr, incoming)
+
 	logger.Debug("RawUDP: Creating new client for %s", clientKey)
 
 	var targetConn net.PacketConn
@@ -763,7 +788,8 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		// Use proxy outbound
 		targetConn, selectedNode, err = p.dialThroughProxy()
 		if err != nil {
-			logger.Error("Failed to connect to target %s via proxy: %v", p.effectiveTargetAddrString(), err)
+			logger.Error("Failed to connect to target %s via proxy (client=%s server=%s active_proxy_clients=%d): %v",
+				p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), err)
 			return nil, false
 		}
 		targetAddr = p.effectiveTargetPacketAddr()
@@ -771,7 +797,8 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		// Direct connection
 		directConn, dialErr := net.DialUDP("udp", nil, p.targetAddr)
 		if dialErr != nil {
-			logger.Error("Failed to connect to target %s: %v", p.effectiveTargetAddrString(), dialErr)
+			logger.Error("Failed to connect to target %s (client=%s server=%s active_proxy_clients=%d): %v",
+				p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), dialErr)
 			return nil, false
 		}
 		// Set socket options
@@ -795,6 +822,13 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		proxyNode:  selectedNode,
 	}
 	clientInfo.lastSeen.Store(now.UnixNano())
+	clientInfo.lastClientPacket.Store(now.UnixNano())
+
+	// Set write deadline once at connection creation. UDP writes to LAN/WAN
+	// targets complete in microseconds; resetting the deadline per packet is
+	// an unnecessary syscall on the hot path. If a write blocks long enough
+	// to hit this deadline, the resulting timeout error is handled below.
+	clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 
 	// Store client
 	p.clients.Store(clientKey, clientInfo)
@@ -802,6 +836,13 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 	// Start response forwarding goroutine
 	p.wg.Add(1)
 	go p.forwardResponses(clientAddr, clientInfo)
+
+	route := "direct"
+	if selectedNode != "" {
+		route = selectedNode
+	}
+	logger.Info("RawUDP: new proxy client server=%s client=%s route=%s active_proxy_clients=%d",
+		p.serverID, clientKey, route, p.GetActiveClientCount())
 
 	return clientInfo, true
 }
@@ -971,6 +1012,12 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawUDPClientInfo) {
 	defer p.wg.Done()
 	defer func() {
+		if r := recover(); r != nil {
+			logger.Info("RawUDP forwardResponses panic recovered: client=%s err=%v", clientAddr.String(), r)
+			p.removeClientIfMatch(clientAddr.String(), clientInfo)
+		}
+	}()
+	defer func() {
 		if clientInfo.kicked.Load() {
 			p.scheduleKickCleanup(clientInfo)
 			return
@@ -1012,8 +1059,8 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// socket (e.g. connection refused): keep the session alive
 					// and let the inactivity reaper handle truly dead peers.
 					if isRecoverableConnError(err) {
-						lastSeenNano := clientInfo.lastSeen.Load()
-						if p.clientInactiveTimeout > 0 && time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
+						lastClientPktNano := clientInfo.lastClientPacket.Load()
+						if time.Since(time.Unix(0, lastClientPktNano)) > p.effectiveClientDisconnectTimeout() {
 							return
 						}
 						continue
@@ -1024,11 +1071,13 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					}
 					return
 				}
-				// Check if client is still active (lock-free)
-				// Skip inactivity check when clientInactiveTimeout=0 (idle_timeout=-1)
-				lastSeenNano := clientInfo.lastSeen.Load()
-				if p.clientInactiveTimeout > 0 && time.Since(time.Unix(0, lastSeenNano)) > p.clientInactiveTimeout {
-					logger.Debug("Client %s inactive, closing connection", clientAddr.String())
+				// Check if client is still active using lastClientPacket (upstream only).
+				// lastSeen includes downstream traffic which can mask client
+				// disconnect when the server keeps sending data.
+				lastClientPktNano := clientInfo.lastClientPacket.Load()
+				if time.Since(time.Unix(0, lastClientPktNano)) > p.effectiveClientDisconnectTimeout() {
+					logger.Info("RawUDP session closed (client silent for %v): server=%s client=%s active_proxy_clients=%d",
+						time.Since(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, clientAddr.String(), p.GetActiveClientCount())
 					return
 				}
 				// Reset deadline for next read attempt
@@ -1051,8 +1100,8 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			// Forward to client FIRST — minimizes time between reading from
 			// target and delivering to client, reducing risk of kernel buffer
 			// overflow on the target connection under heavy traffic.
-			p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 			_, err = p.listener.WriteToUDP(buffer[:n], clientAddr)
+
 			if err != nil {
 				// ICMP from the client side (NAT rebinding, brief unreachable)
 				// surfaces here on the shared listener socket; drop only this
@@ -1061,6 +1110,11 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// Still update stats even on recoverable error
 					clientInfo.bytesDown.Add(int64(n))
 					clientInfo.lastSeen.Store(time.Now().UnixNano())
+					continue
+				}
+				if isTimeoutError(err) {
+					// Reset listener write deadline after a transient timeout
+					p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 					continue
 				}
 				if !isTimeoutError(err) {
@@ -1211,7 +1265,12 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 	clientInfo.mu.Unlock()
 
 	startTime := clientInfo.startTime
-	duration := time.Since(startTime)
+	lastSeenNano := clientInfo.lastSeen.Load()
+	endTime := time.Unix(0, lastSeenNano)
+	if lastSeenNano == 0 || endTime.Before(startTime) {
+		endTime = time.Now()
+	}
+	duration := endTime.Sub(startTime)
 	totalBytes := bytesUp + bytesDown
 	durationStr := formatDuration(duration)
 
@@ -1226,15 +1285,33 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
 		}
 	} else {
-		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s",
-			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s, active_proxy_clients=%d",
+			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes), p.GetActiveClientCount())
 	}
 
 	// Credit any bytes not yet delta-synced before the session is persisted,
 	// otherwise the tail of the connection's traffic is lost from statistics.
+	// Use the client's lastSeen timestamp (not time.Now()) so the session's
+	// LastSeen reflects the actual last packet time, not the removal time
+	// (which can be minutes later due to idle timeout or shutdown flush).
 	if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
-		clientInfo.syncBytesUpToSession(sess)
-		clientInfo.syncBytesDownToSession(sess)
+		lastSeenTime := time.Unix(0, lastSeenNano)
+		if lastSeenNano == 0 {
+			lastSeenTime = time.Now()
+		}
+		// Final delta sync with accurate timestamp
+		upTotal := clientInfo.bytesUp.Load()
+		upPrev := clientInfo.bytesUpSynced.Load()
+		if upTotal > upPrev {
+			clientInfo.bytesUpSynced.Store(upTotal)
+			sess.AddBytesUpAtTime(upTotal-upPrev, lastSeenTime)
+		}
+		downTotal := clientInfo.bytesDown.Load()
+		downPrev := clientInfo.bytesDownSynced.Load()
+		if downTotal > downPrev {
+			clientInfo.bytesDownSynced.Store(downTotal)
+			sess.AddBytesDownAtTime(downTotal-downPrev, lastSeenTime)
+		}
 	}
 
 	if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
@@ -1271,11 +1348,17 @@ func formatBytes(b int64) string {
 // cleanupInactiveClients periodically removes inactive clients
 func (p *RawUDPProxy) cleanupInactiveClients() {
 	defer p.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Info("RawUDP cleanupInactiveClients panic recovered: %v", r)
+		}
+	}()
 
 	// Check every 10 seconds for faster cleanup
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	sweepNum := 0
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -1287,53 +1370,144 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 				p.maybeRefreshPingCacheAsync(false)
 			}
 			now := time.Now()
-			// Use the full configured idle_timeout. RakNet has its own
-			// keepalive (connected ping/pong) and disconnect mechanism
-			// (DisconnectNotification), so the proxy does not need to
-			// aggressively guess whether a connection is dead based on
-			// silence alone. When idle_timeout=-1 (clientInactiveTimeout=0),
-			// skip inactivity cleanup entirely — never disconnect.
-			disconnectTimeout := p.clientInactiveTimeout
-			p.clients.Range(func(key, value interface{}) bool {
-				clientInfo := value.(*rawUDPClientInfo)
-				lastSeenNano := clientInfo.lastSeen.Load()
-
-				if disconnectTimeout > 0 && now.Sub(time.Unix(0, lastSeenNano)) > disconnectTimeout {
-					logger.Info("RawUDP session closed (idle timeout %v): client=%s", disconnectTimeout, key.(string))
-					p.removeClient(key.(string))
-				} else if disconnectTimeout == 0 && now.Sub(time.Unix(0, lastSeenNano)) > MaxRawUDPStaleTimeout {
-					logger.Info("RawUDP session closed (max stale timeout %v): client=%s", MaxRawUDPStaleTimeout, key.(string))
-					p.removeClient(key.(string))
-				} else {
-					// Clean up stale split packets for active clients
-					clientInfo.mu.Lock()
-					clientInfo.cleanupStaleSplitPackets()
-					playerName := clientInfo.playerName
-					playerUUID := clientInfo.playerUUID
-					playerXUID := clientInfo.playerXUID
-					clientInfo.mu.Unlock()
-
-					// Keep the session alive for still-connected clients during
-					// traffic lulls and back-fill identity once the Login parses.
-					// LastSeen is advanced from the real traffic timestamp (not
-					// "now") so the recorded exit time stays accurate.
-					if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
-						if playerName != "" && sess.GetDisplayName() == "" {
-							sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
-						}
-						sess.AdvanceLastSeen(time.Unix(0, lastSeenNano))
-					} else if clientInfo.loginParsed.Load() && playerName != "" {
-						if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
-							clientInfo.sessionCreated.Store(true)
-							sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
-							sess.UpdateLastSeen()
-						}
+			removed := p.sweepInactiveClients(now, p.effectiveClientDisconnectTimeout())
+			sweepNum++
+			if removed > 0 {
+				logger.Info("RawUDP: cleanup sweep server=%s removed=%d inactive clients, active_proxy_clients=%d",
+					p.serverID, removed, p.GetActiveClientCount())
+			}
+			if sweepNum%6 == 0 {
+				active := p.GetActiveClientCount()
+				if active > 0 {
+					idleTimeout := 0
+					if p.config != nil {
+						idleTimeout = p.config.IdleTimeout
 					}
+					logger.Info("RawUDP: proxy client stats server=%s active_proxy_clients=%d idle_timeout=%ds effective_silent_timeout=%v",
+						p.serverID, active, idleTimeout, p.effectiveClientDisconnectTimeout())
 				}
-				return true
-			})
+			}
 		}
 	}
+}
+
+func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout time.Duration) int {
+	removed := 0
+	p.clients.Range(func(key, value interface{}) bool {
+		clientInfo := value.(*rawUDPClientInfo)
+		lastSeenNano := clientInfo.lastSeen.Load()
+		lastClientPktNano := clientInfo.lastClientPacket.Load()
+
+		if effectiveClientTimeout > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > effectiveClientTimeout {
+			p.removeClient(key.(string))
+			removed++
+			logger.Info("RawUDP session closed (client silent for %v): server=%s client=%s active_proxy_clients=%d",
+				now.Sub(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
+		} else if now.Sub(time.Unix(0, lastSeenNano)) > MaxRawUDPStaleTimeout {
+			p.removeClient(key.(string))
+			removed++
+			logger.Info("RawUDP session closed (max stale timeout %v): server=%s client=%s active_proxy_clients=%d",
+				MaxRawUDPStaleTimeout, p.serverID, key.(string), p.GetActiveClientCount())
+		} else {
+			clientInfo.mu.Lock()
+			clientInfo.cleanupStaleSplitPackets()
+			playerName := clientInfo.playerName
+			playerUUID := clientInfo.playerUUID
+			playerXUID := clientInfo.playerXUID
+			clientInfo.mu.Unlock()
+
+			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+				if playerName != "" && sess.GetDisplayName() == "" {
+					sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
+				}
+				sess.AdvanceLastSeen(time.Unix(0, lastSeenNano))
+			} else if clientInfo.loginParsed.Load() && playerName != "" {
+				if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
+					clientInfo.sessionCreated.Store(true)
+					sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
+					sess.UpdateLastSeen()
+				}
+			}
+		}
+		return true
+	})
+	return removed
+}
+
+func (p *RawUDPProxy) effectiveClientDisconnectTimeout() time.Duration {
+	if p.clientInactiveTimeout == 0 {
+		return ClientSilentDisconnectTimeout
+	}
+	if p.clientInactiveTimeout > ClientSilentDisconnectTimeout {
+		return ClientSilentDisconnectTimeout
+	}
+	return p.clientInactiveTimeout
+}
+
+func (p *RawUDPProxy) cleanupStaleSameIPClients(clientAddr *net.UDPAddr, incoming []byte) {
+	if clientAddr == nil || clientAddr.IP == nil {
+		return
+	}
+	clientKey := clientAddr.String()
+	clientIP := clientAddr.IP.String()
+	now := time.Now()
+
+	var staleKeys []struct {
+		key    string
+		reason string
+	}
+	p.clients.Range(func(key, value interface{}) bool {
+		keyStr := key.(string)
+		if keyStr == clientKey {
+			return true
+		}
+		info := value.(*rawUDPClientInfo)
+		if info.clientAddr == nil || info.clientAddr.IP == nil || info.clientAddr.IP.String() != clientIP {
+			return true
+		}
+		if info.kicked.Load() {
+			staleKeys = append(staleKeys, struct {
+				key    string
+				reason string
+			}{keyStr, "kicked"})
+			return true
+		}
+		lastClientPkt := time.Unix(0, info.lastClientPacket.Load())
+		silence := now.Sub(lastClientPkt)
+		if silence > sameIPReconnectGrace {
+			staleKeys = append(staleKeys, struct {
+				key    string
+				reason string
+			}{keyStr, fmt.Sprintf("silent_for_%v", silence.Round(time.Second))})
+			return true
+		}
+		if len(incoming) > 0 && isRakNetOpenConnectionRequest(incoming[0]) && silence > sameIPHandshakeGrace {
+			staleKeys = append(staleKeys, struct {
+				key    string
+				reason string
+			}{keyStr, fmt.Sprintf("handshake_reconnect_after_%v", silence.Round(time.Second))})
+		}
+		return true
+	})
+	for _, entry := range staleKeys {
+		logger.Info("RawUDP: removing stale same-IP client %s for new connection %s (reason=%s)",
+			entry.key, clientKey, entry.reason)
+		p.removeClient(entry.key)
+	}
+	if len(staleKeys) > 0 {
+		logger.Info("RawUDP: same-IP cleanup server=%s ip=%s removed=%d active_proxy_clients=%d",
+			p.serverID, clientIP, len(staleKeys), p.GetActiveClientCount())
+	}
+}
+
+// GetActiveClientCount returns the number of per-client upstream UDP links.
+func (p *RawUDPProxy) GetActiveClientCount() int {
+	count := 0
+	p.clients.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
@@ -1348,12 +1522,13 @@ func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
 }
 
 func (p *RawUDPProxy) updateTimeouts() {
-	// idle_timeout = -1 means never disconnect due to inactivity.
+	// idle_timeout = -1 means never disconnect due to brief inactivity.
 	// RakNet has its own keepalive (connected ping/pong) and disconnect
-	// mechanism (DisconnectNotification), so the proxy does not need to
-	// aggressively guess whether a connection is dead.
+	// mechanism (DisconnectNotification). effectiveClientDisconnectTimeout
+	// still applies a 90s upstream-silence ceiling so proxy resources are
+	// not leaked when clients vanish without a clean disconnect.
 	if p.config != nil && p.config.IdleTimeout == -1 {
-		p.clientInactiveTimeout = 0 // 0 = never timeout
+		p.clientInactiveTimeout = 0
 		return
 	}
 	timeout := DefaultClientInactiveTimeout

@@ -154,7 +154,9 @@ func TestChainUDPCache_DeadConnNotReused(t *testing.T) {
 		t.Fatalf("expected *socks5UDPPacketConn, got %T", wrapper1.cached.pc)
 	}
 	// Close the TCP control connection to simulate remote closing it
-	s5Conn.ctrlConn.Close()
+	if st := s5Conn.state.Load(); st != nil {
+		st.ctrlConn.Close()
+	}
 	// Wait for monitorCtrlConn to detect and close the UDP socket
 	time.Sleep(200 * time.Millisecond)
 
@@ -562,9 +564,7 @@ func TestChainUDPCache_IdleSweeperClosesIdleConn(t *testing.T) {
 	}
 
 	// Manually set lastUsed to past to trigger idle sweeper
-	cached.mu.Lock()
-	cached.lastUsed = time.Now().Add(-200 * time.Second) // 200s ago, > 120s threshold
-	cached.mu.Unlock()
+	cached.lastUsed.Store(time.Now().Add(-200 * time.Second).UnixNano()) // 200s ago, > 120s threshold
 
 	// Trigger idle sweeper manually by calling the same logic
 	chainUDP.cacheMu.Lock()
@@ -573,9 +573,7 @@ func TestChainUDPCache_IdleSweeperClosesIdleConn(t *testing.T) {
 		if atomic.LoadInt32(&c.activeUsers) > 0 {
 			continue
 		}
-		c.mu.Lock()
-		idle := now.Sub(c.lastUsed)
-		c.mu.Unlock()
+		idle := now.Sub(time.Unix(0, c.lastUsed.Load()))
 		if idle > 120*time.Second {
 			c.pc.Close()
 			delete(chainUDP.cache, d)
@@ -641,7 +639,9 @@ func TestChainUDPCache_IsConnAlive_SOCKS5(t *testing.T) {
 	}
 
 	// Close TCP control connection
-	s5Conn.ctrlConn.Close()
+	if st := s5Conn.state.Load(); st != nil {
+		st.ctrlConn.Close()
+	}
 	time.Sleep(200 * time.Millisecond)
 
 	// Should now be dead
@@ -1478,7 +1478,7 @@ func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
 	t.Logf("pc1 initial ping: ok")
 
 	// Second call while pc1 is still held (activeUsers > 0).
-	// Wait timeout is 3s for SOCKS5. After timeout, a new conn is created
+	// Wait timeout is 2s for SOCKS5. After timeout, a new conn is created
 	// and the old conn is preserved for the active user (RFC 1928 §7).
 	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
@@ -1487,9 +1487,9 @@ func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
 		t.Fatalf("second ListenPacket: %v", err)
 	}
 
-	// Should have waited at least ~3s (wait timeout) before creating new conn
-	if elapsed < 2500*time.Millisecond {
-		t.Fatalf("expected to wait ~3s for busy conn timeout, but only waited %v", elapsed)
+	// Should have waited at least ~2s (wait timeout) before creating new conn
+	if elapsed < 1500*time.Millisecond {
+		t.Fatalf("expected to wait ~2s for busy conn timeout, but only waited %v", elapsed)
 	}
 	t.Logf("Waited %v for busy conn timeout, got new conn", elapsed)
 

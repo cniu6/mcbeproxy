@@ -265,8 +265,8 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 type CreateProxyOutboundRequest struct {
 	Name         string `json:"name" binding:"required"`
 	Type         string `json:"type" binding:"required"`
-	Server       string `json:"server" binding:"required"`
-	Port         int    `json:"port" binding:"required"`
+	Server       string `json:"server"`
+	Port         int    `json:"port"`
 	Enabled      bool   `json:"enabled"`
 	Group        string `json:"group,omitempty"`
 	Username     string `json:"username,omitempty"`
@@ -2731,12 +2731,17 @@ func shouldReuseCachedUDPTestOutbound(cfg *config.ProxyOutbound) bool {
 		return false
 	}
 	switch cfg.Type {
-	case config.ProtocolAnyTLS, config.ProtocolHysteria2, config.ProtocolSOCKS5:
+	case config.ProtocolAnyTLS, config.ProtocolHysteria2:
 		return true
 	default:
 		// Chain proxies benefit from reusing the cached outbound because
 		// the chainUDPOutbound internally caches UDP PacketConns by
 		// destination, avoiding a full chain re-establishment per test.
+		// SOCKS5 is excluded because each ListenPacket creates a fresh
+		// TCP control connection + UDP ASSOCIATE, so caching the singbox
+		// outbound provides no benefit — and the fromCache=true path
+		// reduces the read budget from 4s to 1.5s, causing false timeouts
+		// on slow SOCKS5 relay paths.
 		return cfg.IsChainProxy()
 	}
 }
@@ -2767,7 +2772,12 @@ type outboundPacketConnNoRetryDialer interface {
 }
 
 func (h *ProxyOutboundHandler) openMCBEPacketConn(ctx context.Context, cfg *config.ProxyOutbound, address string) (net.PacketConn, func(), error) {
-	if h != nil && h.outboundMgr != nil && cfg != nil && strings.TrimSpace(cfg.Name) != "" && shouldReuseCachedUDPTestOutbound(cfg) {
+	pc, cleanup, err, _ := h.openMCBEPacketConnWithCache(ctx, cfg, address, false)
+	return pc, cleanup, err
+}
+
+func (h *ProxyOutboundHandler) openMCBEPacketConnWithCache(ctx context.Context, cfg *config.ProxyOutbound, address string, skipCache bool) (net.PacketConn, func(), error, bool) {
+	if !skipCache && h != nil && h.outboundMgr != nil && cfg != nil && strings.TrimSpace(cfg.Name) != "" && shouldReuseCachedUDPTestOutbound(cfg) {
 		// Use NoRetry variant for tests when the manager supports it: the
 		// outbound-manager's built-in exponential-backoff retry loop
 		// compounds with Hysteria2's own internal UDP-session retry and
@@ -2786,29 +2796,29 @@ func (h *ProxyOutboundHandler) openMCBEPacketConn(ctx context.Context, cfg *conf
 		if err == nil {
 			return packetConn, func() {
 				_ = packetConn.Close()
-			}, nil
+			}, nil, true
 		}
 		logger.Debug("MCBE UDP cache dial failed node=%s type=%s target=%s err=%v", cfg.Name, cfg.Type, address, err)
 	}
 
 	outbound, err := h.singboxFactory.CreateUDPOutbound(ctx, cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, err, false
 	}
 
 	packetConn, err := outbound.ListenPacket(ctx, address)
 	if err != nil {
 		_ = outbound.Close()
-		return nil, nil, err
+		return nil, nil, err, false
 	}
 
 	return packetConn, func() {
 		_ = packetConn.Close()
 		_ = outbound.Close()
-	}, nil
+	}, nil, false
 }
 
-func performMCBEPing(ctx context.Context, packetConn net.PacketConn, destAddr net.Addr) UDPTestResult {
+func performMCBEPing(ctx context.Context, packetConn net.PacketConn, destAddr net.Addr, readBudget time.Duration) UDPTestResult {
 	pingPacket := buildRakNetPing()
 	expectedTimestamp := binary.BigEndian.Uint64(pingPacket[1:9])
 	startTime := time.Now()
@@ -2822,9 +2832,12 @@ func performMCBEPing(ctx context.Context, packetConn net.PacketConn, destAddr ne
 		writeDeadline = deadline
 	}
 	_ = packetConn.SetWriteDeadline(writeDeadline)
+	writeStart := time.Now()
 	_, err := writePacket(packetConn, pingPacket, destAddr)
+	writeMs := time.Since(writeStart).Milliseconds()
 	_ = packetConn.SetWriteDeadline(time.Time{})
 	if err != nil {
+		logger.Debug("MCBE ping write failed: writeMs=%d err=%v", writeMs, err)
 		return UDPTestResult{
 			Success:   false,
 			LatencyMs: time.Since(startTime).Milliseconds(),
@@ -2835,27 +2848,31 @@ func performMCBEPing(ctx context.Context, packetConn net.PacketConn, destAddr ne
 	// RakNet pong normally returns in well under a second even over a proxy
 	// tunnel, but on cold QUIC sessions and far-flung Pacific paths the first
 	// response packet can be delayed 2-3s by congestion/jitter or the first
-	// cwnd growth step. Keep the read budget at 4s so we don't abandon a
-	// healthy session that is simply slow on its first reply, and always
-	// honor the caller-supplied deadline so we never block past the test
-	// budget enforced by testMCBEServer / executeBatchUDPTest.
-	readDeadline := time.Now().Add(4 * time.Second)
+	// cwnd growth step. Use the caller-supplied readBudget (4s for fresh
+	// conns, 1.5s for cached conns) and always honor the context deadline.
+	readDeadline := time.Now().Add(readBudget)
 	if deadline, ok := ctx.Deadline(); ok && deadline.Before(readDeadline) {
 		readDeadline = deadline
 	}
 
 	buf := make([]byte, 1500)
+	readAttempt := 0
 	for {
+		readAttempt++
 		_ = packetConn.SetReadDeadline(readDeadline)
+		readStart := time.Now()
 		n, _, err := packetConn.ReadFrom(buf)
+		readMs := time.Since(readStart).Milliseconds()
 		latency := time.Since(startTime)
 		if err != nil {
+			logger.Debug("MCBE ping read failed: attempt=%d readMs=%d totalMs=%d err=%v", readAttempt, readMs, latency.Milliseconds(), err)
 			return UDPTestResult{
 				Success:   false,
 				LatencyMs: latency.Milliseconds(),
 				Error:     fmt.Sprintf("Failed to receive response: %v", err),
 			}
 		}
+		logger.Debug("MCBE ping read ok: attempt=%d readMs=%d writeMs=%d totalMs=%d n=%d buf0=0x%02x", readAttempt, readMs, writeMs, latency.Milliseconds(), n, buf[0])
 
 		if n > 9 && buf[0] == 0x1c {
 			responseTimestamp := binary.BigEndian.Uint64(buf[1:9])
@@ -3327,32 +3344,17 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	result := UDPTestResult{
-		Target: address,
-	}
 
-	logger.Info("MCBE UDP test: node=%s type=%s target=%s", cfg.Name, cfg.Type, address)
+	testStart := time.Now()
+	logger.Info("MCBE UDP test: node=%s type=%s target=%s start=%s", cfg.Name, cfg.Type, address, testStart.Format("15:04:05.000"))
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	packetConn, cleanup, err := h.openMCBEPacketConn(ctx, cfg, address)
-	if err != nil {
-		result.Success = false
-		result.Error = fmt.Sprintf("Failed to create UDP connection: %v", err)
-		logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v", cfg.Name, cfg.Type, err)
-		return result
-	}
-	defer cleanup()
-
-	logger.Debug("MCBE UDP test PacketConn type: node=%s type=%s packetConn=%T", cfg.Name, cfg.Type, packetConn)
-
 	// Parse address
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
-		result.Success = false
-		result.Error = fmt.Sprintf("Invalid address: %v", err)
-		return result
+		return UDPTestResult{Target: address, Success: false, Error: fmt.Sprintf("Invalid address: %v", err)}
 	}
 	port, _ := strconv.Atoi(portStr)
 
@@ -3371,18 +3373,106 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 		destAddr = &proxy.HostnamePortAddr{Host: host, Port: port}
 	}
 
-	result = performMCBEPing(ctx, packetConn, destAddr)
+	// mcbeAttempt opens a conn, runs a ping, closes the conn, and returns the
+	// result + timings. Each call is self-contained.
+	mcbeAttempt := func() (UDPTestResult, int64, int64) {
+		openStart := time.Now()
+		packetConn, cleanup, err, fromCache := h.openMCBEPacketConnWithCache(ctx, cfg, address, true)
+		openMs := time.Since(openStart).Milliseconds()
+		if err != nil {
+			logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v openMs=%d", cfg.Name, cfg.Type, err, openMs)
+			return UDPTestResult{Target: address, Success: false, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}, openMs, 0
+		}
+		defer cleanup()
+
+		logger.Debug("MCBE UDP test PacketConn type: node=%s type=%s packetConn=%T openMs=%d fromCache=%v", cfg.Name, cfg.Type, packetConn, openMs, fromCache)
+
+		pingStart := time.Now()
+		readBudget := 4 * time.Second
+		if fromCache {
+			readBudget = 1500 * time.Millisecond
+		}
+		result := performMCBEPing(ctx, packetConn, destAddr, readBudget)
+		pingMs := time.Since(pingStart).Milliseconds()
+		result.Target = address
+		return result, openMs, pingMs
+	}
+
+	// First attempt (inline, not via closure, so we can reuse the conn for
+	// warm ping on Hysteria2/AnyTLS).
+	openStart := time.Now()
+	packetConn, cleanup, err, fromCache := h.openMCBEPacketConnWithCache(ctx, cfg, address, false)
+	openMs := time.Since(openStart).Milliseconds()
+	if err != nil {
+		logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v openMs=%d", cfg.Name, cfg.Type, err, openMs)
+		return UDPTestResult{Target: address, Success: false, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}
+	}
+
+	logger.Debug("MCBE UDP test PacketConn type: node=%s type=%s packetConn=%T openMs=%d fromCache=%v", cfg.Name, cfg.Type, packetConn, openMs, fromCache)
+
+	pingStart := time.Now()
+	readBudget := 4 * time.Second
+	if fromCache {
+		readBudget = 1500 * time.Millisecond
+	}
+	result := performMCBEPing(ctx, packetConn, destAddr, readBudget)
+	pingMs := time.Since(pingStart).Milliseconds()
 	result.Target = address
+
 	if !result.Success {
-		logger.Debug("MCBE UDP test failed: node=%s type=%s target=%s latency=%dms err=%s", cfg.Name, cfg.Type, address, result.LatencyMs, result.Error)
+		cleanup()
+		logger.Debug("MCBE UDP test failed: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d err=%s", cfg.Name, cfg.Type, address, result.LatencyMs, pingMs, openMs, result.Error)
+
+		// Retry on read timeout: SOCKS5 UDP relay servers occasionally create
+		// a broken UDP ASSOCIATE where the TCP control connection succeeds but
+		// the UDP relay path doesn't forward packets. The dead conn is evicted
+		// by cleanup() above, so a fresh ASSOCIATE is created on retry. Only
+		// retry if we have enough budget left (need ~1s for a new ASSOCIATE +
+		// ping).
+		elapsed := time.Since(testStart)
+		if strings.Contains(result.Error, "i/o timeout") && elapsed < 8*time.Second {
+			// For SOCKS5, add a small delay before retry to let the previous
+			// ASSOCIATE's TCP control connection fully close. Without this,
+			// Clash and other SOCKS5 servers may assign a conflicting relay
+			// port or drop packets for the new association.
+			if cfg.Type == config.ProtocolSOCKS5 {
+				time.Sleep(200 * time.Millisecond)
+			}
+			logger.Info("MCBE UDP test retrying after timeout: node=%s type=%s target=%s firstAttemptMs=%d", cfg.Name, cfg.Type, address, elapsed.Milliseconds())
+			result2, openMs2, pingMs2 := mcbeAttempt()
+			if result2.Success {
+				logger.Debug("MCBE UDP test retry ok: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d totalMs=%d server=%s players=%s", cfg.Name, cfg.Type, address, result2.LatencyMs, pingMs2, openMs2, time.Since(testStart).Milliseconds(), result2.ServerName, result2.Players)
+				return result2
+			}
+			logger.Debug("MCBE UDP test retry also failed: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d err=%s", cfg.Name, cfg.Type, address, result2.LatencyMs, pingMs2, openMs2, result2.Error)
+
+			// Second retry for SOCKS5: the first retry may also get a broken
+			// ASSOCIATE. With the 200ms delay and a fresh outbound, the third
+			// attempt has a much higher success rate.
+			elapsed = time.Since(testStart)
+			if cfg.Type == config.ProtocolSOCKS5 && strings.Contains(result2.Error, "i/o timeout") && elapsed < 9*time.Second {
+				time.Sleep(300 * time.Millisecond)
+				logger.Info("MCBE UDP test second retry: node=%s type=%s target=%s elapsedMs=%d", cfg.Name, cfg.Type, address, elapsed.Milliseconds())
+				result3, openMs3, pingMs3 := mcbeAttempt()
+				if result3.Success {
+					logger.Debug("MCBE UDP test second retry ok: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d totalMs=%d server=%s players=%s", cfg.Name, cfg.Type, address, result3.LatencyMs, pingMs3, openMs3, time.Since(testStart).Milliseconds(), result3.ServerName, result3.Players)
+					return result3
+				}
+				logger.Debug("MCBE UDP test second retry also failed: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d err=%s", cfg.Name, cfg.Type, address, result3.LatencyMs, pingMs3, openMs3, result3.Error)
+				return result3
+			}
+			return result2
+		}
 		return result
 	}
-	logger.Debug("MCBE UDP test ok: node=%s type=%s target=%s latency=%dms server=%s players=%s", cfg.Name, cfg.Type, address, result.LatencyMs, result.ServerName, result.Players)
+	defer cleanup()
+
+	logger.Debug("MCBE UDP test ok: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d totalMs=%d server=%s players=%s", cfg.Name, cfg.Type, address, result.LatencyMs, pingMs, openMs, time.Since(testStart).Milliseconds(), result.ServerName, result.Players)
 
 	if shouldMeasureWarmUDPTestLatency(cfg) {
 		warmCtx, warmCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer warmCancel()
-		warmResult := performMCBEPing(warmCtx, packetConn, destAddr)
+		warmResult := performMCBEPing(warmCtx, packetConn, destAddr, 2*time.Second)
 		if warmResult.Success {
 			logger.Debug("MCBE UDP warm latency node=%s type=%s target=%s cold=%d warm=%d", cfg.Name, cfg.Type, address, result.LatencyMs, warmResult.LatencyMs)
 			warmResult.Target = address

@@ -4281,6 +4281,7 @@ const columns = [
     'onUpdate:value': (val) => toggleServerVisible(r, val)
   }) },
   { title: '在线', key: 'active_sessions', width: 45 },
+  { title: '链路', key: 'active_proxy_clients', width: 45 },
   { title: '延迟', key: 'latency', width: 150, render: r => renderServerLatencyCell(r) },
   { title: '历史趋势', key: 'latency_history', width: 170, render: r => renderServerLatencyHistoryCell(r) },
   { title: '操作', key: 'actions', width: 260, fixed: 'right', render: r => {

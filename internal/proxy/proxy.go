@@ -600,6 +600,7 @@ func (p *ProxyServer) Start() error {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic("session-gc")
 		// Track this goroutine as a background task (expected to run for app lifetime)
 		gm := monitor.GetGoroutineManager()
 		gid := gm.TrackBackground("session-gc", "proxy-server", "Session garbage collector", p.cancel)
@@ -692,6 +693,7 @@ func (p *ProxyServer) startAutoPingScheduler() {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic("auto-ping")
 
 		gm := monitor.GetGoroutineManager()
 		gid := gm.TrackBackground("auto-ping", "proxy-server", "Auto ping scheduler", p.cancel)
@@ -835,6 +837,7 @@ func (p *ProxyServer) startTopologyRefreshWorker() {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic("topology-refresh")
 
 		gm := monitor.GetGoroutineManager()
 		gid := gm.TrackBackground("topology-refresh", "proxy-server", "Topology refresh worker", p.cancel)
@@ -2147,6 +2150,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer logger.CapturePanic("listener-" + serverCfg.ID)
 		if err := listener.Listen(p.ctx); err != nil && err != context.Canceled {
 			logger.Error("Listener for server %s stopped with error: %v", serverCfg.ID, err)
 		}
@@ -2650,6 +2654,20 @@ func (p *ProxyServer) GetServerStatus(serverID string) string {
 	return "stopped"
 }
 
+// GetActiveProxyClientsForServer returns per-client upstream UDP link count.
+func (p *ProxyServer) GetActiveProxyClientsForServer(serverID string) int {
+	p.listenersMu.RLock()
+	listener, ok := p.listeners[serverID]
+	p.listenersMu.RUnlock()
+	if !ok {
+		return 0
+	}
+	if counter, ok := listener.(interface{ GetActiveClientCount() int }); ok {
+		return counter.GetActiveClientCount()
+	}
+	return 0
+}
+
 // GetAllServerStatuses returns status information for all configured servers.
 func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 	servers := p.configMgr.GetAllServers()
@@ -2667,6 +2685,7 @@ func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 		status := p.GetServerStatus(server.ID)
 		activeSessions := sessionCounts[server.ID]
 		dto := server.ToDTO(status, activeSessions)
+		dto.ActiveProxyClients = p.GetActiveProxyClientsForServer(server.ID)
 		dto.AutoPingIntervalMinutes = p.effectiveServerAutoPingIntervalMinutes(server)
 		dto.AutoPingTopCandidates = p.effectiveServerAutoPingTopCandidates(server)
 		dto.LastAutoPingAt, dto.NextAutoPingAt = p.getServerAutoPingSchedule(server, status, now)

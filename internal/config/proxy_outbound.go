@@ -20,6 +20,7 @@ const (
 	ProtocolHTTP        = "http"
 	ProtocolHysteria2   = "hysteria2"
 	ProtocolAnyTLS      = "anytls"
+	ProtocolChain       = "chain"
 )
 
 // Supported Shadowsocks encryption methods
@@ -144,6 +145,9 @@ func (p *ProxyOutbound) Validate() error {
 	// Chain proxy nodes are containers — their own Server/Port are not used.
 	// Skip protocol-specific validation for chain proxies.
 	if p.IsChainProxy() {
+		if p.Type == ProtocolChain && len(p.Chain) == 0 {
+			return errors.New("missing required field: chain (at least one hop required for chain type)")
+		}
 		return nil
 	}
 
@@ -173,7 +177,7 @@ func (p *ProxyOutbound) Validate() error {
 	case ProtocolAnyTLS:
 		return p.validateAnyTLS()
 	default:
-		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, socks5, http, hysteria2, anytls, got %s", p.Type)
+		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, socks5, http, hysteria2, anytls, chain, got %s", p.Type)
 	}
 }
 
@@ -653,7 +657,7 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 func (p *ProxyOutbound) IsChainProxy() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return len(p.Chain) > 0
+	return p.Type == ProtocolChain || len(p.Chain) > 0
 }
 
 // GetChain returns a copy of the chain proxy list.

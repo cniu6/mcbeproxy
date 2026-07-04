@@ -1241,7 +1241,7 @@ func TestShouldReuseCachedUDPTestOutbound(t *testing.T) {
 		{name: "trojan not cached", cfg: &config.ProxyOutbound{Type: config.ProtocolTrojan}, want: false},
 		{name: "vmess not cached", cfg: &config.ProxyOutbound{Type: config.ProtocolVMess}, want: false},
 		{name: "shadowsocks not cached", cfg: &config.ProxyOutbound{Type: config.ProtocolShadowsocks}, want: false},
-		{name: "socks5 cached", cfg: &config.ProxyOutbound{Type: config.ProtocolSOCKS5}, want: true},
+		{name: "socks5 not cached", cfg: &config.ProxyOutbound{Type: config.ProtocolSOCKS5}, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

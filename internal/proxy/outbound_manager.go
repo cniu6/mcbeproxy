@@ -1817,6 +1817,7 @@ func (m *outboundManagerImpl) Start() error {
 // cleanupIdleOutbounds periodically closes singbox outbounds that haven't been used recently.
 // This helps release TLS connections and other resources for unused proxy nodes.
 func (m *outboundManagerImpl) cleanupIdleOutbounds() {
+	defer logger.CapturePanic("cleanupIdleOutbounds")
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 

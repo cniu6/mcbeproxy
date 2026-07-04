@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -21,7 +22,8 @@ import (
 // This allows using a SingboxDialer as the underlying dialer for another
 // SingboxDialer/SingboxOutbound, enabling proxy chaining.
 type chainNxDialer struct {
-	tcpDialer singboxcore.Dialer // wraps the previous proxy in the chain
+	tcpDialer   singboxcore.Dialer   // wraps the previous proxy in the chain
+	udpOutbound *SingboxOutbound     // previous hop's outbound for UDP relay tunneling
 }
 
 func (d *chainNxDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -33,15 +35,27 @@ func (d *chainNxDialer) DialContext(ctx context.Context, network string, destina
 	return conn, nil
 }
 
-// ListenPacket is required by N.Dialer but chain dialers only support TCP
-// (the UDP path is handled separately via chainUDPOutbound).
+// ListenPacket is required by N.Dialer. For chain dialers, we delegate to
+// the previous hop's SingboxOutbound to tunnel UDP datagrams through the chain.
+// This is critical for SOCKS5 UDP ASSOCIATE: the relay address returned by the
+// SOCKS5 server is only reachable through the chain, not directly.
 func (d *chainNxDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, fmt.Errorf("chain dialer does not support ListenPacket; use chainUDPOutbound instead")
+	if d.udpOutbound != nil {
+		return d.udpOutbound.ListenPacket(ctx, destination.String())
+	}
+	return nil, fmt.Errorf("chain dialer does not support ListenPacket; no UDP outbound available")
 }
 
 // Close is not part of N.Dialer but is needed for resource cleanup.
 func (d *chainNxDialer) Close() error {
 	return d.tcpDialer.Close()
+}
+
+// chainPrevHop holds both the dialer and outbound of a chain hop so that
+// chainNxDialer can tunnel both TCP and UDP through the previous hop.
+type chainPrevHop struct {
+	dialer   *SingboxDialer
+	outbound *SingboxOutbound
 }
 
 var _ N.Dialer = (*chainNxDialer)(nil)
@@ -100,11 +114,12 @@ func chainSingboxOutbound(cfg *config.ProxyOutbound, prevDialer N.Dialer) (*Sing
 // chainDialer implements singboxcore.Dialer for a chain of proxy outbounds.
 // It dials through each proxy in order, then to the final destination.
 type chainDialer struct {
-	hops     []*config.ProxyOutbound // ordered list of proxy configs (chain[0]..chain[n-1], then the node itself)
-	dialers  []*chainNxDialer        // underlying dialers for each hop (for cleanup)
-	final    *SingboxDialer          // the last hop's SingboxDialer (used for DialContext)
-	closed   bool
-	mu       sync.Mutex
+	hops         []*config.ProxyOutbound // ordered list of proxy configs (chain[0]..chain[n-1], then the node itself)
+	dialers      []*chainNxDialer        // underlying dialers for each hop (for cleanup)
+	final        *SingboxDialer          // the last hop's SingboxDialer (used for DialContext)
+	allOutbounds []*SingboxOutbound      // all hop outbounds for resource cleanup (anytls/hy2 goroutines)
+	closed       bool
+	mu           sync.Mutex
 }
 
 // CreateChainDialer creates a TCP dialer that routes through a chain of proxies.
@@ -118,6 +133,7 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 	// Build the chain: each hop's dialer uses the previous hop's dialer as its underlying
 	var prevDialer N.Dialer = &directDialer{timeout: 30 * time.Second}
 	nxDialers := make([]*chainNxDialer, 0, len(chainConfigs))
+	allOutbounds := make([]*SingboxOutbound, 0, len(chainConfigs))
 	var finalSingboxDialer *SingboxDialer
 
 	for i, cfg := range chainConfigs {
@@ -130,8 +146,15 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 			return nil, fmt.Errorf("chain: failed to create dialer for hop %d (%s): %w", i, cfg.Name, err)
 		}
 
+		// Create outbound for this hop (needed for UDP tunneling via ListenPacket)
+		outbound, err := chainSingboxOutbound(cfg, prevDialer)
+		if err != nil {
+			return nil, fmt.Errorf("chain: failed to create outbound for hop %d (%s): %w", i, cfg.Name, err)
+		}
+		allOutbounds = append(allOutbounds, outbound)
+
 		// Wrap the SingboxDialer as an N.Dialer for the next hop
-		nxD := &chainNxDialer{tcpDialer: sd}
+		nxD := &chainNxDialer{tcpDialer: sd, udpOutbound: outbound}
 		nxDialers = append(nxDialers, nxD)
 		prevDialer = nxD
 
@@ -145,9 +168,10 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 	}
 
 	return &chainDialer{
-		hops:    chainConfigs,
-		dialers: nxDialers,
-		final:   finalSingboxDialer,
+		hops:         chainConfigs,
+		dialers:      nxDialers,
+		final:        finalSingboxDialer,
+		allOutbounds: allOutbounds,
 	}, nil
 }
 
@@ -174,6 +198,11 @@ func (d *chainDialer) Close() error {
 			lastErr = err
 		}
 	}
+	// Close all hop outbounds to release anytls/hy2 background goroutines.
+	// SingboxOutbound.Close() is safe to call multiple times (sets clients to nil).
+	for _, ob := range d.allOutbounds {
+		ob.Close()
+	}
 	return lastErr
 }
 
@@ -188,10 +217,11 @@ var _ singboxcore.Dialer = (*chainDialer)(nil)
 // completed PacketConns are cached by destination and reused. A background
 // goroutine closes idle entries after 2 minutes.
 type chainUDPOutbound struct {
-	hops     []*config.ProxyOutbound
-	outbound *SingboxOutbound // the last hop's outbound (with chained dialer)
-	closed   bool
-	mu       sync.Mutex
+	hops         []*config.ProxyOutbound
+	outbound     *SingboxOutbound   // the last hop's outbound (with chained dialer)
+	allOutbounds []*SingboxOutbound // all hop outbounds for resource cleanup (anytls/hy2 goroutines)
+	closed       bool
+	mu           sync.Mutex
 
 	// UDP connection cache
 	cacheMu    sync.Mutex
@@ -206,11 +236,32 @@ type chainUDPOutbound struct {
 type cachedChainConn struct {
 	pc          net.PacketConn
 	dest        string
-	lastUsed    time.Time
+	lastUsed    atomic.Int64 // unix nano — updated lock-free in hot path
+	createdAt   time.Time // for max lifetime enforcement
+	maxLifetime time.Duration // with jitter applied per-conn
 	mu          sync.Mutex
 	activeUsers int32 // atomic: number of chainConnWrappers currently using this conn
 	hadTimeout  int32 // atomic: set when a read/write timeout occurred — conn may be stale
 	reuseCount  int32 // atomic: number of times this cached conn has been reused via ListenPacket
+	releaseCh   chan struct{} // closed when activeUsers drops to 0 — wakes waiters instantly
+}
+
+// maxLifetimeForProto returns the max lifetime for a cached UDP conn based on
+// the last hop protocol. SOCKS5 UDP relay sessions can silently degrade after
+// several minutes (server-side mapping rotation, NAT changes, etc.), so we
+// force a refresh after ~5 minutes. Other protocols (Hysteria2, AnyTLS, etc.)
+// maintain healthier long-lived sessions, so we allow ~10 minutes.
+// A ±10% jitter is applied per-conn to prevent thundering-herd reconnections
+// when multiple dests are accessed simultaneously.
+func maxLifetimeForProto(isSocks5 bool) time.Duration {
+	base := 10 * time.Minute
+	if isSocks5 {
+		base = 5 * time.Minute
+	}
+	// ±10% jitter: 90%-110% of base
+	jitterRange := int64(float64(base) * 0.1)
+	jitter := time.Duration(rand.Int63n(2*jitterRange) - jitterRange)
+	return base + jitter
 }
 
 // chainConnWrapper is returned to callers of ListenPacket. It forwards
@@ -248,9 +299,7 @@ func (w *chainConnWrapper) evictOnFatalError(err error) {
 		}
 		// No active users — check if the conn has been idle long enough
 		// to be considered dead (TCP control link silently dropped).
-		w.cached.mu.Lock()
-		idle := time.Since(w.cached.lastUsed)
-		w.cached.mu.Unlock()
+		idle := time.Since(time.Unix(0, w.cached.lastUsed.Load()))
 		if idle < 60*time.Second {
 			return
 		}
@@ -278,10 +327,9 @@ func (w *chainConnWrapper) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		w.evictOnFatalError(err)
 	} else {
-		atomic.StoreInt32(&w.cached.hadTimeout, 0) // clear: conn is healthy
-		w.cached.mu.Lock()
-		w.cached.lastUsed = time.Now()
-		w.cached.mu.Unlock()
+		atomic.StoreInt32(&w.cached.hadTimeout, 0)
+		atomic.StoreInt32(&w.cached.reuseCount, 0)
+		w.cached.lastUsed.Store(time.Now().UnixNano())
 	}
 	return n, addr, err
 }
@@ -291,10 +339,8 @@ func (w *chainConnWrapper) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		w.evictOnFatalError(err)
 	} else {
-		atomic.StoreInt32(&w.cached.hadTimeout, 0) // clear: conn is healthy
-		w.cached.mu.Lock()
-		w.cached.lastUsed = time.Now()
-		w.cached.mu.Unlock()
+		atomic.StoreInt32(&w.cached.hadTimeout, 0)
+		w.cached.lastUsed.Store(time.Now().UnixNano())
 	}
 	return n, err
 }
@@ -309,7 +355,16 @@ func (w *chainConnWrapper) Close() error {
 	// Decrement active user count first
 	remaining := atomic.AddInt32(&w.cached.activeUsers, -1)
 	if remaining <= 0 {
-		// No more active users. Check if this conn is still the cached one.
+		// No more active users. Signal any goroutine waiting in ListenPacket
+		// that this conn is now available for reuse.
+		w.cached.mu.Lock()
+		if w.cached.releaseCh != nil {
+			close(w.cached.releaseCh)
+			w.cached.releaseCh = nil
+		}
+		w.cached.mu.Unlock()
+
+		// Check if this conn is still the cached one.
 		w.parent.cacheMu.Lock()
 		if cached, ok := w.parent.cache[w.dest]; !ok || cached != w.cached {
 			// This conn is no longer in the cache (was replaced by a newer
@@ -350,6 +405,7 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	// Build the chain: each hop's dialer uses the previous hop's dialer
 	var prevDialer N.Dialer = &directDialer{timeout: 30 * time.Second}
 	var finalOutbound *SingboxOutbound
+	allOutbounds := make([]*SingboxOutbound, 0, len(chainConfigs))
 
 	for i, cfg := range chainConfigs {
 		if cfg == nil {
@@ -360,13 +416,14 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 		if err != nil {
 			return nil, fmt.Errorf("chain: failed to create outbound for hop %d (%s): %w", i, cfg.Name, err)
 		}
+		allOutbounds = append(allOutbounds, outbound)
 
 		// Create a SingboxDialer for this hop to use as the next hop's underlying dialer
 		sd, err := chainSingboxDialer(cfg, prevDialer)
 		if err != nil {
 			return nil, fmt.Errorf("chain: failed to create dialer for hop %d (%s): %w", i, cfg.Name, err)
 		}
-		nxD := &chainNxDialer{tcpDialer: sd}
+		nxD := &chainNxDialer{tcpDialer: sd, udpOutbound: outbound}
 		prevDialer = nxD
 
 		if i == len(chainConfigs)-1 {
@@ -379,10 +436,11 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	}
 
 	return &chainUDPOutbound{
-		hops:      chainConfigs,
-		outbound:  finalOutbound,
-		cache:     make(map[string]*cachedChainConn),
-		cacheStop: make(chan struct{}),
+		hops:         chainConfigs,
+		outbound:     finalOutbound,
+		allOutbounds: allOutbounds,
+		cache:        make(map[string]*cachedChainConn),
+		cacheStop:    make(chan struct{}),
 	}, nil
 }
 
@@ -409,7 +467,11 @@ func drainUDPBuffer(pc net.PacketConn) {
 func isConnAlive(pc net.PacketConn) bool {
 	// Check SOCKS5-specific liveness flag
 	if s5, ok := pc.(*socks5UDPPacketConn); ok {
-		return !s5.IsRemoteClosed()
+		if s5.IsRemoteClosed() {
+			return false
+		}
+		// Reconnecting means the conn is being rebuilt — still alive.
+		return true
 	}
 	// For other protocols, try a zero-length read with immediate deadline.
 	// A timeout means the conn is alive; a non-timeout error means it's dead.
@@ -465,17 +527,23 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	// finish) before falling back to creating a new connection.
 	waitTimeout := 5 * time.Second
 	if isSocks5LastHop {
-		waitTimeout = 3 * time.Second
+		waitTimeout = 2 * time.Second
 	}
 	waitDeadline := time.Now().Add(waitTimeout)
 
-	// SOCKS5 UDP relay servers (especially Xray/V2Ray-based VPS) may stop
-	// forwarding UDP after a certain number of reuses on the same association.
-	// Force a fresh ASSOCIATE after maxReuseCount reuses to avoid stale relays.
+	// maxReuseCount is now unlimited (0). We rely on three mechanisms to
+	// detect and evict dead SOCKS5 UDP relay connections:
+	//  1. IsRemoteClosed() — checks if the TCP control connection was closed
+	//     by the remote server (called before reuse in the cache lookup below).
+	//  2. hadTimeout flag — set when a ReadFrom/WriteTo times out, causing
+	//     immediate eviction on Close() and before next reuse.
+	//  3. UDP keepalive (every 15s) — keeps the server-side UDP mapping alive
+	//     on healthy connections, preventing idle-timeout drops.
+	// Additionally, testMCBEServer has a retry-on-timeout fallback that creates
+	// a fresh ASSOCIATE if the cached one turns out to be dead.
+	// Previously maxReuseCount=3 forced a new ASSOCIATE every 4th request,
+	// causing 400-800ms latency spikes and ~5% broken-ASSOCIATE failures.
 	maxReuseCount := int32(0) // 0 = unlimited
-	if isSocks5LastHop {
-		maxReuseCount = 3
-	}
 
 	for {
 		cached, ok := c.cache[cacheKey]
@@ -483,7 +551,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 			break // no cached conn — create new one
 		}
 		if atomic.LoadInt32(&cached.activeUsers) > 0 {
-			// Conn is busy — wait for it to be released.
+			// Conn is busy — wait for it to be released via channel signal.
 			// UDP sockets are not shareable: concurrent ReadFrom callers
 			// would steal each other's datagrams. So we wait for the
 			// active user to finish (e.g. a quick ping test) before reusing.
@@ -491,25 +559,40 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 				// Wait timed out — the active user is likely a long-lived
 				// game client, not a stuck ping. Create a new ASSOCIATE;
 				// the old conn stays alive for the active user.
-				//
-				// Per RFC 1928 §7, each UDP ASSOCIATE is independent (tied
-				// to its own TCP control connection). Our VPS shared-relay
-				// model tracks upstreams by client IP:Port, so concurrent
-				// ASSOCIATEs from the same IP to the same dest each get
-				// their own upstream — responses are routed correctly.
 				logger.Debug("ChainUDPOutbound: cached conn for %s still busy after %s wait, creating new conn (old conn preserved for active user)", cacheKey, waitTimeout)
 				break
 			}
+			// Channel-based wait: releaseCh is closed when activeUsers
+			// drops to 0, waking us instantly. This replaces the old
+			// 10ms busy-wait polling and reduces wake latency from
+			// ~5ms avg to ~0.01ms.
+			cached.mu.Lock()
+			ch := cached.releaseCh
+			if ch == nil {
+				ch = make(chan struct{})
+				cached.releaseCh = ch
+			}
+			cached.mu.Unlock()
+			remaining := time.Until(waitDeadline)
+			if remaining <= 0 {
+				break
+			}
 			c.cacheMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			c.cacheMu.Lock()
-			continue
+			select {
+			case <-ch:
+				// Conn was released — re-acquire lock and re-check.
+				c.cacheMu.Lock()
+				continue
+			case <-time.After(remaining):
+				// Wait timed out.
+				c.cacheMu.Lock()
+				continue
+			}
 		}
 
 		// Conn is available — check if it's still usable
-		cached.mu.Lock()
-		idle := time.Since(cached.lastUsed)
-		cached.mu.Unlock()
+		idle := time.Since(time.Unix(0, cached.lastUsed.Load()))
+		age := time.Since(cached.createdAt)
 		if !isConnAlive(cached.pc) {
 			cached.pc.Close()
 			delete(c.cache, cacheKey)
@@ -519,6 +602,11 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 			cached.pc.Close()
 			delete(c.cache, cacheKey)
 			logger.Debug("ChainUDPOutbound: evicted stale cached conn for %s (idle %s > %s) before reuse", cacheKey, idle, maxIdleReuse)
+			break // create new conn
+		} else if cached.maxLifetime > 0 && age > cached.maxLifetime {
+			cached.pc.Close()
+			delete(c.cache, cacheKey)
+			logger.Debug("ChainUDPOutbound: evicted expired cached conn for %s (age %s > maxLifetime %s) before reuse", cacheKey, age, cached.maxLifetime)
 			break // create new conn
 		} else if atomic.LoadInt32(&cached.hadTimeout) != 0 {
 			cached.pc.Close()
@@ -533,28 +621,47 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		} else {
 			atomic.AddInt32(&cached.activeUsers, 1)
 			atomic.AddInt32(&cached.reuseCount, 1)
+			reuseCount := atomic.LoadInt32(&cached.reuseCount)
+			// Create a fresh releaseCh for the next potential waiter.
+			cached.mu.Lock()
+			cached.releaseCh = make(chan struct{})
+			cached.mu.Unlock()
 			c.cacheMu.Unlock()
 			_ = cached.pc.SetDeadline(time.Time{})
-			drainUDPBuffer(cached.pc)
-			logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain", destination, cacheKey, len(c.hops))
+			// Only drain stale packets if the conn has been idle long
+			// enough for a previous user's unread response to be sitting
+			// in the socket buffer. 200ms is enough for a round-trip pong
+			// to arrive after the previous user closed without reading.
+			// The 1ms drain cost is negligible compared to the 100ms+
+			// ping round-trip, so we always drain if idle > 200ms.
+			if idle > 200*time.Millisecond {
+				drainUDPBuffer(cached.pc)
+			}
+			idleDur := time.Since(time.Unix(0, cached.lastUsed.Load()))
+			logger.Debug("ChainUDPOutbound: reusing cached UDP conn for %s (key=%s) via %d-hop chain reuseCount=%d idleMs=%d ageMs=%d", destination, cacheKey, len(c.hops), reuseCount, idleDur.Milliseconds(), age.Milliseconds())
 			return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 		}
 	}
 
 	c.cacheMu.Unlock()
 
+	establishStart := time.Now()
 	logger.Debug("ChainUDPOutbound: establishing UDP to %s via %d-hop chain", destination, len(c.hops))
 	conn, err := c.outbound.ListenPacket(ctx, destination)
+	establishMs := time.Since(establishStart).Milliseconds()
 	if err != nil {
 		return nil, fmt.Errorf("chain UDP outbound failed: %w", err)
 	}
-	logger.Debug("ChainUDPOutbound: UDP connection established to %s via chain", destination)
+	logger.Debug("ChainUDPOutbound: UDP connection established to %s via chain establishMs=%d", destination, establishMs)
 
 	cached := &cachedChainConn{
-		pc:       conn,
-		dest:     cacheKey,
-		lastUsed: time.Now(),
+		pc:          conn,
+		dest:        cacheKey,
+		createdAt:   time.Now(),
+		maxLifetime: maxLifetimeForProto(isSocks5LastHop),
+		releaseCh:   make(chan struct{}),
 	}
+	cached.lastUsed.Store(time.Now().UnixNano())
 
 	// Cache this new conn. If the old cached conn is still in use by someone
 	// else, it will be closed when its last user calls Close() (since it's
@@ -634,15 +741,20 @@ func normalizeCacheKey(destination string) string {
 	return net.JoinHostPort(ipStr, port)
 }
 
-// idleSweeper periodically closes cached UDP connections that have been idle
-// for more than 120 seconds AND have no active users. Connections with active
-// users (e.g. a player connected through the chain proxy) are never closed,
-// even if traffic is momentarily idle. The 120s timeout is chosen to be longer
-// than the 60s ping interval so periodic pings can reuse cached connections.
-// Dead connections are detected by TCP keepalive (~30s) or evictOnFatalError,
-// not by the idle sweeper.
+// idleSweeper is a proactive background health checker that runs every 15
+// seconds. It performs three critical functions:
+//  1. Evicts idle conns past their max idle reuse time (120s) — these are
+//     likely dead since the SOCKS5 relay has dropped the UDP mapping.
+//  2. Health-checks idle conns via isConnAlive — detects silently dropped
+//     TCP control connections before a user tries to reuse them.
+//  3. Enforces max lifetime — prevents using degraded relay sessions that
+//     pass isConnAlive but have stale server-side state.
+//
+// Conns with active users (real players) are never forcibly closed — the
+// player's RakNet keepalive and our UDP keepalive (15s) keep the session
+// alive, and evictOnFatalError handles dead conns.
 func (c *chainUDPOutbound) idleSweeper() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -653,15 +765,38 @@ func (c *chainUDPOutbound) idleSweeper() {
 			now := time.Now()
 			for dest, cached := range c.cache {
 				if atomic.LoadInt32(&cached.activeUsers) > 0 {
+					// Active user — don't evict. But check if the SOCKS5
+					// TCP control connection was silently dropped by the
+					// remote server. If so, mark hadTimeout so the conn
+					// is evicted when the user closes it.
+					if s5, ok := cached.pc.(*socks5UDPPacketConn); ok && s5.IsRemoteClosed() {
+						atomic.StoreInt32(&cached.hadTimeout, 1)
+						logger.Debug("ChainUDPOutbound: marked active cached conn for %s as dead (SOCKS5 remote closed)", dest)
+					}
 					continue
 				}
-				cached.mu.Lock()
-				idle := now.Sub(cached.lastUsed)
-				cached.mu.Unlock()
+				idle := now.Sub(time.Unix(0, cached.lastUsed.Load()))
+				age := now.Sub(cached.createdAt)
+				// 1. Idle timeout
 				if idle > 120*time.Second {
 					cached.pc.Close()
 					delete(c.cache, dest)
 					logger.Debug("ChainUDPOutbound: closed idle cached UDP conn for %s (idle %s)", dest, idle)
+					continue
+				}
+				// 2. Health check — detect dead conns proactively
+				if !isConnAlive(cached.pc) {
+					cached.pc.Close()
+					delete(c.cache, dest)
+					logger.Debug("ChainUDPOutbound: health-checked and evicted dead cached conn for %s (idle %s)", dest, idle)
+					continue
+				}
+				// 3. Max lifetime — force refresh of old conns
+				if cached.maxLifetime > 0 && age > cached.maxLifetime {
+					cached.pc.Close()
+					delete(c.cache, dest)
+					logger.Debug("ChainUDPOutbound: evicted expired cached conn for %s (age %s > maxLifetime %s)", dest, age, cached.maxLifetime)
+					continue
 				}
 			}
 			c.cacheMu.Unlock()
@@ -686,7 +821,12 @@ func (c *chainUDPOutbound) Close() error {
 	}
 	c.cacheMu.Unlock()
 
-	return c.outbound.Close()
+	// Close all hop outbounds to release anytls/hy2 background goroutines.
+	// SingboxOutbound.Close() is safe to call multiple times (sets clients to nil).
+	for _, ob := range c.allOutbounds {
+		ob.Close()
+	}
+	return nil
 }
 
 var _ singboxcore.UDPOutbound = (*chainUDPOutbound)(nil)

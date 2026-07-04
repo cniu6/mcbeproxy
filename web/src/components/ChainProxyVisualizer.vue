@@ -19,8 +19,17 @@
             {{ chainNodes.length }} 跳
           </n-tag>
           <n-tag v-else type="default" size="small" :bordered="false">无链式</n-tag>
+          <n-tag v-if="totalChainLatency > 0" type="info" size="small" :bordered="false">
+            预估总延迟 ~{{ totalChainLatency }}ms
+          </n-tag>
         </n-space>
         <n-space :size="8">
+          <n-button size="small" type="info" secondary @click="testAllHops" :loading="hopTesting" :disabled="chainNodes.length === 0">
+            测试每跳
+          </n-button>
+          <n-button size="small" type="success" secondary @click="testChainUDP" :loading="udpTesting" :disabled="chainNodes.length === 0 || !editingName">
+            测试链路到目标
+          </n-button>
           <n-button size="small" quaternary @click="clearChain" :disabled="chainNodes.length === 0">
             清空
           </n-button>
@@ -55,6 +64,10 @@
               <div class="pool-node-info">
                 <div class="pool-node-name">{{ node.name }}</div>
                 <div class="pool-node-meta">{{ node.type.toUpperCase() }} · {{ node.server }}:{{ node.port }}</div>
+              </div>
+              <div class="pool-node-latency" v-if="node.tcp_latency_ms > 0 || node.udp_latency_ms > 0">
+                <n-tag v-if="node.tcp_latency_ms > 0" size="tiny" :bordered="false" :type="getLatencyTagType(node.tcp_latency_ms)">TCP {{ node.tcp_latency_ms }}ms</n-tag>
+                <n-tag v-if="node.udp_latency_ms > 0" size="tiny" :bordered="false" type="success">UDP {{ node.udp_latency_ms }}ms</n-tag>
               </div>
               <n-tag v-if="node.chain && node.chain.length > 0" type="success" size="tiny" :bordered="false" class="pool-node-chain-badge">链式{{ node.chain.length }}跳</n-tag>
               <div v-if="isInChain(node.name)" class="pool-node-badge">已添加</div>
@@ -101,6 +114,14 @@
                 <div class="chain-node-name">{{ node.name }}</div>
                 <div class="chain-node-meta">{{ node.type.toUpperCase() }} · {{ node.server }}:{{ node.port }}</div>
               </div>
+              <div class="chain-node-latency">
+                <n-tag v-if="hopTestResults[node.name]?.testing" size="tiny" :bordered="false" type="info">测试中...</n-tag>
+                <template v-else-if="hopTestResults[node.name]">
+                  <n-tag v-if="hopTestResults[node.name].success" size="tiny" :bordered="false" :type="getLatencyTagType(hopTestResults[node.name].latency_ms)">TCP {{ hopTestResults[node.name].latency_ms }}ms</n-tag>
+                  <n-tag v-else size="tiny" :bordered="false" type="error">失败</n-tag>
+                </template>
+                <n-tag v-else-if="node.tcp_latency_ms > 0" size="tiny" :bordered="false" :type="getLatencyTagType(node.tcp_latency_ms)">TCP {{ node.tcp_latency_ms }}ms</n-tag>
+              </div>
               <div class="chain-node-actions">
                 <n-button size="tiny" quaternary circle @click.stop="moveNode(idx, -1)" :disabled="idx === 0">
                   <n-icon><ArrowUpIcon /></n-icon>
@@ -108,9 +129,32 @@
                 <n-button size="tiny" quaternary circle @click.stop="moveNode(idx, 1)" :disabled="idx === chainNodes.length - 1">
                   <n-icon><ArrowDownIcon /></n-icon>
                 </n-button>
-                <n-button size="tiny" quaternery circle type="error" @click.stop="removeNode(idx)">
+                <n-button size="tiny" quaternary circle type="error" @click.stop="removeNode(idx)">
                   <n-icon><TrashIcon /></n-icon>
                 </n-button>
+              </div>
+            </div>
+
+            <!-- Arrow to final node -->
+            <div class="chain-arrow">
+              <svg width="24" height="40" viewBox="0 0 24 40">
+                <path d="M12 0 L12 30 M6 24 L12 32 L18 24" stroke="var(--n-text-color-3)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </div>
+
+            <!-- Final exit node -->
+            <div class="chain-final-node-card">
+              <div class="chain-node-order final">★</div>
+              <div class="chain-node-icon" :style="{ background: getProtocolColor(finalNodeType) }">
+                {{ getProtocolIcon(finalNodeType) }}
+              </div>
+              <div class="chain-node-info">
+                <div class="chain-node-name">{{ finalNodeName || '(未命名)' }}</div>
+                <div class="chain-node-meta">{{ finalNodeType.toUpperCase() }} · {{ finalNodeServer || '?' }}:{{ finalNodePort || '?' }}</div>
+              </div>
+              <div class="chain-node-latency" v-if="udpTestResult">
+                <n-tag v-if="udpTestResult.success" size="tiny" :bordered="false" type="success">UDP {{ udpTestResult.latency_ms }}ms</n-tag>
+                <n-tag v-else size="tiny" :bordered="false" type="error">UDP 失败</n-tag>
               </div>
             </div>
 
@@ -127,6 +171,9 @@
                 <n-icon size="20"><TargetIcon /></n-icon>
               </div>
               <span>目标服务器</span>
+              <n-tag v-if="udpTestResult" size="tiny" :bordered="false" :type="udpTestResult.success ? 'success' : 'error'" style="margin-left: 6px">
+                {{ udpTestResult.success ? `${udpTestResult.latency_ms}ms` : '失败' }}
+              </n-tag>
             </div>
           </div>
 
@@ -156,6 +203,8 @@
             <span class="flow-node" :style="{ borderColor: getProtocolColor(node.type) }">{{ node.name }}</span>
             <span class="flow-arrow">→</span>
           </template>
+          <span class="flow-final">{{ finalNodeName || '(出口)' }}</span>
+          <span class="flow-arrow">→</span>
           <span class="flow-target">目标</span>
         </div>
       </div>
@@ -177,6 +226,7 @@ import { ref, computed, watch, h } from 'vue'
 import {
   NModal, NButton, NSpace, NTag, NInput, NIcon,
 } from 'naive-ui'
+import { api } from '../api'
 
 // Icons - using inline SVG paths to avoid extra deps
 const LinkIcon = {
@@ -237,6 +287,7 @@ const props = defineProps({
   finalNodeType: { type: String, default: 'socks5' },
   finalNodeServer: { type: String, default: '' },
   finalNodePort: { type: [Number, String], default: 0 },
+  editingName: { type: String, default: '' },
 })
 
 const emit = defineEmits(['update:show', 'save'])
@@ -248,6 +299,12 @@ const dropTargetIndex = ref(-1)
 const isDraggingFromPool = ref(false)
 const draggedPoolNode = ref(null)
 
+// Test state
+const hopTesting = ref(false)
+const udpTesting = ref(false)
+const hopTestResults = ref({}) // { [name]: { success, latency_ms, testing } }
+const udpTestResult = ref(null) // { success, latency_ms, server_name, players }
+
 // Reset chain when modal opens
 watch(() => props.show, (val) => {
   if (val) {
@@ -255,6 +312,8 @@ watch(() => props.show, (val) => {
     draggingIndex.value = -1
     dropTargetIndex.value = -1
     isDraggingFromPool.value = false
+    hopTestResults.value = {}
+    udpTestResult.value = null
     // Build chain nodes from initial chain names
     chainNodes.value = (props.initialChain || []).map(name => {
       const found = props.poolNodes.find(n => n.name === name)
@@ -375,6 +434,72 @@ function resetDragState() {
 function saveChain() {
   emit('save', chainNodes.value.map(n => n.name))
   emit('update:show', false)
+}
+
+// Estimated total chain latency (sum of hop TCP latencies)
+const totalChainLatency = computed(() => {
+  let total = 0
+  for (const node of chainNodes.value) {
+    const r = hopTestResults.value[node.name]
+    if (r && r.success) total += r.latency_ms
+    else if (node.tcp_latency_ms > 0) total += node.tcp_latency_ms
+  }
+  return total
+})
+
+function getLatencyTagType(ms) {
+  if (ms <= 0) return 'default'
+  if (ms < 100) return 'success'
+  if (ms < 300) return 'info'
+  if (ms < 600) return 'warning'
+  return 'error'
+}
+
+// Test each hop's TCP latency in parallel
+async function testAllHops() {
+  if (chainNodes.value.length === 0) return
+  hopTesting.value = true
+  const promises = chainNodes.value.map(async (node) => {
+    hopTestResults.value = { ...hopTestResults.value, [node.name]: { testing: true } }
+    try {
+      const res = await api('/api/proxy-outbounds/test', 'POST', { name: node.name })
+      if (res.success && res.data) {
+        hopTestResults.value = { ...hopTestResults.value, [node.name]: { success: true, latency_ms: res.data.latency_ms || 0 } }
+      } else {
+        hopTestResults.value = { ...hopTestResults.value, [node.name]: { success: false, latency_ms: 0 } }
+      }
+    } catch (e) {
+      hopTestResults.value = { ...hopTestResults.value, [node.name]: { success: false, latency_ms: 0 } }
+    }
+  })
+  await Promise.all(promises)
+  hopTesting.value = false
+}
+
+// Test the full chain UDP path to a MCBE target
+async function testChainUDP() {
+  if (chainNodes.value.length === 0 || !props.editingName) return
+  udpTesting.value = true
+  udpTestResult.value = null
+  try {
+    const res = await api('/api/proxy-outbounds/test-mcbe', 'POST', {
+      name: props.editingName,
+      address: 'mco.cubecraft.net:19132',
+    })
+    if (res.success && res.data) {
+      udpTestResult.value = {
+        success: res.data.success,
+        latency_ms: res.data.latency_ms || 0,
+        server_name: res.data.server_name || '',
+        players: res.data.players || '',
+      }
+    } else {
+      udpTestResult.value = { success: false, latency_ms: 0 }
+    }
+  } catch (e) {
+    udpTestResult.value = { success: false, latency_ms: 0 }
+  }
+  udpTesting.value = false
 }
 
 // Protocol visual config
@@ -653,6 +778,18 @@ function getProtocolIcon(type) {
   gap: 2px;
   flex-shrink: 0;
 }
+.chain-node-latency {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.pool-node-latency {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
 
 /* Arrow between nodes */
 .chain-arrow {
@@ -663,7 +800,18 @@ function getProtocolIcon(type) {
   opacity: 0.5;
 }
 
-/* Final node card */
+/* Final exit node card */
+.chain-final-node-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 420px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 2px solid #63e2b7;
+  background: rgba(99, 226, 183, 0.08);
+}
 .chain-final-card {
   display: flex;
   align-items: center;

@@ -483,6 +483,7 @@ type ServerConfigDTO struct {
 	LatencyMode         string               `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
 	Status              string               `json:"status"`                 // running, stopped
 	ActiveSessions      int                  `json:"active_sessions"`
+	ActiveProxyClients  int                  `json:"active_proxy_clients"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval

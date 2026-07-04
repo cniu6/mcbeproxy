@@ -353,16 +353,126 @@
     </n-modal>
 
     <!-- 编辑 Modal -->
-    <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" style="width: 700px">
+    <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" :style="{ width: form.type === 'chain' ? '1000px' : '700px', maxWidth: '96vw' }">
       <n-form :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="节点名称" required><n-input v-model:value="form.name" :disabled="!!editingName" placeholder="唯一标识（建议英文）" /></n-form-item></n-gi>
           <n-gi><n-form-item label="协议类型" required><n-select v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="服务器地址" required><n-input v-model:value="form.server" placeholder="example.com" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
-          <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
+
+          <!-- 代理链条：内嵌链路编辑器 -->
+          <template v-if="form.type === 'chain'">
+            <n-gi :span="2">
+              <n-divider style="margin: 8px 0">链路配置</n-divider>
+              <n-alert type="info" style="margin-bottom: 8px">
+                选择节点组成代理链路，流量将按顺序经过每个节点到达目标。支持嵌套（可选择已有的链式节点），自动检测循环引用。
+              </n-alert>
+            </n-gi>
+            <n-gi :span="2">
+              <div class="chain-inline-editor">
+                <div class="chain-inline-toolbar">
+                  <n-space :size="8" align="center">
+                    <n-tag v-if="form.chain && form.chain.length > 0" type="success" size="small" :bordered="false">{{ form.chain.length }} 跳</n-tag>
+                    <n-tag v-else type="warning" size="small" :bordered="false">未配置</n-tag>
+                    <n-tag v-if="chainInlineTotalLatency > 0" type="info" size="small" :bordered="false">预估 ~{{ chainInlineTotalLatency }}ms</n-tag>
+                  </n-space>
+                  <n-space :size="8" align="center">
+                    <n-select v-model:value="chainInlineTestType" size="small" :options="chainInlineTestTypeOptions" style="width: 120px" />
+                    <n-input v-if="chainInlineTestType === 'mcbe' || chainInlineTestType === 'http'" v-model:value="chainInlineTestAddr" size="small" :placeholder="chainInlineTestType === 'mcbe' ? 'MCBE地址 host:port' : 'HTTP URL'" style="width: 200px" />
+                    <n-button size="small" type="info" secondary @click="testChainInlineHops" :loading="chainInlineHopTesting" :disabled="!form.chain || form.chain.length === 0">测试每跳</n-button>
+                    <n-button size="small" type="success" secondary @click="testChainInlineTarget" :loading="chainInlineUDPTesting" :disabled="!form.chain || form.chain.length === 0 || !editingName">测试到目标</n-button>
+                  </n-space>
+                </div>
+
+                <div class="chain-inline-body">
+                  <div class="chain-inline-pool">
+                    <n-input v-model:value="chainInlinePoolSearch" size="small" placeholder="搜索节点..." clearable style="margin-bottom: 6px" />
+                    <div class="chain-inline-pool-list">
+                      <div
+                        v-for="node in chainInlineFilteredPool"
+                        :key="node.name"
+                        class="chain-inline-pool-card"
+                        :class="{ disabled: chainInlineIsInChain(node.name) }"
+                        @click="chainInlineAddNode(node)"
+                      >
+                        <div class="chain-inline-pool-icon" :style="{ background: chainInlineGetColor(node.type) }">{{ chainInlineGetIcon(node.type) }}</div>
+                        <div class="chain-inline-pool-info">
+                          <div class="chain-inline-pool-name">{{ node.name }}</div>
+                          <div class="chain-inline-pool-meta">{{ node.type.toUpperCase() }} · {{ node.server }}:{{ node.port }}</div>
+                        </div>
+                        <div class="chain-inline-pool-latency" v-if="node.tcp_latency_ms > 0 || node.udp_latency_ms > 0">
+                          <n-tag v-if="node.tcp_latency_ms > 0" size="tiny" :bordered="false" :type="chainInlineGetLatencyType(node.tcp_latency_ms)">TCP {{ node.tcp_latency_ms }}ms</n-tag>
+                        </div>
+                        <n-tag v-if="node.chain && node.chain.length > 0" type="success" size="tiny" :bordered="false">链{{ node.chain.length }}跳</n-tag>
+                      </div>
+                      <div v-if="chainInlineFilteredPool.length === 0" class="chain-inline-pool-empty">无可用节点</div>
+                    </div>
+                  </div>
+
+                  <div class="chain-inline-canvas">
+                    <div class="chain-inline-canvas-header">链路顺序（上→下 = 第一跳→最终出口）</div>
+                    <div class="chain-inline-chain-list" v-if="form.chain && form.chain.length > 0">
+                      <div v-for="(name, idx) in form.chain" :key="name" class="chain-inline-chain-card"
+                        :class="{ dragging: chainInlineDragIdx === idx, 'drag-over': chainInlineDragging && chainInlineDragIdx !== -1 && chainInlineDragIdx !== idx }"
+                        draggable="true"
+                        @dragstart="chainInlineDragStart(idx)"
+                        @dragover="chainInlineDragOver($event, idx)"
+                        @drop="chainInlineDrop(idx)"
+                        @dragend="chainInlineDragEnd"
+                      >
+                        <div class="chain-inline-chain-order">{{ idx + 1 }}</div>
+                        <div class="chain-inline-chain-icon" :style="{ background: chainInlineGetColor(chainInlineGetNode(name)?.type || 'unknown') }">{{ chainInlineGetIcon(chainInlineGetNode(name)?.type || 'unknown') }}</div>
+                        <div class="chain-inline-chain-info">
+                          <div class="chain-inline-chain-name">{{ name }}</div>
+                          <div class="chain-inline-chain-meta">{{ (chainInlineGetNode(name)?.type || '?').toUpperCase() }} · {{ chainInlineGetNode(name)?.server || '?' }}:{{ chainInlineGetNode(name)?.port || '?' }}</div>
+                        </div>
+                        <div class="chain-inline-chain-latency">
+                          <n-tag v-if="chainInlineHopResults[name]?.testing" size="tiny" :bordered="false" type="info">...</n-tag>
+                          <template v-else-if="chainInlineHopResults[name]">
+                            <n-tag v-if="chainInlineHopResults[name].success" size="tiny" :bordered="false" :type="chainInlineGetLatencyType(chainInlineHopResults[name].latency_ms)">{{ chainInlineHopResults[name].latency_ms }}ms</n-tag>
+                            <n-tooltip v-else>
+                              <template #trigger><n-tag size="tiny" :bordered="false" type="error">失败</n-tag></template>
+                              {{ chainInlineHopResults[name].error || '测试失败' }}
+                            </n-tooltip>
+                          </template>
+                          <n-tag v-else-if="chainInlineGetNode(name)?.tcp_latency_ms > 0" size="tiny" :bordered="false" :type="chainInlineGetLatencyType(chainInlineGetNode(name).tcp_latency_ms)">{{ chainInlineGetNode(name).tcp_latency_ms }}ms</n-tag>
+                        </div>
+                        <div class="chain-inline-chain-actions">
+                          <n-button size="tiny" quaternary circle @click.stop="chainInlineMove(idx, -1)" :disabled="idx === 0"><n-icon><ArrowUpIcon /></n-icon></n-button>
+                          <n-button size="tiny" quaternary circle @click.stop="chainInlineMove(idx, 1)" :disabled="idx === form.chain.length - 1"><n-icon><ArrowDownIcon /></n-icon></n-button>
+                          <n-button size="tiny" quaternary circle type="error" @click.stop="chainInlineRemove(idx)"><n-icon><TrashIcon /></n-icon></n-button>
+                        </div>
+                      </div>
+                      <div class="chain-inline-arrow">↓</div>
+                      <div class="chain-inline-target">
+                        <span class="chain-inline-target-label">{{ chainInlineTargetLabel }}</span>
+                        <template v-if="chainInlineUDPResult">
+                          <n-tag size="tiny" :bordered="false" :type="chainInlineUDPResult.success ? 'success' : 'error'">
+                            {{ chainInlineUDPResult.success ? chainInlineUDPResult.latency_ms + 'ms' : '失败' }}
+                          </n-tag>
+                          <span v-if="chainInlineUDPResult.server_name" class="chain-inline-target-server">{{ chainInlineUDPResult.server_name }}</span>
+                          <span v-if="chainInlineUDPResult.status_code" class="chain-inline-target-server">HTTP {{ chainInlineUDPResult.status_code }}</span>
+                          <span v-if="chainInlineUDPResult.error" class="chain-inline-target-error">{{ chainInlineUDPResult.error }}</span>
+                        </template>
+                      </div>
+                    </div>
+                    <div v-else class="chain-inline-empty">
+                      <p>从左侧点击节点添加到链路</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </n-gi>
+            <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
+          </template>
+
+          <!-- 普通协议字段 -->
+          <template v-else>
+            <n-gi><n-form-item label="服务器地址" required><n-input v-model:value="form.server" placeholder="example.com" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
           
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
@@ -465,9 +575,6 @@
                     clearable
                     style="flex: 1; min-width: 300px"
                   />
-                  <n-button type="success" secondary @click="openChainVisualizer">
-                    可视化编辑
-                  </n-button>
                 </n-space>
                 <div v-if="form.chain && form.chain.length > 0" class="chain-flow-preview">
                   <span class="chain-flow-label">链路：</span>
@@ -477,27 +584,18 @@
                     <span class="chain-flow-node">{{ name }}</span>
                   </template>
                   <span class="chain-flow-arrow">→</span>
+                  <span class="chain-flow-exit">{{ form.name || '(当前节点)' }}</span>
+                  <span class="chain-flow-arrow">→</span>
                   <span class="chain-flow-target">目标</span>
                 </div>
               </n-space>
             </n-form-item>
           </n-gi>
+          </template>
         </n-grid>
       </n-form>
       <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveOutbound">保存</n-button></n-space></template>
     </n-modal>
-
-    <!-- 链式代理可视化编辑器 -->
-    <ChainProxyVisualizer
-      v-model:show="showChainVisualizer"
-      :poolNodes="chainVisualizerPoolNodes"
-      :initialChain="form.chain || []"
-      :finalNodeName="form.name || ''"
-      :finalNodeType="form.type || 'socks5'"
-      :finalNodeServer="form.server || ''"
-      :finalNodePort="form.port || 0"
-      @save="onChainVisualizerSave"
-    />
 
     <n-modal v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
       <n-space vertical>
@@ -815,7 +913,6 @@ import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
-import ChainProxyVisualizer from '../components/ChainProxyVisualizer.vue'
 import { useDragSelect } from '../composables/useDragSelect'
 
 const props = defineProps({
@@ -828,7 +925,6 @@ const outbounds = ref([])
 const loading = ref(false)
 const highlightName = ref('')
 const showEditModal = ref(false)
-const showChainVisualizer = ref(false)
 const showAutoSelectBlockModal = ref(false)
 const showImportModal = ref(false)
 const showTestOptionsModal = ref(false)
@@ -1055,19 +1151,245 @@ const chainProxyOptions = computed(() => {
     .map(o => ({ label: `${o.name} (${o.type})${o.chain && o.chain.length > 0 ? ' [链式]' : ''}`, value: o.name }))
 })
 
-// 链式可视化编辑器的可用节点池（带完整信息）
+// 链式可视化编辑器的可用节点池（带完整信息，含延迟数据）
 const chainVisualizerPoolNodes = computed(() => {
   return outbounds.value
     .filter(o => o.name !== editingName.value)
-    .map(o => ({ name: o.name, type: o.type, server: o.server, port: o.port, chain: o.chain }))
+    .map(o => ({
+      name: o.name, type: o.type, server: o.server, port: o.port, chain: o.chain,
+      tcp_latency_ms: o.tcp_latency_ms || 0,
+      udp_latency_ms: o.udp_latency_ms || 0,
+      udp_available: o.udp_available,
+      group: o.group || '',
+    }))
 })
 
-const openChainVisualizer = () => {
-  showChainVisualizer.value = true
+// ---- 内嵌链路编辑器 (type=chain) ----
+const chainInlinePoolSearch = ref('')
+const chainInlineHopTesting = ref(false)
+const chainInlineUDPTesting = ref(false)
+const chainInlineHopResults = ref({})
+const chainInlineUDPResult = ref(null)
+const chainInlineTestAddr = ref('mco.cubecraft.net:19132')
+const chainInlineTestType = ref('mcbe')
+const chainInlineTestTypeOptions = [
+  { label: 'MCBE UDP', value: 'mcbe' },
+  { label: 'HTTP', value: 'http' },
+  { label: 'TCP', value: 'tcp' },
+]
+const chainInlineTargetLabel = computed(() => {
+  if (chainInlineTestType.value === 'http') return 'HTTP 目标'
+  if (chainInlineTestType.value === 'tcp') return 'TCP 目标'
+  return 'MCBE 目标服务器'
+})
+
+const chainInlineFilteredPool = computed(() => {
+  const search = chainInlinePoolSearch.value.toLowerCase().trim()
+  let pool = chainVisualizerPoolNodes.value
+  if (search) {
+    pool = pool.filter(n =>
+      n.name.toLowerCase().includes(search) ||
+      n.type.toLowerCase().includes(search) ||
+      (n.server || '').toLowerCase().includes(search)
+    )
+  }
+  return pool
+})
+
+const chainInlineIsInChain = (name) => (form.value.chain || []).includes(name)
+
+const chainInlineGetNode = (name) => chainVisualizerPoolNodes.value.find(n => n.name === name)
+
+function chainInlineAddNode(node) {
+  if (chainInlineIsInChain(node.name)) return
+  if (!form.value.chain) form.value.chain = []
+  form.value.chain = [...form.value.chain, node.name]
 }
 
-const onChainVisualizerSave = (chainNames) => {
-  form.value.chain = chainNames
+function chainInlineMove(idx, dir) {
+  const arr = [...(form.value.chain || [])]
+  const newIdx = idx + dir
+  if (newIdx < 0 || newIdx >= arr.length) return
+  ;[arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]]
+  form.value.chain = arr
+}
+
+function chainInlineRemove(idx) {
+  const arr = [...(form.value.chain || [])]
+  arr.splice(idx, 1)
+  form.value.chain = arr
+}
+
+const chainInlineTotalLatency = computed(() => {
+  let total = 0
+  for (const name of (form.value.chain || [])) {
+    const r = chainInlineHopResults.value[name]
+    if (r && r.success) total += r.latency_ms
+    else {
+      const node = chainInlineGetNode(name)
+      if (node?.tcp_latency_ms > 0) total += node.tcp_latency_ms
+    }
+  }
+  return total
+})
+
+function chainInlineGetLatencyType(ms) {
+  if (ms <= 0) return 'default'
+  if (ms < 100) return 'success'
+  if (ms < 300) return 'info'
+  if (ms < 600) return 'warning'
+  return 'error'
+}
+
+const chainInlineColors = {
+  shadowsocks: '#6366f1', vmess: '#8b5cf6', trojan: '#f59e0b', vless: '#06b6d4',
+  socks5: '#10b981', http: '#3b82f6', hysteria2: '#ec4899', anytls: '#f97316',
+  chain: '#63e2b7', unknown: '#6b7280',
+}
+const chainInlineIcons = {
+  shadowsocks: 'SS', vmess: 'VM', trojan: 'TJ', vless: 'VL',
+  socks5: 'S5', http: 'HP', hysteria2: 'H2', anytls: 'AT', chain: 'CH', unknown: '?',
+}
+function chainInlineGetColor(type) { return chainInlineColors[type] || chainInlineColors.unknown }
+function chainInlineGetIcon(type) { return chainInlineIcons[type] || chainInlineIcons.unknown }
+
+async function testChainInlineHops() {
+  const chain = form.value.chain || []
+  if (chain.length === 0) return
+  chainInlineHopTesting.value = true
+  const promises = chain.map(async (name) => {
+    chainInlineHopResults.value = { ...chainInlineHopResults.value, [name]: { testing: true } }
+    try {
+      const res = await api('/api/proxy-outbounds/test', 'POST', { name })
+      if (res.success && res.data) {
+        const ok = res.data.success !== false
+        chainInlineHopResults.value = { ...chainInlineHopResults.value, [name]: { success: ok, latency_ms: res.data.latency_ms || 0, error: res.data.error || '' } }
+      } else {
+        chainInlineHopResults.value = { ...chainInlineHopResults.value, [name]: { success: false, latency_ms: 0, error: res.msg || '请求失败' } }
+      }
+    } catch (e) {
+      chainInlineHopResults.value = { ...chainInlineHopResults.value, [name]: { success: false, latency_ms: 0, error: String(e) } }
+    }
+  })
+  await Promise.all(promises)
+  chainInlineHopTesting.value = false
+}
+
+async function testChainInlineTarget() {
+  const chain = form.value.chain || []
+  if (chain.length === 0 || !editingName.value) return
+  chainInlineUDPTesting.value = true
+  chainInlineUDPResult.value = null
+  try {
+    const testType = chainInlineTestType.value
+    if (testType === 'mcbe') {
+      const addr = chainInlineTestAddr.value.trim() || 'mco.cubecraft.net:19132'
+      const res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name: editingName.value, address: addr })
+      if (res.success && res.data) {
+        chainInlineUDPResult.value = { success: res.data.success !== false, latency_ms: res.data.latency_ms || 0, server_name: res.data.server_name || '', error: res.data.error || '' }
+      } else {
+        chainInlineUDPResult.value = { success: false, latency_ms: 0, error: res.msg || '请求失败' }
+      }
+    } else if (testType === 'http') {
+      const url = chainInlineTestAddr.value.trim() || 'https://www.google.com/generate_204'
+      const res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name: editingName.value, include_ping: false, include_udp: false, custom_http: { url, method: 'GET' } })
+      if (res.success && res.data) {
+        const httpResult = res.data.custom_http || (res.data.http_tests && res.data.http_tests[0])
+        if (httpResult) {
+          chainInlineUDPResult.value = { success: httpResult.success !== false, latency_ms: httpResult.latency_ms || 0, status_code: httpResult.status_code || 0, error: httpResult.error || '' }
+        } else {
+          chainInlineUDPResult.value = { success: res.data.success !== false, latency_ms: 0, error: res.data.error || '无HTTP结果' }
+        }
+      } else {
+        chainInlineUDPResult.value = { success: false, latency_ms: 0, error: res.msg || '请求失败' }
+      }
+    } else {
+      // TCP test through chain
+      const res = await api('/api/proxy-outbounds/test', 'POST', { name: editingName.value })
+      if (res.success && res.data) {
+        chainInlineUDPResult.value = { success: res.data.success !== false, latency_ms: res.data.latency_ms || 0, error: res.data.error || '' }
+      } else {
+        chainInlineUDPResult.value = { success: false, latency_ms: 0, error: res.msg || '请求失败' }
+      }
+    }
+  } catch (e) {
+    chainInlineUDPResult.value = { success: false, latency_ms: 0, error: String(e) }
+  }
+  chainInlineUDPTesting.value = false
+}
+
+// Reset inline chain test state when modal opens
+watch(() => showEditModal.value, (val) => {
+  if (val) {
+    chainInlinePoolSearch.value = ''
+    chainInlineHopResults.value = {}
+    chainInlineUDPResult.value = null
+    chainInlineTestAddr.value = 'mco.cubecraft.net:19132'
+    chainInlineTestType.value = 'mcbe'
+  }
+})
+
+// Update default address when test type changes
+watch(() => chainInlineTestType.value, (newType) => {
+  chainInlineUDPResult.value = null
+  if (newType === 'http') {
+    chainInlineTestAddr.value = 'https://www.google.com/generate_204'
+  } else if (newType === 'mcbe') {
+    chainInlineTestAddr.value = 'mco.cubecraft.net:19132'
+  }
+})
+
+// Icons for chain inline editor
+const ArrowUpIcon = {
+  render() {
+    return h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, [
+      h('line', { x1: '12', y1: '19', x2: '12', y2: '5' }),
+      h('polyline', { points: '5 12 12 5 19 12' })
+    ])
+  }
+}
+const ArrowDownIcon = {
+  render() {
+    return h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, [
+      h('line', { x1: '12', y1: '5', x2: '12', y2: '19' }),
+      h('polyline', { points: '19 12 12 19 5 12' })
+    ])
+  }
+}
+const TrashIcon = {
+  render() {
+    return h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, [
+      h('polyline', { points: '3 6 5 6 21 6' }),
+      h('path', { d: 'M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2' })
+    ])
+  }
+}
+
+// Drag-and-drop for inline chain editor
+const chainInlineDragging = ref(false)
+const chainInlineDragIdx = ref(-1)
+
+function chainInlineDragStart(idx) {
+  chainInlineDragIdx.value = idx
+  chainInlineDragging.value = true
+}
+function chainInlineDragOver(e, idx) {
+  if (chainInlineDragIdx.value === -1) return
+  e.preventDefault()
+}
+function chainInlineDrop(idx) {
+  const from = chainInlineDragIdx.value
+  if (from === -1 || from === idx) return
+  const arr = [...(form.value.chain || [])]
+  const [item] = arr.splice(from, 1)
+  arr.splice(idx, 0, item)
+  form.value.chain = arr
+  chainInlineDragIdx.value = -1
+  chainInlineDragging.value = false
+}
+function chainInlineDragEnd() {
+  chainInlineDragIdx.value = -1
+  chainInlineDragging.value = false
 }
 
 // 协议筛选选项
@@ -1295,7 +1617,8 @@ const protocolOptions = [
   { label: 'SOCKS5', value: 'socks5' },
   { label: 'HTTP Proxy', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
-  { label: 'Hysteria2', value: 'hysteria2' }
+  { label: 'Hysteria2', value: 'hysteria2' },
+  { label: '代理链条', value: 'chain' }
 ]
 
 const ssMethodOptions = [
@@ -2283,8 +2606,17 @@ const onProtocolChange = () => {
 }
 
 const saveOutbound = async () => {
-  if (!form.value.name || !form.value.server || !form.value.port) {
-    message.warning('请填写必填项')
+  if (!form.value.name) {
+    message.warning('请填写节点名称')
+    return
+  }
+  if (form.value.type === 'chain') {
+    if (!form.value.chain || form.value.chain.length === 0) {
+      message.warning('代理链条至少需要选择一个节点')
+      return
+    }
+  } else if (!form.value.server || !form.value.port) {
+    message.warning('请填写服务器地址和端口')
     return
   }
   const url = editingName.value ? '/api/proxy-outbounds/update' : '/api/proxy-outbounds'
@@ -3813,5 +4145,231 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 .chain-flow-arrow {
   color: var(--n-text-color-3);
   font-size: 11px;
+}
+
+/* Inline chain editor (type=chain) */
+.chain-inline-editor {
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.chain-inline-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--n-border-color);
+  background: var(--n-card-color);
+}
+.chain-inline-body {
+  display: flex;
+  gap: 1px;
+  background: var(--n-border-color);
+  min-height: 300px;
+  max-height: 400px;
+}
+.chain-inline-pool {
+  width: 280px;
+  flex-shrink: 0;
+  background: var(--n-color);
+  padding: 8px;
+  overflow-y: auto;
+}
+.chain-inline-pool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chain-inline-pool-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--n-border-color);
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.chain-inline-pool-card:hover {
+  border-color: #63e2b7;
+  background: rgba(99, 226, 183, 0.06);
+}
+.chain-inline-pool-card.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.chain-inline-pool-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.chain-inline-pool-info {
+  flex: 1;
+  min-width: 0;
+}
+.chain-inline-pool-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-inline-pool-meta {
+  font-size: 10px;
+  color: var(--n-text-color-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-inline-pool-latency {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.chain-inline-pool-empty {
+  text-align: center;
+  color: var(--n-text-color-3);
+  padding: 20px;
+  font-size: 12px;
+}
+.chain-inline-canvas {
+  flex: 1;
+  background: var(--n-color);
+  padding: 8px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.chain-inline-canvas-header {
+  font-size: 11px;
+  color: var(--n-text-color-3);
+  margin-bottom: 8px;
+}
+.chain-inline-chain-list {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+.chain-inline-chain-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 380px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--n-border-color);
+  background: var(--n-card-color);
+  cursor: grab;
+  transition: all 0.15s ease;
+}
+.chain-inline-chain-card:active {
+  cursor: grabbing;
+}
+.chain-inline-chain-card.dragging {
+  opacity: 0.5;
+  border-style: dashed;
+}
+.chain-inline-chain-card.drag-over {
+  border-color: #63e2b7;
+  box-shadow: 0 0 0 2px rgba(99, 226, 183, 0.2);
+}
+.chain-inline-chain-order {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--n-color-target);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.chain-inline-chain-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.chain-inline-chain-info {
+  flex: 1;
+  min-width: 0;
+}
+.chain-inline-chain-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-inline-chain-meta {
+  font-size: 10px;
+  color: var(--n-text-color-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-inline-chain-latency {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.chain-inline-chain-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.chain-inline-arrow {
+  color: var(--n-text-color-3);
+  font-size: 18px;
+  margin: 2px 0;
+}
+.chain-inline-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px dashed var(--n-border-color);
+}
+.chain-inline-target-label {
+  font-size: 12px;
+  color: var(--n-text-color-3);
+}
+.chain-inline-target-server {
+  font-size: 11px;
+  color: var(--n-text-color-2);
+  margin-left: 4px;
+}
+.chain-inline-target-error {
+  font-size: 10px;
+  color: #e88080;
+  margin-left: 4px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-inline-empty {
+  text-align: center;
+  color: var(--n-text-color-3);
+  padding: 40px 0;
+  font-size: 13px;
 }
 </style>

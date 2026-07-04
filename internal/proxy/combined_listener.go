@@ -64,6 +64,16 @@ func (c *combinedListener) Stop() error {
 	return nil
 }
 
+func (c *combinedListener) GetActiveClientCount() int {
+	total := 0
+	for _, l := range c.listeners {
+		if counter, ok := l.(interface{ GetActiveClientCount() int }); ok {
+			total += counter.GetActiveClientCount()
+		}
+	}
+	return total
+}
+
 func (c *combinedListener) UpdateConfig(cfg *config.ServerConfig) {
 	for _, l := range c.listeners {
 		if updater, ok := l.(interface{ UpdateConfig(*config.ServerConfig) }); ok {

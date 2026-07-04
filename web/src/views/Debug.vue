@@ -493,6 +493,7 @@ const serverColumns = [
   { title: '名称', key: 'name', width: 150 },
   { title: '状态', key: 'status', width: 80, render: (row) => h(NTag, { type: row.status === 'running' ? 'success' : 'error', size: 'small' }, () => row.status === 'running' ? '运行' : '停止') },
   { title: '在线', key: 'active_sessions', width: 60 },
+  { title: '链路', key: 'active_proxy_clients', width: 60 },
   { title: '代理', key: 'proxy_outbound', ellipsis: { tooltip: true } },
   { title: '延迟', key: 'cached_latency', width: 80, render: (row) => {
     if (row.cached_latency > 0) {

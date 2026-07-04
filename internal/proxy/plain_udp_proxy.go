@@ -164,9 +164,12 @@ func (p *PlainUDPProxy) getOrCreateClient(ctx context.Context, clientAddr *net.U
 		return val.(*plainUDPClient), false
 	}
 
+	p.cleanupStaleSameIPClients(clientAddr)
+
 	targetConn, targetAddr, err := p.dialTargetConn(ctx)
 	if err != nil {
-		logger.Error("PlainUDPProxy: failed to dial target %s: %v", p.config.GetTargetAddr(), err)
+		logger.Error("PlainUDPProxy: failed to dial target %s (client=%s server=%s active_proxy_clients=%d): %v",
+			p.config.GetTargetAddr(), clientKey, p.serverID, p.GetActiveClientCount(), err)
 		return nil, false
 	}
 
@@ -181,6 +184,9 @@ func (p *PlainUDPProxy) getOrCreateClient(ctx context.Context, clientAddr *net.U
 
 	p.wg.Add(1)
 	go p.forwardResponses(ctx, clientKey, client)
+
+	logger.Info("PlainUDP: new proxy client server=%s client=%s active_proxy_clients=%d",
+		p.serverID, clientKey, p.GetActiveClientCount())
 
 	return client, true
 }
@@ -254,6 +260,12 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 
 func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, clientInfo *plainUDPClient) {
 	defer p.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Info("PlainUDP forwardResponses panic recovered: client=%s err=%v", clientKey, r)
+			p.removeClientIfMatch(clientKey, clientInfo)
+		}
+	}()
 	defer p.removeClientIfMatch(clientKey, clientInfo)
 
 	bufPtr := p.bufferPool.Get()
@@ -315,6 +327,57 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 	}
 }
 
+func (p *PlainUDPProxy) cleanupStaleSameIPClients(clientAddr *net.UDPAddr) {
+	if clientAddr == nil || clientAddr.IP == nil {
+		return
+	}
+	clientKey := clientAddr.String()
+	clientIP := clientAddr.IP.String()
+	now := time.Now()
+
+	var staleKeys []struct {
+		key    string
+		reason string
+	}
+	p.clients.Range(func(key, value interface{}) bool {
+		keyStr := key.(string)
+		if keyStr == clientKey {
+			return true
+		}
+		info := value.(*plainUDPClient)
+		if info.clientAddr == nil || info.clientAddr.IP == nil || info.clientAddr.IP.String() != clientIP {
+			return true
+		}
+		silence := now.Sub(time.Unix(0, info.lastSeen.Load()))
+		if silence > sameIPReconnectGrace {
+			staleKeys = append(staleKeys, struct {
+				key    string
+				reason string
+			}{keyStr, fmt.Sprintf("silent_for_%v", silence.Round(time.Second))})
+		}
+		return true
+	})
+	for _, entry := range staleKeys {
+		logger.Info("PlainUDP: removing stale same-IP client %s for new connection %s (reason=%s)",
+			entry.key, clientKey, entry.reason)
+		p.removeClient(entry.key)
+	}
+	if len(staleKeys) > 0 {
+		logger.Info("PlainUDP: same-IP cleanup server=%s ip=%s removed=%d active_proxy_clients=%d",
+			p.serverID, clientIP, len(staleKeys), p.GetActiveClientCount())
+	}
+}
+
+// GetActiveClientCount returns the number of per-client upstream UDP links.
+func (p *PlainUDPProxy) GetActiveClientCount() int {
+	count := 0
+	p.clients.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
 func (p *PlainUDPProxy) removeClient(clientKey string) {
 	p.removeClientIfMatch(clientKey, nil)
 }
@@ -325,11 +388,15 @@ func (p *PlainUDPProxy) removeClientIfMatch(clientKey string, expected *plainUDP
 			return
 		}
 		_ = expected.targetConn.Close()
+		logger.Info("PlainUDP: client disconnected server=%s client=%s active_proxy_clients=%d",
+			p.serverID, clientKey, p.GetActiveClientCount())
 		return
 	}
 	if val, ok := p.clients.LoadAndDelete(clientKey); ok {
 		client := val.(*plainUDPClient)
 		_ = client.targetConn.Close()
+		logger.Info("PlainUDP: client disconnected server=%s client=%s active_proxy_clients=%d",
+			p.serverID, clientKey, p.GetActiveClientCount())
 	}
 }
 

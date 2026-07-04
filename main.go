@@ -28,6 +28,9 @@ var (
 )
 
 func main() {
+	// Global panic capture — writes stack dump + panic details to a standalone file
+	defer logger.CapturePanic("main")
+
 	flag.Parse()
 
 	logger.Init()
@@ -182,6 +185,7 @@ func main() {
 
 	apiAddr := fmt.Sprintf(":%d", globalConfig.APIPort)
 	go func() {
+		defer logger.CapturePanic("api-server")
 		logger.Info("Starting API server on %s", apiAddr)
 		if err := apiServer.Start(apiAddr); err != nil {
 			logger.Error("API server error: %v", err)
