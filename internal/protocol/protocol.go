@@ -49,6 +49,8 @@ var RakNetMagic = []byte{
 	0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
 }
 
+const maxDecompressedGamePacketSize int64 = 2 * 1024 * 1024
+
 // Common errors
 var (
 	ErrInvalidPacket     = errors.New("invalid packet")
@@ -214,10 +216,9 @@ func (ph *ProtocolHandler) tryDecompress(data []byte) ([]byte, error) {
 	zlibReader, err := zlib.NewReader(bytes.NewReader(data))
 	if err == nil {
 		defer zlibReader.Close()
-		var buf bytes.Buffer
-		_, err = io.Copy(&buf, zlibReader)
-		if err == nil && buf.Len() > 0 {
-			return buf.Bytes(), nil
+		decompressed, copyErr := readLimitedDecompressed(zlibReader)
+		if copyErr == nil && len(decompressed) > 0 {
+			return decompressed, nil
 		}
 	}
 
@@ -225,12 +226,18 @@ func (ph *ProtocolHandler) tryDecompress(data []byte) ([]byte, error) {
 	flateReader := flate.NewReader(bytes.NewReader(data))
 	defer flateReader.Close()
 
+	return readLimitedDecompressed(flateReader)
+}
+
+func readLimitedDecompressed(r io.Reader) ([]byte, error) {
 	var buf bytes.Buffer
-	_, err = io.Copy(&buf, flateReader)
-	if err != nil {
+	limited := io.LimitReader(r, maxDecompressedGamePacketSize+1)
+	if _, err := io.Copy(&buf, limited); err != nil {
 		return nil, err
 	}
-
+	if int64(buf.Len()) > maxDecompressedGamePacketSize {
+		 return nil, fmt.Errorf("decompressed packet exceeds %d bytes", maxDecompressedGamePacketSize)
+	}
 	return buf.Bytes(), nil
 }
 
@@ -257,13 +264,16 @@ func (ph *ProtocolHandler) parseLoginData(data []byte) (*PlayerInfo, error) {
 	}
 	payloadLen := binary.LittleEndian.Uint32(data[5:9])
 
-	// Validate payload length
-	if len(data) < 9+int(payloadLen) {
+	// Validate payload length without converting attacker-controlled uint32 to int
+	// before proving it fits in the remaining packet.
+	remaining := uint64(len(data) - 9)
+	if uint64(payloadLen) > remaining {
 		// Partial packet - try to extract what we can
 		return ph.extractPlayerInfoFromPartialPayload(data[9:], info)
 	}
 
-	payload := data[9 : 9+payloadLen]
+	payloadEnd := 9 + int(payloadLen)
+	payload := data[9:payloadEnd]
 	return ph.extractPlayerInfoFromPayload(payload, info)
 }
 

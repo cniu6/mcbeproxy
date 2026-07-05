@@ -53,6 +53,7 @@ func (d *Database) Initialize() error {
 		client_addr TEXT NOT NULL,
 		server_id TEXT NOT NULL,
 		uuid TEXT,
+		xuid TEXT,
 		display_name TEXT,
 		bytes_up INTEGER DEFAULT 0,
 		bytes_down INTEGER DEFAULT 0,
@@ -106,7 +107,7 @@ func (d *Database) Initialize() error {
 		display_name_lower TEXT NOT NULL,
 		enabled BOOLEAN DEFAULT TRUE,
 		reason TEXT,
-		server_id TEXT, -- NULL or empty for global blacklist
+		server_id TEXT NOT NULL DEFAULT '', -- empty string = global blacklist
 		added_at DATETIME NOT NULL,
 		expires_at DATETIME,
 		added_by TEXT,
@@ -123,7 +124,7 @@ func (d *Database) Initialize() error {
 		display_name_lower TEXT NOT NULL,
 		enabled BOOLEAN DEFAULT TRUE,
 		reason TEXT,
-		server_id TEXT, -- NULL or empty for global whitelist
+		server_id TEXT NOT NULL DEFAULT '', -- empty string = global whitelist
 		added_at DATETIME NOT NULL,
 		expires_at DATETIME,
 		added_by TEXT,
@@ -150,6 +151,7 @@ func (d *Database) Initialize() error {
 
 	// Migrations: add status and status_reason columns to sessions table
 	migrations := []string{
+		"ALTER TABLE sessions ADD COLUMN xuid TEXT DEFAULT ''",
 		"ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT ''",
 		"ALTER TABLE sessions ADD COLUMN status_reason TEXT DEFAULT ''",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
@@ -166,7 +168,60 @@ func (d *Database) Initialize() error {
 		_, _ = d.db.Exec(m) // ignore errors (column may already exist)
 	}
 
+	if err := migrateACLServerIDScope(d.db); err != nil {
+		return fmt.Errorf("acl server_id migration: %w", err)
+	}
+
 	return nil
+}
+
+// migrateACLServerIDScope normalizes NULL global server_id to ” and removes
+// duplicate rows for the same logical scope (including NULL vs ” global keys).
+func migrateACLServerIDScope(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	tables := []string{"blacklist", "whitelist"}
+	for _, table := range tables {
+		if _, err := tx.Exec(fmt.Sprintf(`
+			DELETE FROM %s
+			WHERE id NOT IN (
+				SELECT MAX(id) FROM %s GROUP BY COALESCE(server_id, ''), LOWER(TRIM(display_name))
+			)`, table, table)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`
+			UPDATE %s
+			SET
+				display_name = TRIM(display_name),
+				display_name_lower = LOWER(TRIM(display_name)),
+				server_id = TRIM(COALESCE(server_id, ''))`, table)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`
+			DELETE FROM %s
+			WHERE id NOT IN (
+				SELECT MAX(id) FROM %s GROUP BY display_name_lower, server_id
+			)`, table, table)); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(`
+		DELETE FROM acl_settings
+		WHERE rowid NOT IN (
+			SELECT MIN(rowid) FROM acl_settings GROUP BY TRIM(COALESCE(server_id, ''))
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE acl_settings SET server_id = TRIM(COALESCE(server_id, ''))`); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 // Close closes the database connection.

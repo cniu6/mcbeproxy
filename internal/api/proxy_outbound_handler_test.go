@@ -280,6 +280,98 @@ func setupTestRouter(handler *ProxyOutboundHandler) *gin.Engine {
 	return router
 }
 
+func TestProxyOutboundBodyUpdateRejectsRename(t *testing.T) {
+	dir := t.TempDir()
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))
+	handler := NewProxyOutboundHandler(configMgr, config.NewProxySubscriptionConfigManager(filepath.Join(dir, "subs.json")), nil, newMockOutboundManager())
+	if err := configMgr.AddOutbound(&config.ProxyOutbound{Name: "old", Type: config.ProtocolShadowsocks, Server: "127.0.0.1", Port: 8388, Method: "aes-128-gcm", Password: "secret", Enabled: true}); err != nil {
+		t.Fatalf("AddOutbound failed: %v", err)
+	}
+	router := gin.New()
+	router.POST("/api/proxy-outbounds/update", handler.UpdateProxyOutboundByBody)
+
+	payload := map[string]any{"name": "new", "type": config.ProtocolShadowsocks, "server": "127.0.0.1", "port": 8388, "method": "aes-128-gcm", "password": "secret", "enabled": true}
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy-outbounds/update", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("rename update status = %d, want 400, body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestProxyOutboundSensitiveFieldsHiddenAndBlankUpdatePreserves(t *testing.T) {
+	dir := t.TempDir()
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))
+	handler := NewProxyOutboundHandler(configMgr, config.NewProxySubscriptionConfigManager(filepath.Join(dir, "subs.json")), nil, newMockOutboundManager())
+	if err := configMgr.AddOutbound(&config.ProxyOutbound{Name: "node", Type: config.ProtocolShadowsocks, Server: "127.0.0.1", Port: 8388, Method: "aes-128-gcm", Password: "secret", UUID: "uuid-secret", ObfsPassword: "obfs-secret", Enabled: true}); err != nil {
+		t.Fatalf("AddOutbound failed: %v", err)
+	}
+	router := gin.New()
+	router.GET("/api/proxy-outbounds/:name", handler.GetProxyOutbound)
+	router.POST("/api/proxy-outbounds/update", handler.UpdateProxyOutboundByBody)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/proxy-outbounds/node", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte("secret")) || bytes.Contains(w.Body.Bytes(), []byte("uuid-secret")) || bytes.Contains(w.Body.Bytes(), []byte("obfs-secret")) {
+		t.Fatalf("response leaked sensitive field: %s", w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("has_password")) || !bytes.Contains(w.Body.Bytes(), []byte("has_uuid")) || !bytes.Contains(w.Body.Bytes(), []byte("has_obfs_password")) {
+		t.Fatalf("response missing sensitive presence indicators: %s", w.Body.String())
+	}
+
+	payload := map[string]any{"name": "node", "type": config.ProtocolShadowsocks, "server": "127.0.0.1", "port": 8389, "method": "aes-128-gcm", "password": "", "uuid": "", "obfs_password": "", "enabled": true}
+	body, _ := json.Marshal(payload)
+	req = httptest.NewRequest(http.MethodPost, "/api/proxy-outbounds/update", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("update status = %d, body=%s", w.Code, w.Body.String())
+	}
+	stored, ok := configMgr.GetOutbound("node")
+	if !ok {
+		t.Fatal("updated outbound not found")
+	}
+	if stored.Password != "secret" || stored.UUID != "uuid-secret" || stored.ObfsPassword != "obfs-secret" {
+		t.Fatalf("blank sensitive update overwrote secrets: password=%q uuid=%q obfs=%q", stored.Password, stored.UUID, stored.ObfsPassword)
+	}
+}
+
+func TestProxyOutboundBodyDeleteTriggersReloadHook(t *testing.T) {
+	dir := t.TempDir()
+	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))
+	handler := NewProxyOutboundHandler(configMgr, config.NewProxySubscriptionConfigManager(filepath.Join(dir, "subs.json")), nil, newMockOutboundManager())
+	if err := configMgr.AddOutbound(&config.ProxyOutbound{Name: "node", Type: config.ProtocolShadowsocks, Server: "127.0.0.1", Port: 8388, Method: "aes-128-gcm", Password: "secret", Enabled: true}); err != nil {
+		t.Fatalf("AddOutbound failed: %v", err)
+	}
+	var reloaded atomic.Int32
+	handler.SetOutboundReloadHook(func(name string) {
+		if name == "node" {
+			reloaded.Add(1)
+		}
+	})
+	router := gin.New()
+	router.POST("/api/proxy-outbounds/delete", handler.DeleteProxyOutboundByBody)
+
+	body, _ := json.Marshal(map[string]any{"name": "node"})
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy-outbounds/delete", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if reloaded.Load() != 1 {
+		t.Fatalf("reload hook calls = %d, want 1", reloaded.Load())
+	}
+}
+
 func TestCreateProxySubscriptionSaveDoesNotLeaveAutoUpdateImmediatelyDue(t *testing.T) {
 	dir := t.TempDir()
 	configMgr := config.NewProxyOutboundConfigManager(filepath.Join(dir, "proxy_outbounds.json"))

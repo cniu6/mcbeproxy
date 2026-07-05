@@ -44,7 +44,7 @@ func TestRawUDPProxy_SweepInactiveClients_IdleNeverCleansSilentClient(t *testing
 	client := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132},
 		targetConn: targetConn,
-		sessionID:  "127.0.0.1:19132",
+		sessionKey: "127.0.0.1:19132",
 		startTime:  time.Now().Add(-time.Hour),
 	}
 	client.lastSeen.Store(old)
@@ -73,7 +73,7 @@ func TestRawUDPProxy_CleanupStaleSameIPClients(t *testing.T) {
 	oldClient := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: oldPort},
 		targetConn: targetConn,
-		sessionID:  oldKey,
+		sessionKey: oldKey,
 		startTime:  time.Now().Add(-time.Minute),
 	}
 	stale := time.Now().Add(-sameIPHandshakeGrace - time.Second).UnixNano()

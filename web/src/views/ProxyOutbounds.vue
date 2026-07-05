@@ -477,12 +477,12 @@
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
             <n-gi><n-form-item label="加密方式"><n-select v-model:value="form.method" :options="ssMethodOptions" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
           </template>
           
           <!-- VMess 字段 -->
           <template v-if="form.type === 'vmess'">
-            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" placeholder="用户 UUID" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="AlterID"><n-input-number v-model:value="form.alter_id" :min="0" style="width: 100%" /></n-form-item></n-gi>
             <n-gi><n-form-item label="加密方式"><n-select v-model:value="form.security" :options="vmessSecurityOptions" /></n-form-item></n-gi>
           </template>
@@ -495,12 +495,12 @@
           <!-- SOCKS5 / HTTP 字段 -->
           <template v-if="['socks5', 'http'].includes(form.type)">
             <n-gi><n-form-item label="用户名"><n-input v-model:value="form.username" placeholder="可选" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="可选" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password', '可选')" /></n-form-item></n-gi>
           </template>
 
           <!-- AnyTLS 字段 -->
           <template v-if="form.type === 'anytls'">
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="如: h2,http/1.1" /></n-form-item></n-gi>
             <n-gi><n-form-item label="空闲检查(s)"><n-input-number v-model:value="form.idle_session_check_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
             <n-gi><n-form-item label="空闲超时(s)"><n-input-number v-model:value="form.idle_session_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
@@ -509,16 +509,16 @@
           
           <!-- VLESS 字段 -->
           <template v-if="form.type === 'vless'">
-            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" placeholder="用户 UUID" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="Flow"><n-select v-model:value="form.flow" :options="vlessFlowOptions" clearable /></n-form-item></n-gi>
           </template>
           
           <!-- Hysteria2 字段 -->
           <template v-if="form.type === 'hysteria2'">
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="端口跳跃"><n-input v-model:value="form.port_hopping" placeholder="如: 20000-55000 (可选)" /></n-form-item></n-gi>
             <n-gi><n-form-item label="混淆类型"><n-select v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable /></n-form-item></n-gi>
-            <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input v-model:value="form.obfs_password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input v-model:value="form.obfs_password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('obfs_password')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
           </template>
           
@@ -634,7 +634,7 @@
     <!-- 导入 Modal -->
     <n-modal v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
       <n-alert type="info" style="margin-bottom: 12px">
-        支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、hysteria2://<br/>
+        支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、hysteria2://、hy2://，也支持 Clash/Mihomo YAML 订阅<br/>
         每行一个链接，支持批量导入，支持 Base64 编码的订阅内容
       </n-alert>
       <n-form-item label="导入分组" style="margin-bottom: 12px">
@@ -2569,9 +2569,19 @@ const loadHistoryConfig = async () => {
 	latencyHistoryStorageLimit.value = Math.max(Number(res.data.latency_history_storage_limit) || 1000, 1)
 }
 
+const sensitiveFieldPlaceholder = (field, fallback = '') => {
+  if (!editingName.value) return fallback
+  const flagMap = {
+    password: 'has_password',
+    uuid: 'has_uuid',
+    obfs_password: 'has_obfs_password'
+  }
+  return form.value?.[flagMap[field]] ? '已配置，留空则保留旧值' : fallback
+}
+
 const openEditModal = (o) => {
   editingName.value = o.name
-  form.value = { ...defaultForm, ...o }
+  form.value = { ...defaultForm, ...o, password: '', uuid: '', obfs_password: '' }
   showEditModal.value = true
 }
 
@@ -2620,7 +2630,11 @@ const saveOutbound = async () => {
     return
   }
   const url = editingName.value ? '/api/proxy-outbounds/update' : '/api/proxy-outbounds'
-  const res = await api(url, 'POST', form.value)
+  const payload = { ...form.value }
+  delete payload.has_password
+  delete payload.has_uuid
+  delete payload.has_obfs_password
+  const res = await api(url, 'POST', payload)
   if (res.success) {
     message.success(editingName.value ? '已更新' : '已创建')
     showEditModal.value = false
@@ -3293,6 +3307,7 @@ const getImportConfigValidationError = (config) => {
   if (['vmess', 'vless'].includes(config.type) && !config.uuid) return '解析结果缺少 uuid'
   if (config.type === 'shadowsocks' && (!config.method || !config.password)) return '解析结果缺少 Shadowsocks 鉴权信息'
   if (['trojan', 'anytls', 'hysteria2'].includes(config.type) && !config.password) return '解析结果缺少密码'
+  if (config.type === 'hysteria2' && config.hop_interval !== undefined && Number(config.hop_interval) < 0) return '解析结果 hop_interval 无效'
   return ''
 }
 
@@ -3569,13 +3584,19 @@ const parseVless = (link) => {
   }
 }
 
+const parsePositiveNumber = (value) => {
+  const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)/)
+  if (!match) return 0
+  const parsed = Number.parseFloat(match[1])
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0
+}
+
 // 解析 Hysteria2 链接
 const parseHysteria2 = (link) => {
   try {
     const url = new URL(link)
     const originalName = url.hash ? decodeURIComponent(url.hash.slice(1)) : `${url.hostname}:${url.port}`
-    // 解析端口跳跃参数 mport (如 "20000-55000")
-    const mport = url.searchParams.get('mport') || ''
+    // 解析端口跳跃参数 mport/ports (如 "20000-55000")
     return {
       name: originalName,
       type: 'hysteria2',
@@ -3583,12 +3604,16 @@ const parseHysteria2 = (link) => {
       port: parseInt(url.port) || 443,
       password: decodeURIComponent(url.username),
       obfs: url.searchParams.get('obfs') || '',
-      obfs_password: url.searchParams.get('obfs-password') || '',
-      port_hopping: mport,
+      obfs_password: url.searchParams.get('obfs-password') || url.searchParams.get('obfs_password') || '',
+      port_hopping: url.searchParams.get('mport') || url.searchParams.get('ports') || '',
+      hop_interval: parsePositiveNumber(url.searchParams.get('hop-interval') || url.searchParams.get('hop_interval')),
+      up_mbps: parsePositiveNumber(url.searchParams.get('up') || url.searchParams.get('up-mbps') || url.searchParams.get('up_mbps')),
+      down_mbps: parsePositiveNumber(url.searchParams.get('down') || url.searchParams.get('down-mbps') || url.searchParams.get('down_mbps')),
       tls: true,
       sni: url.searchParams.get('sni') || url.hostname,
       alpn: url.searchParams.get('alpn') || '',
-      insecure: parseBoolQueryValue(url.searchParams.get('insecure')),
+      cert_fingerprint: url.searchParams.get('pinSHA256') || url.searchParams.get('pin_sha256') || url.searchParams.get('cert-fingerprint') || url.searchParams.get('cert_fingerprint') || url.searchParams.get('certFingerprint') || '',
+      insecure: parseBoolQueryValue(url.searchParams.get('insecure')) || parseBoolQueryValue(url.searchParams.get('allowInsecure')) || parseBoolQueryValue(url.searchParams.get('skip-cert-verify')),
       enabled: true
     }
   } catch (e) {
@@ -3607,7 +3632,7 @@ const parseLink = (link) => {
   if (link.startsWith('trojan://')) return parseTrojan(link)
   if (link.startsWith('anytls://')) return parseAnyTLS(link)
   if (link.startsWith('vless://')) return parseVless(link)
-  if (link.startsWith('hysteria2://') || link.startsWith('hy2://')) return parseHysteria2(link.replace('hy2://', 'hysteria2://'))
+  if (link.startsWith('hysteria2://') || link.startsWith('hy2://') || link.startsWith('hysteria://')) return parseHysteria2(link.replace('hy2://', 'hysteria2://').replace('hysteria://', 'hysteria2://'))
   
   return null
 }

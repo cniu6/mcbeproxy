@@ -3,6 +3,7 @@ package db
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,7 +12,52 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
-// **Feature: mcpe-server-proxy, Property 9: Player Stats Accumulation**
+func TestPlayerRepositoryUpdateStatsWithIdentityUsesProvidedLastSeen(t *testing.T) {
+	database, err := NewDatabase(filepath.Join(t.TempDir(), "players.db"))
+	if err != nil {
+		t.Fatalf("NewDatabase failed: %v", err)
+	}
+	if err := database.Initialize(); err != nil {
+		database.Close()
+		t.Fatalf("Initialize failed: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	repo := NewPlayerRepository(database)
+	createdAt := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	if err := repo.Create(&PlayerRecord{
+		DisplayName:   "SameName",
+		UUID:          "old-uuid",
+		XUID:          "old-xuid",
+		FirstSeen:     createdAt,
+		LastSeen:      createdAt,
+		TotalBytes:    10,
+		TotalPlaytime: 20,
+	}); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	lastSeen := createdAt.Add(time.Hour)
+	if err := repo.UpdateStatsWithIdentity("SameName", "new-uuid", "new-xuid", 30, 40*time.Second, lastSeen); err != nil {
+		t.Fatalf("UpdateStatsWithIdentity failed: %v", err)
+	}
+
+	got, err := repo.GetByDisplayName("SameName")
+	if err != nil {
+		t.Fatalf("GetByDisplayName failed: %v", err)
+	}
+	if got.UUID != "new-uuid" || got.XUID != "new-xuid" {
+		t.Fatalf("identity not refreshed: uuid=%q xuid=%q", got.UUID, got.XUID)
+	}
+	if !got.LastSeen.Equal(lastSeen) {
+		t.Fatalf("LastSeen = %v, want %v", got.LastSeen, lastSeen)
+	}
+	if got.TotalBytes != 40 || got.TotalPlaytime != 60 {
+		t.Fatalf("stats not accumulated: bytes=%d playtime=%d", got.TotalBytes, got.TotalPlaytime)
+	}
+}
+
+
 // **Validates: Requirements 4.4**
 // *For any* player, after a session ends, the player's total_bytes SHALL increase by
 // the session's (bytes_up + bytes_down), and total_playtime SHALL increase by the session duration.

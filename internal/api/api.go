@@ -40,6 +40,7 @@ type APIServer struct {
 	router       *gin.Engine
 	server       *http.Server
 	globalConfig *config.GlobalConfig
+	configPath   string
 	configMgr    *config.ConfigManager
 	sessionMgr   *session.SessionManager
 	db           *db.Database
@@ -57,6 +58,18 @@ type APIServer struct {
 	// Proxy port config manager
 	proxyPortConfigMgr   *config.ProxyPortConfigManager
 	serverLatencyHistory *serverLatencyHistoryStore
+}
+
+func (a *APIServer) globalConfigPath() string {
+	path := strings.TrimSpace(a.configPath)
+	if path == "" {
+		path = "config.json"
+	}
+	return path
+}
+
+func (a *APIServer) saveGlobalConfig() error {
+	return a.globalConfig.Save(a.globalConfigPath())
 }
 
 // ProxyController defines the interface for controlling proxy servers.
@@ -162,6 +175,7 @@ func containsString(list []string, target string) bool {
 // NewAPIServer creates a new API server instance.
 func NewAPIServer(
 	globalConfig *config.GlobalConfig,
+	configPath string,
 	configMgr *config.ConfigManager,
 	sessionMgr *session.SessionManager,
 	database *db.Database,
@@ -186,6 +200,7 @@ func NewAPIServer(
 	api := &APIServer{
 		router:               gin.New(),
 		globalConfig:         globalConfig,
+		configPath:           strings.TrimSpace(configPath),
 		configMgr:            configMgr,
 		sessionMgr:           sessionMgr,
 		db:                   database,
@@ -254,28 +269,30 @@ func (a *APIServer) setupRoutes() {
 		// Server management endpoints
 		api.GET("/servers", a.getServers)
 		api.GET("/servers/latency-overview", a.getServerLatencyOverview)
-		api.POST("/servers", a.createServer)
-		api.PUT("/servers/:id", a.updateServer)
-		api.DELETE("/servers/:id", a.deleteServer)
-		api.POST("/servers/:id/start", a.startServer)
-		api.POST("/servers/:id/stop", a.stopServer)
-		api.POST("/servers/:id/reload", a.reloadServer)
-		api.POST("/servers/:id/hide", a.hideServer)
-		api.POST("/servers/:id/show", a.showServer)
+		serverAdminGroup := api.Group("/servers")
+		serverAdminGroup.Use(a.requireAdminMiddleware())
+		serverAdminGroup.POST("", a.createServer)
+		serverAdminGroup.PUT("/:id", a.updateServer)
+		serverAdminGroup.DELETE("/:id", a.deleteServer)
+		serverAdminGroup.POST("/:id/start", a.startServer)
+		serverAdminGroup.POST("/:id/stop", a.stopServer)
+		serverAdminGroup.POST("/:id/reload", a.reloadServer)
+		serverAdminGroup.POST("/:id/hide", a.hideServer)
+		serverAdminGroup.POST("/:id/show", a.showServer)
 		// Backward-compatible aliases: the old disable/enable toggle now only
 		// controls visibility on the public status page (display-only).
-		api.POST("/servers/:id/disable", a.hideServer)
-		api.POST("/servers/:id/enable", a.showServer)
+		serverAdminGroup.POST("/:id/disable", a.hideServer)
+		serverAdminGroup.POST("/:id/enable", a.showServer)
 		api.GET("/servers/:id/latency", a.getServerLatency)
 		api.GET("/servers/:id/latency-history", a.getWebServerLatencyHistory)
 		if a.proxyOutboundHandler != nil {
 			api.GET("/servers/:id/node-latency", a.proxyOutboundHandler.GetServerNodeLatency)
 			api.GET("/servers/:id/node-latency-history", a.proxyOutboundHandler.GetServerNodeLatencyHistory)
 			api.GET("/servers/:id/current-node", a.proxyOutboundHandler.GetServerCurrentNode)
-			api.POST("/servers/:id/switch-node", a.proxyOutboundHandler.SwitchServerNode)
+			serverAdminGroup.POST("/:id/switch-node", a.proxyOutboundHandler.SwitchServerNode)
 			api.GET("/servers/:id/blocked-nodes", a.proxyOutboundHandler.GetServerBlockedNodes)
-			api.POST("/servers/:id/block-node", a.proxyOutboundHandler.BlockServerNode)
-			api.POST("/servers/:id/unblock-node", a.proxyOutboundHandler.UnblockServerNode)
+			serverAdminGroup.POST("/:id/block-node", a.proxyOutboundHandler.BlockServerNode)
+			serverAdminGroup.POST("/:id/unblock-node", a.proxyOutboundHandler.UnblockServerNode)
 		}
 
 		// Session endpoints
@@ -298,15 +315,19 @@ func (a *APIServer) setupRoutes() {
 		api.DELETE("/players/:name", a.deletePlayer)
 
 		// API key management endpoints
-		api.POST("/keys", a.createAPIKey)
-		api.DELETE("/keys/:key", a.deleteAPIKey)
+		keyAdminGroup := api.Group("/keys")
+		keyAdminGroup.Use(a.requireAdminMiddleware())
+		keyAdminGroup.POST("", a.createAPIKey)
+		keyAdminGroup.DELETE("/:key", a.deleteAPIKey)
 
 		// System stats endpoints
 		api.GET("/stats/system", a.getSystemStats)
 		api.GET("/config", a.getConfig)
-		api.PUT("/config", a.updateConfig)
-		api.PUT("/config/entry-path", a.updateEntryPath)
-		api.PUT("/config/max-session-records", a.updateMaxSessionRecords)
+		configAdminGroup := api.Group("/config")
+		configAdminGroup.Use(a.requireAdminMiddleware())
+		configAdminGroup.PUT("", a.updateConfig)
+		configAdminGroup.PUT("/entry-path", a.updateEntryPath)
+		configAdminGroup.PUT("/max-session-records", a.updateMaxSessionRecords)
 
 		// Goroutine management endpoints (for debugging)
 		debugGroup := api.Group("/debug")
@@ -330,31 +351,35 @@ func (a *APIServer) setupRoutes() {
 		// Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8
 		aclGroup := api.Group("/acl")
 		{
+			aclAdminGroup := aclGroup.Group("")
+			aclAdminGroup.Use(a.requireAdminMiddleware())
 			// Blacklist endpoints
 			aclGroup.GET("/blacklist", a.getBlacklist)
-			aclGroup.POST("/blacklist", a.addToBlacklist)
-			aclGroup.PUT("/blacklist/:name/enabled", a.updateBlacklistEnabled)
-			aclGroup.DELETE("/blacklist/:name", a.removeFromBlacklist)
+			aclAdminGroup.POST("/blacklist", a.addToBlacklist)
+			aclAdminGroup.PUT("/blacklist/:name/enabled", a.updateBlacklistEnabled)
+			aclAdminGroup.DELETE("/blacklist/:name", a.removeFromBlacklist)
 
 			// Whitelist endpoints
 			aclGroup.GET("/whitelist", a.getWhitelist)
-			aclGroup.POST("/whitelist", a.addToWhitelist)
-			aclGroup.PUT("/whitelist/:name/enabled", a.updateWhitelistEnabled)
-			aclGroup.DELETE("/whitelist/:name", a.removeFromWhitelist)
+			aclAdminGroup.POST("/whitelist", a.addToWhitelist)
+			aclAdminGroup.PUT("/whitelist/:name/enabled", a.updateWhitelistEnabled)
+			aclAdminGroup.DELETE("/whitelist/:name", a.removeFromWhitelist)
 
 			// Settings endpoints
 			aclGroup.GET("/settings", a.getACLSettings)
-			aclGroup.PUT("/settings", a.updateACLSettings)
+			aclAdminGroup.PUT("/settings", a.updateACLSettings)
 		}
 
 		// Proxy outbound endpoints
 		// Requirements: 4.3, 5.3
 		if a.proxyOutboundHandler != nil {
 			proxyOutboundGroup := api.Group("/proxy-outbounds")
+			proxyOutboundAdminGroup := proxyOutboundGroup.Group("")
+			proxyOutboundAdminGroup.Use(a.requireAdminMiddleware())
 			{
 				proxyOutboundGroup.GET("", a.proxyOutboundHandler.ListProxyOutbounds)
-				proxyOutboundGroup.POST("", a.proxyOutboundHandler.CreateProxyOutbound)
-				proxyOutboundGroup.POST("/parse-import", a.proxyOutboundHandler.ParseImportContent)
+				proxyOutboundAdminGroup.POST("", a.proxyOutboundHandler.CreateProxyOutbound)
+				proxyOutboundAdminGroup.POST("/parse-import", a.proxyOutboundHandler.ParseImportContent)
 				// New endpoints with name in body (recommended for special characters)
 				proxyOutboundGroup.POST("/test", a.proxyOutboundHandler.TestProxyOutboundByBody)
 				proxyOutboundGroup.POST("/batch-test", a.proxyOutboundHandler.BatchTestProxyOutbounds)
@@ -363,12 +388,12 @@ func (a *APIServer) setupRoutes() {
 				proxyOutboundGroup.POST("/health", a.proxyOutboundHandler.GetProxyOutboundHealthByBody)
 				proxyOutboundGroup.POST("/fetch-subscription", a.proxyOutboundHandler.FetchSubscription)
 				proxyOutboundGroup.POST("/get", a.proxyOutboundHandler.GetProxyOutboundByBody)
-				proxyOutboundGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
-				proxyOutboundGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)
-				proxyOutboundGroup.POST("/block-auto-select", a.proxyOutboundHandler.BlockProxyOutboundAutoSelectByBody)
-				proxyOutboundGroup.POST("/block-auto-select/batch", a.proxyOutboundHandler.BatchBlockProxyOutboundAutoSelectByBody)
-				proxyOutboundGroup.POST("/unblock-auto-select", a.proxyOutboundHandler.UnblockProxyOutboundAutoSelectByBody)
-				proxyOutboundGroup.POST("/unblock-auto-select/batch", a.proxyOutboundHandler.BatchUnblockProxyOutboundAutoSelectByBody)
+				proxyOutboundAdminGroup.POST("/update", a.proxyOutboundHandler.UpdateProxyOutboundByBody)
+				proxyOutboundAdminGroup.POST("/delete", a.proxyOutboundHandler.DeleteProxyOutboundByBody)
+				proxyOutboundAdminGroup.POST("/block-auto-select", a.proxyOutboundHandler.BlockProxyOutboundAutoSelectByBody)
+				proxyOutboundAdminGroup.POST("/block-auto-select/batch", a.proxyOutboundHandler.BatchBlockProxyOutboundAutoSelectByBody)
+				proxyOutboundAdminGroup.POST("/unblock-auto-select", a.proxyOutboundHandler.UnblockProxyOutboundAutoSelectByBody)
+				proxyOutboundAdminGroup.POST("/unblock-auto-select/batch", a.proxyOutboundHandler.BatchUnblockProxyOutboundAutoSelectByBody)
 				proxyOutboundGroup.GET("/latency-overview", a.proxyOutboundHandler.GetProxyOutboundLatencyOverview)
 				// Group statistics endpoints (must be before /:name to avoid conflicts)
 				// Requirements: 8.1, 8.2, 8.3, 8.4
@@ -377,33 +402,37 @@ func (a *APIServer) setupRoutes() {
 				// Legacy endpoints with name in URL (kept for compatibility)
 				proxyOutboundGroup.GET("/:name/latency-history", a.proxyOutboundHandler.GetProxyOutboundLatencyHistory)
 				proxyOutboundGroup.GET("/:name", a.proxyOutboundHandler.GetProxyOutbound)
-				proxyOutboundGroup.PUT("/:name", a.proxyOutboundHandler.UpdateProxyOutbound)
-				proxyOutboundGroup.DELETE("/:name", a.proxyOutboundHandler.DeleteProxyOutbound)
+				proxyOutboundAdminGroup.PUT("/:name", a.proxyOutboundHandler.UpdateProxyOutbound)
+				proxyOutboundAdminGroup.DELETE("/:name", a.proxyOutboundHandler.DeleteProxyOutbound)
 				proxyOutboundGroup.POST("/:name/test", a.proxyOutboundHandler.TestProxyOutbound)
 				proxyOutboundGroup.GET("/:name/health", a.proxyOutboundHandler.GetProxyOutboundHealth)
 			}
 
 			proxySubscriptionGroup := api.Group("/proxy-subscriptions")
+			proxySubscriptionAdminGroup := proxySubscriptionGroup.Group("")
+			proxySubscriptionAdminGroup.Use(a.requireAdminMiddleware())
 			{
 				proxySubscriptionGroup.GET("", a.proxyOutboundHandler.ListProxySubscriptions)
-				proxySubscriptionGroup.POST("", a.proxyOutboundHandler.CreateProxySubscription)
-				proxySubscriptionGroup.POST("/update-all", a.proxyOutboundHandler.UpdateAllProxySubscriptions)
-				proxySubscriptionGroup.PUT("/:id", a.proxyOutboundHandler.UpdateProxySubscription)
-				proxySubscriptionGroup.DELETE("/:id", a.proxyOutboundHandler.DeleteProxySubscription)
-				proxySubscriptionGroup.POST("/:id/update", a.proxyOutboundHandler.UpdateProxySubscriptionNow)
+				proxySubscriptionAdminGroup.POST("", a.proxyOutboundHandler.CreateProxySubscription)
+				proxySubscriptionAdminGroup.POST("/update-all", a.proxyOutboundHandler.UpdateAllProxySubscriptions)
+				proxySubscriptionAdminGroup.PUT("/:id", a.proxyOutboundHandler.UpdateProxySubscription)
+				proxySubscriptionAdminGroup.DELETE("/:id", a.proxyOutboundHandler.DeleteProxySubscription)
+				proxySubscriptionAdminGroup.POST("/:id/update", a.proxyOutboundHandler.UpdateProxySubscriptionNow)
 			}
 		}
 
 		// Proxy port endpoints
 		if a.proxyPortConfigMgr != nil {
 			proxyPortGroup := api.Group("/proxy-ports")
+			proxyPortAdminGroup := proxyPortGroup.Group("")
+			proxyPortAdminGroup.Use(a.requireAdminMiddleware())
 			{
 				proxyPortGroup.GET("", a.getProxyPorts)
 				proxyPortGroup.GET("/:id/runtime", a.getProxyPortRuntime)
-				proxyPortGroup.POST("", a.createProxyPort)
-				proxyPortGroup.POST("/bulk", a.createProxyPortsBulk)
-				proxyPortGroup.PUT("/:id", a.updateProxyPort)
-				proxyPortGroup.DELETE("/:id", a.deleteProxyPort)
+				proxyPortAdminGroup.POST("", a.createProxyPort)
+				proxyPortAdminGroup.POST("/bulk", a.createProxyPortsBulk)
+				proxyPortAdminGroup.PUT("/:id", a.updateProxyPort)
+				proxyPortAdminGroup.DELETE("/:id", a.deleteProxyPort)
 				proxyPortGroup.POST("/:id/test", a.testProxyPort)
 			}
 		}
@@ -412,6 +441,11 @@ func (a *APIServer) setupRoutes() {
 
 // Start starts the API server on the specified address.
 func (a *APIServer) Start(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
 	a.server = &http.Server{
 		Addr:              addr,
 		Handler:           a.router,
@@ -422,7 +456,7 @@ func (a *APIServer) Start(addr string) error {
 	}
 
 	go func() {
-		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := a.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("API server error: %v", err)
 		}
 	}()
@@ -553,7 +587,7 @@ func (a *APIServer) authMiddleware() gin.HandlerFunc {
 
 		// Store key info in context for later use
 		c.Set("api_key", key)
-		c.Set(ctxAuthIsAdmin, true)
+		c.Set(ctxAuthIsAdmin, key.IsAdmin)
 		c.Next()
 	}
 }
@@ -651,6 +685,9 @@ func (a *APIServer) updateServer(c *gin.Context) {
 		return
 	}
 
+	// 路由参数是唯一可信目标；请求体 id 仅用于兼容输入，并在此覆盖为路径 id。
+	serverCfg.ID = serverID
+
 	if err := a.configMgr.UpdateServer(serverID, &serverCfg); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to update server", err.Error())
 		return
@@ -661,26 +698,26 @@ func (a *APIServer) updateServer(c *gin.Context) {
 	// - 如果没在跑且新配置 enabled：直接 StartServer，避免依赖 fsnotify
 	// - 如果在跑但新配置 disabled：StopServer
 	if a.proxyController != nil {
-		running := a.proxyController.IsServerRunning(serverCfg.ID)
+		running := a.proxyController.IsServerRunning(serverID)
 		switch {
 		case running && serverCfg.Enabled:
-			if err := a.proxyController.ReloadServer(serverCfg.ID); err != nil {
-				logger.Error("Failed to reload server %s after config update: %v", serverCfg.ID, err)
+			if err := a.proxyController.ReloadServer(serverID); err != nil {
+				logger.Error("Failed to reload server %s after config update: %v", serverID, err)
 			}
 		case running && !serverCfg.Enabled:
-			if err := a.proxyController.StopServer(serverCfg.ID); err != nil {
-				logger.Error("Failed to stop server %s after disable: %v", serverCfg.ID, err)
+			if err := a.proxyController.StopServer(serverID); err != nil {
+				logger.Error("Failed to stop server %s after disable: %v", serverID, err)
 			}
 		case !running && serverCfg.Enabled:
-			if err := a.proxyController.StartServer(serverCfg.ID); err != nil {
-				logger.Error("Failed to start server %s after enable: %v", serverCfg.ID, err)
+			if err := a.proxyController.StartServer(serverID); err != nil {
+				logger.Error("Failed to start server %s after enable: %v", serverID, err)
 			}
 		}
 	}
 
 	// Return the updated server with status
-	status := a.proxyController.GetServerStatus(serverCfg.ID)
-	activeSessions := a.proxyController.GetActiveSessionsForServer(serverCfg.ID)
+	status := a.proxyController.GetServerStatus(serverID)
+	activeSessions := a.proxyController.GetActiveSessionsForServer(serverID)
 	respondSuccess(c, serverCfg.ToDTO(status, activeSessions))
 }
 
@@ -1027,12 +1064,16 @@ type CreateAPIKeyRequest struct {
 // createAPIKey creates a new API key.
 // POST /api/keys
 func (a *APIServer) createAPIKey(c *gin.Context) {
+	if !isAdminRequest(c) {
+		respondError(c, http.StatusForbidden, "需要管理员权限", "")
+		return
+	}
+
 	var req CreateAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	req.IsAdmin = true
 
 	// Generate a random API key
 	keyBytes := make([]byte, 32)
@@ -1485,7 +1526,7 @@ func (a *APIServer) updateConfig(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid config", err.Error())
 		return
 	}
-	if err := nextConfig.Save("config.json"); err != nil {
+	if err := nextConfig.Save(a.globalConfigPath()); err != nil {
 		respondError(c, http.StatusInternalServerError, "Failed to save config", err.Error())
 		return
 	}
@@ -1533,7 +1574,7 @@ func (a *APIServer) updateEntryPath(c *gin.Context) {
 	a.globalConfig.APIEntryPath = req.EntryPath
 
 	// Persist to file so the change survives restarts
-	if err := a.globalConfig.Save("config.json"); err != nil {
+	if err := a.saveGlobalConfig(); err != nil {
 		logger.Error("Failed to persist entry path change: %v", err)
 	}
 
@@ -1567,7 +1608,7 @@ func (a *APIServer) updateMaxSessionRecords(c *gin.Context) {
 	a.globalConfig.MaxSessionRecords = req.MaxSessionRecords
 
 	// Save config to file (using default path "config.json")
-	if err := a.globalConfig.Save("config.json"); err != nil {
+	if err := a.saveGlobalConfig(); err != nil {
 		logger.Error("Failed to save config to file: %v", err)
 		// Continue anyway - config is updated in memory
 	}
@@ -1592,6 +1633,9 @@ func (a *APIServer) updateMaxSessionRecords(c *gin.Context) {
 func (a *APIServer) getMetrics(c *gin.Context) {
 	// Update metrics before serving
 	if a.promMetrics != nil {
+		if a.sessionMgr != nil {
+			a.promMetrics.SetActiveSessions(len(a.sessionMgr.GetAllSessions()))
+		}
 		a.promMetrics.Update()
 		// Use the custom registry handler
 		promhttp.HandlerFor(a.promMetrics.Registry, promhttp.HandlerOpts{}).ServeHTTP(c.Writer, c.Request)
@@ -1623,7 +1667,7 @@ func (a *APIServer) getBlacklist(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 
 	var entries []*db.BlacklistEntry
 	var err error
@@ -1675,7 +1719,7 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 		DisplayName: playerName,
 		Enabled:     enabled,
 		Reason:      req.Reason,
-		ServerID:    req.ServerID,
+		ServerID:    db.NormalizeACLServerID(req.ServerID),
 		AddedAt:     time.Now(),
 		ExpiresAt:   req.ExpiresAt,
 		AddedBy:     "", // Could be set from API key context if needed
@@ -1689,7 +1733,7 @@ func (a *APIServer) addToBlacklist(c *gin.Context) {
 	// Kick the player if they are currently online
 	kickedCount := 0
 	if a.proxyController != nil {
-		kickedCount = a.proxyController.KickPlayer(playerName, a.buildBlacklistKickMessage(playerName, req.ServerID, entry.Reason))
+		kickedCount = a.proxyController.KickPlayer(playerName, a.buildBlacklistKickMessage(playerName, entry.ServerID, entry.Reason))
 	}
 
 	respondSuccess(c, map[string]interface{}{
@@ -1720,7 +1764,7 @@ func (a *APIServer) updateBlacklistEnabled(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 	entry, err := a.aclManager.UpdateBlacklistEntryEnabled(name, serverID, *req.Enabled)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1758,7 +1802,7 @@ func (a *APIServer) removeFromBlacklist(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 
 	if err := a.aclManager.RemoveFromBlacklist(name, serverID); err != nil {
 		if err == sql.ErrNoRows {
@@ -1782,7 +1826,7 @@ func (a *APIServer) getWhitelist(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 
 	var entries []*db.WhitelistEntry
 	var err error
@@ -1834,7 +1878,7 @@ func (a *APIServer) addToWhitelist(c *gin.Context) {
 		DisplayName: playerName,
 		Enabled:     enabled,
 		Reason:      req.Reason,
-		ServerID:    req.ServerID,
+		ServerID:    db.NormalizeACLServerID(req.ServerID),
 		AddedAt:     time.Now(),
 		ExpiresAt:   req.ExpiresAt,
 		AddedBy:     "", // Could be set from API key context if needed
@@ -1870,7 +1914,7 @@ func (a *APIServer) updateWhitelistEnabled(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 	entry, err := a.aclManager.UpdateWhitelistEntryEnabled(name, serverID, *req.Enabled)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1900,7 +1944,7 @@ func (a *APIServer) removeFromWhitelist(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 
 	if err := a.aclManager.RemoveFromWhitelist(name, serverID); err != nil {
 		if err == sql.ErrNoRows {
@@ -1924,7 +1968,7 @@ func (a *APIServer) getACLSettings(c *gin.Context) {
 		return
 	}
 
-	serverID := c.Query("server_id")
+	serverID := db.NormalizeACLServerID(c.Query("server_id"))
 
 	settings, err := a.aclManager.GetSettings(serverID)
 	if err != nil {
@@ -1952,7 +1996,7 @@ func (a *APIServer) updateACLSettings(c *gin.Context) {
 	}
 
 	settings := &db.ACLSettings{
-		ServerID:         settingsDTO.ServerID,
+		ServerID:         db.NormalizeACLServerID(settingsDTO.ServerID),
 		BlacklistEnabled: settingsDTO.BlacklistEnabled,
 		WhitelistEnabled: settingsDTO.WhitelistEnabled,
 		DefaultMessage:   settingsDTO.DefaultMessage,

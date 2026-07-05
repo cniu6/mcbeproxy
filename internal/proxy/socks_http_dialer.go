@@ -340,13 +340,15 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 
 	// Proactive reconnect creates new SOCKS5 UDP ASSOCIATEs that can
 	// invalidate other connections' UDP relay mappings at the same SOCKS5
-	// server, causing silent packet loss. Disable it globally; UDP keepalive
-	// (every 10s) + reactive reconnect (on TCP close) are sufficient to
-	// maintain associations and handle server-side idle timeouts.
+	// server, causing silent packet loss. Chain UDP cache owns stale-conn
+	// replacement, so cached SOCKS5 associations must be marked dead instead
+	// of reconnecting in place; otherwise a dead cached entry can become alive
+	// again and be reused with changed control/UDP state.
 	s5pc := &socks5UDPPacketConn{
 		destination:               resolvedDest,
 		stopCh:                    make(chan struct{}),
 		disableProactiveReconnect: true,
+		disableReactiveReconnect:  s.disableSOCKS5ReactiveReconnect,
 		reconnectFn: func() (net.Conn, net.PacketConn, net.Addr, error) {
 			reconnectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -440,7 +442,14 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 			continue
 		}
 
-		// TCP control connection closed by remote — reactive reconnect.
+		// TCP control connection closed by remote. For cached SOCKS5 UDP
+		// associations, do not reconnect in place: the cache needs to observe
+		// the old entry as dead and create a fresh PacketConn on next use.
+		if c.disableReactiveReconnect {
+			logger.Info("SOCKS5 UDP: TCP control connection closed, marking association dead: err=%v", err)
+			c.markRemoteClosed(st)
+			return
+		}
 		logger.Info("SOCKS5 UDP: TCP control connection closed, attempting reconnect: err=%v", err)
 		c.doReactiveReconnect(st, &backoff, maxBackoff)
 		proactiveTimer.Reset(proactiveReconnectInterval)
@@ -466,6 +475,15 @@ func (c *socks5UDPPacketConn) doProactiveReconnect(oldState *connState) {
 	oldState.ctrlConn.Close()
 	c.reconnecting.Store(false)
 	logger.Info("SOCKS5 UDP: proactive reconnect succeeded (make-before-break)")
+}
+
+func (c *socks5UDPPacketConn) markRemoteClosed(st *connState) {
+	c.remoteClosed.Store(true)
+	c.reconnecting.Store(false)
+	if st != nil {
+		st.udpConn.Close()
+		st.ctrlConn.Close()
+	}
 }
 
 // doReactiveReconnect handles the case where the server already closed the TCP
@@ -651,6 +669,7 @@ type socks5UDPPacketConn struct {
 	stopCh                    chan struct{}
 	reconnectFn               func() (net.Conn, net.PacketConn, net.Addr, error)
 	disableProactiveReconnect bool // set for chain SOCKS5 to avoid multi-ASSOCIATE interference
+	disableReactiveReconnect  bool // set for cached SOCKS5 so dead entries are replaced by the cache
 }
 
 var socks5UDPWritePool = sync.Pool{

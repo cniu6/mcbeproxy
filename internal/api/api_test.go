@@ -3,9 +3,11 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +22,41 @@ import (
 	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/session"
 )
+
+func TestMetricsEndpointUpdatesActiveSessionsGauge(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	sess, _ := api.sessionMgr.GetOrCreate("127.0.0.1:50000", "srv1")
+	sess.SetPlayerInfoWithXUID("uuid-1", "MetricPlayer", "xuid-1")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/metrics", nil)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "mcpe_proxy_active_sessions 1") {
+		t.Fatalf("active sessions metric not updated from session manager; body=%s", w.Body.String())
+	}
+}
+
+func TestAPIServerStartReturnsListenError(t *testing.T) {
+	api, _, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	err = api.Start(listener.Addr().String())
+	if err == nil {
+		t.Fatal("Start() succeeded on occupied address, want listen error")
+	}
+}
 
 // mockProxyController implements ProxyController for testing.
 type mockProxyController struct {
@@ -108,6 +145,7 @@ func setupTestAPI(t *testing.T) (*APIServer, *db.Database, func()) {
 	// Create API server
 	api := NewAPIServer(
 		config.DefaultGlobalConfig(),
+		"config.json",
 		configMgr,
 		sessionMgr,
 		database,
@@ -164,8 +202,20 @@ func TestDebugRoutes_RequireValidKeyWhenConfigured(t *testing.T) {
 	req.Header.Set("X-API-Key", apiKey.Key)
 	w = httptest.NewRecorder()
 	api.GetRouter().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-admin valid key status code = %d, want 403, body = %s", w.Code, w.Body.String())
+	}
+
+	adminKey := &db.APIKey{Key: "debug-admin-key", Name: "debug-admin", CreatedAt: time.Now(), IsAdmin: true}
+	if err := keyRepo.Create(adminKey); err != nil {
+		t.Fatalf("Create admin API key failed: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/debug/goroutines", nil)
+	req.Header.Set("X-API-Key", adminKey.Key)
+	w = httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("valid key status code = %d, body = %s", w.Code, w.Body.String())
+		t.Fatalf("admin key status code = %d, body = %s", w.Code, w.Body.String())
 	}
 }
 
@@ -216,13 +266,13 @@ func TestValidateAPIKey_UsesConfigKeyWhenConfigured(t *testing.T) {
 	}
 }
 
-func TestAnyValidAPIKeyCanDeleteKeys(t *testing.T) {
+func TestNonAdminAPIKeyCannotUseAdminRoutes(t *testing.T) {
 	api, database, cleanup := setupTestAPI(t)
 	defer cleanup()
 
 	keyRepo := db.NewAPIKeyRepository(database, 100)
 	primary := &db.APIKey{Key: "primary-key", Name: "primary", CreatedAt: time.Now(), IsAdmin: false}
-	secondary := &db.APIKey{Key: "secondary-key", Name: "secondary", CreatedAt: time.Now(), IsAdmin: false}
+	secondary := &db.APIKey{Key: "secondary-key", Name: "secondary", CreatedAt: time.Now(), IsAdmin: true}
 	if err := keyRepo.Create(primary); err != nil {
 		t.Fatalf("Create primary API key failed: %v", err)
 	}
@@ -231,6 +281,37 @@ func TestAnyValidAPIKeyCanDeleteKeys(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/keys/secondary-key", nil)
+	req.Header.Set("X-API-Key", primary.Key)
+	w := httptest.NewRecorder()
+	api.GetRouter().ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status code = %d, want 403, body = %s", w.Code, w.Body.String())
+	}
+	keys, err := keyRepo.List()
+	if err != nil {
+		t.Fatalf("List API keys failed: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("non-admin key should not delete keys, remaining keys: %+v", keys)
+	}
+}
+
+func TestAdminAPIKeyCanDeleteKeys(t *testing.T) {
+	api, database, cleanup := setupTestAPI(t)
+	defer cleanup()
+
+	keyRepo := db.NewAPIKeyRepository(database, 100)
+	primary := &db.APIKey{Key: "primary-admin-key", Name: "primary", CreatedAt: time.Now(), IsAdmin: true}
+	secondary := &db.APIKey{Key: "secondary-user-key", Name: "secondary", CreatedAt: time.Now(), IsAdmin: false}
+	if err := keyRepo.Create(primary); err != nil {
+		t.Fatalf("Create primary API key failed: %v", err)
+	}
+	if err := keyRepo.Create(secondary); err != nil {
+		t.Fatalf("Create secondary API key failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/keys/secondary-user-key", nil)
 	req.Header.Set("X-API-Key", primary.Key)
 	w := httptest.NewRecorder()
 	api.GetRouter().ServeHTTP(w, req)
@@ -247,7 +328,7 @@ func TestAnyValidAPIKeyCanDeleteKeys(t *testing.T) {
 	}
 }
 
-func TestCreateAPIKeyAlwaysStoresAdmin(t *testing.T) {
+func TestCreateAPIKeyRespectsRequestedAdminFlag(t *testing.T) {
 	api, database, cleanup := setupTestAPI(t)
 	defer cleanup()
 
@@ -273,16 +354,16 @@ func TestCreateAPIKeyAlwaysStoresAdmin(t *testing.T) {
 	if !ok {
 		t.Fatalf("unexpected response data type: %T", resp.Data)
 	}
-	if isAdmin, ok := data["is_admin"].(bool); !ok || !isAdmin {
-		t.Fatalf("expected response is_admin=true, got %+v", data["is_admin"])
+	if isAdmin, ok := data["is_admin"].(bool); !ok || isAdmin {
+		t.Fatalf("expected response is_admin=false, got %+v", data["is_admin"])
 	}
 
 	keys, err := db.NewAPIKeyRepository(database, 100).List()
 	if err != nil {
 		t.Fatalf("List API keys failed: %v", err)
 	}
-	if len(keys) != 1 || !keys[0].IsAdmin {
-		t.Fatalf("expected stored API key to be admin, got %+v", keys)
+	if len(keys) != 1 || keys[0].IsAdmin {
+		t.Fatalf("expected stored API key to be non-admin, got %+v", keys)
 	}
 }
 

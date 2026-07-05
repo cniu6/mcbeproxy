@@ -256,8 +256,10 @@ func (m *ProxyOutboundConfigManager) UpdateOutbound(name string, config *ProxyOu
 		return fmt.Errorf("proxy outbound with name %s not found", name)
 	}
 
-	// If name changed, remove old entry
 	if name != config.Name {
+		if _, exists := m.outbounds[config.Name]; exists {
+			return fmt.Errorf("proxy outbound with name %s already exists", config.Name)
+		}
 		delete(m.outbounds, name)
 	}
 	m.outbounds[config.Name] = config.Clone()

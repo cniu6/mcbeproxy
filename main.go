@@ -165,6 +165,7 @@ func main() {
 
 	apiServer := api.NewAPIServer(
 		globalConfig,
+		*configPath,
 		configMgr,
 		proxyServer.GetSessionManager(),
 		database,

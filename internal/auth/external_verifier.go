@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -137,12 +138,12 @@ func (v *ExternalVerifier) addToCache(key string, allowed bool, reason string) {
 }
 
 func (v *ExternalVerifier) doVerify(xuid, uuid, playerName, serverID, clientAddr string) (bool, string) {
-	// Split client address into IP and port
-	clientIP := clientAddr
+	// Split client address into IP and port.
+	clientIP := strings.Trim(clientAddr, "[]")
 	clientPort := ""
-	if idx := strings.LastIndex(clientAddr, ":"); idx != -1 {
-		clientIP = clientAddr[:idx]
-		clientPort = clientAddr[idx+1:]
+	if host, port, err := net.SplitHostPort(clientAddr); err == nil {
+		clientIP = strings.Trim(host, "[]")
+		clientPort = port
 	}
 
 	req := VerifyRequest{

@@ -381,7 +381,7 @@ const addToWhitelist = async () => {
     player_name: form.player_name,
     reason: form.reason,
     enabled: form.enabled,
-    server_id: form.server_id || null,
+    server_id: form.server_id || '',
     expires_at: expiresAt || null
   })
   return res
@@ -392,18 +392,35 @@ const submitForm = async () => {
     message.warning('请填写玩家名')
     return
   }
-  // 编辑：先删除旧记录，再添加新记录
   if (editingEntry.value) {
     const old = editingEntry.value
-    const url =
-      '/api/acl/whitelist/' +
-      encodeURIComponent(old.player_name) +
-      (old.server_id ? '?server_id=' + old.server_id : '')
-    const delRes = await api(url, 'DELETE')
-    if (!delRes.success) {
-      message.error(delRes.error || '修改失败（删除旧记录失败）')
+    const nextName = form.player_name.trim()
+    const nextServerId = form.server_id || ''
+    const changedKey = old.player_name !== nextName || old.server_id !== nextServerId
+
+    const res = await addToWhitelist()
+    if (!res.success) {
+      if (!res.silent) message.error(res.msg || res.error || '失败')
       return
     }
+
+    if (changedKey) {
+      const url =
+        '/api/acl/whitelist/' +
+        encodeURIComponent(old.player_name) +
+        (old.server_id ? '?server_id=' + encodeURIComponent(old.server_id) : '')
+      const delRes = await api(url, 'DELETE')
+      if (!delRes.success) {
+        message.warning(delRes.error || delRes.msg || '新记录已保存，但旧记录删除失败')
+      }
+    }
+
+    message.success('已保存')
+    showAddModal.value = false
+    editingEntry.value = null
+    resetForm()
+    load()
+    return
   }
 
   const res = await addToWhitelist()
@@ -441,7 +458,7 @@ const openEdit = (row) => {
 }
 
 const remove = async (name, serverId) => {
-  const url = '/api/acl/whitelist/' + encodeURIComponent(name) + (serverId ? '?server_id=' + serverId : '')
+  const url = '/api/acl/whitelist/' + encodeURIComponent(name) + (serverId ? '?server_id=' + encodeURIComponent(serverId) : '')
   const res = await api(url, 'DELETE')
   if (res.success) {
     message.success('已移除')
@@ -461,7 +478,7 @@ const batchRemove = async () => {
     const url =
       '/api/acl/whitelist/' +
       encodeURIComponent(item.player_name) +
-      (item.server_id ? '?server_id=' + item.server_id : '')
+      (item.server_id ? '?server_id=' + encodeURIComponent(item.server_id) : '')
     const res = await api(url, 'DELETE')
     if (res.success) success++
     else failed++
@@ -493,6 +510,11 @@ const openImportModal = () => { importJson.value = ''; importText.value = ''; sh
 const pasteImport = async () => { importJson.value = await navigator.clipboard.readText(); message.success('已粘贴') }
 const handleUpload = ({ file }) => { const reader = new FileReader(); reader.onload = (e) => { importJson.value = e.target.result }; reader.readAsText(file.file) }
 
+const normalizeWhitelistImportItem = (item = {}) => ({
+  ...item,
+  server_id: item.server_id || ''
+})
+
 const importData = async () => {
   let success = 0, failed = 0
   
@@ -501,7 +523,7 @@ const importData = async () => {
     try {
       const list = JSON.parse(importJson.value)
       for (const item of (Array.isArray(list) ? list : [list])) {
-        const res = await api('/api/acl/whitelist', 'POST', item)
+        const res = await api('/api/acl/whitelist', 'POST', normalizeWhitelistImportItem(item))
         if (res.success) success++
         else failed++
       }
@@ -516,7 +538,7 @@ const importData = async () => {
       const playerName = parts[0].trim()
       const reason = parts[1]?.trim() || ''
       if (playerName) {
-        const res = await api('/api/acl/whitelist', 'POST', { player_name: playerName, reason })
+        const res = await api('/api/acl/whitelist', 'POST', { player_name: playerName, reason, server_id: '' })
         if (res.success) success++
         else failed++
       }

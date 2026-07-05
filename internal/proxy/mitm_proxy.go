@@ -210,6 +210,11 @@ func (p *MITMProxy) handleConnection(ctx context.Context, clientConn *minecraft.
 
 	// Create session with player info including XUID (Requirements 2.1, 2.2, 2.3, 2.5)
 	sess, _ := p.sessionMgr.GetOrCreate(clientAddr, p.serverID)
+	defer func() {
+		if err := p.sessionMgr.Remove(clientAddr); err != nil {
+			logger.Debug("Failed to remove MITM session for %s: %v", clientAddr, err)
+		}
+	}()
 	sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 
 	// Connect to remote server

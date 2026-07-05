@@ -2,6 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/leanovate/gopter"
@@ -9,7 +13,27 @@ import (
 	"github.com/leanovate/gopter/prop"
 )
 
-// **Feature: mcpe-server-proxy, Property 6: Configuration Validation**
+func TestGlobalConfigSaveUsesStrictPermissionsWhenAPIKeySet(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not apply Unix-style file permission bits from Chmod")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := DefaultGlobalConfig()
+	cfg.APIKey = "secret-key"
+
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("mode = %v, want 0600", got)
+	}
+}
+
+
 // **Validates: Requirements 3.7**
 //
 // *For any* server configuration, the Validate() function SHALL return an error
@@ -607,6 +631,53 @@ func TestProperty3_LoadBalanceSortDefault(t *testing.T) {
 	))
 
 	properties.TestingRun(t)
+}
+
+func TestServerConfig_GetTargetAddrUsesJoinHostPort(t *testing.T) {
+	cfg := &ServerConfig{
+		Target: "2001:db8::1",
+		Port:   19132,
+	}
+	if got, want := cfg.GetTargetAddr(), "[2001:db8::1]:19132"; got != want {
+		t.Fatalf("GetTargetAddr() = %q, want %q", got, want)
+	}
+
+	cfg.SetResolvedIP("2001:db8::2")
+	if got, want := cfg.GetTargetAddr(), "[2001:db8::2]:19132"; got != want {
+		t.Fatalf("GetTargetAddr() with resolved IP = %q, want %q", got, want)
+	}
+}
+
+func TestConfigManagerLoadRejectsDuplicateServerID(t *testing.T) {
+	file, err := os.CreateTemp("", "server_list_duplicate_*.json")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer os.Remove(file.Name())
+
+	data := `[
+		{"id":"srv1","name":"first","target":"127.0.0.1","port":19132,"listen_addr":"0.0.0.0:19132","protocol":"raknet","enabled":true},
+		{"id":"srv1","name":"second","target":"127.0.0.1","port":19133,"listen_addr":"0.0.0.0:19133","protocol":"raknet","enabled":true}
+	]`
+	if _, err := file.WriteString(data); err != nil {
+		file.Close()
+		t.Fatalf("WriteString failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	mgr, err := NewConfigManager(file.Name())
+	if err != nil {
+		t.Fatalf("NewConfigManager failed: %v", err)
+	}
+	err = mgr.Load()
+	if err == nil {
+		t.Fatal("Load() succeeded, want duplicate server ID error")
+	}
+	if !strings.Contains(err.Error(), "duplicate server ID srv1") {
+		t.Fatalf("Load() error = %v, want duplicate server ID", err)
+	}
 }
 
 // TestServerConfig_LegacyDisabledMigratesToHidden verifies that an old config

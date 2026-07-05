@@ -88,16 +88,26 @@ func (r *PlayerRepository) DeleteByDisplayName(displayName string) error {
 // UpdateStats updates a player's statistics after a session ends.
 // This atomically adds bytesAdded to total_bytes and playtimeAdded to total_playtime.
 func (r *PlayerRepository) UpdateStats(displayName string, bytesAdded int64, playtimeAdded time.Duration) error {
+	return r.UpdateStatsWithIdentity(displayName, "", "", bytesAdded, playtimeAdded, time.Now())
+}
+
+// UpdateStatsWithIdentity updates player statistics and refreshes the latest known identity.
+func (r *PlayerRepository) UpdateStatsWithIdentity(displayName, uuid, xuid string, bytesAdded int64, playtimeAdded time.Duration, lastSeen time.Time) error {
+	if lastSeen.IsZero() {
+		lastSeen = time.Now()
+	}
 	query := `
 		UPDATE players 
 		SET total_bytes = total_bytes + ?, 
 		    total_playtime = total_playtime + ?,
-		    last_seen = ?
+		    last_seen = ?,
+		    uuid = CASE WHEN ? != '' THEN ? ELSE uuid END,
+		    xuid = CASE WHEN ? != '' THEN ? ELSE xuid END
 		WHERE display_name = ?
 	`
 
 	playtimeSeconds := int64(playtimeAdded.Seconds())
-	result, err := r.db.DB().Exec(query, bytesAdded, playtimeSeconds, time.Now(), displayName)
+	result, err := r.db.DB().Exec(query, bytesAdded, playtimeSeconds, lastSeen, uuid, uuid, xuid, xuid, displayName)
 	if err != nil {
 		return fmt.Errorf("failed to update player stats: %w", err)
 	}

@@ -505,6 +505,9 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 		outbound.Obfs = getString(item, "obfs")
 		outbound.ObfsPassword = firstNonEmpty(getString(item, "obfs-password"), getString(item, "obfs_password"))
 		outbound.PortHopping = firstNonEmpty(getString(item, "ports"), getString(item, "port-hopping"), getString(item, "port_hopping"))
+		outbound.HopInterval = getIntAlt(item, "hop-interval", "hop_interval")
+		outbound.UpMbps = parseMbps(firstNonEmpty(getString(item, "up"), getString(item, "up-mbps"), getString(item, "up_mbps")))
+		outbound.DownMbps = parseMbps(firstNonEmpty(getString(item, "down"), getString(item, "down-mbps"), getString(item, "down_mbps")))
 		outbound.TLS = true
 	default:
 		return ParsedOutbound{}, false
@@ -678,8 +681,10 @@ func parseLink(link string) (ParsedOutbound, bool) {
 		return parseAnyTLS(trimmed)
 	case hasSchemePrefix(trimmed, "vless"):
 		return parseVLESS(trimmed)
-	case hasSchemePrefix(trimmed, "hysteria2", "hy2"):
-		return parseHysteria2(strings.Replace(trimmed, "hy2://", "hysteria2://", 1))
+	case hasSchemePrefix(trimmed, "hysteria2", "hy2", "hysteria"):
+		normalized := strings.Replace(trimmed, "hy2://", "hysteria2://", 1)
+		normalized = strings.Replace(normalized, "hysteria://", "hysteria2://", 1)
+		return parseHysteria2(normalized)
 	case hasSchemePrefix(trimmed, "socks", "socks5", "socks5h"):
 		return parseSOCKS5(trimmed)
 	case hasSchemePrefix(trimmed, "http", "https"):
@@ -1085,8 +1090,11 @@ func parseHysteria2(link string) (ParsedOutbound, bool) {
 		Obfs:            parsed.Query().Get("obfs"),
 		ObfsPassword:    parsed.Query().Get("obfs-password"),
 		PortHopping:     firstNonEmpty(parsed.Query().Get("mport"), parsed.Query().Get("ports")),
-		ALPN:            parsed.Query().Get("alpn"),
+		ALPN:            queryFirst(parsed.Query(), "alpn"),
 		CertFingerprint: queryFirst(parsed.Query(), "pinSHA256", "pin_sha256", "cert-fingerprint", "cert_fingerprint", "certFingerprint"),
+		HopInterval:     parsePositiveInt(firstNonEmpty(queryFirst(parsed.Query(), "hop-interval", "hop_interval"))),
+		UpMbps:          parseMbps(queryFirst(parsed.Query(), "up", "up-mbps", "up_mbps")),
+		DownMbps:        parseMbps(queryFirst(parsed.Query(), "down", "down-mbps", "down_mbps")),
 		TLS:             true,
 		SNI:             firstNonEmpty(parsed.Query().Get("sni"), server),
 		Enabled:         true,
@@ -1315,11 +1323,37 @@ func normalizeProtocol(value string) string {
 		return config.ProtocolSOCKS5
 	case "http", "https":
 		return config.ProtocolHTTP
-	case "hy2", "hysteria2":
+	case "hy2", "hysteria", "hysteria2":
 		return config.ProtocolHysteria2
 	default:
 		return value
 	}
+}
+
+func parsePositiveInt(value string) int {
+	parsed, _ := strconv.Atoi(strings.TrimSpace(value))
+	if parsed > 0 {
+		return parsed
+	}
+	return 0
+}
+
+func parseMbps(value string) int {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return 0
+	}
+	fields := strings.Fields(value)
+	if len(fields) > 0 {
+		value = fields[0]
+	}
+	value = strings.TrimSuffix(value, "mbps")
+	value = strings.TrimSuffix(value, "m")
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || parsed <= 0 {
+		return 0
+	}
+	return int(parsed + 0.5)
 }
 
 func firstNonEmpty(values ...string) string {

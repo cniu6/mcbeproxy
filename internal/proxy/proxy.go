@@ -169,7 +169,7 @@ type ProxyServer struct {
 	listeners              map[string]Listener                // serverID -> listener (can be UDPListener or RakNetProxy)
 	listenAddrs            map[string]string                  // serverID -> listen addr (for detecting addr changes during Reload)
 	listenersMu            sync.RWMutex
-	reloadMu               sync.Mutex                         // serializes Reload to prevent concurrent listener start/stop races
+	reloadMu               sync.Mutex // serializes Reload to prevent concurrent listener start/stop races
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
@@ -506,6 +506,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 		ClientAddr:   snap.ClientAddr,
 		ServerID:     snap.ServerID,
 		UUID:         snap.UUID,
+		XUID:         snap.XUID,
 		DisplayName:  snap.DisplayName,
 		BytesUp:      snap.BytesUp,
 		BytesDown:    snap.BytesDown,
@@ -563,7 +564,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 		} else {
 			// Update existing player stats with retry
 			err = errorHandler.RetryOperation("update player stats", func() error {
-				return playerRepo.UpdateStats(snap.DisplayName, totalBytes, duration)
+				return playerRepo.UpdateStatsWithIdentity(snap.DisplayName, snap.UUID, snap.XUID, totalBytes, duration, endTime)
 			})
 			if err != nil {
 				logger.LogDatabaseError("update player stats", err)
@@ -2460,9 +2461,10 @@ func (p *ProxyServer) reloadProxyOutbounds() error {
 		logger.Info("Proxy outbounds changed: %d added, %d deleted", addedCount, deletedCount)
 	}
 
-	// Reload sing-box outbounds only if there are changes
+	// Reload sing-box outbounds whenever runtime configs were added, updated, or deleted.
+	// UpdateOutbound invalidates per-node cached runtimes; Reload finishes cleanup for removals.
 	// Requirements: 8.2
-	if addedCount > 0 || deletedCount > 0 {
+	if addedCount > 0 || updatedCount > 0 || deletedCount > 0 {
 		if err := p.outboundMgr.Reload(); err != nil {
 			logger.Error("Failed to reload outbound manager: %v", err)
 			return err
@@ -2533,6 +2535,10 @@ func (p *ProxyServer) StartServer(serverID string) error {
 	}
 	p.runningMu.RUnlock()
 
+	// Serialize with Reload/ReloadServer to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	serverCfg, exists := p.configMgr.GetServer(serverID)
 	if !exists {
 		return fmt.Errorf("server %s not found", serverID)
@@ -2558,6 +2564,10 @@ func (p *ProxyServer) StopServer(serverID string) error {
 		return fmt.Errorf("proxy server is not running")
 	}
 	p.runningMu.RUnlock()
+
+	// Serialize with Reload/ReloadServer to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
 
 	return p.stopListener(serverID)
 }

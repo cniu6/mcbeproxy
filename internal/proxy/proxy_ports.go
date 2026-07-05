@@ -431,7 +431,10 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 			remote.Close()
 			return
 		}
-		if err := resp.Write(conn); err != nil {
+		if err := func() error {
+			defer resp.Body.Close()
+			return resp.Write(conn)
+		}(); err != nil {
 			remote.Close()
 			return
 		}

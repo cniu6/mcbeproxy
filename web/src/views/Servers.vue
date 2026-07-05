@@ -382,7 +382,7 @@
           </n-gi>
         </n-grid>
       </n-form>
-      <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveServer">保存</n-button></n-space></template>
+      <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" :loading="savingServer" @click="saveServer">保存</n-button></n-space></template>
     </n-modal>
 
     <!-- 导出 Modal -->
@@ -583,7 +583,7 @@
             <n-button>上传 JSON 文件</n-button>
           </n-upload>
           <n-button @click="pasteImport">从剪贴板粘贴</n-button>
-          <n-button type="primary" @click="importServers">导入</n-button>
+          <n-button type="primary" :loading="importingServers" @click="importServers">导入</n-button>
           <n-button @click="showImportModal = false">取消</n-button>
         </n-space>
       </template>
@@ -1126,6 +1126,8 @@ const showImportModal = ref(false)
 const editingId = ref(null)
 const exportJson = ref('')
 const importJson = ref('')
+const savingServer = ref(false)
+const importingServers = ref(false)
 const pagination = ref({
   page: 1,
   pageSize: 100,
@@ -1304,6 +1306,18 @@ const buildServerPayload = (server) => {
     payload.auto_ping_full_scan_mode = ''
   }
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
+  delete payload.status
+  delete payload.connections
+  delete payload.active_connections
+  delete payload.current_connections
+  delete payload.total_connections
+  delete payload.latency_ms
+  delete payload.player_count
+  delete payload.players
+  delete payload.current_node
+  delete payload.best_node
+  delete payload.next_ping_at
+  delete payload.last_ping_at
   return payload
 }
 
@@ -2913,6 +2927,40 @@ const runBatchTestType = async (names, type, progressRef, serverId = '') => {
   })
 }
 
+const runNodeBatchTest = async ({
+  names,
+  key,
+  progressRef,
+  loadingRef,
+  serverId = '',
+  label = '节点',
+  afterSuccess
+}) => {
+  loadingRef.value = true
+  try {
+    if (key === 'all') {
+      const totalTests = names.length * 3
+      progressRef.value = { current: 0, total: totalTests, success: 0, failed: 0 }
+      message.info(`开始一键测试 ${names.length} 个${label}...`)
+      await runBatchTestType(names, 'tcp', progressRef, serverId)
+      await runBatchTestType(names, 'http', progressRef, serverId)
+      await runBatchTestType(names, 'udp', progressRef, serverId)
+    } else {
+      progressRef.value = { current: 0, total: names.length, success: 0, failed: 0 }
+      message.info(`开始 ${key.toUpperCase()} 测试 ${names.length} 个${label}...`)
+      await runBatchTestType(names, key, progressRef, serverId)
+    }
+    if (afterSuccess) {
+      await afterSuccess()
+    }
+    message.success(`测试完成: ${progressRef.value.success} 成功, ${progressRef.value.failed} 失败`)
+  } catch (err) {
+    message.error(`批量测试失败: ${err?.message || err || '未知错误'}`)
+  } finally {
+    loadingRef.value = false
+  }
+}
+
 // 处理批量测试结果
 const applyBatchTestItemResult = (item, type, progressRef) => {
   progressRef.value.current++
@@ -2952,24 +3000,15 @@ const handleQuickBatchTest = async (key) => {
     message.warning('没有可测试的节点')
     return
   }
-  
-  quickBatchTesting.value = true
-  
-  if (key === 'all') {
-    const totalTests = names.length * 3
-    quickBatchProgress.value = { current: 0, total: totalTests, success: 0, failed: 0 }
-    message.info(`开始一键测试 ${names.length} 个节点...`)
-    await runBatchTestType(names, 'tcp', quickBatchProgress, selectedServerId.value)
-    await runBatchTestType(names, 'http', quickBatchProgress, selectedServerId.value)
-    await runBatchTestType(names, 'udp', quickBatchProgress, selectedServerId.value)
-  } else {
-    quickBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
-    message.info(`开始 ${key.toUpperCase()} 测试 ${names.length} 个节点...`)
-    await runBatchTestType(names, key, quickBatchProgress, selectedServerId.value)
-  }
-  
-  quickBatchTesting.value = false
-  message.success(`测试完成: ${quickBatchProgress.value.success} 成功, ${quickBatchProgress.value.failed} 失败`)
+
+  await runNodeBatchTest({
+    names,
+    key,
+    progressRef: quickBatchProgress,
+    loadingRef: quickBatchTesting,
+    serverId: selectedServerId.value,
+    label: '节点'
+  })
 }
 
 // 节点选择模式的批量测试
@@ -2979,24 +3018,15 @@ const handleFormNodesBatchTest = async (key) => {
     message.warning('没有可测试的节点')
     return
   }
-  
-  formBatchTesting.value = true
-  
-  if (key === 'all') {
-    const totalTests = names.length * 3
-    formBatchProgress.value = { current: 0, total: totalTests, success: 0, failed: 0 }
-    message.info(`开始一键测试 ${names.length} 个节点...`)
-    await runBatchTestType(names, 'tcp', formBatchProgress, form.value?.id || '')
-    await runBatchTestType(names, 'http', formBatchProgress, form.value?.id || '')
-    await runBatchTestType(names, 'udp', formBatchProgress, form.value?.id || '')
-  } else {
-    formBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
-    message.info(`开始 ${key.toUpperCase()} 测试 ${names.length} 个节点...`)
-    await runBatchTestType(names, key, formBatchProgress, form.value?.id || '')
-  }
-  
-  formBatchTesting.value = false
-  message.success(`测试完成: ${formBatchProgress.value.success} 成功, ${formBatchProgress.value.failed} 失败`)
+
+  await runNodeBatchTest({
+    names,
+    key,
+    progressRef: formBatchProgress,
+    loadingRef: formBatchTesting,
+    serverId: form.value?.id || '',
+    label: '节点'
+  })
 }
 
 const handleFinalServerCandidatesBatchTest = async (key) => {
@@ -3006,24 +3036,17 @@ const handleFinalServerCandidatesBatchTest = async (key) => {
     return
   }
 
-  finalServerBatchTesting.value = true
-
-  if (key === 'all') {
-    const totalTests = names.length * 3
-    finalServerBatchProgress.value = { current: 0, total: totalTests, success: 0, failed: 0 }
-    message.info(`开始一键测试 ${names.length} 个候选节点...`)
-    await runBatchTestType(names, 'tcp', finalServerBatchProgress, form.value?.id || '')
-    await runBatchTestType(names, 'http', finalServerBatchProgress, form.value?.id || '')
-    await runBatchTestType(names, 'udp', finalServerBatchProgress, form.value?.id || '')
-  } else {
-    finalServerBatchProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
-    message.info(`开始 ${key.toUpperCase()} 测试 ${names.length} 个候选节点...`)
-    await runBatchTestType(names, key, finalServerBatchProgress, form.value?.id || '')
-  }
-
-  finalServerBatchTesting.value = false
-  await Promise.all([refreshFinalServerNodeLatencies(), fetchCurrentNode()])
-  message.success(`测试完成: ${finalServerBatchProgress.value.success} 成功, ${finalServerBatchProgress.value.failed} 失败`)
+  await runNodeBatchTest({
+    names,
+    key,
+    progressRef: finalServerBatchProgress,
+    loadingRef: finalServerBatchTesting,
+    serverId: form.value?.id || '',
+    label: '候选节点',
+    afterSuccess: async () => {
+      await Promise.all([refreshFinalServerNodeLatencies(), fetchCurrentNode()])
+    }
+  })
 }
 
 // 单个节点测试
@@ -4483,6 +4506,7 @@ const onNameChange = () => {
 }
 
 const saveServer = async () => {
+  if (savingServer.value) return
   if (!form.value.id || !form.value.name || !form.value.target) { message.warning('请填写必填项'); return }
   if (udpSpeederValidationError.value) { message.warning(udpSpeederValidationError.value); return }
   const latencyModeError = getLatencyModeDisabledReason(form.value.latency_mode || 'normal')
@@ -4511,10 +4535,22 @@ const saveServer = async () => {
     }
   }
 
-  const payload = buildServerPayload(form.value)
-  const res = await api(editingId.value ? `/api/servers/${editingId.value}` : '/api/servers', editingId.value ? 'PUT' : 'POST', payload)
-  if (res.success) { message.success(editingId.value ? '已更新' : '已创建'); showEditModal.value = false; load() }
-  else message.error(res.error || '操作失败')
+  savingServer.value = true
+  try {
+    const payload = buildServerPayload(form.value)
+    const res = await api(editingId.value ? `/api/servers/${encodeURIComponent(editingId.value)}` : '/api/servers', editingId.value ? 'PUT' : 'POST', payload)
+    if (res.success) {
+      message.success(editingId.value ? '已更新' : '已创建')
+      showEditModal.value = false
+      await load()
+    } else {
+      message.error(res.error || res.msg || '操作失败')
+    }
+  } catch (err) {
+    message.error(`保存失败: ${err?.message || err || '未知错误'}`)
+  } finally {
+    savingServer.value = false
+  }
 }
 
 const deleteServer = async (id) => {
@@ -4590,14 +4626,34 @@ const handleUpload = ({ file }) => {
 }
 
 const importServers = async () => {
+  if (importingServers.value) return
+  importingServers.value = true
   try {
     const data = JSON.parse(importJson.value)
     const list = Array.isArray(data) ? data : [data]
     let success = 0, failed = 0
-    for (const s of list) { const res = await api('/api/servers', 'POST', s); if (res.success) success++; else failed++ }
-    message.success(`导入完成: ${success} 成功, ${failed} 失败`)
-    showImportModal.value = false; load()
-  } catch (e) { message.error('JSON 格式错误: ' + e.message) }
+    const errors = []
+    for (const item of list) {
+      const payload = buildServerPayload(item)
+      const res = await api('/api/servers', 'POST', payload)
+      if (res.success) {
+        success++
+      } else {
+        failed++
+        errors.push(`${payload.id || item?.id || '未命名'}: ${res.error || res.msg || '失败'}`)
+      }
+    }
+    if (success > 0) message.success(`导入完成: ${success} 成功, ${failed} 失败`)
+    if (failed > 0) message.error(errors.slice(0, 3).join('；') || `${failed} 个服务器导入失败`)
+    if (failed === 0) {
+      showImportModal.value = false
+    }
+    await load()
+  } catch (e) {
+    message.error('JSON 格式错误: ' + e.message)
+  } finally {
+    importingServers.value = false
+  }
 }
 
 onMounted(async () => {

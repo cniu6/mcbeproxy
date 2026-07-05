@@ -73,6 +73,9 @@ type SingboxOutbound struct {
 	hy2Mu           sync.Mutex // Protects hy2Client for reconnection
 	anytlsClient    *anytls.Client
 	anytlsUOTClient *uot.Client
+	// For chain UDP caching, SOCKS5 control-close must mark the cached
+	// association dead instead of reconnecting it in place.
+	disableSOCKS5ReactiveReconnect bool
 	// Hysteria2 uses per-destination UDP connections
 	// Each destination gets its own HyUDPConn to avoid demultiplexing issues
 }

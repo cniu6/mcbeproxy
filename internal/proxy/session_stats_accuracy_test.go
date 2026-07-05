@@ -46,6 +46,7 @@ func TestPersistSession_EndTimeUsesLastSeenNotNow(t *testing.T) {
 		ServerID:    "srv1",
 		UUID:        "uuid-1",
 		DisplayName: "PlayerOne",
+		XUID:        "xuid-1",
 		BytesUp:     1000,
 		BytesDown:   2000,
 		StartTime:   start,
@@ -70,6 +71,9 @@ func TestPersistSession_EndTimeUsesLastSeenNotNow(t *testing.T) {
 	// 游玩时长应为 start→lastSeen 约 5 分钟，而不是 start→now 的 10 分钟。
 	if player.TotalPlaytime < 290 || player.TotalPlaytime > 310 {
 		t.Fatalf("TotalPlaytime = %ds, want ~300s", player.TotalPlaytime)
+	}
+	if player.XUID != "xuid-1" || player.LastSeen.Sub(lastSeen) < -2*time.Second || player.LastSeen.Sub(lastSeen) > 2*time.Second {
+		t.Fatalf("player identity/last_seen not refreshed: xuid=%q last_seen=%v want xuid-1/~%v", player.XUID, player.LastSeen, lastSeen)
 	}
 }
 
@@ -98,6 +102,55 @@ func TestPersistSession_EndTimeFallsBackToNowWhenLastSeenInvalid(t *testing.T) {
 	}
 }
 
+func TestPersistSession_ExistingPlayerRefreshesUUIDXUIDAndLastSeen(t *testing.T) {
+	sessionRepo, playerRepo := newTestStatsDB(t)
+	errorHandler := proxyerrors.NewErrorHandler()
+
+	firstSeen := time.Now().Add(-2 * time.Hour)
+	if err := playerRepo.Create(&db.PlayerRecord{
+		DisplayName:   "SameDisplayName",
+		UUID:          "old-uuid",
+		XUID:          "old-xuid",
+		FirstSeen:     firstSeen,
+		LastSeen:      firstSeen,
+		TotalBytes:    10,
+		TotalPlaytime: 20,
+	}); err != nil {
+		t.Fatalf("create existing player: %v", err)
+	}
+
+	start := time.Now().Add(-10 * time.Minute)
+	lastSeen := time.Now().Add(-7 * time.Minute)
+	sess := &session.Session{
+		ID:          "sess-existing-player",
+		ClientAddr:  "10.0.0.9:50000",
+		ServerID:    "srv1",
+		UUID:        "new-uuid",
+		XUID:        "new-xuid",
+		DisplayName: "SameDisplayName",
+		BytesUp:     100,
+		BytesDown:   200,
+		StartTime:   start,
+		LastSeen:    lastSeen,
+	}
+
+	persistSession(sess, sessionRepo, playerRepo, errorHandler)
+
+	player, err := playerRepo.GetByDisplayName("SameDisplayName")
+	if err != nil {
+		t.Fatalf("player record not found: %v", err)
+	}
+	if player.UUID != "new-uuid" || player.XUID != "new-xuid" {
+		t.Fatalf("identity not refreshed: uuid=%q xuid=%q", player.UUID, player.XUID)
+	}
+	if diff := player.LastSeen.Sub(lastSeen); diff < -2*time.Second || diff > 2*time.Second {
+		t.Fatalf("LastSeen = %v, want ~%v", player.LastSeen, lastSeen)
+	}
+	if player.TotalBytes != 310 {
+		t.Fatalf("TotalBytes = %d, want 310", player.TotalBytes)
+	}
+}
+
 func TestRawUDP_PreSessionTrafficIsBackfilled(t *testing.T) {
 	sm := session.NewSessionManager(time.Hour)
 	cfg := &config.ServerConfig{ID: "raw-stats", Target: "127.0.0.1", Port: 19999, ProxyMode: "raw_udp"}
@@ -106,7 +159,7 @@ func TestRawUDP_PreSessionTrafficIsBackfilled(t *testing.T) {
 	connectedAt := time.Now().Add(-3 * time.Second)
 	clientInfo := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 3), Port: 40000},
-		sessionID:  "10.0.0.3:40000",
+		sessionKey: "10.0.0.3:40000",
 		startTime:  connectedAt,
 	}
 	// 模拟会话创建之前的握手/Login 流量（旧实现会全部漏统计）。
@@ -115,7 +168,7 @@ func TestRawUDP_PreSessionTrafficIsBackfilled(t *testing.T) {
 
 	p.ensureSession(clientInfo)
 
-	sess, exists := sm.Get(clientInfo.sessionID)
+	sess, exists := sm.Get(clientInfo.sessionKey)
 	if !exists {
 		t.Fatal("session not created by ensureSession")
 	}
@@ -195,14 +248,14 @@ func TestRawUDP_SweepKeepsSessionStatsInSync(t *testing.T) {
 	client := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 50005},
 		targetConn: targetConn,
-		sessionID:  "10.0.0.5:50005",
+		sessionKey: "10.0.0.5:50005",
 		startTime:  now.Add(-2 * time.Minute),
 	}
 	client.lastSeen.Store(now.UnixNano())
 	client.lastClientPacket.Store(now.UnixNano())
 	client.bytesUp.Store(5000)
 	client.bytesDown.Store(9000)
-	p.clients.Store(client.sessionID, client)
+	p.clients.Store(client.sessionKey, client)
 	p.ensureSession(client)
 
 	p.sweepInactiveClients(now, p.effectiveClientDisconnectTimeout())
@@ -233,7 +286,7 @@ func TestRawUDP_StopFinalizesSessionStats(t *testing.T) {
 	client := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 6), Port: 50006},
 		targetConn: targetConn,
-		sessionID:  "10.0.0.6:50006",
+		sessionKey: "10.0.0.6:50006",
 		startTime:  time.Now().Add(-5 * time.Minute),
 	}
 	client.lastSeen.Store(lastSeen.UnixNano())
@@ -243,7 +296,7 @@ func TestRawUDP_StopFinalizesSessionStats(t *testing.T) {
 	client.mu.Lock()
 	client.playerName = "StopPlayer"
 	client.mu.Unlock()
-	p.clients.Store(client.sessionID, client)
+	p.clients.Store(client.sessionKey, client)
 	p.ensureSession(client)
 
 	if err := p.Stop(); err != nil {

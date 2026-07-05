@@ -145,29 +145,35 @@ type ProxyOutboundDTO struct {
 	LastCheck     string `json:"last_check,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 
-	// Protocol-specific fields (optional in response)
-	Username     string `json:"username,omitempty"`
-	Method       string `json:"method,omitempty"`
-	Password     string `json:"password,omitempty"`
-	UUID         string `json:"uuid,omitempty"`
-	AlterID      int    `json:"alter_id,omitempty"`
-	Security     string `json:"security,omitempty"`
-	Flow         string `json:"flow,omitempty"`
-	Obfs         string `json:"obfs,omitempty"`
-	ObfsPassword string `json:"obfs_password,omitempty"`
-	TLS          bool   `json:"tls,omitempty"`
-	SNI          string `json:"sni,omitempty"`
-	Insecure     bool   `json:"insecure,omitempty"`
-	Fingerprint  string `json:"fingerprint,omitempty"`
+	// Protocol-specific fields (presence indicators only; secret values are never returned)
+	HasPassword     bool   `json:"has_password,omitempty"`
+	HasUUID         bool   `json:"has_uuid,omitempty"`
+	HasObfsPassword bool   `json:"has_obfs_password,omitempty"`
+	Username        string `json:"username,omitempty"`
+	Method          string `json:"method,omitempty"`
+	Password        string `json:"password,omitempty"`
+	UUID            string `json:"uuid,omitempty"`
+	AlterID         int    `json:"alter_id,omitempty"`
+	Security        string `json:"security,omitempty"`
+	Flow            string `json:"flow,omitempty"`
+	Obfs            string `json:"obfs,omitempty"`
+	ObfsPassword    string `json:"obfs_password,omitempty"`
+	TLS             bool   `json:"tls,omitempty"`
+	SNI             string `json:"sni,omitempty"`
+	Insecure        bool   `json:"insecure,omitempty"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
 
 	// Hysteria2 specific fields
-	PortHopping     string `json:"port_hopping,omitempty"`
-	HopInterval     int    `json:"hop_interval,omitempty"`
-	UpMbps          int    `json:"up_mbps,omitempty"`
-	DownMbps        int    `json:"down_mbps,omitempty"`
-	ALPN            string `json:"alpn,omitempty"`
-	CertFingerprint string `json:"cert_fingerprint,omitempty"`
-	DisableMTU      bool   `json:"disable_mtu,omitempty"`
+	PortHopping              string `json:"port_hopping,omitempty"`
+	HopInterval              int    `json:"hop_interval,omitempty"`
+	UpMbps                   int    `json:"up_mbps,omitempty"`
+	DownMbps                 int    `json:"down_mbps,omitempty"`
+	ALPN                     string `json:"alpn,omitempty"`
+	CertFingerprint          string `json:"cert_fingerprint,omitempty"`
+	DisableMTU               bool   `json:"disable_mtu,omitempty"`
+	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
+	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
+	MinIdleSession           int    `json:"min_idle_session,omitempty"`
 
 	// Reality specific fields (for VLESS)
 	Reality          bool   `json:"reality,omitempty"`
@@ -193,33 +199,36 @@ type ProxyOutboundDTO struct {
 // toDTO converts a ProxyOutbound to ProxyOutboundDTO with health status.
 func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO {
 	dto := ProxyOutboundDTO{
-		Name:         cfg.Name,
-		Type:         cfg.Type,
-		Server:       cfg.Server,
-		Port:         cfg.Port,
-		Enabled:      cfg.Enabled,
-		Group:        cfg.Group,
-		Username:     cfg.Username,
-		Method:       cfg.Method,
-		Password:     cfg.Password,
-		UUID:         cfg.UUID,
-		AlterID:      cfg.AlterID,
-		Security:     cfg.Security,
-		Flow:         cfg.Flow,
-		Obfs:         cfg.Obfs,
-		ObfsPassword: cfg.ObfsPassword,
-		TLS:          cfg.TLS,
-		SNI:          cfg.SNI,
-		Insecure:     cfg.Insecure,
-		Fingerprint:  cfg.Fingerprint,
+		Name:            cfg.Name,
+		Type:            cfg.Type,
+		Server:          cfg.Server,
+		Port:            cfg.Port,
+		Enabled:         cfg.Enabled,
+		Group:           cfg.Group,
+		Username:        cfg.Username,
+		Method:          cfg.Method,
+		HasPassword:     cfg.Password != "",
+		HasUUID:         cfg.UUID != "",
+		AlterID:         cfg.AlterID,
+		Security:        cfg.Security,
+		Flow:            cfg.Flow,
+		Obfs:            cfg.Obfs,
+		HasObfsPassword: cfg.ObfsPassword != "",
+		TLS:             cfg.TLS,
+		SNI:             cfg.SNI,
+		Insecure:        cfg.Insecure,
+		Fingerprint:     cfg.Fingerprint,
 		// Hysteria2 specific
-		PortHopping:     cfg.PortHopping,
-		HopInterval:     cfg.HopInterval,
-		UpMbps:          cfg.UpMbps,
-		DownMbps:        cfg.DownMbps,
-		ALPN:            cfg.ALPN,
-		CertFingerprint: cfg.CertFingerprint,
-		DisableMTU:      cfg.DisableMTU,
+		PortHopping:              cfg.PortHopping,
+		HopInterval:              cfg.HopInterval,
+		UpMbps:                   cfg.UpMbps,
+		DownMbps:                 cfg.DownMbps,
+		ALPN:                     cfg.ALPN,
+		CertFingerprint:          cfg.CertFingerprint,
+		DisableMTU:               cfg.DisableMTU,
+		IdleSessionCheckInterval: cfg.IdleSessionCheckInterval,
+		IdleSessionTimeout:       cfg.IdleSessionTimeout,
+		MinIdleSession:           cfg.MinIdleSession,
 		// Reality specific
 		Reality:          cfg.Reality,
 		RealityPublicKey: cfg.RealityPublicKey,
@@ -286,13 +295,16 @@ type CreateProxyOutboundRequest struct {
 	Fingerprint  string `json:"fingerprint,omitempty"`
 
 	// Hysteria2 specific fields
-	PortHopping     string `json:"port_hopping,omitempty"`
-	HopInterval     int    `json:"hop_interval,omitempty"`
-	UpMbps          int    `json:"up_mbps,omitempty"`
-	DownMbps        int    `json:"down_mbps,omitempty"`
-	ALPN            string `json:"alpn,omitempty"`
-	CertFingerprint string `json:"cert_fingerprint,omitempty"`
-	DisableMTU      bool   `json:"disable_mtu,omitempty"`
+	PortHopping              string `json:"port_hopping,omitempty"`
+	HopInterval              int    `json:"hop_interval,omitempty"`
+	UpMbps                   int    `json:"up_mbps,omitempty"`
+	DownMbps                 int    `json:"down_mbps,omitempty"`
+	ALPN                     string `json:"alpn,omitempty"`
+	CertFingerprint          string `json:"cert_fingerprint,omitempty"`
+	DisableMTU               bool   `json:"disable_mtu,omitempty"`
+	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
+	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
+	MinIdleSession           int    `json:"min_idle_session,omitempty"`
 
 	// Reality specific fields (for VLESS)
 	Reality          bool   `json:"reality,omitempty"`
@@ -338,13 +350,16 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		Insecure:     r.Insecure,
 		Fingerprint:  r.Fingerprint,
 		// Hysteria2 specific
-		PortHopping:     r.PortHopping,
-		HopInterval:     r.HopInterval,
-		UpMbps:          r.UpMbps,
-		DownMbps:        r.DownMbps,
-		ALPN:            r.ALPN,
-		CertFingerprint: r.CertFingerprint,
-		DisableMTU:      r.DisableMTU,
+		PortHopping:              r.PortHopping,
+		HopInterval:              r.HopInterval,
+		UpMbps:                   r.UpMbps,
+		DownMbps:                 r.DownMbps,
+		ALPN:                     r.ALPN,
+		CertFingerprint:          r.CertFingerprint,
+		DisableMTU:               r.DisableMTU,
+		IdleSessionCheckInterval: r.IdleSessionCheckInterval,
+		IdleSessionTimeout:       r.IdleSessionTimeout,
+		MinIdleSession:           r.MinIdleSession,
 		// Reality specific
 		Reality:          r.Reality,
 		RealityPublicKey: r.RealityPublicKey,
@@ -1071,8 +1086,7 @@ func (h *ProxyOutboundHandler) CreateProxyOutbound(c *gin.Context) {
 	// Also add to outbound manager for runtime use
 	if h.outboundMgr != nil {
 		if err := h.outboundMgr.AddOutbound(cfg); err != nil {
-			// Log but don't fail - config is saved
-			// The outbound manager will sync on next reload
+			logger.Error("Failed to add proxy outbound %s to runtime manager: %v", cfg.Name, err)
 		}
 	}
 
@@ -1146,6 +1160,64 @@ func (h *ProxyOutboundHandler) GetProxyOutbound(c *gin.Context) {
 	respondSuccess(c, h.toDTO(outbound))
 }
 
+func (h *ProxyOutboundHandler) applySensitiveFieldDefaults(name string, cfg *config.ProxyOutbound) {
+	if h == nil || h.configMgr == nil || cfg == nil {
+		return
+	}
+	existing, exists := h.configMgr.GetOutbound(name)
+	if !exists || existing == nil {
+		return
+	}
+	if cfg.Password == "" {
+		cfg.Password = existing.Password
+	}
+	if cfg.UUID == "" {
+		cfg.UUID = existing.UUID
+	}
+	if cfg.ObfsPassword == "" {
+		cfg.ObfsPassword = existing.ObfsPassword
+	}
+}
+
+func (h *ProxyOutboundHandler) updateProxyOutboundConfig(name string, cfg *config.ProxyOutbound) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if cfg == nil {
+		return fmt.Errorf("proxy outbound cannot be nil")
+	}
+	if strings.TrimSpace(cfg.Name) != name {
+		return fmt.Errorf("renaming proxy outbounds is not supported; create a new node and update references explicitly")
+	}
+	h.applySensitiveFieldDefaults(name, cfg)
+	if err := h.configMgr.UpdateOutbound(name, cfg); err != nil {
+		return err
+	}
+	if h.outboundMgr != nil {
+		if err := h.outboundMgr.UpdateOutbound(name, cfg); err != nil {
+			logger.Error("Failed to update proxy outbound %s in runtime manager: %v", name, err)
+		}
+	}
+	h.triggerOutboundReloadHook(name)
+	return nil
+}
+
+func (h *ProxyOutboundHandler) deleteProxyOutboundConfig(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if err := h.configMgr.DeleteOutbound(name); err != nil {
+		return err
+	}
+	if h.outboundMgr != nil {
+		if err := h.outboundMgr.DeleteOutbound(name); err != nil {
+			logger.Error("Failed to delete proxy outbound %s from runtime manager: %v", name, err)
+		}
+	}
+	h.triggerOutboundReloadHook(name)
+	return nil
+}
+
 // UpdateProxyOutbound updates an existing proxy outbound configuration.
 // PUT /api/proxy-outbounds/:name
 // Requirements: 5.3
@@ -1164,21 +1236,10 @@ func (h *ProxyOutboundHandler) UpdateProxyOutbound(c *gin.Context) {
 
 	cfg := req.toProxyOutbound()
 
-	// Update in config manager (validates and persists)
-	if err := h.configMgr.UpdateOutbound(name, cfg); err != nil {
+	if err := h.updateProxyOutboundConfig(name, cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to update proxy outbound", err.Error())
 		return
 	}
-
-	// Also update in outbound manager for runtime use
-	if h.outboundMgr != nil {
-		if err := h.outboundMgr.UpdateOutbound(name, cfg); err != nil {
-			// Log but don't fail - config is saved
-		}
-	}
-
-	// Reload running servers/ports that reference this node so edits take effect immediately.
-	h.triggerOutboundReloadHook(name)
 
 	respondSuccess(c, h.toDTO(cfg))
 }
@@ -1193,16 +1254,9 @@ func (h *ProxyOutboundHandler) DeleteProxyOutbound(c *gin.Context) {
 		return
 	}
 
-	// Delete from config manager (persists)
-	if err := h.configMgr.DeleteOutbound(name); err != nil {
+	if err := h.deleteProxyOutboundConfig(name); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to delete proxy outbound", err.Error())
 		return
-	}
-
-	// Also delete from outbound manager
-	if h.outboundMgr != nil {
-		// This will also cascade update server configs
-		_ = h.outboundMgr.DeleteOutbound(name)
 	}
 
 	respondSuccessWithMsg(c, "代理出站节点已删除", nil)
@@ -2058,21 +2112,10 @@ func (h *ProxyOutboundHandler) UpdateProxyOutboundByBody(c *gin.Context) {
 	// Use the name from the request body
 	cfg := req.toProxyOutbound()
 
-	// Update in config manager (validates and persists)
-	if err := h.configMgr.UpdateOutbound(req.Name, cfg); err != nil {
+	if err := h.updateProxyOutboundConfig(req.Name, cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to update proxy outbound", err.Error())
 		return
 	}
-
-	// Also update in outbound manager for runtime use
-	if h.outboundMgr != nil {
-		if err := h.outboundMgr.UpdateOutbound(req.Name, cfg); err != nil {
-			// Log but don't fail - config is saved
-		}
-	}
-
-	// Reload running servers/ports that reference this node so edits take effect immediately.
-	h.triggerOutboundReloadHook(req.Name)
 
 	respondSuccess(c, h.toDTO(cfg))
 }
@@ -2087,16 +2130,9 @@ func (h *ProxyOutboundHandler) DeleteProxyOutboundByBody(c *gin.Context) {
 		return
 	}
 
-	// Delete from config manager (persists)
-	if err := h.configMgr.DeleteOutbound(req.Name); err != nil {
+	if err := h.deleteProxyOutboundConfig(req.Name); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to delete proxy outbound", err.Error())
 		return
-	}
-
-	// Also delete from outbound manager
-	if h.outboundMgr != nil {
-		// This will also cascade update server configs
-		_ = h.outboundMgr.DeleteOutbound(req.Name)
 	}
 
 	respondSuccessWithMsg(c, "代理出站节点已删除", nil)

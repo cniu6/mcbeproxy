@@ -86,6 +86,22 @@ func TestParseSubscriptionContent_TrojanSNIChangeDoesNotForceInsecure(t *testing
 	}
 }
 
+func TestParseSubscriptionContent_HysteriaMihomoFields(t *testing.T) {
+	content := []byte("hysteria://secret@example.com:443?ports=20000-55000&hop-interval=30&up=30%20Mbps&down=200%20Mbps&obfs=salamander&obfs-password=obfs&sni=edge.example.com&pinSHA256=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff#hy2\n")
+
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent returned error: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolHysteria2 || got.PortHopping != "20000-55000" || got.HopInterval != 30 || got.UpMbps != 30 || got.DownMbps != 200 || got.Obfs != "salamander" || got.ObfsPassword != "obfs" || got.SNI != "edge.example.com" || got.CertFingerprint == "" {
+		t.Fatalf("unexpected hysteria2 mihomo parse result: %+v", got)
+	}
+}
+
 func TestParseSubscriptionContent_VLESSRealityFingerprintLink(t *testing.T) {
 	content := []byte("vless://88262562-4037-4e18-8a7c-aad7da0d8d3d@us3.miyazono-kaori.com:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=download-porter.hoyoverse.com&fp=chrome&pbk=W69IUo4AnRh5R8kBqp5q88Ttaf8rB5ZeqbvQpS5krTY&sid=9f3d2bcc02a2&spx=%2F&type=tcp&headerType=none#vless-reality\n")
 
@@ -138,6 +154,22 @@ func TestParseSubscriptionContent_ClashYAMLProxyAliases(t *testing.T) {
 	}
 	if got := parsed[1].Outbound; got.Type != config.ProtocolHTTP || !got.TLS || got.SNI != "proxy.example.com" {
 		t.Fatalf("unexpected clash https parse result: %+v", got)
+	}
+}
+
+func TestParseSubscriptionContent_ClashYAMLHysteriaMihomoFields(t *testing.T) {
+	content := []byte("proxies:\n  - name: hy2-node\n    type: hysteria2\n    server: hy2.example.net\n    port: 443\n    ports: 20000-55000\n    hop-interval: 30\n    password: secret\n    up: 30 Mbps\n    down: 200 Mbps\n    obfs: salamander\n    obfs-password: obfs\n    alpn: [h3]\n    skip-cert-verify: true\n")
+
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent returned error: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolHysteria2 || got.PortHopping != "20000-55000" || got.HopInterval != 30 || got.UpMbps != 30 || got.DownMbps != 200 || got.ALPN != "h3" || !got.Insecure {
+		t.Fatalf("unexpected clash hysteria2 parse result: %+v", got)
 	}
 }
 

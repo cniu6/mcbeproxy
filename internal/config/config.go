@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -420,7 +421,7 @@ func (sc *ServerConfig) GetTargetAddr() string {
 	if ip == "" {
 		ip = sc.Target
 	}
-	return fmt.Sprintf("%s:%d", ip, sc.Port)
+	return net.JoinHostPort(ip, strconv.Itoa(sc.Port))
 }
 
 // SetResolvedIP sets the resolved IP address.
@@ -961,9 +962,13 @@ func (cm *ConfigManager) Load() error {
 		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Validate all configs before applying
+	seenIDs := make(map[string]struct{}, len(configs))
 	for _, config := range configs {
 		config.Normalize()
+		if _, exists := seenIDs[config.ID]; exists {
+			return fmt.Errorf("duplicate server ID %s", config.ID)
+		}
+		seenIDs[config.ID] = struct{}{}
 		if err := config.Validate(); err != nil {
 			return fmt.Errorf("invalid config for server %s: %w", config.ID, err)
 		}
@@ -1330,7 +1335,11 @@ func (gc *GlobalConfig) Save(path string) error {
 		return fmt.Errorf("failed to marshal global config: %w", err)
 	}
 
-	if err := atomicWriteFile(path, data, 0644); err != nil {
+	perm := os.FileMode(0644)
+	if gc.APIKey != "" {
+		perm = 0600
+	}
+	if err := atomicWriteFile(path, data, perm); err != nil {
 		return fmt.Errorf("failed to write global config: %w", err)
 	}
 
@@ -1562,7 +1571,7 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 					}
 					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
 						if err := cm.Reload(); err != nil {
-								logger.Error("Config reload error: %v", err)
+							logger.Error("Config reload error: %v", err)
 						}
 						// Re-add file to watcher after reload.
 						// After atomicWriteFile replaces the file via rename,

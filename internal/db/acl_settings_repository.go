@@ -25,7 +25,8 @@ func (r *ACLSettingsRepository) Get(serverID string) (*ACLSettings, error) {
 		WHERE server_id = ?
 	`
 
-	row := r.db.DB().QueryRow(query, serverID)
+	scope := normalizeACLServerID(serverID)
+	row := r.db.DB().QueryRow(query, scope)
 
 	var settings ACLSettings
 	var srvID, defaultMsg, whitelistMsg sql.NullString
@@ -81,6 +82,8 @@ func (r *ACLSettingsRepository) Update(settings *ACLSettings) error {
 			default_ban_message = excluded.default_ban_message,
 			whitelist_message = excluded.whitelist_message
 	`
+
+	settings.ServerID = normalizeACLServerID(settings.ServerID)
 
 	_, err := r.db.DB().Exec(query,
 		settings.ServerID,

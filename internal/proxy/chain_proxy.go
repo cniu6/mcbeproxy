@@ -22,8 +22,8 @@ import (
 // This allows using a SingboxDialer as the underlying dialer for another
 // SingboxDialer/SingboxOutbound, enabling proxy chaining.
 type chainNxDialer struct {
-	tcpDialer   singboxcore.Dialer   // wraps the previous proxy in the chain
-	udpOutbound *SingboxOutbound     // previous hop's outbound for UDP relay tunneling
+	tcpDialer   singboxcore.Dialer // wraps the previous proxy in the chain
+	udpOutbound *SingboxOutbound   // previous hop's outbound for UDP relay tunneling
 }
 
 func (d *chainNxDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -80,8 +80,9 @@ func chainSingboxOutbound(cfg *config.ProxyOutbound, prevDialer N.Dialer) (*Sing
 		return nil, fmt.Errorf("chain: outbound config is nil")
 	}
 	outbound := &SingboxOutbound{
-		config: cfg,
-		dialer: prevDialer,
+		config:                         cfg,
+		dialer:                         prevDialer,
+		disableSOCKS5ReactiveReconnect: cfg.Type == config.ProtocolSOCKS5,
 	}
 
 	var err error
@@ -224,10 +225,10 @@ type chainUDPOutbound struct {
 	mu           sync.Mutex
 
 	// UDP connection cache
-	cacheMu    sync.Mutex
-	cache      map[string]*cachedChainConn // destination -> cached conn
-	cacheStop  chan struct{}
-	cacheOnce  sync.Once
+	cacheMu   sync.Mutex
+	cache     map[string]*cachedChainConn // destination -> cached conn
+	cacheStop chan struct{}
+	cacheOnce sync.Once
 }
 
 // cachedChainConn wraps a PacketConn for reuse. Close() does NOT close the
@@ -236,13 +237,13 @@ type chainUDPOutbound struct {
 type cachedChainConn struct {
 	pc          net.PacketConn
 	dest        string
-	lastUsed    atomic.Int64 // unix nano — updated lock-free in hot path
-	createdAt   time.Time // for max lifetime enforcement
+	lastUsed    atomic.Int64  // unix nano — updated lock-free in hot path
+	createdAt   time.Time     // for max lifetime enforcement
 	maxLifetime time.Duration // with jitter applied per-conn
 	mu          sync.Mutex
-	activeUsers int32 // atomic: number of chainConnWrappers currently using this conn
-	hadTimeout  int32 // atomic: set when a read/write timeout occurred — conn may be stale
-	reuseCount  int32 // atomic: number of times this cached conn has been reused via ListenPacket
+	activeUsers int32         // atomic: number of chainConnWrappers currently using this conn
+	hadTimeout  int32         // atomic: set when a read/write timeout occurred — conn may be stale
+	reuseCount  int32         // atomic: number of times this cached conn has been reused via ListenPacket
 	releaseCh   chan struct{} // closed when activeUsers drops to 0 — wakes waiters instantly
 }
 
@@ -347,9 +348,11 @@ func (w *chainConnWrapper) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 func (w *chainConnWrapper) LocalAddr() net.Addr { return w.cached.pc.LocalAddr() }
 
-func (w *chainConnWrapper) SetDeadline(t time.Time) error      { return w.cached.pc.SetDeadline(t) }
-func (w *chainConnWrapper) SetReadDeadline(t time.Time) error  { return w.cached.pc.SetReadDeadline(t) }
-func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error { return w.cached.pc.SetWriteDeadline(t) }
+func (w *chainConnWrapper) SetDeadline(t time.Time) error     { return w.cached.pc.SetDeadline(t) }
+func (w *chainConnWrapper) SetReadDeadline(t time.Time) error { return w.cached.pc.SetReadDeadline(t) }
+func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error {
+	return w.cached.pc.SetWriteDeadline(t)
+}
 
 func (w *chainConnWrapper) Close() error {
 	// Decrement active user count first

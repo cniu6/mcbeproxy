@@ -18,41 +18,49 @@ func NewWhitelistRepository(db *Database) *WhitelistRepository {
 	return &WhitelistRepository{db: db}
 }
 
+func normalizeWhitelistDisplayName(displayName string) (string, string) {
+	trimmed := strings.TrimSpace(displayName)
+	return trimmed, strings.ToLower(trimmed)
+}
+
 // Create inserts a new whitelist entry into the database.
+// If the entry already exists (same display_name and server_id), it will be updated.
 func (r *WhitelistRepository) Create(entry *WhitelistEntry) error {
 	query := `
 		INSERT INTO whitelist (display_name, display_name_lower, enabled, reason, server_id, added_at, expires_at, added_by)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(display_name_lower, server_id) DO UPDATE SET
+			enabled = excluded.enabled,
+			reason = excluded.reason,
+			added_at = excluded.added_at,
+			expires_at = excluded.expires_at,
+			added_by = excluded.added_by
 	`
 
-	// Convert empty string to NULL for server_id (global whitelist)
-	var serverID interface{}
-	if entry.ServerID == "" {
-		serverID = nil
-	} else {
-		serverID = entry.ServerID
-	}
+	serverID := normalizeACLServerID(entry.ServerID)
+	entry.ServerID = serverID
 
-	result, err := r.db.DB().Exec(query,
-		entry.DisplayName,
-		strings.ToLower(entry.DisplayName),
+	displayName, displayNameLower := normalizeWhitelistDisplayName(entry.DisplayName)
+	entry.DisplayName = displayName
+
+	if _, err := r.db.DB().Exec(query,
+		displayName,
+		displayNameLower,
 		entry.Enabled,
 		entry.Reason,
 		serverID,
 		entry.AddedAt,
 		entry.ExpiresAt,
 		entry.AddedBy,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to create whitelist entry: %w", err)
 	}
 
-	id, err := result.LastInsertId()
+	stored, err := r.GetByName(displayName, serverID)
 	if err != nil {
-		return fmt.Errorf("failed to get last insert id: %w", err)
+		return fmt.Errorf("failed to reload whitelist entry after upsert: %w", err)
 	}
-	entry.ID = id
-
+	*entry = *stored
 	return nil
 }
 
@@ -62,14 +70,12 @@ func (r *WhitelistRepository) GetByName(displayName, serverID string) (*Whitelis
 	query := `
 		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM whitelist 
-		WHERE display_name_lower = ? AND (
-			server_id = ? OR 
-			(server_id IS NULL AND ? = '') OR
-			(server_id = '' AND ? = '')
-		)
+		WHERE display_name_lower = ? AND server_id = ?
 	`
 
-	row := r.db.DB().QueryRow(query, strings.ToLower(displayName), serverID, serverID, serverID)
+	_, displayNameLower := normalizeWhitelistDisplayName(displayName)
+	scope := normalizeACLServerID(serverID)
+	row := r.db.DB().QueryRow(query, displayNameLower, scope)
 	return r.scanWhitelistEntry(row)
 }
 
@@ -77,14 +83,12 @@ func (r *WhitelistRepository) UpdateEnabled(displayName, serverID string, enable
 	query := `
 		UPDATE whitelist
 		SET enabled = ?
-		WHERE display_name_lower = ? AND (
-			server_id = ? OR
-			(server_id IS NULL AND ? = '') OR
-			(server_id = '' AND ? = '')
-		)
+		WHERE display_name_lower = ? AND server_id = ?
 	`
 
-	result, err := r.db.DB().Exec(query, enabled, strings.ToLower(displayName), serverID, serverID, serverID)
+	_, displayNameLower := normalizeWhitelistDisplayName(displayName)
+	scope := normalizeACLServerID(serverID)
+	result, err := r.db.DB().Exec(query, enabled, displayNameLower, scope)
 	if err != nil {
 		return fmt.Errorf("failed to update whitelist entry enabled state: %w", err)
 	}
@@ -104,14 +108,12 @@ func (r *WhitelistRepository) UpdateEnabled(displayName, serverID string, enable
 func (r *WhitelistRepository) Delete(displayName, serverID string) error {
 	query := `
 		DELETE FROM whitelist 
-		WHERE display_name_lower = ? AND (
-			server_id = ? OR 
-			(server_id IS NULL AND ? = '') OR
-			(server_id = '' AND ? = '')
-		)
+		WHERE display_name_lower = ? AND server_id = ?
 	`
 
-	result, err := r.db.DB().Exec(query, strings.ToLower(displayName), serverID, serverID, serverID)
+	_, displayNameLower := normalizeWhitelistDisplayName(displayName)
+	scope := normalizeACLServerID(serverID)
+	result, err := r.db.DB().Exec(query, displayNameLower, scope)
 	if err != nil {
 		return fmt.Errorf("failed to delete whitelist entry: %w", err)
 	}
@@ -133,11 +135,12 @@ func (r *WhitelistRepository) List(serverID string) ([]*WhitelistEntry, error) {
 	query := `
 		SELECT id, display_name, enabled, reason, server_id, added_at, expires_at, added_by
 		FROM whitelist 
-		WHERE server_id = ? OR (server_id IS NULL AND ? = '') OR (server_id = '' AND ? = '')
+		WHERE server_id = ?
 		ORDER BY added_at DESC
 	`
 
-	rows, err := r.db.DB().Query(query, serverID, serverID, serverID)
+	scope := normalizeACLServerID(serverID)
+	rows, err := r.db.DB().Query(query, scope)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list whitelist entries: %w", err)
 	}

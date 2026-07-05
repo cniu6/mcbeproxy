@@ -173,7 +173,7 @@ type rawUDPClientInfo struct {
 	proxyNode            string                        // Name of the proxy node used (empty if direct)
 	loginParsed          atomic.Bool                   // Whether we've tried to parse login
 	sessionCreated       atomic.Bool                   // Whether a SessionManager entry exists for this client
-	sessionID            string                        // Session ID for session manager
+	sessionKey           string                        // Client address key used by SessionManager
 	splitPackets         map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
 	compressionID        atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
 	sendDatagramSeq      atomic.Uint32                 // Best-effort outgoing datagram sequence for injected packets (24-bit)
@@ -626,10 +626,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 	// Main packet forwarding loop
 	buffer := make([]byte, MaxUDPPacketSize)
 
-	// Set read deadline once; reset only after timeout to check ctx.Done().
-	// This eliminates 1 syscall per incoming packet.
-	p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-
+	// Refresh the deadline before every read. UDP deadlines are absolute; a
+	// one-time deadline would eventually expire and make later reads time out
+	// immediately even while traffic is healthy.
 	for {
 		select {
 		case <-ctx.Done():
@@ -637,6 +636,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 		case <-p.ctx.Done():
 			return nil
 		default:
+			p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
 			n, clientAddr, err := p.listener.ReadFromUDP(buffer)
 			if err != nil {
 				if p.closed.Load() {
@@ -710,7 +710,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 			// Update session stats (delta sync so bytes received before the
 			// session existed are credited too instead of being lost)
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+			if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
 				clientInfo.syncBytesUpToSession(sess)
 			}
 
@@ -725,6 +725,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 			// Check if we need to verify login first (lock-free check)
 			loginParsed := clientInfo.loginParsed.Load()
+
+			// Refresh the write deadline before each upstream write; deadlines are absolute.
+			clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 
 			// If login not yet parsed, check if this packet contains Login
 			if !loginParsed {
@@ -767,7 +770,6 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 						break
 					}
 					logger.Debug("Write to target timed out for %s (consecutive=%d), dropping datagram", clientAddr.String(), timeoutCount)
-					clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 					continue
 				}
 				logger.Info("RawUDP session closed (write to target failed): client=%s err=%v", clientAddr.String(), err)
@@ -850,17 +852,11 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		targetConn: targetConn,
 		targetAddr: targetAddr,
 		startTime:  now,
-		sessionID:  clientKey,
+		sessionKey: clientKey,
 		proxyNode:  selectedNode,
 	}
 	clientInfo.lastSeen.Store(now.UnixNano())
 	clientInfo.lastClientPacket.Store(now.UnixNano())
-
-	// Set write deadline once at connection creation. UDP writes to LAN/WAN
-	// targets complete in microseconds; resetting the deadline per packet is
-	// an unnecessary syscall on the hot path. If a write blocks long enough
-	// to hit this deadline, the resulting timeout error is handled below.
-	clientInfo.targetConn.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 
 	// Store client
 	p.clients.Store(clientKey, clientInfo)
@@ -893,9 +889,9 @@ func (p *RawUDPProxy) ensureSession(clientInfo *rawUDPClientInfo) {
 	if clientInfo == nil || clientInfo.sessionCreated.Load() {
 		return
 	}
-	sess, created := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
+	sess, created := p.sessionMgr.GetOrCreate(clientInfo.sessionKey, p.serverID)
 	if created {
-		logger.Debug("RawUDP: session %s created on RakNet connection establishment (pre-login)", clientInfo.sessionID)
+		logger.Debug("RawUDP: session for %s created on RakNet connection establishment (pre-login)", clientInfo.sessionKey)
 	}
 	if sess != nil {
 		// The session is registered lazily; align its start with the moment
@@ -1058,10 +1054,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 	buffer := getRawUDPBuffer()
 	defer putRawUDPBuffer(buffer)
 
-	// Set initial read deadline once; reset only after timeout to check
-	// inactivity. This eliminates 1 syscall per successful packet.
-	clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-
+	// Refresh the read deadline before each read. Deadlines on Go net.Conn are
+	// absolute, so leaving an old deadline in place causes permanent immediate
+	// timeouts after it expires.
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -1072,6 +1067,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				return
 			}
 
+			clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
 			n, _, err := clientInfo.targetConn.ReadFrom(buffer)
 			if err != nil {
 				if p.closed.Load() {
@@ -1119,6 +1115,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
 				logger.Info("RawUDP session closed (server sent RakNet disconnect): client=%s", clientAddr.String())
 				// Forward to client and then close
+				p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 				p.listener.WriteToUDP(buffer[:n], clientAddr)
 				return
 			}
@@ -1130,6 +1127,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			// Forward to client FIRST — minimizes time between reading from
 			// target and delivering to client, reducing risk of kernel buffer
 			// overflow on the target connection under heavy traffic.
+			p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 			_, err = p.listener.WriteToUDP(buffer[:n], clientAddr)
 
 			if err != nil {
@@ -1140,14 +1138,12 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// Still update stats even on recoverable error
 					clientInfo.bytesDown.Add(int64(n))
 					clientInfo.lastSeen.Store(time.Now().UnixNano())
-					if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+					if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
 						clientInfo.syncBytesDownToSession(sess)
 					}
 					continue
 				}
 				if isTimeoutError(err) {
-					// Reset listener write deadline after a transient timeout
-					p.listener.SetWriteDeadline(time.Now().Add(UDPWriteTimeout))
 					continue
 				}
 				if !isTimeoutError(err) {
@@ -1163,7 +1159,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
 
 			// Update session stats with single lock (delta sync)
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+			if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
 				clientInfo.syncBytesDownToSession(sess)
 			}
 		}
@@ -1327,7 +1323,7 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 	// Use the client's lastSeen timestamp (not time.Now()) so the session's
 	// LastSeen reflects the actual last packet time, not the removal time
 	// (which can be minutes later due to idle timeout or shutdown flush).
-	if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+	if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
 		lastSeenTime := time.Unix(0, lastSeenNano)
 		if lastSeenNano == 0 {
 			lastSeenTime = time.Now()
@@ -1348,7 +1344,7 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 		sess.SetLastSeenAt(lastSeenTime)
 	}
 
-	if err := p.sessionMgr.Remove(clientInfo.sessionID); err != nil {
+	if err := p.sessionMgr.Remove(clientInfo.sessionKey); err != nil {
 		if !strings.Contains(err.Error(), "session not found") {
 			logger.Debug("Failed to remove session for %s: %v", clientKey, err)
 		}
@@ -1443,13 +1439,13 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 			playerXUID := clientInfo.playerXUID
 			clientInfo.mu.Unlock()
 
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionID); exists {
+			if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
 				if playerName != "" && sess.GetDisplayName() == "" {
 					sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 				}
 				clientInfo.syncSessionStatsFromClient(sess)
 			} else if clientInfo.loginParsed.Load() && playerName != "" {
-				if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID); sess != nil {
+				if sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionKey, p.serverID); sess != nil {
 					clientInfo.sessionCreated.Store(true)
 					sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 					sess.UpdateLastSeen()
@@ -1844,7 +1840,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 	clientInfo.compressionID.Store(uint32(gamePacket[1]))
 
 	// Create (or reuse a pre-login) session and attach the parsed player info.
-	sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionID, p.serverID)
+	sess, _ := p.sessionMgr.GetOrCreate(clientInfo.sessionKey, p.serverID)
 	if sess != nil {
 		if !clientInfo.sessionCreated.Load() {
 			sess.BackdateStartTime(clientInfo.startTime)
@@ -1852,7 +1848,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 		clientInfo.sessionCreated.Store(true)
 		sess.SetPlayerInfoWithXUID(playerUUID, playerName, playerXUID)
 		sess.SetLastSeenAt(clientInfo.lastActivityTime())
-		logger.Debug("Created session %s with player info: name=%s", clientInfo.sessionID, playerName)
+		logger.Debug("Created session for %s with player info: name=%s", clientInfo.sessionKey, playerName)
 	}
 
 	logger.Info("Player login detected: name=%s, uuid=%s, xuid=%s, client=%s",
