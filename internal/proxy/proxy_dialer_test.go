@@ -660,6 +660,108 @@ func TestPlainUDPProxyRefreshTargetAddr_PreserveHostnameWhenProxying(t *testing.
 	}
 }
 
+func TestRelayStreamPreservesHalfCloseResponse(t *testing.T) {
+	clientConn, relayLocal := newPlainTCPRelayPair(t)
+	defer clientConn.Close()
+	defer relayLocal.Close()
+
+	relayRemote, targetConn := newPlainTCPRelayPair(t)
+	defer relayRemote.Close()
+	defer targetConn.Close()
+
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relayStream(relayLocal, relayLocal, relayRemote)
+	}()
+
+	targetDone := make(chan error, 1)
+	go func() {
+		request, err := io.ReadAll(targetConn)
+		if err != nil {
+			targetDone <- err
+			return
+		}
+		if string(request) != "request" {
+			targetDone <- fmt.Errorf("unexpected request: %q", request)
+			return
+		}
+		if _, err := targetConn.Write([]byte("response-after-half-close")); err != nil {
+			targetDone <- err
+			return
+		}
+		if tcp, ok := targetConn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		targetDone <- nil
+	}()
+
+	if _, err := clientConn.Write([]byte("request")); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	if tcp, ok := clientConn.(*net.TCPConn); ok {
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatalf("client CloseWrite: %v", err)
+		}
+	} else {
+		t.Fatalf("client conn does not support CloseWrite: %T", clientConn)
+	}
+
+	response, err := io.ReadAll(clientConn)
+	if err != nil {
+		t.Fatalf("client read response: %v", err)
+	}
+	if string(response) != "response-after-half-close" {
+		t.Fatalf("unexpected response after half-close: %q", response)
+	}
+	if err := <-targetDone; err != nil {
+		t.Fatalf("target failed: %v", err)
+	}
+	select {
+	case <-relayDone:
+	case <-time.After(time.Second):
+		t.Fatal("relay did not finish after both sides half-closed")
+	}
+}
+
+func newPlainTCPRelayPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp pair: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial tcp pair: %v", err)
+	}
+
+	select {
+	case server := <-accepted:
+		return client, server
+	case err := <-acceptErr:
+		_ = client.Close()
+		t.Fatalf("accept tcp pair: %v", err)
+	case <-time.After(time.Second):
+		_ = client.Close()
+		t.Fatal("timeout accepting tcp pair")
+	}
+	panic("unreachable")
+}
+
 func TestPlainTCPProxyDialOutboundFailsClosedWithoutOutboundManager(t *testing.T) {
 	proxy := NewPlainTCPProxy("server-1", &config.ServerConfig{
 		ID:            "server-1",

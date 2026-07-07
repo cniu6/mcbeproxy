@@ -175,6 +175,9 @@ type OutboundManager interface {
 	// GetActiveConnectionCount returns the total number of active connections across all outbounds.
 	GetActiveConnectionCount() int64
 
+	// GetOutboundConnectionCount returns active connections for one outbound.
+	GetOutboundConnectionCount(outboundName string) int64
+
 	// GetGroupStats returns statistics for a specific group.
 	// Returns nil if the group has no nodes.
 	// Requirements: 4.1, 4.2, 4.3, 4.4, 4.5
@@ -254,26 +257,124 @@ type serverConfigGetter interface {
 	GetServer(serverID string) (*config.ServerConfig, bool)
 }
 
+type activeSingboxOutbound struct {
+	outbound singboxcore.UDPOutbound
+	cfg      *config.ProxyOutbound
+}
+
+type retiredSingboxOutbound struct {
+	name     string
+	outbound singboxcore.UDPOutbound
+	cfg      *config.ProxyOutbound
+}
+
 // outboundManagerImpl is the in-memory implementation of OutboundManager.
 type outboundManagerImpl struct {
-	mu                  sync.RWMutex
-	globalConfig        *config.GlobalConfig
-	outbounds           map[string]*config.ProxyOutbound
-	singboxOutbounds    map[string]singboxcore.UDPOutbound
-	singboxLastUsed     map[string]time.Time // Track last usage time for idle cleanup
-	singboxInitGroup    singleflight.Group
-	singboxFactory      singboxcore.Factory
-	serverConfigUpdater ServerConfigUpdater
-	cleanupCtx          context.Context
-	cleanupCancel       context.CancelFunc
-	serverNodeLatencyMu sync.RWMutex
-	serverNodeLatency   map[serverNodeLatencyKey]serverNodeLatencyValue
-	serverNodeHistory   map[serverNodeLatencyKey]*serverNodeLatencyHistory
-	outboundLatencyMu   sync.RWMutex
-	outboundHistory     map[outboundLatencyKey]*outboundLatencyHistory
-	serverSelectedMu    sync.RWMutex
-	serverSelectedNode  map[string]string // serverID -> pinned node name
-	serverManualNode    map[string]bool   // serverID -> pinned by explicit manual switch
+	mu                      sync.RWMutex
+	globalConfig            *config.GlobalConfig
+	outbounds               map[string]*config.ProxyOutbound
+	singboxOutbounds        map[string]singboxcore.UDPOutbound
+	singboxOutboundConfigs  map[string]*config.ProxyOutbound
+	singboxLastUsed         map[string]time.Time // Track last usage time for idle cleanup
+	retiredSingboxOutbounds []*retiredSingboxOutbound
+	singboxInitGroup        singleflight.Group
+	singboxFactory          singboxcore.Factory
+	serverConfigUpdater     ServerConfigUpdater
+	cleanupCtx              context.Context
+	cleanupCancel           context.CancelFunc
+	serverNodeLatencyMu     sync.RWMutex
+	serverNodeLatency       map[serverNodeLatencyKey]serverNodeLatencyValue
+	serverNodeHistory       map[serverNodeLatencyKey]*serverNodeLatencyHistory
+	outboundLatencyMu       sync.RWMutex
+	outboundHistory         map[outboundLatencyKey]*outboundLatencyHistory
+	serverSelectedMu        sync.RWMutex
+	serverSelectedNode      map[string]string // serverID -> pinned node name
+	serverManualNode        map[string]bool   // serverID -> pinned by explicit manual switch
+}
+
+func (m *outboundManagerImpl) retireSingboxOutboundLocked(name string) {
+	outbound, ok := m.singboxOutbounds[name]
+	if !ok || outbound == nil {
+		return
+	}
+	cfg := m.singboxOutboundConfigs[name]
+	delete(m.singboxOutbounds, name)
+	delete(m.singboxOutboundConfigs, name)
+	delete(m.singboxLastUsed, name)
+	if cfg != nil && cfg.GetConnCount() > 0 {
+		m.retiredSingboxOutbounds = append(m.retiredSingboxOutbounds, &retiredSingboxOutbound{name: name, outbound: outbound, cfg: cfg})
+		return
+	}
+	_ = outbound.Close()
+}
+
+func (m *outboundManagerImpl) closeReadyRetiredSingboxOutboundsLocked() {
+	if len(m.retiredSingboxOutbounds) == 0 {
+		return
+	}
+	kept := m.retiredSingboxOutbounds[:0]
+	for _, retired := range m.retiredSingboxOutbounds {
+		if retired == nil || retired.outbound == nil {
+			continue
+		}
+		if retired.cfg != nil && retired.cfg.GetConnCount() > 0 {
+			kept = append(kept, retired)
+			continue
+		}
+		_ = retired.outbound.Close()
+	}
+	for i := len(kept); i < len(m.retiredSingboxOutbounds); i++ {
+		m.retiredSingboxOutbounds[i] = nil
+	}
+	m.retiredSingboxOutbounds = kept
+}
+
+func (m *outboundManagerImpl) closeAllRetiredSingboxOutboundsLocked() {
+	for _, retired := range m.retiredSingboxOutbounds {
+		if retired != nil && retired.outbound != nil {
+			_ = retired.outbound.Close()
+		}
+	}
+	m.retiredSingboxOutbounds = nil
+}
+
+func (m *outboundManagerImpl) acquireSingboxOutboundLocked(name string) (*activeSingboxOutbound, bool) {
+	outbound := m.singboxOutbounds[name]
+	cfg := m.singboxOutboundConfigs[name]
+	if outbound == nil || cfg == nil {
+		return nil, false
+	}
+	m.singboxLastUsed[name] = time.Now()
+	cfg.IncrConnCount()
+	return &activeSingboxOutbound{outbound: outbound, cfg: cfg}, true
+}
+
+func (m *outboundManagerImpl) releaseSingboxOutbound(active *activeSingboxOutbound) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseSingboxOutboundLocked(active)
+}
+
+func (m *outboundManagerImpl) releaseSingboxOutboundLocked(active *activeSingboxOutbound) {
+	if active != nil && active.cfg != nil {
+		active.cfg.DecrConnCount()
+	}
+	m.closeReadyRetiredSingboxOutboundsLocked()
+}
+
+func (m *outboundManagerImpl) activeConnectionCountLocked() int64 {
+	var total int64
+	for _, cfg := range m.outbounds {
+		if cfg != nil {
+			total += cfg.GetConnCount()
+		}
+	}
+	for _, retired := range m.retiredSingboxOutbounds {
+		if retired != nil && retired.cfg != nil {
+			total += retired.cfg.GetConnCount()
+		}
+	}
+	return total
 }
 
 type ServerNodeLatencySample struct {
@@ -366,17 +467,18 @@ func NewOutboundManagerWithSingboxFactoryAndConfig(serverConfigUpdater ServerCon
 		factory = NewSingboxCoreFactory()
 	}
 	m := &outboundManagerImpl{
-		globalConfig:        globalConfig,
-		outbounds:           make(map[string]*config.ProxyOutbound),
-		singboxOutbounds:    make(map[string]singboxcore.UDPOutbound),
-		singboxLastUsed:     make(map[string]time.Time),
-		singboxFactory:      factory,
-		serverConfigUpdater: serverConfigUpdater,
-		serverNodeLatency:   make(map[serverNodeLatencyKey]serverNodeLatencyValue),
-		serverNodeHistory:   make(map[serverNodeLatencyKey]*serverNodeLatencyHistory),
-		outboundHistory:     make(map[outboundLatencyKey]*outboundLatencyHistory),
-		serverSelectedNode:  make(map[string]string),
-		serverManualNode:    make(map[string]bool),
+		globalConfig:           globalConfig,
+		outbounds:              make(map[string]*config.ProxyOutbound),
+		singboxOutbounds:       make(map[string]singboxcore.UDPOutbound),
+		singboxOutboundConfigs: make(map[string]*config.ProxyOutbound),
+		singboxLastUsed:        make(map[string]time.Time),
+		singboxFactory:         factory,
+		serverConfigUpdater:    serverConfigUpdater,
+		serverNodeLatency:      make(map[serverNodeLatencyKey]serverNodeLatencyValue),
+		serverNodeHistory:      make(map[serverNodeLatencyKey]*serverNodeLatencyHistory),
+		outboundHistory:        make(map[outboundLatencyKey]*outboundLatencyHistory),
+		serverSelectedNode:     make(map[string]string),
+		serverManualNode:       make(map[string]bool),
 	}
 	// Wrap with ChainFactory so that outbounds with Chain config are routed
 	// through the chain instead of a single hop.
@@ -1086,7 +1188,7 @@ func (m *outboundManagerImpl) AddOutbound(cfg *config.ProxyOutbound) error {
 	}
 
 	// Store a clone to prevent external modification
-	m.outbounds[cfg.Name] = cfg.Clone()
+	m.outbounds[cfg.Name] = cfg.CloneWithFreshRuntime()
 	return nil
 }
 
@@ -1117,12 +1219,9 @@ func (m *outboundManagerImpl) DeleteOutbound(name string) error {
 	}
 	deletedGroup := deletedCfg.Group
 
-	// Close and remove the sing-box outbound if it exists
-	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
-		singboxOutbound.Close()
-		delete(m.singboxOutbounds, name)
-		delete(m.singboxLastUsed, name)
-	}
+	// Retire the sing-box outbound if it exists. Active PacketConns keep the old
+	// runtime alive until they close; new dials cannot use this deleted config.
+	m.retireSingboxOutboundLocked(name)
 
 	// Delete the outbound
 	delete(m.outbounds, name)
@@ -1143,12 +1242,7 @@ func (m *outboundManagerImpl) DeleteOutboundNoCascade(name string) error {
 		return ErrOutboundNotFound
 	}
 
-	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
-		singboxOutbound.Close()
-		delete(m.singboxOutbounds, name)
-		delete(m.singboxLastUsed, name)
-	}
-
+	m.retireSingboxOutboundLocked(name)
 	delete(m.outbounds, name)
 	return nil
 }
@@ -1254,29 +1348,37 @@ func (m *outboundManagerImpl) UpdateOutbound(name string, cfg *config.ProxyOutbo
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.outbounds[name]; !exists {
+	existingCfg, exists := m.outbounds[name]
+	if !exists {
 		return ErrOutboundNotFound
 	}
 
-	// If name changed, we need to handle the rename
+	// If name changed, future dials must use a fresh runtime under the new key.
 	if name != cfg.Name {
-		// Check if new name already exists
 		if _, exists := m.outbounds[cfg.Name]; exists {
 			return ErrOutboundExists
 		}
-		// Remove old entry
+		m.retireSingboxOutboundLocked(name)
 		delete(m.outbounds, name)
+		m.outbounds[cfg.Name] = cfg.CloneWithFreshRuntime()
+		return nil
 	}
 
-	// Close and remove the cached sing-box outbound (will be recreated on next use)
-	if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
-		singboxOutbound.Close()
-		delete(m.singboxOutbounds, name)
-		delete(m.singboxLastUsed, name)
+	// No effective runtime/config change: preserve the current runtime and avoid
+	// invalidating active UDP PacketConns on ordinary reload/save paths.
+	if existingCfg.Equal(cfg) {
+		updated := cfg.CloneWithRuntimeFrom(existingCfg)
+		m.outbounds[name] = updated
+		if runtimeCfg, ok := m.singboxOutboundConfigs[name]; ok && runtimeCfg == existingCfg {
+			m.singboxOutboundConfigs[name] = updated
+		}
+		return nil
 	}
 
-	// Store the updated configuration
-	m.outbounds[cfg.Name] = cfg.Clone()
+	// Runtime-affecting change: switch future dials to a fresh runtime while the
+	// old runtime drains through its own tracked PacketConns.
+	m.retireSingboxOutboundLocked(name)
+	m.outbounds[name] = cfg.CloneWithFreshRuntime()
 	return nil
 }
 
@@ -1406,9 +1508,11 @@ func (m *outboundManagerImpl) prepareDialPacketConn(outboundName string) error {
 		if time.Since(lastCheck) < 30*time.Second {
 			return fmt.Errorf("%w: %s - %s", ErrOutboundUnhealthy, outboundName, lastErr)
 		}
-		if _, err := m.recreateSingboxOutbound(outboundName); err != nil {
+		active, err := m.recreateSingboxOutbound(outboundName)
+		if err != nil {
 			return fmt.Errorf("%w: %s - failed to recreate: %v", ErrOutboundUnhealthy, outboundName, err)
 		}
+		m.releaseSingboxOutbound(active)
 	}
 
 	return nil
@@ -1528,8 +1632,8 @@ func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, ou
 		return nil, ErrOutboundNotFound
 	}
 
-	// Get or create sing-box outbound instance
-	singboxOutbound, err := m.getOrCreateSingboxOutbound(cfg)
+	// Get or create sing-box outbound instance and hold a runtime reference while dialing.
+	active, err := m.getOrCreateSingboxOutbound(cfg)
 	if err != nil {
 		if markHealth {
 			cfg.SetHealthy(false)
@@ -1540,15 +1644,18 @@ func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, ou
 	}
 
 	// Create packet connection
-	conn, err := singboxOutbound.ListenPacket(ctx, destination)
+	conn, err := active.outbound.ListenPacket(ctx, destination)
 	if err != nil {
+		m.releaseSingboxOutbound(active)
 		if shouldRecreateSingboxUDPOutbound(cfg, err) {
-			newOutbound, recreateErr := m.recreateSingboxOutbound(outboundName)
+			newActive, recreateErr := m.recreateSingboxOutbound(outboundName)
 			if recreateErr == nil {
-				conn, err = newOutbound.ListenPacket(ctx, destination)
+				conn, err = newActive.outbound.ListenPacket(ctx, destination)
 				if err == nil {
+					active = newActive
 					goto success
 				}
+				m.releaseSingboxOutbound(newActive)
 			}
 			if markHealth {
 				cfg.SetLastCheck(time.Now())
@@ -1566,155 +1673,145 @@ func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, ou
 
 success:
 
-	m.mu.Lock()
-	if cfg, ok := m.outbounds[outboundName]; ok {
-		cfg.IncrConnCount()
-		if markHealth {
-			cfg.SetHealthy(true)
-			cfg.SetLastError("")
-			cfg.SetLastCheck(time.Now())
-		}
-		m.mu.Unlock()
-	} else {
-		m.mu.Unlock()
+	m.mu.RLock()
+	_, stillExists := m.outbounds[outboundName]
+	m.mu.RUnlock()
+	if !stillExists {
 		if conn != nil {
-			conn.Close()
+			_ = conn.Close()
 		}
+		m.releaseSingboxOutbound(active)
 		return nil, ErrOutboundNotFound
+	}
+
+	if markHealth && active != nil && active.cfg != nil {
+		active.cfg.SetHealthy(true)
+		active.cfg.SetLastError("")
+		active.cfg.SetLastCheck(time.Now())
 	}
 
 	return &trackedPacketConn{
 		PacketConn: conn,
-		cfg:        cfg,
+		cfg:        active.cfg,
 		onClose: func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			if c, ok := m.outbounds[outboundName]; ok {
-				c.DecrConnCount()
-			}
+			m.releaseSingboxOutbound(active)
 		},
 	}, nil
 }
 
 // getOrCreateSingboxOutbound gets an existing sing-box outbound or creates a new one.
-func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbound) (singboxcore.UDPOutbound, error) {
+func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbound) (*activeSingboxOutbound, error) {
 	if cfg == nil {
 		return nil, ErrOutboundNotFound
 	}
 
-	m.mu.RLock()
-	if _, ok := m.singboxOutbounds[cfg.Name]; ok {
-		m.mu.RUnlock()
+	for attempt := 0; attempt < 2; attempt++ {
 		m.mu.Lock()
-		var existing singboxcore.UDPOutbound
-		if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
-			m.singboxLastUsed[cfg.Name] = time.Now()
-			existing = current
+		if active, ok := m.acquireSingboxOutboundLocked(cfg.Name); ok {
+			m.mu.Unlock()
+			return active, nil
 		}
 		m.mu.Unlock()
-		if existing != nil {
-			return existing, nil
-		}
-	} else {
-		m.mu.RUnlock()
-	}
 
-	result, err, _ := m.singboxInitGroup.Do(cfg.Name, func() (interface{}, error) {
-		m.mu.RLock()
-		if _, ok := m.singboxOutbounds[cfg.Name]; ok {
-			m.mu.RUnlock()
+		_, err, _ := m.singboxInitGroup.Do(cfg.Name, func() (interface{}, error) {
 			m.mu.Lock()
-			var existing singboxcore.UDPOutbound
-			if current, stillOK := m.singboxOutbounds[cfg.Name]; stillOK {
-				m.singboxLastUsed[cfg.Name] = time.Now()
-				existing = current
+			if _, ok := m.singboxOutbounds[cfg.Name]; ok {
+				m.mu.Unlock()
+				return nil, nil
 			}
+			currentCfg, exists := m.outbounds[cfg.Name]
+			if !exists || currentCfg == nil {
+				m.mu.Unlock()
+				return nil, ErrOutboundNotFound
+			}
+			cfgCopy := currentCfg.Clone()
 			m.mu.Unlock()
-			if existing != nil {
-				return existing, nil
+
+			singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), cfgCopy)
+			if createErr != nil {
+				return nil, createErr
 			}
-		} else {
-			m.mu.RUnlock()
-		}
-		m.mu.RLock()
-		currentCfg, exists := m.outbounds[cfg.Name]
-		m.mu.RUnlock()
-		if !exists || currentCfg == nil {
-			return nil, ErrOutboundNotFound
-		}
 
-		singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), currentCfg.Clone())
-		if createErr != nil {
-			return nil, createErr
-		}
-
-		m.mu.Lock()
-		if existing, ok := m.singboxOutbounds[cfg.Name]; ok {
+			m.mu.Lock()
+			if _, ok := m.singboxOutbounds[cfg.Name]; ok {
+				m.mu.Unlock()
+				_ = singboxOutbound.Close()
+				return nil, nil
+			}
+			currentCfg, exists = m.outbounds[cfg.Name]
+			if !exists || currentCfg == nil {
+				m.mu.Unlock()
+				_ = singboxOutbound.Close()
+				return nil, ErrOutboundNotFound
+			}
+			m.singboxOutbounds[cfg.Name] = singboxOutbound
+			m.singboxOutboundConfigs[cfg.Name] = currentCfg
 			m.singboxLastUsed[cfg.Name] = time.Now()
 			m.mu.Unlock()
-			_ = singboxOutbound.Close()
-			return existing, nil
+			return nil, nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		m.singboxOutbounds[cfg.Name] = singboxOutbound
-		m.singboxLastUsed[cfg.Name] = time.Now()
-		m.mu.Unlock()
-		return singboxOutbound, nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	singboxOutbound, ok := result.(singboxcore.UDPOutbound)
-	if !ok || singboxOutbound == nil {
+
+	m.mu.Lock()
+	active, ok := m.acquireSingboxOutboundLocked(cfg.Name)
+	m.mu.Unlock()
+	if !ok || active == nil {
 		return nil, fmt.Errorf("failed to initialize sing-box outbound for %s", cfg.Name)
 	}
-	return singboxOutbound, nil
+	return active, nil
 }
 
 // recreateSingboxOutbound closes and recreates a sing-box outbound.
 // This is useful for protocols like Hysteria2 that may need reconnection.
-func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (singboxcore.UDPOutbound, error) {
-	result, err, _ := m.singboxInitGroup.Do(name, func() (interface{}, error) {
-		m.mu.Lock()
-		cfg, exists := m.outbounds[name]
-		if !exists || cfg == nil {
+func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*activeSingboxOutbound, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		_, err, _ := m.singboxInitGroup.Do(name, func() (interface{}, error) {
+			m.mu.Lock()
+			cfg, exists := m.outbounds[name]
+			if !exists || cfg == nil {
+				m.mu.Unlock()
+				return nil, ErrOutboundNotFound
+			}
+			cfgCopy := cfg.Clone()
 			m.mu.Unlock()
-			return nil, ErrOutboundNotFound
-		}
-		cfgCopy := cfg.Clone()
-		existing := m.singboxOutbounds[name]
-		delete(m.singboxOutbounds, name)
-		delete(m.singboxLastUsed, name)
-		m.mu.Unlock()
 
-		if existing != nil {
-			_ = existing.Close()
-		}
+			singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), cfgCopy)
+			if createErr != nil {
+				return nil, createErr
+			}
 
-		singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), cfgCopy)
-		if createErr != nil {
-			return nil, createErr
-		}
-
-		m.mu.Lock()
-		if current, ok := m.singboxOutbounds[name]; ok {
+			m.mu.Lock()
+			currentCfg, exists := m.outbounds[name]
+			if !exists || currentCfg == nil || currentCfg != cfg {
+				m.mu.Unlock()
+				_ = singboxOutbound.Close()
+				return nil, nil
+			}
+			runtimeCfg := currentCfg.CloneWithFreshRuntime()
+			m.retireSingboxOutboundLocked(name)
+			m.outbounds[name] = runtimeCfg
+			m.singboxOutbounds[name] = singboxOutbound
+			m.singboxOutboundConfigs[name] = runtimeCfg
 			m.singboxLastUsed[name] = time.Now()
 			m.mu.Unlock()
-			_ = singboxOutbound.Close()
-			return current, nil
+			return nil, nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		m.singboxOutbounds[name] = singboxOutbound
-		m.singboxLastUsed[name] = time.Now()
+
+		m.mu.Lock()
+		active, ok := m.acquireSingboxOutboundLocked(name)
 		m.mu.Unlock()
-		return singboxOutbound, nil
-	})
-	if err != nil {
-		return nil, err
+		if ok && active != nil {
+			return active, nil
+		}
 	}
-	singboxOutbound, ok := result.(singboxcore.UDPOutbound)
-	if !ok || singboxOutbound == nil {
-		return nil, fmt.Errorf("failed to recreate sing-box outbound for %s", name)
-	}
-	return singboxOutbound, nil
+
+	return nil, fmt.Errorf("failed to recreate sing-box outbound for %s", name)
 }
 
 // trackedPacketConn wraps a PacketConn to track when it's closed.
@@ -1725,6 +1822,8 @@ type trackedPacketConn struct {
 	closeErr  error
 	cfg       *config.ProxyOutbound
 }
+
+var _ udpSocketBufferConfigurer = (*trackedPacketConn)(nil)
 
 func (c *trackedPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	n, addr, err = c.PacketConn.ReadFrom(p)
@@ -1740,6 +1839,20 @@ func (c *trackedPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) 
 		c.cfg.AddBytesUp(int64(n))
 	}
 	return n, err
+}
+
+func (c *trackedPacketConn) SetReadBuffer(bytes int) error {
+	if setter, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
+		return setter.SetReadBuffer(bytes)
+	}
+	return fmt.Errorf("underlying packet conn %T does not support SetReadBuffer", c.PacketConn)
+}
+
+func (c *trackedPacketConn) SetWriteBuffer(bytes int) error {
+	if setter, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
+		return setter.SetWriteBuffer(bytes)
+	}
+	return fmt.Errorf("underlying packet conn %T does not support SetWriteBuffer", c.PacketConn)
 }
 
 // Close closes the connection and calls the onClose callback.
@@ -1829,20 +1942,19 @@ func (m *outboundManagerImpl) cleanupIdleOutbounds() {
 			m.mu.Lock()
 			now := time.Now()
 			for name, lastUsed := range m.singboxLastUsed {
-				// Skip if outbound has active connections
-				if cfg, ok := m.outbounds[name]; ok && cfg.GetConnCount() > 0 {
+				// Skip if this runtime generation has active connections.
+				if cfg := m.singboxOutboundConfigs[name]; cfg != nil && cfg.GetConnCount() > 0 {
 					continue
 				}
 				// Close if idle for too long
 				if now.Sub(lastUsed) > OutboundIdleTimeout {
-					if outbound, ok := m.singboxOutbounds[name]; ok {
+					if _, ok := m.singboxOutbounds[name]; ok {
 						logger.Debug("Closing idle outbound: %s (idle for %v)", name, now.Sub(lastUsed))
-						outbound.Close()
-						delete(m.singboxOutbounds, name)
-						delete(m.singboxLastUsed, name)
+						m.retireSingboxOutboundLocked(name)
 					}
 				}
 			}
+			m.closeReadyRetiredSingboxOutboundsLocked()
 			m.mu.Unlock()
 			m.cleanupExpiredServerNodeLatencyHistory(now)
 			m.cleanupExpiredOutboundLatencyHistory(now)
@@ -1868,11 +1980,7 @@ func (m *outboundManagerImpl) Stop() error {
 	waited := time.Duration(0)
 
 	for waited < maxWait {
-		activeConns := int64(0)
-		for _, cfg := range m.outbounds {
-			activeConns += cfg.GetConnCount()
-		}
-		if activeConns == 0 {
+		if m.activeConnectionCountLocked() == 0 {
 			break
 		}
 		m.mu.Unlock()
@@ -1890,7 +1998,9 @@ func (m *outboundManagerImpl) Stop() error {
 
 	// Clear the cached outbounds
 	m.singboxOutbounds = make(map[string]singboxcore.UDPOutbound)
+	m.singboxOutboundConfigs = make(map[string]*config.ProxyOutbound)
 	m.singboxLastUsed = make(map[string]time.Time)
+	m.closeAllRetiredSingboxOutboundsLocked()
 
 	return nil
 }
@@ -1906,12 +2016,8 @@ func (m *outboundManagerImpl) Reload() error {
 	// Track which outbounds need to be recreated
 	for name, cfg := range m.outbounds {
 		if !cfg.Enabled {
-			// Close and remove disabled outbounds
-			if singboxOutbound, ok := m.singboxOutbounds[name]; ok {
-				singboxOutbound.Close()
-				delete(m.singboxOutbounds, name)
-				delete(m.singboxLastUsed, name)
-			}
+			// Retire disabled outbounds; active PacketConns drain naturally.
+			m.retireSingboxOutboundLocked(name)
 			continue
 		}
 
@@ -1927,6 +2033,7 @@ func (m *outboundManagerImpl) Reload() error {
 				continue
 			}
 			m.singboxOutbounds[name] = singboxOutbound
+			m.singboxOutboundConfigs[name] = cfg
 			m.singboxLastUsed[name] = time.Now()
 			cfg.SetHealthy(true)
 			cfg.SetLastError("")
@@ -1937,11 +2044,10 @@ func (m *outboundManagerImpl) Reload() error {
 	// Remove sing-box outbounds for deleted configurations
 	for name := range m.singboxOutbounds {
 		if _, exists := m.outbounds[name]; !exists {
-			m.singboxOutbounds[name].Close()
-			delete(m.singboxOutbounds, name)
-			delete(m.singboxLastUsed, name)
+			m.retireSingboxOutboundLocked(name)
 		}
 	}
+	m.closeReadyRetiredSingboxOutboundsLocked()
 
 	return nil
 }
@@ -1951,9 +2057,20 @@ func (m *outboundManagerImpl) GetActiveConnectionCount() int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	return m.activeConnectionCountLocked()
+}
+
+func (m *outboundManagerImpl) GetOutboundConnectionCount(outboundName string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var total int64
-	for _, cfg := range m.outbounds {
+	if cfg, ok := m.outbounds[outboundName]; ok && cfg != nil {
 		total += cfg.GetConnCount()
+	}
+	for _, retired := range m.retiredSingboxOutbounds {
+		if retired != nil && retired.name == outboundName && retired.cfg != nil {
+			total += retired.cfg.GetConnCount()
+		}
 	}
 	return total
 }

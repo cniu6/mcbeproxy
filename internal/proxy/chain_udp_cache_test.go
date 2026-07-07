@@ -12,6 +12,102 @@ import (
 	"mcpeserverproxy/internal/config"
 )
 
+func TestChainConnWrapperCloseIsIdempotent(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen packet conn: %v", err)
+	}
+	defer pc.Close()
+
+	cached := &cachedChainConn{
+		pc:          pc,
+		dest:        "127.0.0.1:19132",
+		createdAt:   time.Now(),
+		maxLifetime: time.Minute,
+		activeUsers: 1,
+		releaseCh:   make(chan struct{}),
+	}
+	cached.lastUsed.Store(time.Now().UnixNano())
+	parent := &chainUDPOutbound{
+		cache:     map[string]*cachedChainConn{cached.dest: cached},
+		cacheStop: make(chan struct{}),
+	}
+	wrapper := &chainConnWrapper{cached: cached, parent: parent, dest: cached.dest}
+
+	if err := wrapper.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if err := wrapper.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if got := atomic.LoadInt32(&cached.activeUsers); got != 0 {
+		t.Fatalf("activeUsers after double close = %d, want 0", got)
+	}
+}
+
+func resetChainDNSCacheForTest(t *testing.T) {
+	t.Helper()
+	dnsCacheMu.Lock()
+	oldCache := dnsCache
+	oldInFlight := dnsCacheInFlight
+	dnsCache = make(map[string]dnsCacheEntry)
+	dnsCacheInFlight = make(map[string]struct{})
+	dnsCacheMu.Unlock()
+	t.Cleanup(func() {
+		dnsCacheMu.Lock()
+		dnsCache = oldCache
+		dnsCacheInFlight = oldInFlight
+		dnsCacheMu.Unlock()
+	})
+}
+
+func TestNormalizeCacheKeyDoesNotBlockOnDNSMiss(t *testing.T) {
+	resetChainDNSCacheForTest(t)
+	oldResolve := resolveChainCacheIP
+	started := make(chan struct{})
+	release := make(chan struct{})
+	resolveChainCacheIP = func(ctx context.Context, host string) (net.IP, string, error) {
+		close(started)
+		select {
+		case <-release:
+			return net.ParseIP("203.0.113.10"), "test", nil
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		}
+	}
+	t.Cleanup(func() {
+		close(release)
+		resolveChainCacheIP = oldResolve
+	})
+
+	start := time.Now()
+	key := normalizeCacheKey("example.invalid:19132")
+	elapsed := time.Since(start)
+	if key != "example.invalid:19132" {
+		t.Fatalf("cache miss key = %q, want original destination", key)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("normalizeCacheKey blocked on DNS miss for %s", elapsed)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected async DNS warm to start")
+	}
+}
+
+func TestNormalizeCacheKeyUsesWarmedDNSCache(t *testing.T) {
+	resetChainDNSCacheForTest(t)
+	dnsCacheMu.Lock()
+	dnsCache["example.invalid"] = dnsCacheEntry{ip: "203.0.113.20", expiresAt: time.Now().Add(time.Minute)}
+	dnsCacheMu.Unlock()
+
+	if got := normalizeCacheKey("example.invalid:19132"); got != "203.0.113.20:19132" {
+		t.Fatalf("cache hit key = %q, want %q", got, "203.0.113.20:19132")
+	}
+}
+
 // TestChainUDPCache_SequentialReuse verifies that after a wrapper is closed,
 // the next ListenPacket reuses the cached conn (not creating a new one).
 func TestChainUDPCache_SequentialReuse(t *testing.T) {
@@ -362,12 +458,11 @@ func TestChainUDPCache_EvictOnTimeoutWithActiveUsers(t *testing.T) {
 	t.Logf("Conn still works after timeout: %d bytes echoed", n)
 }
 
-// TestChainUDPCache_CloseReplacedConn verifies that when a new conn replaces
-// the cached one while the old one is in use, the old conn is closed when
-// its last user calls Close() (no resource leak). Per RFC 1928 §7, concurrent
-// ASSOCIATEs are independent — the new conn gets its own ASSOCIATE while the
-// old one stays alive for its active user.
-func TestChainUDPCache_CloseReplacedConn(t *testing.T) {
+// TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate verifies that a busy
+// SOCKS5 cached conn is not reused by another active client. After a short
+// wait boundary, a second real client gets its own UDP ASSOCIATE while the
+// first client's relay mapping remains usable.
+func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -376,7 +471,7 @@ func TestChainUDPCache_CloseReplacedConn(t *testing.T) {
 
 	chainOutbound, err := CreateChainUDPOutbound([]*config.ProxyOutbound{
 		{
-			Name:    "hop1-replaced",
+			Name:    "hop1-parallel",
 			Type:    config.ProtocolSOCKS5,
 			Server:  socks5AHost,
 			Port:    socks5APort,
@@ -397,61 +492,62 @@ func TestChainUDPCache_CloseReplacedConn(t *testing.T) {
 		t.Fatalf("first ListenPacket: %v", err)
 	}
 	wrapper1 := pc1.(*chainConnWrapper)
-	originalPC := wrapper1.cached.pc
 
-	// Second call — activeUsers=1, so after wait timeout a new conn is
-	// created and replaces the cache entry. The old conn stays alive for pc1.
+	// Second call while activeUsers=1 should wait briefly, then create a
+	// separate ASSOCIATE for the second real client instead of blocking entry.
+	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
+	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("second ListenPacket: %v", err)
 	}
+	defer pc2.Close()
 	wrapper2 := pc2.(*chainConnWrapper)
+	if wrapper2.cached == wrapper1.cached {
+		t.Fatal("second active client reused the first client's PacketConn")
+	}
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("expected to wait near the 500ms busy boundary, waited %v", elapsed)
+	}
 
-	// Verify the cache now points to the new conn
+	// Verify the cache now points to the newer conn, while the old active conn
+	// remains alive until its owner closes it.
 	chainUDP := chainOutbound.(*chainUDPOutbound)
 	chainUDP.cacheMu.Lock()
 	cachedInCache := chainUDP.cache[dest]
 	chainUDP.cacheMu.Unlock()
 	if cachedInCache != wrapper2.cached {
-		t.Fatal("cache should point to the new conn")
-	}
-	if cachedInCache == wrapper1.cached {
-		t.Fatal("cache should NOT point to the old conn")
+		t.Fatal("cache should point to the newer parallel conn")
 	}
 
-	// Close pc1 — should close the old conn since it's no longer in cache
-	pc1.Close()
-
-	// Verify the old conn is closed by trying to write to it
-	// (should fail with "use of closed connection" or similar)
-	ping := []byte{0x01}
-	_, writeErr := originalPC.WriteTo(ping, realServer)
-	if writeErr == nil {
-		// Some platforms don't error on write to closed UDP socket immediately.
-		// Try read instead.
-		_ = originalPC.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		_, _, readErr := originalPC.ReadFrom(make([]byte, 64))
-		if readErr == nil {
-			t.Log("Old conn not immediately closed (platform-dependent), but Close() was called")
-		}
+	ping1 := []byte{0x01}
+	if _, err := pc1.WriteTo(ping1, realServer); err != nil {
+		t.Fatalf("pc1 write after parallel associate: %v", err)
+	}
+	_ = pc1.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 2048)
+	n, _, err := pc1.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("pc1 read after parallel associate: %v", err)
+	}
+	if n != len(ping1) {
+		t.Fatalf("pc1: expected %d bytes, got %d", len(ping1), n)
 	}
 
-	// Verify pc2 still works
-	if _, err := pc2.WriteTo(ping, realServer); err != nil {
-		t.Fatalf("pc2 write after pc1 close: %v", err)
+	ping2 := []byte{0x02, 0x03}
+	if _, err := pc2.WriteTo(ping2, realServer); err != nil {
+		t.Fatalf("pc2 write after parallel associate: %v", err)
 	}
 	_ = pc2.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 2048)
-	n, _, err := pc2.ReadFrom(buf)
+	n, _, err = pc2.ReadFrom(buf)
 	if err != nil {
-		t.Fatalf("pc2 read after pc1 close: %v", err)
+		t.Fatalf("pc2 read after parallel associate: %v", err)
 	}
-	if n != len(ping) {
-		t.Fatalf("pc2: expected %d bytes, got %d", len(ping), n)
+	if n != len(ping2) {
+		t.Fatalf("pc2: expected %d bytes, got %d", len(ping2), n)
 	}
-	t.Logf("Replaced conn correctly closed, new conn still works")
 
-	pc2.Close()
+	pc1.Close()
 }
 
 // TestChainUDPCache_MultipleSequentialReuse verifies that the cache
@@ -1424,13 +1520,10 @@ func TestChainUDPCache_WaitsForBusyConn(t *testing.T) {
 	_ = pc2.Close()
 }
 
-// TestChainUDPCache_WaitTimeoutPreservesActiveConn verifies that when the wait
-// for a busy cached conn times out, the active user's conn is NOT closed.
-// A new conn is created for the new caller, and the old conn continues to work.
-// Per RFC 1928 §7, each UDP ASSOCIATE is independent (tied to its own TCP
-// control connection). Our VPS shared-relay tracks upstreams by client IP:Port,
-// so concurrent ASSOCIATEs from the same IP each get their own upstream.
-func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
+// TestChainUDPCache_WaitTimeoutCreatesParallelConn verifies that when the wait
+// timeout is reached for a busy SOCKS5 conn, a second real client gets a new
+// ASSOCIATE and the original active conn remains usable.
+func TestChainUDPCache_WaitTimeoutCreatesParallelConn(t *testing.T) {
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -1439,7 +1532,7 @@ func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
 
 	chainOutbound, err := CreateChainUDPOutbound([]*config.ProxyOutbound{
 		{
-			Name:    "hop1-timeout-preserve",
+			Name:    "hop1-timeout-parallel",
 			Type:    config.ProtocolSOCKS5,
 			Server:  socks5AHost,
 			Port:    socks5APort,
@@ -1456,13 +1549,11 @@ func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
 	ping := []byte{0x99, 0x01, 0x02, 0x03}
 	buf := make([]byte, 1500)
 
-	// First call creates and caches a connection
 	pc1, err := chainOutbound.ListenPacket(ctx, dest)
 	if err != nil {
 		t.Fatalf("first ListenPacket: %v", err)
 	}
 
-	// Verify pc1 works
 	_ = pc1.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := pc1.WriteTo(ping, realServer); err != nil {
 		t.Fatalf("first write on pc1: %v", err)
@@ -1475,55 +1566,64 @@ func TestChainUDPCache_WaitTimeoutPreservesActiveConn(t *testing.T) {
 	if n != len(ping) {
 		t.Fatalf("pc1: expected %d bytes, got %d", len(ping), n)
 	}
-	t.Logf("pc1 initial ping: ok")
 
-	// Second call while pc1 is still held (activeUsers > 0).
-	// Wait timeout is 2s for SOCKS5. After timeout, a new conn is created
-	// and the old conn is preserved for the active user (RFC 1928 §7).
 	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("second ListenPacket: %v", err)
 	}
-
-	// Should have waited at least ~2s (wait timeout) before creating new conn
-	if elapsed < 1500*time.Millisecond {
-		t.Fatalf("expected to wait ~2s for busy conn timeout, but only waited %v", elapsed)
+	defer pc2.Close()
+	if elapsed < 400*time.Millisecond {
+		t.Fatalf("expected to wait near the 500ms busy boundary, waited %v", elapsed)
 	}
-	t.Logf("Waited %v for busy conn timeout, got new conn", elapsed)
 
-	// Critical: pc1 should still work after the wait timeout!
-	// The wait timeout must NOT close the active conn.
+	// Critical: pc1 should still work after pc2 is created.
 	_ = pc1.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := pc1.WriteTo(ping, realServer); err != nil {
-		t.Fatalf("pc1 write after wait timeout (conn was killed!): %v", err)
+		t.Fatalf("pc1 write after parallel conn creation: %v", err)
 	}
 	_ = pc1.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err = pc1.ReadFrom(buf)
 	if err != nil {
-		t.Fatalf("pc1 read after wait timeout (conn was killed!): %v", err)
+		t.Fatalf("pc1 read after parallel conn creation: %v", err)
 	}
 	if n != len(ping) {
-		t.Fatalf("pc1 after timeout: expected %d bytes, got %d", len(ping), n)
+		t.Fatalf("pc1 after parallel conn: expected %d bytes, got %d", len(ping), n)
 	}
-	t.Logf("pc1 still works after wait timeout: ok (%d bytes)", n)
 
-	// pc2 should also work (it's a fresh conn with its own ASSOCIATE)
 	_ = pc2.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := pc2.WriteTo(ping, realServer); err != nil {
-		t.Fatalf("pc2 write: %v", err)
+		t.Fatalf("pc2 write after parallel conn creation: %v", err)
 	}
 	_ = pc2.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err = pc2.ReadFrom(buf)
 	if err != nil {
-		t.Fatalf("pc2 read: %v", err)
+		t.Fatalf("pc2 read after parallel conn creation: %v", err)
 	}
 	if n != len(ping) {
 		t.Fatalf("pc2: expected %d bytes, got %d", len(ping), n)
 	}
-	t.Logf("pc2 (new conn) works: ok (%d bytes)", n)
 
 	_ = pc1.Close()
 	_ = pc2.Close()
+
+	pc3, err := chainOutbound.ListenPacket(ctx, dest)
+	if err != nil {
+		t.Fatalf("ListenPacket after both clients close: %v", err)
+	}
+	defer pc3.Close()
+
+	_ = pc3.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := pc3.WriteTo(ping, realServer); err != nil {
+		t.Fatalf("pc3 write after both clients close: %v", err)
+	}
+	_ = pc3.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err = pc3.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("pc3 read after both clients close: %v", err)
+	}
+	if n != len(ping) {
+		t.Fatalf("pc3: expected %d bytes, got %d", len(ping), n)
+	}
 }

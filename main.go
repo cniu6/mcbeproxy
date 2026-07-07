@@ -28,7 +28,8 @@ var (
 )
 
 func main() {
-	// Global panic capture — logs reason + stack, writes crash report, exits non-zero.
+	// Global panic capture logs the reason, exits non-zero, and only writes
+	// standalone crash report files when debug diagnostics are explicitly enabled.
 	defer logger.CapturePanicExit("main")
 
 	flag.Parse()
@@ -37,6 +38,7 @@ func main() {
 
 	if *debugMode {
 		logger.SetDefaultLevel(logger.LevelDebug)
+		logger.SetCrashReportFileOutput(true)
 	}
 
 	if *showVersion {
@@ -73,6 +75,7 @@ func main() {
 	if globalConfig.DebugMode && !*debugMode {
 		logger.SetDefaultLevel(logger.LevelDebug)
 	}
+	logger.SetCrashReportFileOutput(*debugMode || globalConfig.DebugMode)
 
 	logConfig := &logger.LogConfig{
 		LogDir:           globalConfig.LogDir,
@@ -84,7 +87,9 @@ func main() {
 	if err := logger.Configure(logConfig); err != nil {
 		logger.Error("Failed to configure file logging: %v", err)
 	}
-	logger.InstallCrashHandlers(globalConfig.LogDir)
+	if logger.CrashReportFileOutputEnabled() {
+		logger.InstallCrashHandlers(globalConfig.LogDir)
+	}
 
 	configMgr, err := config.NewConfigManager(*serverListPath)
 	if err != nil {

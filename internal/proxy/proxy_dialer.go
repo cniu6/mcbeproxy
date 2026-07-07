@@ -22,6 +22,10 @@ type outboundPacketConnPingDialer interface {
 	DialPacketConnForPing(ctx context.Context, outboundName string, destination string) (net.PacketConn, error)
 }
 
+type outboundConnCountProvider interface {
+	GetOutboundConnectionCount(outboundName string) int64
+}
+
 type proxySelectionConfig interface {
 	IsGroupSelection() bool
 	IsMultiNodeSelection() bool

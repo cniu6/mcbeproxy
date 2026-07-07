@@ -200,6 +200,31 @@ func TestRawUDP_PreSessionTrafficIsBackfilled(t *testing.T) {
 	}
 }
 
+func TestRawUDP_CurrentRatesUseRecentWindow(t *testing.T) {
+	client := &rawUDPClientInfo{startTime: time.Now().Add(-10 * time.Minute)}
+	now := time.Now()
+
+	upBPS, downBPS := rawUDPCurrentRates(client, 1000, 2000, now)
+	if upBPS != 0 || downBPS != 0 {
+		t.Fatalf("initial rate = %d/%d, want 0/0 baseline", upBPS, downBPS)
+	}
+
+	upBPS, downBPS = rawUDPCurrentRates(client, 1500, 2600, now.Add(500*time.Millisecond))
+	if upBPS != 0 || downBPS != 0 {
+		t.Fatalf("sub-second rate update = %d/%d, want previous 0/0", upBPS, downBPS)
+	}
+
+	upBPS, downBPS = rawUDPCurrentRates(client, 3000, 12000, now.Add(2*time.Second))
+	if upBPS != 1000 || downBPS != 5000 {
+		t.Fatalf("recent rate = %d/%d, want 1000/5000", upBPS, downBPS)
+	}
+
+	upBPS, downBPS = rawUDPCurrentRates(client, 3000, 12000, now.Add(4*time.Second))
+	if upBPS != 0 || downBPS != 0 {
+		t.Fatalf("idle recent rate = %d/%d, want 0/0", upBPS, downBPS)
+	}
+}
+
 func TestSession_BackdateAndAdvanceHelpers(t *testing.T) {
 	now := time.Now()
 	sess := &session.Session{StartTime: now, LastSeen: now}
@@ -263,6 +288,61 @@ func TestRawUDP_SweepKeepsSessionStatsInSync(t *testing.T) {
 	snap := sm.GetAllSessions()[0].Snapshot()
 	if snap.BytesUp != 5000 || snap.BytesDown != 9000 {
 		t.Fatalf("sweep did not sync live stats: up=%d down=%d", snap.BytesUp, snap.BytesDown)
+	}
+}
+
+func TestRawUDP_SweepRecreatesSessionWithClientInfoTimestamps(t *testing.T) {
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "raw-recreate", IdleTimeout: 3600}
+	p := NewRawUDPProxy("raw-recreate", cfg, nil, sm)
+	p.updateTimeouts()
+
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+
+	now := time.Now()
+	start := now.Add(-10 * time.Minute)
+	lastSeen := now.Add(-2 * time.Minute)
+	client := &rawUDPClientInfo{
+		clientAddr: &net.UDPAddr{IP: net.IPv4(10, 0, 0, 7), Port: 50007},
+		targetConn: targetConn,
+		sessionKey: "10.0.0.7:50007",
+		startTime:  start,
+	}
+	client.lastSeen.Store(lastSeen.UnixNano())
+	client.lastClientPacket.Store(now.UnixNano())
+	client.bytesUp.Store(1234)
+	client.bytesDown.Store(5678)
+	client.loginParsed.Store(true)
+	client.sessionCreated.Store(true)
+	client.mu.Lock()
+	client.playerName = "RecreatedPlayer"
+	client.playerUUID = "uuid-recreated"
+	client.playerXUID = "xuid-recreated"
+	client.mu.Unlock()
+	p.clients.Store(client.sessionKey, client)
+
+	p.sweepInactiveClients(now, p.effectiveClientDisconnectTimeout())
+
+	sess, exists := sm.Get(client.sessionKey)
+	if !exists {
+		t.Fatal("sweep did not recreate missing session")
+	}
+	snap := sess.Snapshot()
+	if diff := snap.StartTime.Sub(start); diff < -time.Second || diff > time.Second {
+		t.Fatalf("recreated StartTime = %v, want ~%v", snap.StartTime, start)
+	}
+	if diff := snap.LastSeen.Sub(lastSeen); diff < -time.Second || diff > time.Second {
+		t.Fatalf("recreated LastSeen = %v, want ~%v; likely overwritten by now=%v", snap.LastSeen, lastSeen, now)
+	}
+	if snap.BytesUp != 1234 || snap.BytesDown != 5678 {
+		t.Fatalf("recreated stats not synced: up=%d down=%d", snap.BytesUp, snap.BytesDown)
+	}
+	if snap.DisplayName != "RecreatedPlayer" || snap.UUID != "uuid-recreated" || snap.XUID != "xuid-recreated" {
+		t.Fatalf("recreated player info mismatch: %+v", snap)
 	}
 }
 

@@ -504,13 +504,16 @@ func (c *portHoppingPacketConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (n, o
 	return n, 0, err
 }
 
-func resolveOutboundServerIP(_ context.Context, host string) (net.IP, string, error) {
+func resolveOutboundServerIP(ctx context.Context, host string) (net.IP, string, error) {
 	host = strings.TrimSpace(host)
 	if ip := net.ParseIP(host); ip != nil {
 		return ip, "literal", nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	resolver := &config.DNSResolver{}
-	resolved, err := resolver.Resolve(host)
+	resolved, err := resolver.ResolveContext(ctx, host)
 	if err != nil {
 		return nil, "", err
 	}

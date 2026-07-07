@@ -37,18 +37,21 @@ import (
 
 // APIServer provides REST API endpoints for proxy management.
 type APIServer struct {
-	router       *gin.Engine
-	server       *http.Server
-	globalConfig *config.GlobalConfig
-	configPath   string
-	configMgr    *config.ConfigManager
-	sessionMgr   *session.SessionManager
-	db           *db.Database
-	keyRepo      *db.APIKeyRepository
-	playerRepo   *db.PlayerRepository
-	sessionRepo  *db.SessionRepository
-	monitor      *monitor.Monitor
-	promMetrics  *monitor.PrometheusMetrics
+	router          *gin.Engine
+	server          *http.Server
+	lifecycleMu     sync.RWMutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	globalConfig    *config.GlobalConfig
+	configPath      string
+	configMgr       *config.ConfigManager
+	sessionMgr      *session.SessionManager
+	db              *db.Database
+	keyRepo         *db.APIKeyRepository
+	playerRepo      *db.PlayerRepository
+	sessionRepo     *db.SessionRepository
+	monitor         *monitor.Monitor
+	promMetrics     *monitor.PrometheusMetrics
 	// ProxyController interface for start/stop operations
 	proxyController ProxyController
 	// ACL manager for access control
@@ -197,8 +200,11 @@ func NewAPIServer(
 		promMetrics = monitor.NewPrometheusMetrics(mon)
 	}
 
+	apiCtx, apiCancel := context.WithCancel(context.Background())
 	api := &APIServer{
 		router:               gin.New(),
+		lifecycleCtx:         apiCtx,
+		lifecycleCancel:      apiCancel,
 		globalConfig:         globalConfig,
 		configPath:           strings.TrimSpace(configPath),
 		configMgr:            configMgr,
@@ -217,6 +223,7 @@ func NewAPIServer(
 	}
 
 	if api.proxyOutboundHandler != nil {
+		api.proxyOutboundHandler.SetLifecycleContext(api.serverContext())
 		api.proxyOutboundHandler.SetOutboundReloadHook(api.reloadServersUsingOutbound)
 	}
 
@@ -298,21 +305,27 @@ func (a *APIServer) setupRoutes() {
 		// Session endpoints
 		api.GET("/sessions", a.getSessions)
 		api.GET("/sessions/history", a.getSessionHistory)
-		api.DELETE("/sessions/history", a.clearSessionHistory)
-		api.DELETE("/sessions/history/:id", a.deleteSessionHistory)
-		api.DELETE("/sessions/:id", a.kickSession)
+		sessionAdminGroup := api.Group("/sessions")
+		sessionAdminGroup.Use(a.requireAdminMiddleware())
+		sessionAdminGroup.DELETE("/history", a.clearSessionHistory)
+		sessionAdminGroup.DELETE("/history/:id", a.deleteSessionHistory)
+		sessionAdminGroup.DELETE("/:id", a.kickSession)
 
 		// Log endpoints
 		api.GET("/logs", a.getLogFiles)
 		api.GET("/logs/:filename", a.getLogContent)
-		api.DELETE("/logs", a.clearAllLogs)
-		api.DELETE("/logs/:filename", a.deleteLogFile)
+		logAdminGroup := api.Group("/logs")
+		logAdminGroup.Use(a.requireAdminMiddleware())
+		logAdminGroup.DELETE("", a.clearAllLogs)
+		logAdminGroup.DELETE("/:filename", a.deleteLogFile)
 
 		// Player endpoints
 		api.GET("/players", a.getPlayers)
 		api.GET("/players/:name", a.getPlayer)
-		api.POST("/players/:name/kick", a.kickPlayer)
-		api.DELETE("/players/:name", a.deletePlayer)
+		playerAdminGroup := api.Group("/players")
+		playerAdminGroup.Use(a.requireAdminMiddleware())
+		playerAdminGroup.POST("/:name/kick", a.kickPlayer)
+		playerAdminGroup.DELETE("/:name", a.deletePlayer)
 
 		// API key management endpoints
 		keyAdminGroup := api.Group("/keys")
@@ -439,16 +452,68 @@ func (a *APIServer) setupRoutes() {
 	}
 }
 
+func mergeRequestContext(base context.Context, shutdown context.Context) (context.Context, context.CancelFunc) {
+	if base == nil {
+		base = context.Background()
+	}
+	if shutdown == nil {
+		return context.WithCancel(base)
+	}
+	ctx, cancel := context.WithCancel(base)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-shutdown.Done():
+			cancel()
+		}
+	}()
+	return ctx, cancel
+}
+
+func (a *APIServer) serverContext() context.Context {
+	if a == nil {
+		return context.Background()
+	}
+	a.lifecycleMu.RLock()
+	ctx := a.lifecycleCtx
+	a.lifecycleMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (a *APIServer) requestContext(c *gin.Context) (context.Context, context.CancelFunc) {
+	if c == nil || c.Request == nil {
+		return mergeRequestContext(context.Background(), a.serverContext())
+	}
+	return mergeRequestContext(c.Request.Context(), a.serverContext())
+}
+
 // Start starts the API server on the specified address.
 func (a *APIServer) Start(addr string) error {
+	a.lifecycleMu.Lock()
+	if a.lifecycleCancel != nil {
+		a.lifecycleCancel()
+	}
+	a.lifecycleCtx, a.lifecycleCancel = context.WithCancel(context.Background())
+	apiCtx := a.lifecycleCtx
+	a.lifecycleMu.Unlock()
+	if a.proxyOutboundHandler != nil {
+		a.proxyOutboundHandler.SetLifecycleContext(apiCtx)
+	}
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 
 	a.server = &http.Server{
-		Addr:              addr,
-		Handler:           a.router,
+		Addr:    addr,
+		Handler: a.router,
+		BaseContext: func(net.Listener) context.Context {
+			return apiCtx
+		},
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
@@ -466,6 +531,12 @@ func (a *APIServer) Start(addr string) error {
 
 // Stop gracefully stops the API server.
 func (a *APIServer) Stop() error {
+	a.lifecycleMu.RLock()
+	cancelLifecycle := a.lifecycleCancel
+	a.lifecycleMu.RUnlock()
+	if cancelLifecycle != nil {
+		cancelLifecycle()
+	}
 	if a.server == nil {
 		return nil
 	}
@@ -1185,7 +1256,7 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)
 	}
 
-	pings := a.collectServerPings(servers, serverLatencyOverviewRunning)
+	pings := a.collectCachedServerPings(servers, serverLatencyOverviewRunning)
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
 		serverIDs = append(serverIDs, server.ID)
@@ -1211,7 +1282,7 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 
 // buildServerPingFromConfig builds ping info based on the provided server config.
 // It avoids config lookup races and keeps the result tied to the server entry.
-func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map[string]interface{} {
+func (a *APIServer) buildServerPingFromConfig(ctx context.Context, server config.ServerConfigDTO) map[string]interface{} {
 	serverID := server.ID
 	publicPingTimeout := 5 * time.Second
 	if a.globalConfig != nil {
@@ -1286,7 +1357,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 		// to measure real latency and online status instead.
 		protocol := strings.TrimSpace(strings.ToLower(server.Protocol))
 		if protocol == "tcp" || protocol == "tcp_udp" || protocol == "udp" {
-			tcpLatency, tcpOnline := tcpConnectProbe(address, publicPingTimeout)
+			tcpLatency, tcpOnline := tcpConnectProbe(ctx, address, publicPingTimeout)
 			info := map[string]interface{}{
 				"server_id": serverID,
 				"latency":   tcpLatency,
@@ -1299,7 +1370,7 @@ func (a *APIServer) buildServerPingFromConfig(server config.ServerConfigDTO) map
 			return a.recordServerLatencyInfo(a.applyLastKnownLatency(info))
 		}
 
-		ping := a.doPingWithTimeout(address, publicPingTimeout)
+		ping := a.doPingWithTimeout(ctx, address, publicPingTimeout)
 		info := map[string]interface{}{
 			"server_id": serverID,
 			"latency":   ping.Latency,
@@ -2034,7 +2105,7 @@ func (a *APIServer) getLogFiles(c *gin.Context) {
 
 	var logFiles []string
 	for _, f := range files {
-		if !f.IsDir() && (strings.HasSuffix(f.Name(), ".log") || strings.HasSuffix(f.Name(), ".txt")) {
+		if !f.IsDir() && isRuntimeLogFile(f.Name()) {
 			logFiles = append(logFiles, f.Name())
 		}
 	}
@@ -2042,6 +2113,20 @@ func (a *APIServer) getLogFiles(c *gin.Context) {
 	// Sort by name descending (newest first)
 	sort.Sort(sort.Reverse(sort.StringSlice(logFiles)))
 	respondSuccess(c, logFiles)
+}
+
+// isRuntimeLogFile returns true for normal application log files shown in the
+// dashboard log viewer. Panic/crash reports contain full goroutine stack dumps
+// and are intentionally excluded so they do not flood the live log page.
+func isRuntimeLogFile(name string) bool {
+	if name == "" || !strings.HasSuffix(name, ".log") {
+		return false
+	}
+	base := strings.TrimSuffix(name, ".log")
+	if base == "crash_latest" || strings.HasPrefix(base, "recovered_panic_") || strings.HasPrefix(base, "api_panic_") || strings.HasPrefix(base, "fatal_runtime_") || strings.HasPrefix(base, "signal_") {
+		return false
+	}
+	return true
 }
 
 // getLogContent returns the content of a specific log file.
@@ -2053,8 +2138,10 @@ func (a *APIServer) getLogContent(c *gin.Context) {
 		return
 	}
 
-	// Prevent directory traversal
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+	// Prevent directory traversal and keep diagnostic stack dumps out of the
+	// regular log viewer. Crash reports are written as .txt files and can be
+	// inspected from disk when needed, but they should not flood the live log UI.
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") || !isRuntimeLogFile(filename) {
 		respondError(c, http.StatusBadRequest, "Invalid filename", "")
 		return
 	}
@@ -2183,8 +2270,9 @@ func (a *APIServer) deleteLogFile(c *gin.Context) {
 		return
 	}
 
-	// Prevent directory traversal
-	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+	// Prevent directory traversal and only delete normal runtime logs from the
+	// log UI. Crash reports are diagnostic artifacts, not user-facing logs.
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") || !isRuntimeLogFile(filename) {
 		respondError(c, http.StatusBadRequest, "Invalid filename", "")
 		return
 	}
@@ -2219,7 +2307,7 @@ func (a *APIServer) clearAllLogs(c *gin.Context) {
 
 	deleted := 0
 	for _, f := range files {
-		if !f.IsDir() && (strings.HasSuffix(f.Name(), ".log") || strings.HasSuffix(f.Name(), ".txt")) {
+		if !f.IsDir() && isRuntimeLogFile(f.Name()) {
 			if err := os.Remove(logDir + "/" + f.Name()); err == nil {
 				deleted++
 			}
@@ -2372,10 +2460,13 @@ func ensurePingAddress(address string) string {
 // given address. Returns latency in milliseconds and online status. This is
 // used for non-raknet protocol servers (tcp/tcp_udp/udp) where the target is
 // a plain TCP/UDP service rather than a Minecraft Bedrock server.
-func tcpConnectProbe(address string, timeout time.Duration) (int64, bool) {
+func tcpConnectProbe(ctx context.Context, address string, timeout time.Duration) (int64, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dialer := net.Dialer{Timeout: timeout}
 	start := time.Now()
-	conn, err := dialer.Dial("tcp", address)
+	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return -1, false
 	}
@@ -2410,7 +2501,10 @@ func (a *APIServer) doPing(address string) *PingResponse {
 }
 
 // doPingWithTimeout performs ping with an upper time limit to avoid blocking long.
-func (a *APIServer) doPingWithTimeout(address string, timeout time.Duration) *PingResponse {
+func (a *APIServer) doPingWithTimeout(ctx context.Context, address string, timeout time.Duration) *PingResponse {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if timeout <= 0 {
 		return a.doPing(address)
 	}
@@ -2418,10 +2512,19 @@ func (a *APIServer) doPingWithTimeout(address string, timeout time.Duration) *Pi
 	go func() {
 		resultCh <- a.doPing(address)
 	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case res := <-resultCh:
 		return res
-	case <-time.After(timeout):
+	case <-ctx.Done():
+		return &PingResponse{
+			Address: address,
+			Online:  false,
+			Latency: -1,
+			Error:   ctx.Err().Error(),
+		}
+	case <-timer.C:
 		return &PingResponse{
 			Address: address,
 			Online:  false,

@@ -11,6 +11,7 @@ import (
 func configureTestLoggerDir(t *testing.T, dir string) func() {
 	t.Helper()
 	origConfig := defaultLogger.getConfig()
+	origCrashReportOutput := CrashReportFileOutputEnabled()
 	defaultLogger.mu.Lock()
 	defaultLogger.config = &LogConfig{
 		LogDir:           dir,
@@ -20,7 +21,9 @@ func configureTestLoggerDir(t *testing.T, dir string) func() {
 		EnableConsoleLog: false,
 	}
 	defaultLogger.mu.Unlock()
+	SetCrashReportFileOutput(true)
 	return func() {
+		SetCrashReportFileOutput(origCrashReportOutput)
 		defaultLogger.mu.Lock()
 		defaultLogger.config = origConfig
 		defaultLogger.mu.Unlock()
@@ -29,6 +32,23 @@ func configureTestLoggerDir(t *testing.T, dir string) func() {
 
 func TestCapturePanic_NoPanic(t *testing.T) {
 	CapturePanic("test-no-panic")
+}
+
+func TestCapturePanic_DoesNotWriteFileWhenDisabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := configureTestLoggerDir(t, tmpDir)
+	defer restore()
+	SetCrashReportFileOutput(false)
+
+	func() {
+		defer CapturePanic("test-no-file")
+		panic("hidden panic file")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if crashFileCount(t, tmpDir) != 0 {
+		t.Fatalf("expected no crash report files when file output is disabled")
+	}
 }
 
 func TestCapturePanic_WithPanic(t *testing.T) {
@@ -106,6 +126,22 @@ func TestReportAPIPanic(t *testing.T) {
 	if !strings.Contains(content, "boom") {
 		t.Fatalf("expected panic detail, got: %s", content)
 	}
+}
+
+func crashFileCount(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	count := 0
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".txt") && (strings.HasPrefix(name, "recovered_panic_") || strings.HasPrefix(name, "api_panic_") || name == "crash_latest.txt") {
+			count++
+		}
+	}
+	return count
 }
 
 func readFirstCrashFile(t *testing.T, dir string) string {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -360,6 +361,20 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 	return clone
 }
 
+func (p *ProxyOutbound) CloneWithFreshRuntime() *ProxyOutbound {
+	clone := p.Clone()
+	clone.runtime = nil
+	return clone
+}
+
+func (p *ProxyOutbound) CloneWithRuntimeFrom(runtimeSource *ProxyOutbound) *ProxyOutbound {
+	clone := p.Clone()
+	if runtimeSource != nil {
+		clone.runtime = runtimeSource.runtimeState()
+	}
+	return clone
+}
+
 func (p *ProxyOutbound) IsAutoSelectBlocked() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -653,7 +668,8 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.WSHost == other.WSHost &&
 		p.XHTTPMode == other.XHTTPMode &&
 		p.GRPCServiceName == other.GRPCServiceName &&
-		p.GRPCAuthority == other.GRPCAuthority
+		p.GRPCAuthority == other.GRPCAuthority &&
+		reflect.DeepEqual(p.Chain, other.Chain)
 }
 
 // IsChainProxy returns true if this outbound has a chain configuration.

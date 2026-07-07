@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,9 +22,18 @@ const (
 )
 
 var (
-	crashHandlerOnce sync.Once
-	crashOutputFile  *os.File
+	crashHandlerOnce             sync.Once
+	crashOutputFile              *os.File
+	crashReportFileOutputEnabled atomic.Bool
 )
+
+func SetCrashReportFileOutput(enabled bool) {
+	crashReportFileOutputEnabled.Store(enabled)
+}
+
+func CrashReportFileOutputEnabled() bool {
+	return crashReportFileOutputEnabled.Load()
+}
 
 // InstallCrashHandlers registers process-level crash capture:
 //   - runtime/debug.SetCrashOutput for unhandled panics and fatal runtime errors
@@ -63,8 +73,8 @@ func installCrashOutputFile(logDir string) {
 	Info("Crash output capture enabled: %s", crashPath)
 }
 
-// CapturePanic recovers a panic in a worker goroutine, logs the reason, writes
-// crash files, and keeps the process running.
+// CapturePanic recovers a panic in a worker goroutine, logs the reason,
+// optionally writes debug-only crash files, and keeps the process running.
 func CapturePanic(context string) {
 	if r := recover(); r != nil {
 		handleRecoveredPanic(context, r, false)
@@ -72,7 +82,7 @@ func CapturePanic(context string) {
 }
 
 // CapturePanicExit recovers a panic in main or another critical goroutine,
-// logs everything, then exits with code 1.
+// logs the reason, optionally writes debug-only crash files, then exits with code 1.
 func CapturePanicExit(context string) {
 	if r := recover(); r != nil {
 		handleRecoveredPanic(context, r, true)
@@ -81,7 +91,10 @@ func CapturePanicExit(context string) {
 }
 
 func handleRecoveredPanic(context string, r any, exitAfter bool) {
-	stack := captureAllGoroutineStacks()
+	stack := ""
+	if CrashReportFileOutputEnabled() {
+		stack = captureAllGoroutineStacks()
+	}
 	caller := callerDescription(2)
 	reason := fmt.Sprintf("panic in %s (%s): %v", context, caller, r)
 	reportCrash(CrashKindRecoveredPanic, context, reason, r, stack, exitAfter)
@@ -89,7 +102,10 @@ func handleRecoveredPanic(context string, r any, exitAfter bool) {
 
 // ReportAPIPanic logs an HTTP handler panic with request context.
 func ReportAPIPanic(context string, err any) {
-	stack := string(debug.Stack())
+	stack := ""
+	if CrashReportFileOutputEnabled() {
+		stack = string(debug.Stack())
+	}
 	reason := fmt.Sprintf("HTTP handler panic in %s: %v", context, err)
 	reportCrash(CrashKindAPIPanic, context, reason, err, stack, false)
 }
@@ -116,8 +132,10 @@ func reportCrash(kind CrashKind, context, reason string, detail any, stack strin
 	msg := fmt.Sprintf("[%s] %s", kind, reason)
 	Error("%s", msg)
 
-	content := formatCrashReport(kind, context, reason, detail, stack, exitAfter)
-	writeCrashReportFiles(kind, content)
+	if CrashReportFileOutputEnabled() {
+		content := formatCrashReport(kind, context, reason, detail, stack, exitAfter)
+		writeCrashReportFiles(kind, content)
+	}
 
 	// Best-effort flush so crash info survives abrupt termination.
 	defaultLogger.mu.Lock()
@@ -137,6 +155,9 @@ func formatCrashReport(kind CrashKind, context, reason string, detail any, stack
 }
 
 func writeCrashReportFiles(kind CrashKind, content string) {
+	if !CrashReportFileOutputEnabled() {
+		return
+	}
 	logDir := resolveLogDir()
 	stamp := time.Now().Format("2006-01-02_150405")
 	prefix := string(kind)
@@ -147,8 +168,6 @@ func writeCrashReportFiles(kind CrashKind, content string) {
 	candidates := []string{
 		filepath.Join(logDir, fmt.Sprintf("%s_%s.txt", prefix, stamp)),
 		filepath.Join(logDir, "crash_latest.txt"),
-		fmt.Sprintf("%s_%s.txt", prefix, stamp),
-		"crash_latest.txt",
 	}
 
 	written := false

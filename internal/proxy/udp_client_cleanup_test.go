@@ -90,6 +90,18 @@ func TestRawUDPProxy_CleanupStaleSameIPClients(t *testing.T) {
 	}
 }
 
+func TestPlainUDPProxy_IdleTimeoutNeverDoesNotExpireClient(t *testing.T) {
+	cfg := &config.ServerConfig{ID: "plain-idle-never", IdleTimeout: -1}
+	p := NewPlainUDPProxy("plain-idle-never", cfg)
+	p.updateIdleTimeout()
+
+	client := &plainUDPClient{}
+	client.lastSeen.Store(time.Now().Add(-24 * time.Hour).UnixNano())
+	if p.isClientIdleExpired(client, time.Now()) {
+		t.Fatal("expected idle_timeout=-1 to keep plain UDP client alive")
+	}
+}
+
 func TestPlainUDPProxy_CleanupStaleSameIPClients(t *testing.T) {
 	p := &PlainUDPProxy{serverID: "plain-same-ip"}
 

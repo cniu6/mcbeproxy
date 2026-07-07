@@ -292,8 +292,7 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 				// Transient ICMP-induced error on a connected/direct UDP socket:
 				// keep the session and rely on the idle reaper for dead peers.
 				if isRecoverableConnError(err) {
-					lastSeen := time.Unix(0, clientInfo.lastSeen.Load())
-					if time.Since(lastSeen) > p.idleTimeout {
+					if p.isClientIdleExpired(clientInfo, time.Now()) {
 						return
 					}
 					continue
@@ -303,8 +302,7 @@ func (p *PlainUDPProxy) forwardResponses(ctx context.Context, clientKey string, 
 				}
 				return
 			}
-			lastSeen := time.Unix(0, clientInfo.lastSeen.Load())
-			if time.Since(lastSeen) > p.idleTimeout {
+			if p.isClientIdleExpired(clientInfo, time.Now()) {
 				return
 			}
 			continue
@@ -424,10 +422,27 @@ func (p *PlainUDPProxy) refreshTargetAddr() {
 	p.targetAddr = addr
 }
 
+func (p *PlainUDPProxy) isClientIdleExpired(clientInfo *plainUDPClient, now time.Time) bool {
+	if clientInfo == nil || p.idleTimeout < 0 {
+		return false
+	}
+	timeout := p.idleTimeout
+	if timeout == 0 {
+		timeout = defaultPlainIdle
+	}
+	return now.Sub(time.Unix(0, clientInfo.lastSeen.Load())) > timeout
+}
+
 func (p *PlainUDPProxy) updateIdleTimeout() {
-	if p.config != nil && p.config.IdleTimeout > 0 {
-		p.idleTimeout = time.Duration(p.config.IdleTimeout) * time.Second
-		return
+	if p.config != nil {
+		if p.config.IdleTimeout == -1 {
+			p.idleTimeout = -1
+			return
+		}
+		if p.config.IdleTimeout > 0 {
+			p.idleTimeout = time.Duration(p.config.IdleTimeout) * time.Second
+			return
+		}
 	}
 	p.idleTimeout = defaultPlainIdle
 }

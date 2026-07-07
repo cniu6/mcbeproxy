@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -261,7 +262,7 @@ func serverLatencyOverviewRunning(server config.ServerConfigDTO) bool {
 const serverPingConcurrency = 16
 
 func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO, historyLimit int) map[string]interface{} {
-	pings := a.collectServerPings(servers, serverLatencyOverviewRunning)
+	pings := a.collectCachedServerPings(servers, serverLatencyOverviewRunning)
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
 		if !serverLatencyOverviewRunning(server) {
@@ -277,7 +278,69 @@ func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO,
 	}
 }
 
-func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO, eligible func(config.ServerConfigDTO) bool) map[string]map[string]interface{} {
+func (a *APIServer) buildCachedServerPingFromConfig(server config.ServerConfigDTO) map[string]interface{} {
+	serverID := strings.TrimSpace(server.ID)
+	info := map[string]interface{}{
+		"server_id": serverID,
+		"latency":   int64(-1),
+		"online":    false,
+		"source":    "cache_miss",
+	}
+	if !serverLatencyOverviewRunning(server) {
+		info["stopped"] = true
+		info["source"] = "stopped"
+		if server.CustomMOTD != "" {
+			info["motd"] = server.CustomMOTD
+			info["parsed_motd"] = parseMOTD(server.CustomMOTD)
+		}
+		return info
+	}
+
+	if provider, ok := a.proxyController.(LatencyInfoProvider); ok {
+		latency, online, motd, found := provider.GetServerLatencyInfoRaw(serverID)
+		if found {
+			info["latency"] = latency
+			info["online"] = online
+			info["source"] = "proxy"
+			if motd != "" {
+				info["motd"] = motd
+				info["parsed_motd"] = parseMOTD(motd)
+			}
+			return a.applyLastKnownLatency(info)
+		}
+	}
+
+	if sample, ok := a.lastServerLatencySample(serverID); ok {
+		info["latency"] = sample.LatencyMs
+		info["online"] = sample.Online
+		info["stopped"] = sample.Stopped
+		info["source"] = sample.Source
+		info["latency_source"] = "history"
+	}
+	return info
+}
+
+func (a *APIServer) collectCachedServerPings(servers []config.ServerConfigDTO, eligible func(config.ServerConfigDTO) bool) map[string]map[string]interface{} {
+	if len(servers) == 0 {
+		return map[string]map[string]interface{}{}
+	}
+	if eligible == nil {
+		eligible = serverLatencyOverviewRunning
+	}
+	pings := make(map[string]map[string]interface{}, len(servers))
+	for _, server := range servers {
+		if !eligible(server) {
+			continue
+		}
+		pings[server.ID] = a.buildCachedServerPingFromConfig(server)
+	}
+	return pings
+}
+
+func (a *APIServer) collectServerPings(ctx context.Context, servers []config.ServerConfigDTO, eligible func(config.ServerConfigDTO) bool) map[string]map[string]interface{} {
+	if ctx == nil {
+		ctx = a.serverContext()
+	}
 	if len(servers) == 0 {
 		return map[string]map[string]interface{}{}
 	}
@@ -302,9 +365,17 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO, eligibl
 		pingWG.Add(1)
 		go func() {
 			defer pingWG.Done()
-			budget <- struct{}{}
+			select {
+			case <-ctx.Done():
+				return
+			case budget <- struct{}{}:
+			}
 			defer func() { <-budget }()
-			results <- pingResult{id: server.ID, info: a.buildServerPingFromConfig(server)}
+			info := a.buildServerPingFromConfig(ctx, server)
+			select {
+			case results <- pingResult{id: server.ID, info: info}:
+			case <-ctx.Done():
+			}
 		}()
 	}
 	go func() {
@@ -317,6 +388,17 @@ func (a *APIServer) collectServerPings(servers []config.ServerConfigDTO, eligibl
 		pings[result.id] = result.info
 	}
 	return pings
+}
+
+func (a *APIServer) lastServerLatencySample(serverID string) (ServerLatencyHistorySample, bool) {
+	if a == nil || a.serverLatencyHistory == nil {
+		return ServerLatencyHistorySample{}, false
+	}
+	samples := a.serverLatencyHistory.History(serverID)
+	if len(samples) == 0 {
+		return ServerLatencyHistorySample{}, false
+	}
+	return samples[len(samples)-1], true
 }
 
 // lastKnownServerLatency returns the most recent recorded latency sample with a

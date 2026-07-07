@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/golang/snappy"
@@ -342,6 +343,57 @@ func TestDecodeGamePacketBatch(t *testing.T) {
 				t.Fatalf("decoded mismatch: got %q want %q", got, payload)
 			}
 		})
+	}
+}
+
+func wrapRakNetReliablePayloadForRawUDPTest(payload []byte) []byte {
+	var frame bytes.Buffer
+	frame.Write([]byte{0x84, 0x01, 0x00, 0x00}) // datagram + 24-bit LE sequence
+	frame.WriteByte(0x40)                       // reliable encapsulated packet
+	_ = binary.Write(&frame, binary.BigEndian, uint16(len(payload)*8))
+	frame.Write([]byte{0x00, 0x00, 0x00}) // reliable message index
+	frame.Write(payload)
+	return frame.Bytes()
+}
+
+func TestRawUDPLoginParsingStopsAfterBudget(t *testing.T) {
+	proxy := &RawUDPProxy{}
+	client := &rawUDPClientInfo{startTime: time.Now()}
+	gamePacket := wrapGamePacket(t, 0xff, []byte{0x02, 0x00}) // non-Login batch
+	frame := wrapRakNetReliablePayloadForRawUDPTest(gamePacket)
+
+	for i := 0; i < RawUDPLoginParseMaxAttempts+5; i++ {
+		if !proxy.handlePacketWithLoginCheck(frame, client) {
+			t.Fatalf("non-login packet should still be forwarded at attempt %d", i)
+		}
+	}
+	if !client.loginParseDone.Load() {
+		t.Fatal("expected best-effort login parsing to stop after budget")
+	}
+	if client.loginParsed.Load() {
+		t.Fatal("non-login packets must not mark loginParsed")
+	}
+	if got := client.loginParseAttempts.Load(); got != RawUDPLoginParseMaxAttempts {
+		t.Fatalf("login parse attempts = %d, want %d", got, RawUDPLoginParseMaxAttempts)
+	}
+}
+
+func TestRawUDPLoginParsingStopsQuicklyOnUnknownCompression(t *testing.T) {
+	proxy := &RawUDPProxy{}
+	client := &rawUDPClientInfo{startTime: time.Now()}
+	gamePacket := []byte{raknetGamePacketHeader, 0x7f, 0x01, 0x02, 0x03}
+	frame := wrapRakNetReliablePayloadForRawUDPTest(gamePacket)
+
+	for i := 0; i < RawUDPLegacyLoginFallbackMaxAttempts+3; i++ {
+		if !proxy.handlePacketWithLoginCheck(frame, client) {
+			t.Fatalf("unknown-compression packet should still be forwarded at attempt %d", i)
+		}
+	}
+	if !client.loginParseDone.Load() {
+		t.Fatal("expected unknown compression to stop best-effort parsing quickly")
+	}
+	if !client.encrypted.Load() {
+		t.Fatal("unknown compression after fallback budget should mark encrypted")
 	}
 }
 

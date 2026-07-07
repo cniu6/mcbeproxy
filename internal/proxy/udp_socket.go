@@ -122,6 +122,25 @@ func tuneUDPSocketForServer(conn *net.UDPConn, cfg *config.ServerConfig, label s
 	}
 }
 
+func tunePacketConnBuffersForServer(conn net.PacketConn, cfg *config.ServerConfig, label string) {
+	if conn == nil {
+		return
+	}
+	setter, ok := conn.(udpSocketBufferConfigurer)
+	if !ok {
+		logger.Debug("PacketConn buffer tuning skipped for %s: %T does not expose SetReadBuffer/SetWriteBuffer", label, conn)
+		return
+	}
+	aggressive := cfg.IsAggressiveLatency()
+	requested := 0
+	if cfg != nil {
+		requested = cfg.GetUDPSocketBufferSize()
+	}
+	if err := configureUDPConnBuffers(setter, effectiveUDPSocketBufferRequest(requested, aggressive)); err != nil {
+		logger.Warn("Failed to tune PacketConn buffers for %s: %v", label, err)
+	}
+}
+
 // tuneDirectNetConn applies the same UDP socket tuning to a direct net.Conn
 // obtained from net.Dialer (which returns *net.UDPConn for "udp" networks).
 // Non-UDP conns are left untouched.

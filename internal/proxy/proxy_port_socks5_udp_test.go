@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,7 +143,8 @@ func TestProxyPortSOCKS5UDPAssociate(t *testing.T) {
 	}
 
 	// Parse SOCKS5 UDP response header
-	respData := respBuf[10:n]
+	payloadOffset := assertSocks5UDPIPv4ResponseHeader(t, respBuf[:n], echoAddr)
+	respData := respBuf[payloadOffset:n]
 	if len(respData) != len(testData) {
 		t.Fatalf("expected %d bytes, got %d", len(testData), len(respData))
 	}
@@ -159,6 +161,354 @@ func TestProxyPortSOCKS5UDPAssociate(t *testing.T) {
 }
 
 // TestProxyPortSOCKS5UDPAssociateWithAuth tests UDP ASSOCIATE with username/password auth.
+type timeoutOnlyPacketConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newTimeoutOnlyPacketConn() *timeoutOnlyPacketConn {
+	return &timeoutOnlyPacketConn{closed: make(chan struct{})}
+}
+
+func (c *timeoutOnlyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-c.closed:
+		return 0, nil, timeoutErr{}
+	case <-time.After(10 * time.Millisecond):
+		return 0, nil, timeoutErr{}
+	}
+}
+
+func (c *timeoutOnlyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) { return len(p), nil }
+func (c *timeoutOnlyPacketConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *timeoutOnlyPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero} }
+func (c *timeoutOnlyPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (c *timeoutOnlyPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *timeoutOnlyPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func TestSharedUDPRelayIPv6ActivityUsesParsedClientIP(t *testing.T) {
+	relay := &sharedUDPRelay{
+		clients: make(map[string]*udpClientEntry),
+	}
+	relay.clients["[::1]:50000"] = &udpClientEntry{upstreams: map[string]*upstreamConn{
+		"127.0.0.1:19132": {lastSeen: time.Now()},
+	}}
+
+	if !relay.hasRecentActivity(net.ParseIP("::1"), time.Minute) {
+		t.Fatal("expected IPv6 client activity to match parsed UDP client host")
+	}
+	if relay.hasRecentActivity(net.ParseIP("::2"), time.Minute) {
+		t.Fatal("unexpected activity match for different IPv6 client")
+	}
+}
+
+func TestSharedUDPRelayCloseStopsTimeoutOnlyResponseLoop(t *testing.T) {
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen relay UDP: %v", err)
+	}
+
+	relay := &sharedUDPRelay{
+		conn:      relayConn,
+		clients:   make(map[string]*udpClientEntry),
+		activeIPs: make(map[string]int),
+		stopCh:    make(chan struct{}),
+		cfgID:     "timeout-close-test",
+	}
+	pc := newTimeoutOnlyPacketConn()
+	relay.clients["127.0.0.1:50000"] = &udpClientEntry{upstreams: map[string]*upstreamConn{
+		"127.0.0.1:19132": {pc: pc, lastSeen: time.Now()},
+	}}
+
+	relay.wg.Add(1)
+	go relay.forwardUDPResponses(pc, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}, nil)
+
+	done := make(chan struct{})
+	go func() {
+		relay.close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shared UDP relay close did not stop timeout-only response loop")
+	}
+}
+
+type blockingSharedUDPOutboundManager struct {
+	countingRawUDPOutboundManager
+	blockDest        string
+	firstDialStarted chan struct{}
+	releaseFirstDial chan struct{}
+	secondWriteDone  chan struct{}
+	startOnce        sync.Once
+}
+
+func (m *blockingSharedUDPOutboundManager) DialPacketConn(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	if destination == m.blockDest {
+		m.startOnce.Do(func() { close(m.firstDialStarted) })
+		select {
+		case <-m.releaseFirstDial:
+			return newSignalingPacketConn(nil), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return newSignalingPacketConn(m.secondWriteDone), nil
+}
+
+type signalingPacketConn struct {
+	closed chan struct{}
+	once   sync.Once
+	wrote  chan struct{}
+}
+
+func newSignalingPacketConn(wrote chan struct{}) *signalingPacketConn {
+	return &signalingPacketConn{closed: make(chan struct{}), wrote: wrote}
+}
+
+func (c *signalingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-c.closed:
+		return 0, nil, timeoutErr{}
+	case <-time.After(10 * time.Millisecond):
+		return 0, nil, timeoutErr{}
+	}
+}
+
+func (c *signalingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.wrote != nil {
+		select {
+		case <-c.wrote:
+		default:
+			close(c.wrote)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *signalingPacketConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *signalingPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero} }
+func (c *signalingPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (c *signalingPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *signalingPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type failingSharedUDPOutboundManager struct {
+	countingRawUDPOutboundManager
+	pc *failingWritePacketConn
+}
+
+func (m *failingSharedUDPOutboundManager) DialPacketConn(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	return m.pc, nil
+}
+
+type failingWritePacketConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newFailingWritePacketConn() *failingWritePacketConn {
+	return &failingWritePacketConn{closed: make(chan struct{})}
+}
+
+func (c *failingWritePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	select {
+	case <-c.closed:
+		return 0, nil, timeoutErr{}
+	case <-time.After(10 * time.Millisecond):
+		return 0, nil, timeoutErr{}
+	}
+}
+
+func (c *failingWritePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return 0, fmt.Errorf("forced write failure")
+}
+
+func (c *failingWritePacketConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *failingWritePacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero} }
+func (c *failingWritePacketConn) SetDeadline(t time.Time) error      { return nil }
+func (c *failingWritePacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *failingWritePacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func assertSocks5UDPIPv4ResponseHeader(t *testing.T, packet []byte, expected *net.UDPAddr) int {
+	t.Helper()
+	if len(packet) < 10 {
+		t.Fatalf("response too short for SOCKS5 UDP IPv4 header: %d bytes", len(packet))
+	}
+	if packet[0] != 0x00 || packet[1] != 0x00 || packet[2] != 0x00 || packet[3] != 0x01 {
+		t.Fatalf("unexpected SOCKS5 UDP response header prefix: %v", packet[:4])
+	}
+	gotIP := net.IPv4(packet[4], packet[5], packet[6], packet[7])
+	if expectedIP := expected.IP.To4(); expectedIP == nil || !gotIP.Equal(expectedIP) {
+		t.Fatalf("unexpected SOCKS5 UDP response source IP: got %s want %s", gotIP, expected.IP)
+	}
+	gotPort := int(binary.BigEndian.Uint16(packet[8:10]))
+	if gotPort != expected.Port {
+		t.Fatalf("unexpected SOCKS5 UDP response source port: got %d want %d", gotPort, expected.Port)
+	}
+	return 10
+}
+
+func socks5UDPIPv4Datagram(dest *net.UDPAddr, payload []byte) []byte {
+	header := []byte{0x00, 0x00, 0x00, 0x01}
+	header = append(header, dest.IP.To4()...)
+	header = append(header, byte(dest.Port>>8), byte(dest.Port&0xff))
+	return append(header, payload...)
+}
+
+func TestSharedUDPRelayWriteFailuresRemoveUnhealthyUpstream(t *testing.T) {
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen relay UDP: %v", err)
+	}
+
+	pc := newFailingWritePacketConn()
+	mgr := &failingSharedUDPOutboundManager{pc: pc}
+	ctx, cancel := context.WithCancel(context.Background())
+	listener := newProxyPortListener(&config.ProxyPortConfig{
+		ID:            "shared-udp-write-failure-test",
+		ListenAddr:    "127.0.0.1:0",
+		Type:          config.ProxyPortTypeSocks5,
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}, mgr, nil)
+	listener.ctx = ctx
+
+	relay := &sharedUDPRelay{
+		conn:      relayConn,
+		clients:   make(map[string]*udpClientEntry),
+		activeIPs: make(map[string]int),
+		stopCh:    make(chan struct{}),
+		cfgID:     "shared-udp-write-failure-test",
+	}
+	relay.registerClientIP(net.IPv4(127, 0, 0, 1))
+	relay.wg.Add(1)
+	go relay.readLoop(listener)
+	defer func() {
+		cancel()
+		relay.close()
+	}()
+
+	relayAddr := relayConn.LocalAddr().(*net.UDPAddr)
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen client UDP: %v", err)
+	}
+	defer clientUDP.Close()
+
+	dest := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 20), Port: 19132}
+	for i := 0; i < sharedUDPRelayMaxWriteFailures; i++ {
+		if _, err := clientUDP.WriteToUDP(socks5UDPIPv4Datagram(dest, []byte{byte(i + 1)}), relayAddr); err != nil {
+			t.Fatalf("write datagram %d: %v", i, err)
+		}
+	}
+
+	select {
+	case <-pc.closed:
+	case <-time.After(time.Second):
+		t.Fatal("unhealthy upstream was not closed after consecutive write failures")
+	}
+
+	clientKey := clientUDP.LocalAddr().String()
+	deadline := time.After(time.Second)
+	for {
+		relay.mu.Lock()
+		_, stillPresent := relay.clients[clientKey]
+		relay.mu.Unlock()
+		if !stillPresent {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("unhealthy upstream was not removed from relay clients")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestSharedUDPRelaySlowUpstreamDialDoesNotBlockOtherClients(t *testing.T) {
+	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen relay UDP: %v", err)
+	}
+
+	blockedDest := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 10), Port: 19132}
+	fastDest := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 11), Port: 19132}
+	mgr := &blockingSharedUDPOutboundManager{
+		blockDest:        blockedDest.String(),
+		firstDialStarted: make(chan struct{}),
+		releaseFirstDial: make(chan struct{}),
+		secondWriteDone:  make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	listener := newProxyPortListener(&config.ProxyPortConfig{
+		ID:            "shared-udp-hol-test",
+		ListenAddr:    "127.0.0.1:0",
+		Type:          config.ProxyPortTypeSocks5,
+		Enabled:       true,
+		ProxyOutbound: "node-a",
+	}, mgr, nil)
+	listener.ctx = ctx
+
+	relay := &sharedUDPRelay{
+		conn:      relayConn,
+		clients:   make(map[string]*udpClientEntry),
+		activeIPs: make(map[string]int),
+		stopCh:    make(chan struct{}),
+		cfgID:     "shared-udp-hol-test",
+	}
+	relay.registerClientIP(net.IPv4(127, 0, 0, 1))
+	relay.wg.Add(1)
+	go relay.readLoop(listener)
+	defer func() {
+		close(mgr.releaseFirstDial)
+		cancel()
+		relay.close()
+	}()
+
+	relayAddr := relayConn.LocalAddr().(*net.UDPAddr)
+	clientA, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen client A UDP: %v", err)
+	}
+	defer clientA.Close()
+	clientB, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen client B UDP: %v", err)
+	}
+	defer clientB.Close()
+
+	if _, err := clientA.WriteToUDP(socks5UDPIPv4Datagram(blockedDest, []byte("first")), relayAddr); err != nil {
+		t.Fatalf("write first datagram: %v", err)
+	}
+	select {
+	case <-mgr.firstDialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first upstream dial did not start")
+	}
+
+	if _, err := clientB.WriteToUDP(socks5UDPIPv4Datagram(fastDest, []byte("second")), relayAddr); err != nil {
+		t.Fatalf("write second datagram: %v", err)
+	}
+	select {
+	case <-mgr.secondWriteDone:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("second client was blocked by another client's slow upstream dial")
+	}
+}
+
 func TestProxyPortSOCKS5UDPAssociateWithAuth(t *testing.T) {
 	// Start a UDP echo server
 	udpEcho, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -286,7 +636,8 @@ func TestProxyPortSOCKS5UDPAssociateWithAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read from relay: %v", err)
 	}
-	respData := respBuf[10:n]
+	payloadOffset := assertSocks5UDPIPv4ResponseHeader(t, respBuf[:n], echoAddr)
+	respData := respBuf[payloadOffset:n]
 	if len(respData) != len(testData) {
 		t.Fatalf("expected %d bytes, got %d", len(testData), len(respData))
 	}
@@ -422,7 +773,8 @@ func TestProxyPortSOCKS5UDPRapidReconnect(t *testing.T) {
 		if n < 10 {
 			t.Fatalf("cycle %d: response too short: %d bytes", cycle, n)
 		}
-		respData := respBuf[10:n]
+		payloadOffset := assertSocks5UDPIPv4ResponseHeader(t, respBuf[:n], echoAddr)
+		respData := respBuf[payloadOffset:n]
 		if len(respData) != len(testData) {
 			t.Fatalf("cycle %d: expected %d bytes, got %d", cycle, len(testData), len(respData))
 		}

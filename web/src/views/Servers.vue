@@ -9,13 +9,15 @@
       </n-space>
     </n-space>
     
-    <n-card>
+    <n-card class="server-list-card">
       <div class="table-wrapper">
-        <n-data-table 
-          :columns="columns" 
-          :data="sortedServers" 
-          :bordered="false" 
-          :scroll-x="1500"
+        <n-data-table
+          :columns="columns"
+          :data="sortedServers"
+          :bordered="false"
+          :scroll-x="1820"
+          size="small"
+          class="server-table"
           :pagination="pagination"
           @update:page="p => pagination.page = p"
           @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
@@ -365,6 +367,7 @@
                       <th>玩家</th>
                       <th>客户端</th>
                       <th>在线时长</th>
+                      <th>最近活动</th>
                       <th>流量</th>
                     </tr>
                   </thead>
@@ -373,6 +376,12 @@
                       <td>{{ sess.display_name || '连接建立中' }}</td>
                       <td>{{ sess.client_addr }}</td>
                       <td>{{ formatLiveSessionDuration(sess.duration_seconds) }}</td>
+                      <td>
+                        <n-space size="small" align="center" :wrap="false">
+                          <span>{{ formatLiveSessionIdle(sess) }}</span>
+                          <n-tag v-if="Number(sess.idle_seconds || 0) > 60" type="warning" size="small" :bordered="false">疑似断开/等待清理</n-tag>
+                        </n-space>
+                      </td>
                       <td>↑ {{ formatLiveSessionBytes(sess.bytes_up) }} / ↓ {{ formatLiveSessionBytes(sess.bytes_down) }}</td>
                     </tr>
                   </tbody>
@@ -1783,6 +1792,8 @@ let serverOverviewFetchToken = 0
 let editServerLiveSessionsFetchToken = 0
 let finalServerNodeLatencyFetchToken = 0
 let serverOverviewTimer = null
+let serverStatsTimer = null
+let serverStatsPollCancelled = false
 let countdownTimer = null
 
 // 选择的最终服务器
@@ -2084,12 +2095,139 @@ const formatLiveSessionDuration = (seconds) => {
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`
 }
 
+const formatLiveSessionIdle = (session) => {
+  const idle = Number(session?.idle_seconds || 0)
+  const lastSeen = session?.last_seen ? new Date(session.last_seen) : null
+  const lastSeenText = lastSeen && !Number.isNaN(lastSeen.getTime())
+    ? lastSeen.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : '-'
+  return `${formatLiveSessionDuration(idle)}前 · ${lastSeenText}`
+}
+
 const formatLiveSessionBytes = (bytes) => {
   const value = Number(bytes || 0)
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
   return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+const formatRawUDPDurationMs = (ms) => {
+  const value = Math.max(Number(ms || 0), 0)
+  if (value < 1000) return `${value}ms`
+  if (value < 60 * 1000) return `${(value / 1000).toFixed(1)}s`
+  return `${Math.floor(value / 60000)}m ${Math.floor((value % 60000) / 1000)}s`
+}
+
+const formatRawUDPStallReason = (reason) => {
+  const map = {
+    target_no_packet_yet: '目标未回包',
+    target_silent: '目标沉默',
+    client_silent: '客户端沉默'
+  }
+  return map[reason] || '正常'
+}
+
+const formatRawUDPRate = (bytesPerSecond) => {
+  const value = Number(bytesPerSecond || 0)
+  if (!Number.isFinite(value) || value <= 0) return '-'
+  return `${formatLiveSessionBytes(value)}/s`
+}
+
+const formatRawUDPQueue = (stats) => {
+  if (!stats) return '-'
+  const len = Number(stats.upstream_queue_len || 0)
+  const cap = Number(stats.upstream_queue_cap || 0)
+  const drops = Number(stats.upstream_queue_drops || 0)
+  return `${len}/${cap}${drops > 0 ? ` · 丢 ${drops}` : ''}`
+}
+
+const formatRawUDPWriteMs = (last, max, slow) => {
+  const lastMs = Number(last || 0)
+  const maxMs = Number(max || 0)
+  const slowCount = Number(slow || 0)
+  if (lastMs <= 0 && maxMs <= 0 && slowCount <= 0) return '-'
+  return `${lastMs}ms / max ${maxMs}ms${slowCount > 0 ? ` · 慢 ${slowCount}` : ''}`
+}
+
+const formatRawUDPParseState = (stats) => {
+  if (!stats) return '-'
+  const attempts = Number(stats.login_parse_attempts || 0)
+  const state = stats.login_parse_done ? '已停止' : '解析中'
+  return `${state} · ${attempts}次${stats.encrypted ? ' · encrypted' : ''}`
+}
+
+const getRawUDPClientStats = (row) => {
+  const list = Array.isArray(row?.raw_udp_clients) ? row.raw_udp_clients : []
+  return list.filter(Boolean)
+}
+
+const getRawUDPPrimaryStats = (row) => {
+  const list = getRawUDPClientStats(row)
+  return list.find(item => item?.stall_reason) || list[0] || null
+}
+
+const getRawUDPErrorCount = (stats) => {
+  if (!stats) return 0
+  return Number(stats.write_target_errors || 0) + Number(stats.write_client_errors || 0) + Number(stats.write_target_timeouts || 0) + Number(stats.write_client_timeouts || 0) + Number(stats.read_target_timeouts || 0)
+}
+
+const renderRawUDPStatsTooltip = (stats, clients = []) => {
+  if (!stats) return null
+  const errorCount = getRawUDPErrorCount(stats)
+  const otherClients = clients.filter(item => item && item !== stats).slice(0, 4)
+  const lines = [
+    `客户端数: ${clients.length || 1}`,
+    `主客户端: ${stats.client || '-'}`,
+    `线路: ${stats.route || '-'}`,
+    `目标: ${stats.target || '-'}`,
+    `上行: ${stats.up_packets || 0} 包 / ${formatLiveSessionBytes(stats.up_bytes)} (${formatRawUDPRate(stats.up_bytes_per_second)})`,
+    `下行: ${stats.down_packets || 0} 包 / ${formatLiveSessionBytes(stats.down_bytes)} (${formatRawUDPRate(stats.down_bytes_per_second)})`,
+    `距客户端包: ${formatRawUDPDurationMs(stats.since_client_ms)}`,
+    `距目标包: ${formatRawUDPDurationMs(stats.since_target_ms)}`,
+    `写目标耗时: ${formatRawUDPWriteMs(stats.last_write_target_ms, stats.max_write_target_ms, stats.slow_write_target_count)}`,
+    `写客户端耗时: ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`,
+    `上行队列: ${formatRawUDPQueue(stats)}`,
+    `Login解析: ${formatRawUDPParseState(stats)}`,
+    `写目标超时/错误: ${stats.write_target_timeouts || 0}/${stats.write_target_errors || 0}`,
+    `写客户端超时/错误: ${stats.write_client_timeouts || 0}/${stats.write_client_errors || 0}`,
+    `读目标超时: ${stats.read_target_timeouts || 0}`,
+    `异常合计: ${errorCount}`
+  ]
+  const children = lines.map(line => h('div', null, line))
+  if (otherClients.length > 0) {
+    children.push(h('div', { class: 'raw-udp-tooltip-section' }, '其他客户端'))
+    otherClients.forEach(item => {
+      children.push(h('div', { class: 'raw-udp-tooltip-muted' }, `${formatRawUDPStallReason(item.stall_reason)} · ${item.client || '-'} · ↑${item.up_packets || 0} ↓${item.down_packets || 0} · ↓${formatRawUDPRate(item.down_bytes_per_second)} · 写客 ${formatRawUDPWriteMs(item.last_write_client_ms, item.max_write_client_ms, item.slow_write_client_count)}`))
+    })
+    const hiddenCount = clients.length - otherClients.length - 1
+    if (hiddenCount > 0) {
+      children.push(h('div', { class: 'raw-udp-tooltip-muted' }, `另有 ${hiddenCount} 个客户端未展开`))
+    }
+  }
+  return h('div', { class: 'raw-udp-tooltip' }, children)
+}
+
+const renderRawUDPStatsCell = (row) => {
+  const clients = getRawUDPClientStats(row)
+  const stats = getRawUDPPrimaryStats(row)
+  if (!stats) return null
+  const errorCount = getRawUDPErrorCount(stats)
+  const stalled = !!stats.stall_reason
+  const slowClientWrites = Number(stats.slow_write_client_count || 0) > 0
+  const queueDrops = Number(stats.upstream_queue_drops || 0) > 0
+  const tagType = stalled ? 'error' : errorCount > 0 || slowClientWrites || queueDrops ? 'warning' : 'success'
+  const label = stalled ? formatRawUDPStallReason(stats.stall_reason) : slowClientWrites ? '写客户端慢' : queueDrops ? '队列丢包' : 'RawUDP OK'
+  const packetLine = clients.length > 1 ? `${clients.length}客户端 · ↑${stats.up_packets || 0} ↓${stats.down_packets || 0}` : `↑${stats.up_packets || 0} ↓${stats.down_packets || 0}`
+  return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
+    trigger: () => h('div', { class: 'raw-udp-summary' }, [
+      h(NTag, { size: 'small', type: tagType, bordered: false }, () => label),
+      h('div', { class: 'raw-udp-mini' }, packetLine),
+      h('div', { class: 'raw-udp-mini' }, `↓ ${formatRawUDPRate(stats.down_bytes_per_second)} · 写客 ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`),
+      h('div', { class: stalled ? 'raw-udp-stall-line' : 'raw-udp-mini' }, `客 ${formatRawUDPDurationMs(stats.since_client_ms)} · 目 ${formatRawUDPDurationMs(stats.since_target_ms)} · 队 ${formatRawUDPQueue(stats)}`)
+    ]),
+    default: () => renderRawUDPStatsTooltip(stats, clients)
+  })
 }
 
 const getServerPing = (serverId) => serverPingMap.value?.[serverId] || null
@@ -4277,62 +4415,137 @@ const goToProxyOutboundConfirmed = () => {
   }
 }
 
-const columns = [
-  { title: 'ID', key: 'id', width: 100 },
-  { title: '名称', key: 'name', width: 140 },
-  { title: '监听', key: 'listen_addr', width: 130 },
-  { title: '目标', key: 'target', render: r => `${r.target}:${r.port}` },
-  { 
-    title: '代理节点', 
-    key: 'proxy_outbound', 
-    width: 250, 
-    render: r => h(NSpace, { size: 'small' }, () => [
-      h('span', { style: 'display: flex; flex-wrap: wrap; gap: 2px;' }, getProxyTypeTags(r.proxy_outbound, r.id)),
-      h(NButton, { size: 'tiny', quaternary: true, onClick: () => openProxySelector(r.id) }, () => '切换')
+const renderSingleLine = (value, extraClass = '') => {
+  const text = String(value ?? '').trim() || '-'
+  return h('span', { class: ['server-table-ellipsis', extraClass], title: text }, text)
+}
+
+const formatServerProtocolLabel = (protocol) => {
+  const normalized = normalizeProtocolValue(protocol)
+  const labels = {
+    raknet: 'RakNet',
+    udp: 'UDP',
+    tcp: 'TCP',
+    tcp_udp: 'TCP+UDP'
+  }
+  return labels[normalized] || (normalized ? normalized.toUpperCase() : '-')
+}
+
+const renderServerIdentityCell = (row) => {
+  const name = String(row.name || row.id || '-').trim()
+  const id = String(row.id || '-').trim()
+  return h('div', { class: 'server-identity-cell' }, [
+    renderSingleLine(name, 'server-name-line'),
+    h('div', { class: 'server-meta-line', title: id }, id)
+  ])
+}
+
+const renderEndpointCell = (row) => {
+  const listen = String(row.listen_addr || '-').trim() || '-'
+  const targetHost = String(row.target || '').trim()
+  const target = targetHost ? `${targetHost}${row.port ? `:${row.port}` : ''}` : '-'
+  return h('div', { class: 'server-endpoint-cell' }, [
+    h('div', { class: 'server-endpoint-row' }, [
+      h('span', { class: 'server-endpoint-label' }, '监听'),
+      renderSingleLine(listen)
+    ]),
+    h('div', { class: 'server-endpoint-row' }, [
+      h('span', { class: 'server-endpoint-label' }, '目标'),
+      renderSingleLine(target)
     ])
-  },
-  { title: '模式', key: 'proxy_mode', width: 85, render: r => {
-    const mode = getServerModeTag(r)
-    return h(NTag, { type: mode.type, size: 'small' }, () => mode.label)
-  }},
-  { title: '协议', key: 'protocol', width: 70 },
-  { title: '状态', key: 'status', width: 70, render: r => h(NTag, { type: r.status === 'running' ? 'success' : 'error', size: 'small' }, () => r.status === 'running' ? '运行' : '停止') },
-  { title: '展示', key: 'hidden', width: 70, render: r => h(NSwitch, {
-    value: !r.hidden,
-    size: 'small',
-    loading: !!serverActionLoading.value[`visible:${r.id}`],
-    'onUpdate:value': (val) => toggleServerVisible(r, val)
-  }) },
-  { title: '在线', key: 'active_sessions', width: 45 },
-  { title: '链路', key: 'active_proxy_clients', width: 45 },
+  ])
+}
+
+const renderProxyOutboundCell = (row) => {
+  return h('div', { class: 'server-proxy-cell' }, [
+    h('div', { class: 'server-proxy-tags' }, getProxyTypeTags(row.proxy_outbound, row.id)),
+    h(NButton, {
+      size: 'tiny',
+      secondary: true,
+      onClick: (event) => {
+        event?.stopPropagation?.()
+        openProxySelector(row.id)
+      }
+    }, () => '切换')
+  ])
+}
+
+const renderProtocolModeCell = (row) => {
+  const mode = getServerModeTag(row)
+  return h(NSpace, { size: 4, wrap: true, align: 'center' }, () => [
+    h(NTag, { size: 'small', type: 'info', bordered: false }, () => formatServerProtocolLabel(row.protocol)),
+    h(NTag, { size: 'small', type: mode.type, bordered: false }, () => mode.label)
+  ])
+}
+
+const renderStatusDisplayCell = (row) => {
+  const running = row.status === 'running'
+  return h('div', { class: 'server-status-cell' }, [
+    h(NTag, { type: running ? 'success' : 'error', size: 'small', bordered: false }, () => running ? '运行' : '停止'),
+    h('div', { class: 'server-display-toggle' }, [
+      h('span', { class: 'server-display-label' }, '公开'),
+      h(NSwitch, {
+        value: !row.hidden,
+        size: 'small',
+        loading: !!serverActionLoading.value[`visible:${row.id}`],
+        'onUpdate:value': (val) => toggleServerVisible(row, val)
+      })
+    ])
+  ])
+}
+
+const renderConnectionCell = (row) => {
+  const children = [
+    h('div', { class: 'server-count-row' }, [h('span', null, '在线'), h('strong', null, row.active_sessions ?? 0)]),
+    h('div', { class: 'server-count-row' }, [h('span', null, '链路'), h('strong', null, row.active_proxy_clients ?? 0)])
+  ]
+  const rawUDPStats = renderRawUDPStatsCell(row)
+  if (rawUDPStats) {
+    children.push(rawUDPStats)
+  }
+  return h('div', { class: 'server-connection-cell' }, children)
+}
+
+const renderServerActionsCell = (row) => {
+  const running = row.status === 'running'
+  return h(NSpace, { size: 4, wrap: false, align: 'center', class: 'server-row-actions' }, () => [
+    running
+      ? h(NButton, {
+          size: 'tiny',
+          type: 'warning',
+          loading: !!serverActionLoading.value[`stop:${row.id}`],
+          onClick: () => controlServer(row.id, 'stop')
+        }, () => '停止')
+      : h(NButton, {
+          size: 'tiny',
+          type: 'success',
+          loading: !!serverActionLoading.value[`start:${row.id}`],
+          onClick: () => controlServer(row.id, 'start')
+        }, () => '启动'),
+    h(NButton, {
+      size: 'tiny',
+      type: 'info',
+      loading: !!serverActionLoading.value[`reload:${row.id}`],
+      onClick: () => controlServer(row.id, 'reload')
+    }, () => '重载'),
+    h(NButton, { size: 'tiny', onClick: () => openEditModal(row) }, () => '编辑'),
+    h(NPopconfirm, { onPositiveClick: () => deleteServer(row.id) }, {
+      trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'),
+      default: () => '确定删除?'
+    })
+  ])
+}
+
+const columns = [
+  { title: '服务器', key: 'server', width: 220, render: renderServerIdentityCell },
+  { title: '入口 / 目标', key: 'endpoint', width: 310, render: renderEndpointCell },
+  { title: '代理节点', key: 'proxy_outbound', width: 280, render: renderProxyOutboundCell },
+  { title: '协议 / 模式', key: 'protocol_mode', width: 150, render: renderProtocolModeCell },
+  { title: '状态', key: 'status', width: 120, render: renderStatusDisplayCell },
+  { title: '连接 / RawUDP', key: 'connections', width: 190, render: renderConnectionCell },
   { title: '延迟', key: 'latency', width: 150, render: r => renderServerLatencyCell(r) },
   { title: '历史趋势', key: 'latency_history', width: 170, render: r => renderServerLatencyHistoryCell(r) },
-  { title: '操作', key: 'actions', width: 260, fixed: 'right', render: r => {
-    const running = r.status === 'running'
-    return h(NSpace, { size: 4, wrap: false }, () => [
-      running
-        ? h(NButton, {
-            size: 'tiny',
-            type: 'warning',
-            loading: !!serverActionLoading.value[`stop:${r.id}`],
-            onClick: () => controlServer(r.id, 'stop')
-          }, () => '停止')
-        : h(NButton, {
-            size: 'tiny',
-            type: 'success',
-            loading: !!serverActionLoading.value[`start:${r.id}`],
-            onClick: () => controlServer(r.id, 'start')
-          }, () => '启动'),
-      h(NButton, {
-        size: 'tiny',
-        type: 'info',
-        loading: !!serverActionLoading.value[`reload:${r.id}`],
-        onClick: () => controlServer(r.id, 'reload')
-      }, () => '重载'),
-      h(NButton, { size: 'tiny', onClick: () => openEditModal(r) }, () => '编辑'),
-      h(NPopconfirm, { onPositiveClick: () => deleteServer(r.id) }, { trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'), default: () => '确定删除?' })
-    ])
-  }}
+  { title: '操作', key: 'actions', width: 230, fixed: 'right', className: 'server-actions-column', render: renderServerActionsCell }
 ]
 
 // ...
@@ -4655,16 +4868,33 @@ const importServers = async () => {
     importingServers.value = false
   }
 }
+const scheduleServerStatsPoll = () => {
+  if (serverStatsPollCancelled) return
+  serverStatsTimer = setTimeout(async () => {
+    if (serverStatsPollCancelled) return
+    try {
+      if (typeof document === 'undefined' || !document.hidden) {
+        await load({ refreshOverview: false })
+      }
+    } finally {
+      scheduleServerStatsPoll()
+    }
+  }, 5000)
+}
 
 onMounted(async () => {
+  serverStatsPollCancelled = false
   await Promise.all([loadProxyOutbounds(), loadGlobalDefaults()])
   await load()
+  scheduleServerStatsPoll()
   serverOverviewTimer = setInterval(refreshServerLatencyOverview, 30000)
   countdownTimer = setInterval(() => {
     countdownNow.value = Date.now()
   }, 1000)
 })
 onUnmounted(() => {
+  serverStatsPollCancelled = true
+  if (serverStatsTimer) clearTimeout(serverStatsTimer)
   if (serverOverviewTimer) clearInterval(serverOverviewTimer)
   if (countdownTimer) clearInterval(countdownTimer)
 })
@@ -4678,6 +4908,172 @@ onUnmounted(() => {
 .table-wrapper {
   width: 100%;
   overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.server-list-card {
+  min-width: 0;
+}
+
+.server-table {
+  min-width: 0;
+}
+
+.server-identity-cell,
+.server-endpoint-cell,
+.server-status-cell,
+.server-connection-cell {
+  min-width: 0;
+}
+
+.server-table-ellipsis {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+
+.server-name-line {
+  font-weight: 650;
+  color: var(--n-text-color-1);
+}
+
+.server-meta-line {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--n-text-color-3);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-endpoint-cell {
+  display: grid;
+  gap: 6px;
+}
+
+.server-endpoint-row {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+}
+
+.server-endpoint-label,
+.server-display-label,
+.server-count-row span {
+  color: var(--n-text-color-3);
+  font-size: 12px;
+}
+
+.server-proxy-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.server-proxy-tags {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.server-proxy-tags :deep(.n-tag) {
+  max-width: 180px;
+}
+
+.server-proxy-tags :deep(.n-tag__content) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-status-cell,
+.server-connection-cell {
+  display: grid;
+  gap: 6px;
+}
+
+.server-display-toggle,
+.server-count-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.server-count-row strong {
+  color: var(--n-text-color-1);
+  font-weight: 650;
+}
+
+.raw-udp-summary {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  cursor: help;
+}
+
+.raw-udp-mini,
+.raw-udp-stall-line {
+  overflow: hidden;
+  color: var(--n-text-color-3);
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.raw-udp-stall-line {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+.raw-udp-tooltip {
+  display: grid;
+  gap: 4px;
+  max-width: 520px;
+  font-size: 12px;
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+.raw-udp-tooltip-section {
+  margin-top: 4px;
+  color: var(--n-text-color-1);
+  font-weight: 650;
+}
+
+.raw-udp-tooltip-muted {
+  color: var(--n-text-color-3);
+}
+
+.server-row-actions {
+  white-space: nowrap;
+}
+
+:deep(.server-actions-column) {
+  background: var(--n-td-color);
+}
+
+:deep(.n-data-table-th--fixed-right),
+:deep(.n-data-table-td--fixed-right) {
+  box-shadow: -12px 0 18px rgba(0, 0, 0, 0.18);
+}
+
+:deep(.n-data-table-td) {
+  vertical-align: middle;
+}
+
+:deep(.n-data-table-td__content) {
+  min-width: 0;
 }
 
 .node-history-toolbar {

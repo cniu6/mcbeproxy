@@ -17,12 +17,13 @@ import (
 
 // ProxyPortConfigManager manages proxy port configurations with hot reload support.
 type ProxyPortConfigManager struct {
-	ports      map[string]*ProxyPortConfig
-	mu         sync.RWMutex
-	configPath string
-	watcher    *fsnotify.Watcher
-	watcherMu  sync.Mutex
-	onChange   func()
+	ports         map[string]*ProxyPortConfig
+	mu            sync.RWMutex
+	configPath    string
+	watcher       *fsnotify.Watcher
+	debounceTimer *time.Timer
+	watcherMu     sync.Mutex
+	onChange      func()
 }
 
 // NewProxyPortConfigManager creates a new ProxyPortConfigManager instance.
@@ -279,7 +280,6 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 
 	go func() {
 		defer m.closeWatcher()
-		var debounceTimer *time.Timer
 		for {
 			select {
 			case <-ctx.Done():
@@ -289,12 +289,23 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 					return
 				}
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
-					if debounceTimer != nil {
-						debounceTimer.Stop()
+					m.watcherMu.Lock()
+					if m.debounceTimer != nil {
+						m.debounceTimer.Stop()
 					}
-					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+					m.debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
 						if err := m.Reload(); err != nil {
 							logger.Error("Proxy port config reload error: %v", err)
+						}
+						select {
+						case <-ctx.Done():
+							return
+						default:
 						}
 						m.watcherMu.Lock()
 						if m.watcher != nil {
@@ -302,6 +313,7 @@ func (m *ProxyPortConfigManager) Watch(ctx context.Context) error {
 						}
 						m.watcherMu.Unlock()
 					})
+					m.watcherMu.Unlock()
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -323,6 +335,10 @@ func (m *ProxyPortConfigManager) StopWatch() {
 func (m *ProxyPortConfigManager) closeWatcher() {
 	m.watcherMu.Lock()
 	defer m.watcherMu.Unlock()
+	if m.debounceTimer != nil {
+		m.debounceTimer.Stop()
+		m.debounceTimer = nil
+	}
 	if m.watcher != nil {
 		m.watcher.Close()
 		m.watcher = nil

@@ -46,6 +46,13 @@ func TestAdminWriteRoutesRejectNonAdmin(t *testing.T) {
 		{http.MethodPut, "/api/config/entry-path", map[string]any{"entry_path": "/admin"}},
 		{http.MethodPost, "/api/acl/blacklist", map[string]any{"display_name": "BadPlayer", "enabled": true}},
 		{http.MethodPost, "/api/servers", map[string]any{"id": "srv", "name": "srv", "target": "127.0.0.1", "port": 19132, "listen_addr": "127.0.0.1:0", "protocol": "raknet"}},
+		{http.MethodDelete, "/api/sessions/history", nil},
+		{http.MethodDelete, "/api/sessions/history/history-id", nil},
+		{http.MethodDelete, "/api/sessions/session-id", nil},
+		{http.MethodDelete, "/api/logs", nil},
+		{http.MethodDelete, "/api/logs/app.log", nil},
+		{http.MethodPost, "/api/players/Steve/kick", map[string]any{"reason": "admin-only"}},
+		{http.MethodDelete, "/api/players/Steve", nil},
 	}
 
 	for _, tc := range cases {

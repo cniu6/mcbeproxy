@@ -18,6 +18,14 @@ xbox_token.json
 internal/api/dist/*
 !internal/api/dist/.gitkeep
 
+# Runtime panic/crash diagnostics (debug-only, never commit)
+**/recovered_panic_*.txt
+**/api_panic_*.txt
+**/fatal_runtime_*.txt
+**/signal_*.txt
+**/crash_latest.txt
+**/crash_latest.log
+
 # Build output
 build/
 release/

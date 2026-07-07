@@ -269,9 +269,11 @@ func maxLifetimeForProto(isSocks5 bool) time.Duration {
 // reads/writes to the cached underlying conn but Close() is a no-op —
 // the actual cleanup is done by the idle sweeper.
 type chainConnWrapper struct {
-	cached *cachedChainConn
-	parent *chainUDPOutbound
-	dest   string
+	cached    *cachedChainConn
+	parent    *chainUDPOutbound
+	dest      string
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // evictOnFatalError removes the cached entry and closes the underlying conn
@@ -354,49 +356,68 @@ func (w *chainConnWrapper) SetWriteDeadline(t time.Time) error {
 	return w.cached.pc.SetWriteDeadline(t)
 }
 
-func (w *chainConnWrapper) Close() error {
-	// Decrement active user count first
-	remaining := atomic.AddInt32(&w.cached.activeUsers, -1)
-	if remaining <= 0 {
-		// No more active users. Signal any goroutine waiting in ListenPacket
-		// that this conn is now available for reuse.
-		w.cached.mu.Lock()
-		if w.cached.releaseCh != nil {
-			close(w.cached.releaseCh)
-			w.cached.releaseCh = nil
-		}
-		w.cached.mu.Unlock()
-
-		// Check if this conn is still the cached one.
-		w.parent.cacheMu.Lock()
-		if cached, ok := w.parent.cache[w.dest]; !ok || cached != w.cached {
-			// This conn is no longer in the cache (was replaced by a newer
-			// one while it was in use). Close it now to prevent a resource
-			// leak — the idle sweeper can't reach it since it's not cached.
-			w.cached.pc.Close()
-		} else if atomic.LoadInt32(&w.cached.hadTimeout) != 0 {
-			// Previous user had a read/write timeout — the SOCKS5 relay
-			// may have stopped forwarding. Evict the conn so the next
-			// user gets a fresh connection instead of inheriting a dead
-			// relay session.
-			w.cached.pc.Close()
-			delete(w.parent.cache, w.dest)
-			logger.Debug("ChainUDPOutbound: evicted cached conn for %s on close (had timeout)", w.dest)
-		} else {
-			// Still in cache — set a short read deadline to unblock
-			// any pending ReadFrom calls (e.g. forwardResponses in
-			// RawUDPProxy.Stop()). 1s is long enough for the next user
-			// to start reading before the deadline fires, but short
-			// enough to not block Stop() for too long.
-			w.cached.pc.SetReadDeadline(time.Now().Add(1 * time.Second))
-			w.cached.pc.SetWriteDeadline(time.Time{})
-		}
-		w.parent.cacheMu.Unlock()
+func (w *chainConnWrapper) SetReadBuffer(bytes int) error {
+	if setter, ok := w.cached.pc.(interface{ SetReadBuffer(int) error }); ok {
+		return setter.SetReadBuffer(bytes)
 	}
-	return nil
+	return fmt.Errorf("underlying packet conn %T does not support SetReadBuffer", w.cached.pc)
+}
+
+func (w *chainConnWrapper) SetWriteBuffer(bytes int) error {
+	if setter, ok := w.cached.pc.(interface{ SetWriteBuffer(int) error }); ok {
+		return setter.SetWriteBuffer(bytes)
+	}
+	return fmt.Errorf("underlying packet conn %T does not support SetWriteBuffer", w.cached.pc)
+}
+
+func (w *chainConnWrapper) Close() error {
+	w.closeOnce.Do(func() {
+		// Decrement active user count first
+		remaining := atomic.AddInt32(&w.cached.activeUsers, -1)
+		if remaining <= 0 {
+			// No more active users. Signal any goroutine waiting in ListenPacket
+			// that this conn is now available for reuse.
+			w.cached.mu.Lock()
+			if w.cached.releaseCh != nil {
+				close(w.cached.releaseCh)
+				w.cached.releaseCh = nil
+			}
+			w.cached.mu.Unlock()
+
+			// Check if this conn is still the cached one.
+			w.parent.cacheMu.Lock()
+			if cached, ok := w.parent.cache[w.dest]; !ok || cached != w.cached {
+				// This conn is no longer in the cache (was replaced by a newer
+				// one while it was in use). Close it now to prevent a resource
+				// leak — the idle sweeper can't reach it since it's not cached.
+				w.closeErr = w.cached.pc.Close()
+			} else if atomic.LoadInt32(&w.cached.hadTimeout) != 0 {
+				// Previous user had a read/write timeout — the SOCKS5 relay
+				// may have stopped forwarding. Evict the conn so the next
+				// user gets a fresh connection instead of inheriting a dead
+				// relay session.
+				w.closeErr = w.cached.pc.Close()
+				delete(w.parent.cache, w.dest)
+				logger.Debug("ChainUDPOutbound: evicted cached conn for %s on close (had timeout)", w.dest)
+			} else {
+				// Still in cache — set a short read deadline to unblock
+				// any pending ReadFrom calls (e.g. forwardResponses in
+				// RawUDPProxy.Stop()). 1s is long enough for the next user
+				// to start reading before the deadline fires, but short
+				// enough to not block Stop() for too long.
+				w.closeErr = w.cached.pc.SetReadDeadline(time.Now().Add(1 * time.Second))
+				if err := w.cached.pc.SetWriteDeadline(time.Time{}); w.closeErr == nil {
+					w.closeErr = err
+				}
+			}
+			w.parent.cacheMu.Unlock()
+		}
+	})
+	return w.closeErr
 }
 
 var _ net.PacketConn = (*chainConnWrapper)(nil)
+var _ udpSocketBufferConfigurer = (*chainConnWrapper)(nil)
 
 // CreateChainUDPOutbound creates a UDP outbound that routes through a chain of proxies.
 // chainConfigs is ordered: chainConfigs[0] is the first hop, chainConfigs[len-1] is the last.
@@ -501,6 +522,12 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		logger.Debug("ChainUDPOutbound: normalized cache key dest=%s -> key=%s", destination, cacheKey)
 	}
 
+	// If the first call used the domain as its key while DNS was warming, keep
+	// using that existing cache entry until it naturally expires. Otherwise a
+	// later warmed IP key would create a second UDP ASSOCIATE for the same active
+	// game session, exactly the latency spike the DNS warm-up is meant to avoid.
+	normalizedCacheKey := cacheKey
+
 	// Try cache first — but ONLY if no one else is actively using it AND it's
 	// still alive. Multiple concurrent readers on the same SOCKS5 UDP socket
 	// would steal each other's datagrams (UDP ReadFrom returns complete
@@ -522,12 +549,19 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		maxIdleReuse = 30 * time.Second
 	}
 	c.cacheMu.Lock()
+	if normalizedCacheKey != destination {
+		if _, ok := c.cache[destination]; ok {
+			cacheKey = destination
+			logger.Debug("ChainUDPOutbound: keeping existing domain-key UDP cache entry for %s instead of warmed key %s", destination, normalizedCacheKey)
+		}
+	}
 
 	// Wait for the cached conn to become available if it's currently in use.
 	// This prevents creating multiple concurrent SOCKS5 ASSOCIATEs to the same
 	// remote server, which can cause the server to drop packets for the older
-	// association. We wait up to 3s for SOCKS5 (enough for a quick ping to
-	// finish) before falling back to creating a new connection.
+	// association. SOCKS5 must never fall back to a second ASSOCIATE for the
+	// same destination; other protocols may create a parallel conn after a wait
+	// because they don't share the same relay-mapping failure mode.
 	waitTimeout := 5 * time.Second
 	if isSocks5LastHop {
 		waitTimeout = 2 * time.Second
@@ -554,15 +588,14 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 			break // no cached conn — create new one
 		}
 		if atomic.LoadInt32(&cached.activeUsers) > 0 {
-			// Conn is busy — wait for it to be released via channel signal.
-			// UDP sockets are not shareable: concurrent ReadFrom callers
-			// would steal each other's datagrams. So we wait for the
-			// active user to finish (e.g. a quick ping test) before reusing.
+			// Conn is busy — wait briefly for short-lived users (ping/tests) to
+			// release it. If the owner is a real game client it may stay active
+			// for minutes or hours, so after the wait boundary create a parallel
+			// UDP association and preserve the active conn. RawUDP health pings
+			// are skipped while an outbound has active clients, so this fallback is
+			// for real concurrent players rather than background probes.
 			if time.Now().After(waitDeadline) {
-				// Wait timed out — the active user is likely a long-lived
-				// game client, not a stuck ping. Create a new ASSOCIATE;
-				// the old conn stays alive for the active user.
-				logger.Debug("ChainUDPOutbound: cached conn for %s still busy after %s wait, creating new conn (old conn preserved for active user)", cacheKey, waitTimeout)
+				logger.Info("ChainUDPOutbound: cached conn for %s still busy after %s wait, creating parallel conn for concurrent client (old conn preserved)", cacheKey, waitTimeout)
 				break
 			}
 			// Channel-based wait: releaseCh is closed when activeUsers
@@ -578,6 +611,7 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 			cached.mu.Unlock()
 			remaining := time.Until(waitDeadline)
 			if remaining <= 0 {
+				logger.Info("ChainUDPOutbound: cached conn for %s reached busy wait boundary, creating parallel conn for concurrent client (old conn preserved)", cacheKey)
 				break
 			}
 			c.cacheMu.Unlock()
@@ -660,8 +694,10 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	cached := &cachedChainConn{
 		pc:          conn,
 		dest:        cacheKey,
+		lastUsed:    atomic.Int64{},
 		createdAt:   time.Now(),
 		maxLifetime: maxLifetimeForProto(isSocks5LastHop),
+		activeUsers: 1,
 		releaseCh:   make(chan struct{}),
 	}
 	cached.lastUsed.Store(time.Now().UnixNano())
@@ -678,20 +714,77 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		go c.idleSweeper()
 	})
 
-	atomic.AddInt32(&cached.activeUsers, 1)
 	return &chainConnWrapper{cached: cached, parent: c, dest: cacheKey}, nil
 }
 
-// normalizeCacheKey resolves the host part of a host:port address to an IP
-// address so that the same server accessed by domain or IP shares a single
-// cache entry. If resolution fails, the original string is used as-is.
-// DNS results are cached for 5 minutes to avoid repeated lookups.
+// normalizeCacheKey returns a cache key for a host:port destination without
+// putting DNS resolution on the UDP hot path. A cached DNS result is used when
+// available; a miss returns the original destination immediately and warms the
+// DNS cache in the background.
+//
+// This avoids turning a slow resolver/public-DNS fallback into first-packet or
+// lobby-transfer latency. Once warmed, later calls can share domain/IP cache
+// entries without forcing the first call to wait for DNS.
 var dnsCacheMu sync.Mutex
 var dnsCache = make(map[string]dnsCacheEntry)
+var dnsCacheInFlight = make(map[string]struct{})
+
+var resolveChainCacheIP = resolveOutboundServerIP
 
 type dnsCacheEntry struct {
 	ip        string
 	expiresAt time.Time
+}
+
+func lookupDNSCache(host string) (string, bool) {
+	now := time.Now()
+	dnsCacheMu.Lock()
+	defer dnsCacheMu.Unlock()
+	entry, ok := dnsCache[host]
+	if !ok {
+		return "", false
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(dnsCache, host)
+		return "", false
+	}
+	if entry.ip == "" {
+		return "", false
+	}
+	return entry.ip, true
+}
+
+func warmDNSCache(host string) {
+	dnsCacheMu.Lock()
+	if _, ok := dnsCacheInFlight[host]; ok {
+		dnsCacheMu.Unlock()
+		return
+	}
+	dnsCacheInFlight[host] = struct{}{}
+	dnsCacheMu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		ip, _, err := resolveChainCacheIP(ctx, host)
+
+		dnsCacheMu.Lock()
+		defer dnsCacheMu.Unlock()
+		delete(dnsCacheInFlight, host)
+		if err != nil || ip == nil {
+			logger.Debug("ChainUDPOutbound: async DNS warm failed host=%s err=%v", host, err)
+			return
+		}
+		dnsCache[host] = dnsCacheEntry{ip: ip.String(), expiresAt: time.Now().Add(5 * time.Minute)}
+		if len(dnsCache) > 100 {
+			now := time.Now()
+			for h, e := range dnsCache {
+				if !now.Before(e.expiresAt) {
+					delete(dnsCache, h)
+				}
+			}
+		}
+	}()
 }
 
 func normalizeCacheKey(destination string) string {
@@ -703,45 +796,11 @@ func normalizeCacheKey(destination string) string {
 		return destination // already an IP
 	}
 
-	// Check DNS cache first
-	dnsCacheMu.Lock()
-	if entry, ok := dnsCache[host]; ok && time.Now().Before(entry.expiresAt) {
-		dnsCacheMu.Unlock()
-		return net.JoinHostPort(entry.ip, port)
+	if ip, ok := lookupDNSCache(host); ok {
+		return net.JoinHostPort(ip, port)
 	}
-	dnsCacheMu.Unlock()
-
-	// Use the filtered resolver (resolveOutboundServerIP) instead of
-	// net.DefaultResolver. When a TUN proxy (Clash/Mihomo) is running, the
-	// system resolver returns fake IPs (198.18.0.0/15, 100.64/10, ...) which
-	// would produce a different cache key than the real IP used by
-	// pingTargetServer (which gets resolved IP from config). This mismatch
-	// prevents the MCBE UDP test from reusing the ping's cached SOCKS5 UDP
-	// connection, forcing it to create a new UDP ASSOCIATE that may get a
-	// firewalled relay port — causing the persistent read i/o timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	ip, _, err := resolveOutboundServerIP(ctx, host)
-	if err != nil || ip == nil {
-		return destination
-	}
-	ipStr := ip.String()
-
-	// Cache the result
-	dnsCacheMu.Lock()
-	dnsCache[host] = dnsCacheEntry{ip: ipStr, expiresAt: time.Now().Add(5 * time.Minute)}
-	// Clean expired entries occasionally
-	if len(dnsCache) > 100 {
-		now := time.Now()
-		for h, e := range dnsCache {
-			if !now.Before(e.expiresAt) {
-				delete(dnsCache, h)
-			}
-		}
-	}
-	dnsCacheMu.Unlock()
-
-	return net.JoinHostPort(ipStr, port)
+	warmDNSCache(host)
+	return destination
 }
 
 // idleSweeper is a proactive background health checker that runs every 15

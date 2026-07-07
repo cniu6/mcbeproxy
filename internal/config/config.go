@@ -454,37 +454,70 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 	return &sc, nil
 }
 
+type RawUDPClientStatsDTO struct {
+	Client              string `json:"client"`
+	Route               string `json:"route"`
+	Target              string `json:"target"`
+	UpPackets           int64  `json:"up_packets"`
+	DownPackets         int64  `json:"down_packets"`
+	UpBytes             int64  `json:"up_bytes"`
+	DownBytes           int64  `json:"down_bytes"`
+	UpBytesPerSecond    int64  `json:"up_bytes_per_second"`
+	DownBytesPerSecond  int64  `json:"down_bytes_per_second"`
+	SinceClientMs       int64  `json:"since_client_ms"`
+	SinceTargetMs       int64  `json:"since_target_ms"`
+	WriteTargetErrors   int64  `json:"write_target_errors"`
+	WriteTargetTimeouts int64  `json:"write_target_timeouts"`
+	WriteClientErrors   int64  `json:"write_client_errors"`
+	WriteClientTimeouts int64  `json:"write_client_timeouts"`
+	ReadTargetTimeouts  int64  `json:"read_target_timeouts"`
+	UpstreamQueueLen    int    `json:"upstream_queue_len"`
+	UpstreamQueueCap    int    `json:"upstream_queue_cap"`
+	UpstreamQueueDrops  int64  `json:"upstream_queue_drops"`
+	LoginParseAttempts  int64  `json:"login_parse_attempts"`
+	LoginParseDone      bool   `json:"login_parse_done"`
+	Encrypted           bool   `json:"encrypted"`
+	LastWriteTargetMs   int64  `json:"last_write_target_ms"`
+	MaxWriteTargetMs    int64  `json:"max_write_target_ms"`
+	SlowWriteTarget     int64  `json:"slow_write_target_count"`
+	LastWriteClientMs   int64  `json:"last_write_client_ms"`
+	MaxWriteClientMs    int64  `json:"max_write_client_ms"`
+	SlowWriteClient     int64  `json:"slow_write_client_count"`
+	StallReason         string `json:"stall_reason,omitempty"`
+}
+
 // ServerConfigDTO is the data transfer object for server config API responses.
 type ServerConfigDTO struct {
-	ID                  string               `json:"id"`
-	Name                string               `json:"name"`
-	Target              string               `json:"target"`
-	Port                int                  `json:"port"`
-	ListenAddr          string               `json:"listen_addr"`
-	Protocol            string               `json:"protocol"`
-	Enabled             bool                 `json:"enabled"`
-	Hidden              bool                 `json:"hidden"` // Whether this server is hidden from the public status page (/api/web/index)
-	UDPSpeeder          *UDPSpeederConfigDTO `json:"udp_speeder,omitempty"`
-	SendRealIP          bool                 `json:"send_real_ip"`
-	ResolveInterval     int                  `json:"resolve_interval"`
-	IdleTimeout         int                  `json:"idle_timeout"`
-	BufferSize          int                  `json:"buffer_size"`
-	UDPSocketBufferSize int                  `json:"udp_socket_buffer_size"`
-	DisabledMessage     string               `json:"disabled_message"`
-	CustomMOTD          string               `json:"custom_motd"`
-	ProxyMode           string               `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
-	ACLServerID         string               `json:"acl_server_id,omitempty"`
-	RawUDPKickStrategy  string               `json:"raw_udp_kick_strategy,omitempty"`
-	XboxAuthEnabled     bool                 `json:"xbox_auth_enabled"`
-	XboxTokenPath       string               `json:"xbox_token_path"`
-	ProxyOutbound       string               `json:"proxy_outbound"`         // Proxy outbound node name or "@group" for group selection
-	ShowRealLatency     bool                 `json:"show_real_latency"`      // Show real latency through proxy
-	LoadBalance         string               `json:"load_balance"`           // Load balance strategy
-	LoadBalanceSort     string               `json:"load_balance_sort"`      // Latency sort type
-	LatencyMode         string               `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
-	Status              string               `json:"status"`                 // running, stopped
-	ActiveSessions      int                  `json:"active_sessions"`
-	ActiveProxyClients  int                  `json:"active_proxy_clients"`
+	ID                  string                 `json:"id"`
+	Name                string                 `json:"name"`
+	Target              string                 `json:"target"`
+	Port                int                    `json:"port"`
+	ListenAddr          string                 `json:"listen_addr"`
+	Protocol            string                 `json:"protocol"`
+	Enabled             bool                   `json:"enabled"`
+	Hidden              bool                   `json:"hidden"` // Whether this server is hidden from the public status page (/api/web/index)
+	UDPSpeeder          *UDPSpeederConfigDTO   `json:"udp_speeder,omitempty"`
+	SendRealIP          bool                   `json:"send_real_ip"`
+	ResolveInterval     int                    `json:"resolve_interval"`
+	IdleTimeout         int                    `json:"idle_timeout"`
+	BufferSize          int                    `json:"buffer_size"`
+	UDPSocketBufferSize int                    `json:"udp_socket_buffer_size"`
+	DisabledMessage     string                 `json:"disabled_message"`
+	CustomMOTD          string                 `json:"custom_motd"`
+	ProxyMode           string                 `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
+	ACLServerID         string                 `json:"acl_server_id,omitempty"`
+	RawUDPKickStrategy  string                 `json:"raw_udp_kick_strategy,omitempty"`
+	XboxAuthEnabled     bool                   `json:"xbox_auth_enabled"`
+	XboxTokenPath       string                 `json:"xbox_token_path"`
+	ProxyOutbound       string                 `json:"proxy_outbound"`         // Proxy outbound node name or "@group" for group selection
+	ShowRealLatency     bool                   `json:"show_real_latency"`      // Show real latency through proxy
+	LoadBalance         string                 `json:"load_balance"`           // Load balance strategy
+	LoadBalanceSort     string                 `json:"load_balance_sort"`      // Latency sort type
+	LatencyMode         string                 `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
+	Status              string                 `json:"status"`                 // running, stopped
+	ActiveSessions      int                    `json:"active_sessions"`
+	ActiveProxyClients  int                    `json:"active_proxy_clients"`
+	RawUDPClients       []RawUDPClientStatsDTO `json:"raw_udp_clients,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval
@@ -859,10 +892,64 @@ func newResolveDNSResolver(server string, timeout time.Duration) *net.Resolver {
 	dialer := &net.Dialer{Timeout: timeout}
 	return &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp", server)
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			// Respect the resolver's requested transport: Go starts with UDP and
+			// can retry with TCP when needed. Forcing TCP here made every public-DNS
+			// fallback pay an extra handshake before the actual proxy dial.
+			return dialer.DialContext(ctx, network, server)
 		},
 	}
+}
+
+type publicDNSResolveResult struct {
+	ip     net.IP
+	server string
+	err    error
+}
+
+func resolveViaPublicDNS(ctx context.Context, hostname string) (net.IP, error) {
+	queryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	resultCh := make(chan publicDNSResolveResult, len(publicDNSServers))
+	for _, dnsServer := range publicDNSServers {
+		dnsServer := dnsServer
+		go func() {
+			resolver := newResolveDNSResolver(dnsServer, 1200*time.Millisecond)
+			addrs, err := resolver.LookupIPAddr(queryCtx, hostname)
+			usable := filterUsableResolveIPs(addrs)
+			if ip := preferredResolveIP(usable); ip != nil {
+				resultCh <- publicDNSResolveResult{ip: ip, server: dnsServer}
+				return
+			}
+			if err == nil {
+				err = fmt.Errorf("no usable public IP found")
+			}
+			resultCh <- publicDNSResolveResult{server: dnsServer, err: err}
+		}()
+	}
+
+	var lastErr error
+	for range publicDNSServers {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-resultCh:
+			if result.ip != nil {
+				logger.Debug("Config DNS resolve ok: host=%s source=public_dns server=%s ip=%s", hostname, result.server, result.ip.String())
+				cancel()
+				return result.ip, nil
+			}
+			if result.err != nil {
+				lastErr = result.err
+				logger.Debug("Config DNS resolve public dns failed: host=%s server=%s err=%v", hostname, result.server, result.err)
+			}
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable public IP found")
+	}
+	return nil, lastErr
 }
 
 func resolveUsableIP(ctx context.Context, hostname string) (net.IP, error) {
@@ -884,37 +971,27 @@ func resolveUsableIP(ctx context.Context, hostname string) (net.IP, error) {
 		logger.Debug("Config DNS resolve system returned only special-use IPs: host=%s ips=%s", hostname, strings.Join(resolved, ","))
 	}
 
-	var lastErr error
-	for _, dnsServer := range publicDNSServers {
-		resolver := newResolveDNSResolver(dnsServer, 3*time.Second)
-		addrs, err = resolver.LookupIPAddr(ctx, hostname)
-		usable = filterUsableResolveIPs(addrs)
-		if ip := preferredResolveIP(usable); ip != nil {
-			logger.Debug("Config DNS resolve ok: host=%s source=public_dns server=%s ip=%s", hostname, dnsServer, ip.String())
-			return ip, nil
-		}
-		if err != nil {
-			lastErr = err
-			logger.Debug("Config DNS resolve public dns failed: host=%s server=%s err=%v", hostname, dnsServer, err)
-			continue
-		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no usable public IP found")
-	}
-	return nil, lastErr
+	return resolveViaPublicDNS(ctx, hostname)
 }
 
 // Resolve resolves a hostname to an IP address.
 func (r *DNSResolver) Resolve(hostname string) (string, error) {
+	return r.ResolveContext(context.Background(), hostname)
+}
+
+// ResolveContext resolves a hostname to an IP address and observes caller cancellation.
+func (r *DNSResolver) ResolveContext(ctx context.Context, hostname string) (string, error) {
 	// Check if it's already an IP address
 	if ip := net.ParseIP(hostname); ip != nil {
 		return hostname, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resolveCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	resolvedIP, err := resolveUsableIP(ctx, hostname)
+	resolvedIP, err := resolveUsableIP(resolveCtx, hostname)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve %s: %w", hostname, err)
 	}
@@ -923,13 +1000,14 @@ func (r *DNSResolver) Resolve(hostname string) (string, error) {
 
 // ConfigManager manages server configurations with hot reload support.
 type ConfigManager struct {
-	servers    map[string]*ServerConfig
-	mu         sync.RWMutex
-	configPath string
-	watcher    *fsnotify.Watcher
-	watcherMu  sync.Mutex
-	resolver   *DNSResolver
-	onChange   func() // callback when config changes
+	servers       map[string]*ServerConfig
+	mu            sync.RWMutex
+	configPath    string
+	watcher       *fsnotify.Watcher
+	debounceTimer *time.Timer
+	watcherMu     sync.Mutex
+	resolver      *DNSResolver
+	onChange      func() // callback when config changes
 }
 
 // NewConfigManager creates a new ConfigManager instance.
@@ -1127,19 +1205,27 @@ func (cm *ConfigManager) saveToFile() error {
 }
 
 // RefreshDNS re-resolves DNS for all servers that need refresh.
-func (cm *ConfigManager) RefreshDNS() {
+func (cm *ConfigManager) RefreshDNS(ctx context.Context) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	now := time.Now()
 	for _, server := range cm.servers {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		if server.ResolveInterval <= 0 {
 			continue
 		}
 
 		interval := time.Duration(server.ResolveInterval) * time.Second
 		if now.Sub(server.GetLastResolved()) >= interval {
-			if ip, err := cm.resolver.Resolve(server.Target); err == nil {
+			if ip, err := cm.resolver.ResolveContext(ctx, server.Target); err == nil {
 				server.SetResolvedIP(ip)
 			}
 		}
@@ -1148,19 +1234,17 @@ func (cm *ConfigManager) RefreshDNS() {
 
 // StartDNSRefresh starts a background goroutine to periodically refresh DNS.
 func (cm *ConfigManager) StartDNSRefresh(ctx context.Context, interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				cm.RefreshDNS()
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cm.RefreshDNS(ctx)
 		}
-	}()
+	}
 }
 
 // SetOnChange sets a callback function to be called when configuration changes.
@@ -1550,7 +1634,6 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 	go func() {
 		defer cm.closeWatcher()
 
-		var debounceTimer *time.Timer
 		for {
 			select {
 			case <-ctx.Done():
@@ -1566,12 +1649,23 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 				// would be silently missed.
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
 					// Debounce: coalesce rapid events into a single reload
-					if debounceTimer != nil {
-						debounceTimer.Stop()
+					cm.watcherMu.Lock()
+					if cm.debounceTimer != nil {
+						cm.debounceTimer.Stop()
 					}
-					debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+					cm.debounceTimer = time.AfterFunc(150*time.Millisecond, func() {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
 						if err := cm.Reload(); err != nil {
 							logger.Error("Config reload error: %v", err)
+						}
+						select {
+						case <-ctx.Done():
+							return
+						default:
 						}
 						// Re-add file to watcher after reload.
 						// After atomicWriteFile replaces the file via rename,
@@ -1584,6 +1678,7 @@ func (cm *ConfigManager) Watch(ctx context.Context) error {
 						}
 						cm.watcherMu.Unlock()
 					})
+					cm.watcherMu.Unlock()
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {
@@ -1613,6 +1708,10 @@ func (cm *ConfigManager) IsWatching() bool {
 func (cm *ConfigManager) closeWatcher() {
 	cm.watcherMu.Lock()
 	defer cm.watcherMu.Unlock()
+	if cm.debounceTimer != nil {
+		cm.debounceTimer.Stop()
+		cm.debounceTimer = nil
+	}
 	if cm.watcher != nil {
 		cm.watcher.Close()
 		cm.watcher = nil

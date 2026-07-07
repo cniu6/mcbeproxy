@@ -293,6 +293,15 @@ func (s *Session) SetLastSeenAt(t time.Time) {
 func (s *Session) ToDTO() SessionDTO {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	duration := int64(now.Sub(s.StartTime).Seconds())
+	if duration < 0 {
+		duration = 0
+	}
+	idle := int64(now.Sub(s.LastSeen).Seconds())
+	if idle < 0 {
+		idle = 0
+	}
 	return SessionDTO{
 		ID:          s.ID,
 		ClientAddr:  s.ClientAddr,
@@ -303,7 +312,9 @@ func (s *Session) ToDTO() SessionDTO {
 		BytesUp:     s.BytesUp,
 		BytesDown:   s.BytesDown,
 		StartTime:   s.StartTime,
-		Duration:    int64(time.Since(s.StartTime).Seconds()),
+		LastSeen:    s.LastSeen,
+		Duration:    duration,
+		IdleSeconds: idle,
 	}
 }
 
@@ -318,7 +329,9 @@ type SessionDTO struct {
 	BytesUp     int64     `json:"bytes_up"`
 	BytesDown   int64     `json:"bytes_down"`
 	StartTime   time.Time `json:"start_time"`
+	LastSeen    time.Time `json:"last_seen"`
 	Duration    int64     `json:"duration_seconds"`
+	IdleSeconds int64     `json:"idle_seconds"`
 }
 
 // SessionRecord represents a session record for database persistence.

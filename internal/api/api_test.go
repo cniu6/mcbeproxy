@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -670,7 +671,7 @@ func TestBuildWebIndexResponse_ExcludesHiddenServers(t *testing.T) {
 		{ID: "visible-2", Name: "visible-2", Status: "stopped"},
 	}}
 
-	data := api.buildWebIndexResponse()
+	data := api.buildWebIndexResponse(context.Background())
 
 	var resp struct {
 		Servers []struct {

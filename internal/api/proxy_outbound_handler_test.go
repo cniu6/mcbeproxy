@@ -110,6 +110,9 @@ func (m *mockOutboundManager) Stop() error   { return nil }
 func (m *mockOutboundManager) Reload() error { return nil }
 
 func (m *mockOutboundManager) GetActiveConnectionCount() int64 { return 0 }
+func (m *mockOutboundManager) GetOutboundConnectionCount(outboundName string) int64 {
+	return 0
+}
 
 func (m *mockOutboundManager) GetGroupStats(groupName string) *proxy.GroupStats {
 	var nodes []*config.ProxyOutbound

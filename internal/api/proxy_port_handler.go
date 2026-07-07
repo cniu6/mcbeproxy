@@ -309,7 +309,9 @@ func (a *APIServer) testProxyPort(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), proxyPortTestTimeout)
+	reqCtx, reqCancel := a.requestContext(c)
+	defer reqCancel()
+	ctx, cancel := context.WithTimeout(reqCtx, proxyPortTestTimeout)
 	defer cancel()
 
 	runProxyPortConnectivityTest(ctx, port, testURL, &result)

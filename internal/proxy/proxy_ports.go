@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +23,15 @@ import (
 )
 
 const (
-	defaultProxyDialTimeout      = 10 * time.Second
-	defaultProxyHandshakeTimeout = 15 * time.Second
-	maxSocks4FieldLength         = 4096
+	defaultProxyDialTimeout        = 10 * time.Second
+	defaultProxyHandshakeTimeout   = 15 * time.Second
+	proxyPortStopWaitTimeout       = 5 * time.Second
+	maxSocks4FieldLength           = 4096
+	sharedUDPRelayQueueSize        = 256
+	sharedUDPRelayMaxWriteFailures = 3
+	sharedUDPRelayDropLogEvery       = int64(1024)
+	sharedUDPRelayMaxResponseHeader = 262 // RSV + FRAG + ATYP + 255-byte domain + port
+	sharedUDPRelayMaxDatagramSize  = 65535
 )
 
 // ProxyPortManager manages local proxy port listeners.
@@ -94,11 +101,55 @@ func (m *ProxyPortManager) Stop() {
 	m.stopListeners(true, true)
 }
 
-// Reload stops listeners without waiting for active connections and restarts them.
-// This keeps API updates responsive while still reloading config.
+// Reload reconciles proxy port listeners with the latest config. Unchanged
+// listeners are kept alive so active TCP clients and SOCKS5 UDP relays are not
+// interrupted by unrelated proxy-port CRUD/file-watcher reloads.
 func (m *ProxyPortManager) Reload(enabled bool) error {
-	m.stopListeners(false, false)
+	if !enabled || m.configMgr == nil {
+		m.stopListeners(false, false)
+		return nil
+	}
+
+	ports := m.configMgr.GetAllPorts()
+	desired := make(map[string]*config.ProxyPortConfig, len(ports))
+	for _, cfg := range ports {
+		if cfg == nil || !cfg.Enabled {
+			continue
+		}
+		desired[cfg.ID] = cfg.Clone()
+	}
+
+	m.mu.Lock()
+	for id, listener := range m.listeners {
+		cfg, ok := desired[id]
+		if !ok || !proxyPortRuntimeConfigEqual(listener.cfg, cfg) {
+			listener.StopWithWait(false)
+			delete(m.listeners, id)
+		}
+	}
+	m.mu.Unlock()
+
 	return m.Start(enabled)
+}
+
+func proxyPortRuntimeConfigEqual(a, b *config.ProxyPortConfig) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ac := a.Clone()
+	bc := b.Clone()
+	ac.ApplyDefaults()
+	bc.ApplyDefaults()
+	return ac.ID == bc.ID &&
+		ac.ListenAddr == bc.ListenAddr &&
+		ac.Type == bc.Type &&
+		ac.Enabled == bc.Enabled &&
+		ac.Username == bc.Username &&
+		ac.Password == bc.Password &&
+		ac.ProxyOutbound == bc.ProxyOutbound &&
+		ac.LoadBalance == bc.LoadBalance &&
+		ac.LoadBalanceSort == bc.LoadBalanceSort &&
+		reflect.DeepEqual(ac.AllowList, bc.AllowList)
 }
 
 func (m *ProxyPortManager) stopListeners(wait bool, closeDialers bool) {
@@ -229,17 +280,19 @@ func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
 }
 
 type proxyPortListener struct {
-	cfg         *config.ProxyPortConfig
-	outboundMgr OutboundManager
-	dialerPool  *proxyPortDialerPool
-	listener    net.Listener
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	allowList   []*net.IPNet
-	activeConns atomic.Int64
-	sharedRelay *sharedUDPRelay
-	relayMu     sync.Mutex
+	cfg            *config.ProxyPortConfig
+	outboundMgr    OutboundManager
+	dialerPool     *proxyPortDialerPool
+	listener       net.Listener
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	allowList      []*net.IPNet
+	activeConns    atomic.Int64
+	activeConnsMu  sync.Mutex
+	activeNetConns map[net.Conn]struct{}
+	sharedRelay    *sharedUDPRelay
+	relayMu        sync.Mutex
 }
 
 func newProxyPortListener(cfg *config.ProxyPortConfig, outboundMgr OutboundManager, dialerPool *proxyPortDialerPool) *proxyPortListener {
@@ -273,6 +326,9 @@ func (l *proxyPortListener) Start() error {
 	}
 	l.listener = ln
 	l.ctx, l.cancel = context.WithCancel(context.Background())
+	l.activeConnsMu.Lock()
+	l.activeNetConns = make(map[net.Conn]struct{})
+	l.activeConnsMu.Unlock()
 
 	l.wg.Add(1)
 	go l.acceptLoop()
@@ -286,14 +342,77 @@ func (l *proxyPortListener) StopWithWait(wait bool) {
 	if l.listener != nil {
 		_ = l.listener.Close()
 	}
+	l.closeActiveConns()
 	l.relayMu.Lock()
 	if l.sharedRelay != nil {
 		l.sharedRelay.close()
 		l.sharedRelay = nil
 	}
 	l.relayMu.Unlock()
+	l.closeActiveConns()
 	if wait {
+		l.waitStopped(proxyPortStopWaitTimeout)
+	}
+}
+
+func (l *proxyPortListener) trackConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	if l.ctx != nil && l.ctx.Err() != nil {
+		_ = conn.Close()
+		return false
+	}
+	l.activeConnsMu.Lock()
+	if l.activeNetConns == nil {
+		l.activeNetConns = make(map[net.Conn]struct{})
+	}
+	l.activeNetConns[conn] = struct{}{}
+	l.activeConnsMu.Unlock()
+	return true
+}
+
+func (l *proxyPortListener) untrackConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	l.activeConnsMu.Lock()
+	delete(l.activeNetConns, conn)
+	l.activeConnsMu.Unlock()
+}
+
+func (l *proxyPortListener) closeTrackedConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.Close()
+	l.untrackConn(conn)
+}
+
+func (l *proxyPortListener) closeActiveConns() {
+	l.activeConnsMu.Lock()
+	conns := make([]net.Conn, 0, len(l.activeNetConns))
+	for conn := range l.activeNetConns {
+		conns = append(conns, conn)
+	}
+	l.activeConnsMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func (l *proxyPortListener) waitStopped(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
 		l.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+		l.closeActiveConns()
+		logger.Warn("ProxyPort: stop timed out after %s for %s; active connections may still be closing", timeout, l.cfg.ListenAddr)
 	}
 }
 
@@ -320,6 +439,10 @@ func (l *proxyPortListener) acceptLoop() {
 		l.wg.Add(1)
 		go func(c net.Conn) {
 			defer l.wg.Done()
+			if !l.trackConn(c) {
+				return
+			}
+			defer l.untrackConn(c)
 			l.activeConns.Add(1)
 			defer l.activeConns.Add(-1)
 			setProxyHandshakeDeadline(c)
@@ -412,6 +535,10 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 			writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway")
 			return
 		}
+		if !l.trackConn(remote) {
+			writeHTTPError(conn, http.StatusServiceUnavailable, "Service Unavailable")
+			return
+		}
 
 		req.RequestURI = ""
 		if req.URL != nil {
@@ -422,23 +549,23 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 		req.Header.Del("Proxy-Connection")
 
 		if err := req.Write(remote); err != nil {
-			remote.Close()
+			l.closeTrackedConn(remote)
 			return
 		}
 
 		resp, err := http.ReadResponse(bufio.NewReader(remote), req)
 		if err != nil {
-			remote.Close()
+			l.closeTrackedConn(remote)
 			return
 		}
 		if err := func() error {
 			defer resp.Body.Close()
 			return resp.Write(conn)
 		}(); err != nil {
-			remote.Close()
+			l.closeTrackedConn(remote)
 			return
 		}
-		remote.Close()
+		l.closeTrackedConn(remote)
 
 		if req.Close || resp.Close {
 			return
@@ -463,10 +590,14 @@ func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reade
 		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway")
 		return
 	}
+	if !l.trackConn(remote) {
+		writeHTTPError(conn, http.StatusServiceUnavailable, "Service Unavailable")
+		return
+	}
 	clearProxyConnDeadline(conn)
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	defer remote.Close()
+	defer l.closeTrackedConn(remote)
 	relayStream(conn, reader, remote)
 }
 
@@ -489,9 +620,13 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 			writeSocks5Reply(conn, 0x05)
 			return
 		}
+		if !l.trackConn(remote) {
+			writeSocks5Reply(conn, 0x01)
+			return
+		}
 		clearProxyConnDeadline(conn)
 		writeSocks5Reply(conn, 0x00)
-		defer remote.Close()
+		defer l.closeTrackedConn(remote)
 		relayStream(conn, reader, remote)
 	case 0x03: // UDP ASSOCIATE
 		l.handleSocks5UDPAssociate(conn)
@@ -684,10 +819,14 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 		writeSocks4Reply(conn, 0x5B, destIP, port)
 		return
 	}
+	if !l.trackConn(remote) {
+		writeSocks4Reply(conn, 0x5B, destIP, port)
+		return
+	}
 	clearProxyConnDeadline(conn)
 
 	writeSocks4Reply(conn, 0x5A, destIP, port)
-	defer remote.Close()
+	defer l.closeTrackedConn(remote)
 	relayStream(conn, reader, remote)
 }
 
@@ -897,6 +1036,7 @@ type sharedUDPRelay struct {
 	activeIPs   map[string]int // net.IP.String() -> reference count of active TCP control conns
 	wg          sync.WaitGroup
 	stopCh      chan struct{}
+	closeOnce   sync.Once
 	cfgID       string
 }
 
@@ -906,10 +1046,105 @@ type udpClientEntry struct {
 	mu        sync.Mutex
 }
 
+type udpRelayPacket struct {
+	payload []byte
+	dest    net.Addr
+}
+
+type udpRelayEnqueueResult struct {
+	queued        bool
+	droppedOldest bool
+	dropCount     int64
+	queueDepth    int
+}
+
+type sharedUDPUpstreamStats struct {
+	EnqueuedPackets int64
+	DroppedPackets  int64
+	WritePackets    int64
+	WriteErrors     int64
+	QueueDepth      int
+}
+
 // upstreamConn represents a single upstream UDP connection for a destination.
 type upstreamConn struct {
+	mu       sync.Mutex
 	pc       net.PacketConn
 	lastSeen time.Time
+	queue    chan udpRelayPacket
+	done     chan struct{}
+	once     sync.Once
+
+	enqueuedPackets atomic.Int64
+	droppedPackets  atomic.Int64
+	writePackets    atomic.Int64
+	writeErrors     atomic.Int64
+}
+
+func newUpstreamConn() *upstreamConn {
+	return &upstreamConn{
+		lastSeen: time.Now(),
+		queue:    make(chan udpRelayPacket, sharedUDPRelayQueueSize),
+		done:     make(chan struct{}),
+	}
+}
+
+func (uc *upstreamConn) enqueue(packet udpRelayPacket) udpRelayEnqueueResult {
+	select {
+	case <-uc.done:
+		return udpRelayEnqueueResult{}
+	default:
+	}
+	select {
+	case uc.queue <- packet:
+		uc.enqueuedPackets.Add(1)
+		return udpRelayEnqueueResult{queued: true, queueDepth: len(uc.queue)}
+	default:
+		// Keep the newest realtime game packet instead of letting backlog inflate latency.
+		select {
+		case <-uc.queue:
+		default:
+		}
+		dropCount := uc.droppedPackets.Add(1)
+		select {
+		case uc.queue <- packet:
+			uc.enqueuedPackets.Add(1)
+			return udpRelayEnqueueResult{queued: true, droppedOldest: true, dropCount: dropCount, queueDepth: len(uc.queue)}
+		case <-uc.done:
+			return udpRelayEnqueueResult{droppedOldest: true, dropCount: dropCount, queueDepth: len(uc.queue)}
+		default:
+			return udpRelayEnqueueResult{droppedOldest: true, dropCount: dropCount, queueDepth: len(uc.queue)}
+		}
+	}
+}
+
+func (uc *upstreamConn) stats() sharedUDPUpstreamStats {
+	queueDepth := 0
+	if uc.queue != nil {
+		queueDepth = len(uc.queue)
+	}
+	return sharedUDPUpstreamStats{
+		EnqueuedPackets: uc.enqueuedPackets.Load(),
+		DroppedPackets:  uc.droppedPackets.Load(),
+		WritePackets:    uc.writePackets.Load(),
+		WriteErrors:     uc.writeErrors.Load(),
+		QueueDepth:      queueDepth,
+	}
+}
+
+func (uc *upstreamConn) close() {
+	uc.once.Do(func() {
+		if uc.done != nil {
+			close(uc.done)
+		}
+		uc.mu.Lock()
+		pc := uc.pc
+		uc.mu.Unlock()
+		if pc != nil {
+			_ = pc.SetReadDeadline(time.Now())
+			_ = pc.Close()
+		}
+	})
 }
 
 // getOrCreateSharedUDPRelay lazily creates the shared UDP relay socket bound
@@ -1000,13 +1235,11 @@ func (r *sharedUDPRelay) isClientIPActive(ip net.IP) bool {
 // actively sending UDP keepalives or game traffic, even if no TCP-level
 // data is ever sent.
 func (r *sharedUDPRelay) hasRecentActivity(ip net.IP, maxIdle time.Duration) bool {
-	ipStr := ip.String()
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for clientKey, entry := range r.clients {
-		// clientKey is "IP:Port" — only check entries from this IP
-		if !strings.HasPrefix(clientKey, ipStr+":") {
+		if !sameClientIP(clientKey, ip) {
 			continue
 		}
 		entry.mu.Lock()
@@ -1019,6 +1252,89 @@ func (r *sharedUDPRelay) hasRecentActivity(ip net.IP, maxIdle time.Duration) boo
 		entry.mu.Unlock()
 	}
 	return false
+}
+
+func sameClientIP(clientKey string, ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(clientKey)
+	if err == nil {
+		parsed := net.ParseIP(host)
+		return parsed != nil && parsed.Equal(ip)
+	}
+	return strings.HasPrefix(clientKey, ip.String()+":")
+}
+
+func socks5UDPResponseAddr(destAddr string) net.Addr {
+	host, portStr, err := net.SplitHostPort(destAddr)
+	if err != nil {
+		return nil
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.UDPAddr{IP: ip, Port: port}
+	}
+	return &HostnamePortAddr{Host: host, Port: port}
+}
+
+func appendSocks5UDPResponseHeader(dst []byte, addr net.Addr) ([]byte, bool) {
+	if addr == nil {
+		return dst, false
+	}
+
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		if udpAddr == nil || udpAddr.Port < 0 || udpAddr.Port > 65535 {
+			return dst, false
+		}
+		if ip4 := udpAddr.IP.To4(); ip4 != nil {
+			dst = append(dst, 0x00, 0x00, 0x00, 0x01)
+			dst = append(dst, ip4...)
+			dst = append(dst, byte(udpAddr.Port>>8), byte(udpAddr.Port))
+			return dst, true
+		}
+		if ip16 := udpAddr.IP.To16(); ip16 != nil {
+			dst = append(dst, 0x00, 0x00, 0x00, 0x04)
+			dst = append(dst, ip16...)
+			dst = append(dst, byte(udpAddr.Port>>8), byte(udpAddr.Port))
+			return dst, true
+		}
+		return dst, false
+	}
+
+	host := ""
+	port := 0
+	if hostnameAddr, ok := addr.(*HostnamePortAddr); ok {
+		host = hostnameAddr.Host
+		port = hostnameAddr.Port
+	} else {
+		parsedHost, portStr, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return dst, false
+		}
+		parsedPort, err := strconv.Atoi(portStr)
+		if err != nil {
+			return dst, false
+		}
+		host = parsedHost
+		port = parsedPort
+	}
+	if port < 0 || port > 65535 {
+		return dst, false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return appendSocks5UDPResponseHeader(dst, &net.UDPAddr{IP: ip, Port: port})
+	}
+	if len(host) == 0 || len(host) > 255 {
+		return dst, false
+	}
+	dst = append(dst, 0x00, 0x00, 0x00, 0x03, byte(len(host)))
+	dst = append(dst, host...)
+	dst = append(dst, byte(port>>8), byte(port))
+	return dst, true
 }
 
 // dialUDPUpstream creates an upstream UDP connection for the given destination.
@@ -1106,7 +1422,7 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 					entry.mu.Lock()
 					for ukey, uc := range entry.upstreams {
 						if now.Sub(uc.lastSeen) > 120*time.Second {
-							uc.pc.Close()
+							uc.close()
 							delete(entry.upstreams, ukey)
 						}
 					}
@@ -1210,109 +1526,200 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 			continue
 		}
 
-		// Get or create client entry
-		r.mu.Lock()
-		entry, exists := r.clients[clientKey]
-		if !exists {
-			entry = &udpClientEntry{
-				upstreams: make(map[string]*upstreamConn),
-			}
-			r.clients[clientKey] = entry
-		}
-		r.mu.Unlock()
+		// Get or create client entry and enqueue work. The shared relay read loop
+		// must never dial or write upstream synchronously; one slow upstream would
+		// otherwise head-of-line block all clients sharing this UDP socket.
+		entry := r.getOrCreateClientEntry(clientKey)
+		uc := r.getOrCreateUpstream(l, entry, clientKey, destAddr, clientAddr)
 
-		// Get or create upstream connection for this dest
-		entry.mu.Lock()
-		uc, exists := entry.upstreams[destAddr]
-		if !exists {
-			logger.Debug("SOCKS5 UDP relay: creating upstream for %s (client=%s, proxy_port=%s)", destAddr, clientKey, r.cfgID)
-			pc, err := l.dialUDPUpstream(destAddr)
-			if err != nil {
-				logger.Warn("SOCKS5 UDP relay: failed to dial upstream for %s: %v (proxy_port=%s)", destAddr, err, r.cfgID)
-				entry.mu.Unlock()
-				continue
-			}
-
-			uc = &upstreamConn{pc: pc, lastSeen: time.Now()}
-			entry.upstreams[destAddr] = uc
-
-			// Start response goroutine: upstream -> client via shared relay socket
-			r.wg.Add(1)
-			go func(pc net.PacketConn, clientAddr *net.UDPAddr) {
-				defer r.wg.Done()
-				respBuf := make([]byte, 65535)
-				// Set read deadline once; reset only after timeout.
-				// This eliminates 1 syscall per response packet.
-				// 30s timeout: MCBE servers may have 10-20s silence bursts;
-				// shorter timeouts cause unnecessary loop iterations.
-				pc.SetReadDeadline(time.Now().Add(30 * time.Second))
-				for {
-					n, _, err := pc.ReadFrom(respBuf[10:])
-					if err != nil {
-						if isTimeoutError(err) {
-							// Check if the upstream is still considered active;
-							// if so, reset deadline and continue waiting.
-							// The idle sweeper will close truly stale ones.
-							pc.SetReadDeadline(time.Now().Add(30 * time.Second))
-							continue
-						}
-						return
-					}
-					// SOCKS5 UDP header: RSV(2)+FRAG(1)+ATYP(1)+ADDR(4)+PORT(2) = 10 bytes
-					respBuf[0] = 0x00
-					respBuf[1] = 0x00
-					respBuf[2] = 0x00
-					respBuf[3] = 0x01
-					respBuf[4] = 0
-					respBuf[5] = 0
-					respBuf[6] = 0
-					respBuf[7] = 0
-					respBuf[8] = 0
-					respBuf[9] = 0
-					// Set a short write deadline so a slow client doesn't
-					// block response forwarding and cause upstream buffer
-					// overflow (which would drop game packets). 100ms is
-					// enough for a healthy LAN/WAN path; exceeding it means
-					// the client is congested and dropping this packet is
-					// better than stalling the entire upstream read loop.
-					_ = r.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-					_, _ = r.conn.WriteToUDP(respBuf[:10+n], clientAddr)
-				}
-			}(pc, &net.UDPAddr{IP: clientAddr.IP, Port: clientAddr.Port})
-		}
-		uc.lastSeen = time.Now()
-		entry.mu.Unlock()
-
-		// Forward payload to upstream via writePacketConn (handles connected PacketConn)
-		// Set a short write deadline so a congested upstream doesn't block the
-		// entire readLoop (which would queue up packets from ALL clients and
-		// cause kernel buffer overflow on the shared relay socket).
 		var destNetAddr net.Addr
 		if ip := net.ParseIP(destHost); ip != nil {
 			destNetAddr = &net.UDPAddr{IP: ip, Port: destPort}
 		} else {
 			destNetAddr = &HostnamePortAddr{Host: destHost, Port: destPort}
 		}
-		_ = uc.pc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		_, _ = writePacketConn(uc.pc, payload, destNetAddr)
+		payloadCopy := append([]byte(nil), payload...)
+		enqueueResult := uc.enqueue(udpRelayPacket{payload: payloadCopy, dest: destNetAddr})
+		if enqueueResult.droppedOldest && (enqueueResult.dropCount == 1 || enqueueResult.dropCount%sharedUDPRelayDropLogEvery == 0) {
+			logger.Warn("SOCKS5 UDP relay: upstream queue full, dropped oldest packet for %s (client=%s, proxy_port=%s, drops=%d, queue_depth=%d)",
+				destAddr, clientKey, r.cfgID, enqueueResult.dropCount, enqueueResult.queueDepth)
+		}
+		if !enqueueResult.queued {
+			logger.Debug("SOCKS5 UDP relay: dropping upstream packet for %s (client=%s, proxy_port=%s)", destAddr, clientKey, r.cfgID)
+		}
+	}
+}
+
+func (r *sharedUDPRelay) getOrCreateClientEntry(clientKey string) *udpClientEntry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, exists := r.clients[clientKey]
+	if !exists {
+		entry = &udpClientEntry{upstreams: make(map[string]*upstreamConn)}
+		r.clients[clientKey] = entry
+	}
+	return entry
+}
+
+func (r *sharedUDPRelay) getOrCreateUpstream(l *proxyPortListener, entry *udpClientEntry, clientKey string, destAddr string, clientAddr *net.UDPAddr) *upstreamConn {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	uc, exists := entry.upstreams[destAddr]
+	if exists {
+		uc.lastSeen = time.Now()
+		return uc
+	}
+
+	logger.Debug("SOCKS5 UDP relay: creating upstream for %s (client=%s, proxy_port=%s)", destAddr, clientKey, r.cfgID)
+	uc = newUpstreamConn()
+	entry.upstreams[destAddr] = uc
+	clientCopy := *clientAddr
+	r.wg.Add(1)
+	go r.upstreamWorker(l, clientKey, destAddr, uc, &clientCopy)
+	return uc
+}
+
+func (r *sharedUDPRelay) removeUpstream(clientKey string, destAddr string, target *upstreamConn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.clients[clientKey]
+	if !ok {
+		return
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if current := entry.upstreams[destAddr]; current == target {
+		delete(entry.upstreams, destAddr)
+	}
+	if len(entry.upstreams) == 0 {
+		delete(r.clients, clientKey)
+	}
+}
+
+func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, destAddr string, uc *upstreamConn, clientAddr *net.UDPAddr) {
+	defer r.wg.Done()
+	pc, err := l.dialUDPUpstream(destAddr)
+	if err != nil {
+		logger.Warn("SOCKS5 UDP relay: failed to dial upstream for %s: %v (proxy_port=%s)", destAddr, err, r.cfgID)
+		uc.close()
+		r.removeUpstream(clientKey, destAddr, uc)
+		return
+	}
+
+	uc.mu.Lock()
+	select {
+	case <-uc.done:
+		uc.mu.Unlock()
+		_ = pc.Close()
+		return
+	default:
+		uc.pc = pc
+	}
+	uc.mu.Unlock()
+
+	r.wg.Add(1)
+	go r.forwardUDPResponses(pc, clientAddr, socks5UDPResponseAddr(destAddr), uc.done)
+
+	consecutiveWriteFailures := 0
+	for {
+		select {
+		case <-r.stopCh:
+			uc.close()
+			return
+		case <-uc.done:
+			return
+		case packet := <-uc.queue:
+			_ = pc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			n, err := writePacketConn(pc, packet.payload, packet.dest)
+			if err != nil || n != len(packet.payload) {
+				uc.writeErrors.Add(1)
+				consecutiveWriteFailures++
+				if consecutiveWriteFailures >= sharedUDPRelayMaxWriteFailures {
+					stats := uc.stats()
+					logger.Warn("SOCKS5 UDP relay: closing unhealthy upstream for %s after %d consecutive write failures (client=%s, proxy_port=%s, writes=%d, write_errors=%d, drops=%d, queue_depth=%d, last_error=%v)",
+						destAddr, consecutiveWriteFailures, clientKey, r.cfgID, stats.WritePackets, stats.WriteErrors, stats.DroppedPackets, stats.QueueDepth, err)
+					uc.close()
+					r.removeUpstream(clientKey, destAddr, uc)
+					return
+				}
+				continue
+			}
+			uc.writePackets.Add(1)
+			consecutiveWriteFailures = 0
+		}
+	}
+}
+
+func (r *sharedUDPRelay) forwardUDPResponses(pc net.PacketConn, clientAddr *net.UDPAddr, fallbackAddr net.Addr, done <-chan struct{}) {
+	defer r.wg.Done()
+	respBuf := make([]byte, sharedUDPRelayMaxResponseHeader+sharedUDPRelayMaxDatagramSize)
+	// Set read deadline once; reset only after timeout. This eliminates 1
+	// syscall per response packet. 30s timeout tolerates MCBE silence bursts.
+	_ = pc.SetReadDeadline(time.Now().Add(30 * time.Second))
+	for {
+		n, responseAddr, err := pc.ReadFrom(respBuf[sharedUDPRelayMaxResponseHeader:])
+		if err != nil {
+			if isTimeoutError(err) {
+				select {
+				case <-r.stopCh:
+					return
+				case <-done:
+					return
+				default:
+				}
+				_ = pc.SetReadDeadline(time.Now().Add(30 * time.Second))
+				continue
+			}
+			return
+		}
+
+		select {
+		case <-r.stopCh:
+			return
+		case <-done:
+			return
+		default:
+		}
+
+		header, ok := appendSocks5UDPResponseHeader(respBuf[:0], responseAddr)
+		if !ok {
+			header, ok = appendSocks5UDPResponseHeader(respBuf[:0], fallbackAddr)
+		}
+		if !ok {
+			logger.Debug("SOCKS5 UDP relay: dropping response with unknown source address %v (proxy_port=%s)", responseAddr, r.cfgID)
+			continue
+		}
+		if len(header)+n > sharedUDPRelayMaxDatagramSize {
+			logger.Debug("SOCKS5 UDP relay: dropping oversized response from %v (payload=%d header=%d proxy_port=%s)", responseAddr, n, len(header), r.cfgID)
+			continue
+		}
+		packetStart := sharedUDPRelayMaxResponseHeader - len(header)
+		copy(respBuf[packetStart:sharedUDPRelayMaxResponseHeader], header)
+
+		// Set a short write deadline so a slow client doesn't block response
+		// forwarding and cause upstream buffer overflow.
+		_ = r.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		_, _ = r.conn.WriteToUDP(respBuf[packetStart:sharedUDPRelayMaxResponseHeader+n], clientAddr)
 	}
 }
 
 // close closes the shared relay socket and all client upstream connections.
 func (r *sharedUDPRelay) close() {
-	close(r.stopCh)
-	r.conn.Close()
-	r.mu.Lock()
-	for _, entry := range r.clients {
-		entry.mu.Lock()
-		for _, uc := range entry.upstreams {
-			uc.pc.Close()
+	r.closeOnce.Do(func() {
+		close(r.stopCh)
+		r.conn.Close()
+		r.mu.Lock()
+		for _, entry := range r.clients {
+			entry.mu.Lock()
+			for _, uc := range entry.upstreams {
+				uc.close()
+			}
+			entry.mu.Unlock()
 		}
-		entry.mu.Unlock()
-	}
-	r.clients = nil
-	r.mu.Unlock()
-	r.wg.Wait()
+		r.clients = nil
+		r.mu.Unlock()
+		r.wg.Wait()
+	})
 }
 
 // handleSocks5UDPAssociate handles the SOCKS5 UDP ASSOCIATE command.

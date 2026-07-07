@@ -466,11 +466,13 @@ func (c *socks5UDPPacketConn) doProactiveReconnect(oldState *connState) {
 		return
 	}
 	c.reconnecting.Store(true)
-	c.state.Store(&connState{
+	newState := &connState{
 		udpConn:   newUdp,
 		ctrlConn:  newCtrl,
 		relayAddr: newRelay,
-	})
+	}
+	c.applyConfiguredBuffers(newState)
+	c.state.Store(newState)
 	oldState.udpConn.Close()
 	oldState.ctrlConn.Close()
 	c.reconnecting.Store(false)
@@ -497,11 +499,13 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 	for !c.closed.Load() {
 		newCtrl, newUdp, newRelay, err := c.reconnectFn()
 		if err == nil {
-			c.state.Store(&connState{
+			newState := &connState{
 				udpConn:   newUdp,
 				ctrlConn:  newCtrl,
 				relayAddr: newRelay,
-			})
+			}
+			c.applyConfiguredBuffers(newState)
+			c.state.Store(newState)
 			c.reconnecting.Store(false)
 			logger.Info("SOCKS5 UDP: reactive reconnect succeeded, resuming")
 			*backoff = 1 * time.Second
@@ -670,6 +674,24 @@ type socks5UDPPacketConn struct {
 	reconnectFn               func() (net.Conn, net.PacketConn, net.Addr, error)
 	disableProactiveReconnect bool // set for chain SOCKS5 to avoid multi-ASSOCIATE interference
 	disableReactiveReconnect  bool // set for cached SOCKS5 so dead entries are replaced by the cache
+	readBufferSize            atomic.Int64
+	writeBufferSize           atomic.Int64
+}
+
+func (c *socks5UDPPacketConn) applyConfiguredBuffers(st *connState) {
+	if c == nil || st == nil || st.udpConn == nil {
+		return
+	}
+	if readSize := int(c.readBufferSize.Load()); readSize > 0 {
+		if setter, ok := st.udpConn.(interface{ SetReadBuffer(int) error }); ok {
+			_ = setter.SetReadBuffer(readSize)
+		}
+	}
+	if writeSize := int(c.writeBufferSize.Load()); writeSize > 0 {
+		if setter, ok := st.udpConn.(interface{ SetWriteBuffer(int) error }); ok {
+			_ = setter.SetWriteBuffer(writeSize)
+		}
+	}
 }
 
 var socks5UDPWritePool = sync.Pool{
@@ -825,6 +847,38 @@ func (c *socks5UDPPacketConn) SetReadDeadline(t time.Time) error {
 	return errors.New("socks5: no connection")
 }
 
+func (c *socks5UDPPacketConn) SetReadBuffer(bytes int) error {
+	if bytes <= 0 {
+		return nil
+	}
+	c.readBufferSize.Store(int64(bytes))
+	st := c.state.Load()
+	if st == nil || st.udpConn == nil {
+		return errors.New("socks5: no connection")
+	}
+	setter, ok := st.udpConn.(interface{ SetReadBuffer(int) error })
+	if !ok {
+		return errors.New("socks5: udp conn does not support SetReadBuffer")
+	}
+	return setter.SetReadBuffer(bytes)
+}
+
+func (c *socks5UDPPacketConn) SetWriteBuffer(bytes int) error {
+	if bytes <= 0 {
+		return nil
+	}
+	c.writeBufferSize.Store(int64(bytes))
+	st := c.state.Load()
+	if st == nil || st.udpConn == nil {
+		return errors.New("socks5: no connection")
+	}
+	setter, ok := st.udpConn.(interface{ SetWriteBuffer(int) error })
+	if !ok {
+		return errors.New("socks5: udp conn does not support SetWriteBuffer")
+	}
+	return setter.SetWriteBuffer(bytes)
+}
+
 // SetWriteDeadline is a no-op on socks5UDPPacketConn. The write deadline is
 // managed internally by WriteTo (and udpKeepalive) under writeMu, so external
 // callers (e.g. RawUDPProxy, chainConnWrapper) setting it would race with the
@@ -852,6 +906,7 @@ func (c *socks5UDPPacketConn) Close() error {
 }
 
 var _ net.PacketConn = (*socks5UDPPacketConn)(nil)
+var _ udpSocketBufferConfigurer = (*socks5UDPPacketConn)(nil)
 
 // enableTCPKeepalive enables TCP keepalive on the underlying TCP connection,
 // even if wrapped by TLS. This is critical for SOCKS5 UDP ASSOCIATE: without

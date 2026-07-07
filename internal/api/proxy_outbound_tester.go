@@ -22,7 +22,7 @@ func (h *ProxyOutboundHandler) TestTCP(name string) error {
 		return fmt.Errorf("proxy outbound not found: %s", name)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(h.serverContext(), 10*time.Second)
 	defer cancel()
 
 	startTime := time.Now()
@@ -56,14 +56,15 @@ func (h *ProxyOutboundHandler) TestHTTP(name string) error {
 		return fmt.Errorf("proxy outbound not found: %s", name)
 	}
 
-	dialer, err := h.singboxFactory.CreateDialer(context.Background(), cfg)
+	baseCtx := h.serverContext()
+	dialer, err := h.singboxFactory.CreateDialer(baseCtx, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy dialer: %w", err)
 	}
 	defer dialer.Close()
 
 	target := DefaultHTTPTestTargets[0]
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
 	defer cancel()
 	httpResult := h.testHTTPThroughProxy(ctx, cfg, dialer, target)
 
@@ -100,7 +101,7 @@ func (h *ProxyOutboundHandler) TestUDP(name string) error {
 		return fmt.Errorf("proxy outbound not found: %s", name)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(h.serverContext(), 12*time.Second)
 	defer cancel()
 	result := h.testMCBEServer(ctx, cfg, defaultMCBEUDPTestAddress)
 	available := result.Success

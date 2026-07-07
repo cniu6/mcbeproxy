@@ -145,6 +145,7 @@ func shouldFallbackToConnectedWrite(err error) bool {
 }
 
 const autoSwitchMinDwell = 3 * time.Minute
+const serverStatusSnapshotTTL = time.Second
 const autoSwitchMinLatencyGainMs int64 = 8
 const autoSwitchMinRelativeGain = 0.10
 
@@ -169,6 +170,8 @@ type ProxyServer struct {
 	listeners              map[string]Listener                // serverID -> listener (can be UDPListener or RakNetProxy)
 	listenAddrs            map[string]string                  // serverID -> listen addr (for detecting addr changes during Reload)
 	listenersMu            sync.RWMutex
+	manuallyStoppedServers map[string]bool
+	manualStopMu           sync.RWMutex
 	reloadMu               sync.Mutex // serializes Reload to prevent concurrent listener start/stop races
 	ctx                    context.Context
 	cancel                 context.CancelFunc
@@ -184,6 +187,9 @@ type ProxyServer struct {
 	topologyRefreshSignal  chan struct{}
 	autoPingBootstrapMu    sync.Mutex
 	autoPingBootstrapPos   map[string]int
+	serverStatusCacheMu    sync.Mutex
+	serverStatusCacheAt    time.Time
+	serverStatusCache      []config.ServerConfigDTO
 }
 
 // NewProxyServer creates a new ProxyServer with all components initialized.
@@ -285,6 +291,7 @@ func NewProxyServer(
 		proxyPortManager:       proxyPortManager,
 		listeners:              make(map[string]Listener),
 		listenAddrs:            make(map[string]string),
+		manuallyStoppedServers: make(map[string]bool),
 		serverAutoPingLastRun:  make(map[string]time.Time),
 		topologyRefreshSignal:  make(chan struct{}, 1),
 		autoPingBootstrapPos:   make(map[string]int),
@@ -317,6 +324,41 @@ func (p *ProxyServer) SetOutboundManager(outboundMgr OutboundManager) {
 
 func (p *ProxyServer) SetServerLatencyRecorder(recorder ServerLatencyRecorder) {
 	p.serverLatencyRecorder = recorder
+}
+
+func (p *ProxyServer) setServerManuallyStopped(serverID string, stopped bool) {
+	serverID = strings.TrimSpace(serverID)
+	if p == nil || serverID == "" {
+		return
+	}
+	p.manualStopMu.Lock()
+	if stopped {
+		p.manuallyStoppedServers[serverID] = true
+	} else {
+		delete(p.manuallyStoppedServers, serverID)
+	}
+	p.manualStopMu.Unlock()
+}
+
+func (p *ProxyServer) isServerManuallyStopped(serverID string) bool {
+	serverID = strings.TrimSpace(serverID)
+	if p == nil || serverID == "" {
+		return false
+	}
+	p.manualStopMu.RLock()
+	stopped := p.manuallyStoppedServers[serverID]
+	p.manualStopMu.RUnlock()
+	return stopped
+}
+
+func (p *ProxyServer) shouldAutoRecoverServer(serverCfg *config.ServerConfig) bool {
+	if p == nil || serverCfg == nil || !serverCfg.Enabled {
+		return false
+	}
+	if p.isServerManuallyStopped(serverCfg.ID) {
+		return false
+	}
+	return !p.IsServerRunning(serverCfg.ID)
 }
 
 func (p *ProxyServer) setServerAutoPingLastRun(serverID string, at time.Time) {
@@ -610,7 +652,12 @@ func (p *ProxyServer) Start() error {
 	}()
 
 	// Start DNS refresh
-	p.configMgr.StartDNSRefresh(p.ctx, 60*time.Second)
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer logger.CapturePanic("dns-refresh")
+		p.configMgr.StartDNSRefresh(p.ctx, 60*time.Second)
+	}()
 
 	// Set up config change callbacks BEFORE starting watchers to avoid
 	// a race condition where file changes between Watch() and SetOnChange()
@@ -668,6 +715,11 @@ func (p *ProxyServer) Start() error {
 		}
 	}
 
+	// Keep enabled listeners self-healing after restart. On Windows a previous
+	// process can hold sockets briefly, so an enabled server may fail the first
+	// bind attempt and then become startable seconds later.
+	p.startEnabledListenerRecoveryWorker()
+
 	// Start auto ping scheduler (per-server, per-node latency cache)
 	p.startAutoPingScheduler()
 	p.startTopologyRefreshWorker()
@@ -681,6 +733,72 @@ func (p *ProxyServer) Start() error {
 
 	logger.Info("Proxy server started with %d listeners", p.listenerCount())
 	return nil
+}
+
+func (p *ProxyServer) startEnabledListenerRecoveryWorker() {
+	if p == nil || p.configMgr == nil || p.ctx == nil {
+		return
+	}
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer logger.CapturePanic("enabled-listener-recovery")
+
+		gm := monitor.GetGoroutineManager()
+		gid := gm.TrackBackground("enabled-listener-recovery", "proxy-server", "Recover enabled listeners that failed initial bind", p.cancel)
+		defer gm.Untrack(gid)
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				p.recoverEnabledListeners()
+			}
+		}
+	}()
+}
+
+func (p *ProxyServer) recoverEnabledListeners() {
+	if p == nil || p.configMgr == nil {
+		return
+	}
+	p.runningMu.RLock()
+	running := p.running
+	p.runningMu.RUnlock()
+	if !running {
+		return
+	}
+
+	for _, serverCfg := range p.configMgr.GetAllServers() {
+		if !p.shouldAutoRecoverServer(serverCfg) {
+			continue
+		}
+
+		p.reloadMu.Lock()
+		latestCfg, exists := p.configMgr.GetServer(serverCfg.ID)
+		if !exists || latestCfg == nil || !latestCfg.Enabled {
+			p.setServerManuallyStopped(serverCfg.ID, false)
+			p.reloadMu.Unlock()
+			continue
+		}
+		if p.isServerManuallyStopped(latestCfg.ID) || p.IsServerRunning(latestCfg.ID) {
+			p.reloadMu.Unlock()
+			continue
+		}
+		if err := p.startListener(latestCfg); err != nil {
+			logger.Warn("Enabled server %s is stopped; retry start failed: %v", latestCfg.ID, err)
+			p.reloadMu.Unlock()
+			continue
+		}
+		p.invalidateServerStatusCache()
+		logger.Info("Recovered enabled listener for server %s", latestCfg.ID)
+		p.reloadMu.Unlock()
+	}
 }
 
 func (p *ProxyServer) startAutoPingScheduler() {
@@ -2162,6 +2280,17 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 }
 
 // stopListener stops a specific listener.
+func (p *ProxyServer) removeSessionsForServer(serverID string) {
+	if p == nil || p.sessionMgr == nil {
+		return
+	}
+	for _, sess := range p.sessionMgr.GetAllSessions() {
+		if sess != nil && sess.ServerID == serverID {
+			_ = p.sessionMgr.Remove(sess.ClientAddr)
+		}
+	}
+}
+
 func (p *ProxyServer) stopListener(serverID string) error {
 	p.listenersMu.Lock()
 	defer p.listenersMu.Unlock()
@@ -2174,6 +2303,7 @@ func (p *ProxyServer) stopListener(serverID string) error {
 	if err := listener.Stop(); err != nil {
 		return fmt.Errorf("failed to stop listener: %w", err)
 	}
+	p.removeSessionsForServer(serverID)
 
 	delete(p.listeners, serverID)
 	delete(p.listenAddrs, serverID)
@@ -2191,6 +2321,12 @@ func (p *ProxyServer) Stop() error {
 	}
 	p.running = false
 	p.runningMu.Unlock()
+
+	// Serialize shutdown with any reload callback that already passed the
+	// running check, so Stop cannot clear runtime maps while reload rebuilds
+	// listeners/outbounds/ports.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
 
 	// Cancel context to signal all goroutines to stop
 	if p.cancel != nil {
@@ -2251,17 +2387,17 @@ func (p *ProxyServer) Stop() error {
 
 // Reload reloads the configuration and updates listeners accordingly.
 func (p *ProxyServer) Reload() error {
+	// Serialize reloads: prevent concurrent Reload calls from racing
+	// on listener start/stop decisions (e.g., fsnotify + API call).
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	p.runningMu.RLock()
 	if !p.running {
 		p.runningMu.RUnlock()
 		return fmt.Errorf("proxy server is not running")
 	}
 	p.runningMu.RUnlock()
-
-	// Serialize reloads: prevent concurrent Reload calls from racing
-	// on listener start/stop decisions (e.g., fsnotify + API call).
-	p.reloadMu.Lock()
-	defer p.reloadMu.Unlock()
 
 	servers := p.configMgr.GetAllServers()
 	serverMap := make(map[string]*config.ServerConfig)
@@ -2285,6 +2421,7 @@ func (p *ProxyServer) Reload() error {
 	for serverID := range currentListeners {
 		serverCfg, exists := serverMap[serverID]
 		if !exists || !serverCfg.Enabled {
+			p.setServerManuallyStopped(serverID, false)
 			if err := p.stopListener(serverID); err != nil {
 				logger.Error("Failed to stop listener for removed/disabled server %s: %v", serverID, err)
 			}
@@ -2296,6 +2433,9 @@ func (p *ProxyServer) Reload() error {
 		if serverCfg.Enabled {
 			existingListener, exists := currentListeners[serverCfg.ID]
 			if !exists {
+				if p.isServerManuallyStopped(serverCfg.ID) {
+					continue
+				}
 				// New server - start listener
 				if err := p.startListener(serverCfg); err != nil {
 					logger.Error("Failed to start listener for server %s: %v", serverCfg.ID, err)
@@ -2388,6 +2528,16 @@ func listenerKindFromConfig(serverCfg *config.ServerConfig) string {
 
 // ReloadProxyPorts reloads proxy port listeners based on current config.
 func (p *ProxyServer) ReloadProxyPorts() error {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
+	p.runningMu.RLock()
+	if !p.running {
+		p.runningMu.RUnlock()
+		return fmt.Errorf("proxy server is not running")
+	}
+	p.runningMu.RUnlock()
+
 	if p.proxyPortManager == nil {
 		return nil
 	}
@@ -2398,6 +2548,9 @@ func (p *ProxyServer) ReloadProxyPorts() error {
 // reloadProxyOutbounds reloads proxy outbound configurations and recreates sing-box outbounds.
 // Requirements: 8.2 - Recreate sing-box outbounds on config change
 func (p *ProxyServer) reloadProxyOutbounds() error {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	p.runningMu.RLock()
 	if !p.running {
 		p.runningMu.RUnlock()
@@ -2478,16 +2631,16 @@ func (p *ProxyServer) reloadProxyOutbounds() error {
 // ReloadServer reloads a specific server configuration without affecting others.
 // This provides atomic restart for individual servers.
 func (p *ProxyServer) ReloadServer(serverID string) error {
+	// Serialize with Reload to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	p.runningMu.RLock()
 	if !p.running {
 		p.runningMu.RUnlock()
 		return fmt.Errorf("proxy server is not running")
 	}
 	p.runningMu.RUnlock()
-
-	// Serialize with Reload to prevent races on listener management.
-	p.reloadMu.Lock()
-	defer p.reloadMu.Unlock()
 
 	// Get the latest config for this server
 	serverCfg, exists := p.configMgr.GetServer(serverID)
@@ -2517,17 +2670,23 @@ func (p *ProxyServer) ReloadServer(serverID string) error {
 
 	// Start with new config if enabled
 	if serverCfg.Enabled {
+		p.setServerManuallyStopped(serverID, false)
 		if err := p.startListener(serverCfg); err != nil {
 			return fmt.Errorf("failed to start server %s: %w", serverID, err)
 		}
 	}
 
+	p.invalidateServerStatusCache()
 	logger.Info("Server %s reloaded successfully", serverID)
 	return nil
 }
 
 // StartServer starts the proxy for a specific server configuration.
 func (p *ProxyServer) StartServer(serverID string) error {
+	// Serialize with Reload/ReloadServer to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	p.runningMu.RLock()
 	if !p.running {
 		p.runningMu.RUnlock()
@@ -2535,14 +2694,11 @@ func (p *ProxyServer) StartServer(serverID string) error {
 	}
 	p.runningMu.RUnlock()
 
-	// Serialize with Reload/ReloadServer to prevent races on listener management.
-	p.reloadMu.Lock()
-	defer p.reloadMu.Unlock()
-
 	serverCfg, exists := p.configMgr.GetServer(serverID)
 	if !exists {
 		return fmt.Errorf("server %s not found", serverID)
 	}
+	p.setServerManuallyStopped(serverID, false)
 
 	// Check if already running
 	p.listenersMu.RLock()
@@ -2553,11 +2709,19 @@ func (p *ProxyServer) StartServer(serverID string) error {
 		return fmt.Errorf("server %s is already running", serverID)
 	}
 
-	return p.startListener(serverCfg)
+	if err := p.startListener(serverCfg); err != nil {
+		return err
+	}
+	p.invalidateServerStatusCache()
+	return nil
 }
 
 // StopServer stops the proxy for a specific server configuration.
 func (p *ProxyServer) StopServer(serverID string) error {
+	// Serialize with Reload/ReloadServer to prevent races on listener management.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	p.runningMu.RLock()
 	if !p.running {
 		p.runningMu.RUnlock()
@@ -2565,11 +2729,16 @@ func (p *ProxyServer) StopServer(serverID string) error {
 	}
 	p.runningMu.RUnlock()
 
-	// Serialize with Reload/ReloadServer to prevent races on listener management.
-	p.reloadMu.Lock()
-	defer p.reloadMu.Unlock()
-
-	return p.stopListener(serverID)
+	if err := p.stopListener(serverID); err != nil {
+		return err
+	}
+	if serverCfg, exists := p.configMgr.GetServer(serverID); exists && serverCfg.Enabled {
+		p.setServerManuallyStopped(serverID, true)
+	} else {
+		p.setServerManuallyStopped(serverID, false)
+	}
+	p.invalidateServerStatusCache()
+	return nil
 }
 
 // IsServerRunning checks if a specific server's listener is running.
@@ -2664,6 +2833,10 @@ func (p *ProxyServer) GetServerStatus(serverID string) string {
 	return "stopped"
 }
 
+type rawUDPClientStatsProvider interface {
+	GetRawUDPClientStats() []config.RawUDPClientStatsDTO
+}
+
 // GetActiveProxyClientsForServer returns per-client upstream UDP link count.
 func (p *ProxyServer) GetActiveProxyClientsForServer(serverID string) int {
 	p.listenersMu.RLock()
@@ -2678,12 +2851,60 @@ func (p *ProxyServer) GetActiveProxyClientsForServer(serverID string) int {
 	return 0
 }
 
+func (p *ProxyServer) GetRawUDPClientStatsForServer(serverID string) []config.RawUDPClientStatsDTO {
+	p.listenersMu.RLock()
+	listener, ok := p.listeners[serverID]
+	p.listenersMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	if provider, ok := listener.(rawUDPClientStatsProvider); ok {
+		return provider.GetRawUDPClientStats()
+	}
+	return nil
+}
+
+func cloneServerStatusDTOs(statuses []config.ServerConfigDTO) []config.ServerConfigDTO {
+	if len(statuses) == 0 {
+		return []config.ServerConfigDTO{}
+	}
+	cloned := make([]config.ServerConfigDTO, len(statuses))
+	copy(cloned, statuses)
+	for i := range cloned {
+		if len(statuses[i].RawUDPClients) > 0 {
+			cloned[i].RawUDPClients = append([]config.RawUDPClientStatsDTO(nil), statuses[i].RawUDPClients...)
+		}
+	}
+	return cloned
+}
+
+func (p *ProxyServer) invalidateServerStatusCache() {
+	if p == nil {
+		return
+	}
+	p.serverStatusCacheMu.Lock()
+	p.serverStatusCacheAt = time.Time{}
+	p.serverStatusCache = nil
+	p.serverStatusCacheMu.Unlock()
+}
+
 // GetAllServerStatuses returns status information for all configured servers.
 func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
+	if p == nil || p.configMgr == nil {
+		return []config.ServerConfigDTO{}
+	}
+	now := time.Now()
+	p.serverStatusCacheMu.Lock()
+	if !p.serverStatusCacheAt.IsZero() && now.Sub(p.serverStatusCacheAt) < serverStatusSnapshotTTL {
+		cached := cloneServerStatusDTOs(p.serverStatusCache)
+		p.serverStatusCacheMu.Unlock()
+		return cached
+	}
+	p.serverStatusCacheMu.Unlock()
+
 	servers := p.configMgr.GetAllServers()
 	result := make([]config.ServerConfigDTO, 0, len(servers))
 	sessionCounts := make(map[string]int, len(servers))
-	now := time.Now()
 	if p.sessionMgr != nil {
 		sessions := p.sessionMgr.GetAllSessions()
 		for _, sess := range sessions {
@@ -2696,11 +2917,17 @@ func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 		activeSessions := sessionCounts[server.ID]
 		dto := server.ToDTO(status, activeSessions)
 		dto.ActiveProxyClients = p.GetActiveProxyClientsForServer(server.ID)
+		dto.RawUDPClients = p.GetRawUDPClientStatsForServer(server.ID)
 		dto.AutoPingIntervalMinutes = p.effectiveServerAutoPingIntervalMinutes(server)
 		dto.AutoPingTopCandidates = p.effectiveServerAutoPingTopCandidates(server)
 		dto.LastAutoPingAt, dto.NextAutoPingAt = p.getServerAutoPingSchedule(server, status, now)
 		result = append(result, dto)
 	}
+
+	p.serverStatusCacheMu.Lock()
+	p.serverStatusCache = cloneServerStatusDTOs(result)
+	p.serverStatusCacheAt = now
+	p.serverStatusCacheMu.Unlock()
 
 	return result
 }

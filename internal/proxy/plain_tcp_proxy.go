@@ -126,6 +126,8 @@ func (p *PlainTCPProxy) handleConn(ctx context.Context, client net.Conn) {
 		return
 	}
 	defer remote.Close()
+	p.conns.Store(remote, remote)
+	defer p.conns.Delete(remote)
 
 	relayStream(client, client, remote)
 }
@@ -176,19 +178,37 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 }
 
 func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
+	type relayResult struct {
+		err        error
+		halfClosed bool
+	}
+
+	done := make(chan relayResult, 2)
 	go func() {
-		_, _ = io.Copy(remote, localReader)
-		closeWriteSide(remote)
+		_, err := io.Copy(remote, localReader)
+		done <- relayResult{err: err, halfClosed: closeWriteSide(remote)}
 	}()
-	_, _ = io.Copy(local, remote)
-	closeWriteSide(local)
+	go func() {
+		_, err := io.Copy(local, remote)
+		done <- relayResult{err: err, halfClosed: closeWriteSide(local)}
+	}()
+
+	first := <-done
+	if first.err != nil || !first.halfClosed {
+		_ = local.Close()
+		_ = remote.Close()
+	}
+	<-done
+	_ = local.Close()
+	_ = remote.Close()
 }
 
-func closeWriteSide(conn net.Conn) {
+func closeWriteSide(conn net.Conn) bool {
 	type closeWriter interface {
 		CloseWrite() error
 	}
 	if cw, ok := conn.(closeWriter); ok {
-		_ = cw.CloseWrite()
+		return cw.CloseWrite() == nil
 	}
+	return false
 }

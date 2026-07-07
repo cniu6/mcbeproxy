@@ -38,6 +38,8 @@ type ProxyOutboundHandler struct {
 	outboundMgr            proxy.OutboundManager
 	singboxFactory         singboxcore.Factory
 	subService             *subscription.Service
+	lifecycleMu            sync.RWMutex
+	lifecycleCtx           context.Context
 	activityProvider       proxyOutboundUsageActivityProvider
 	subscriptionUpdateHook func(string)
 	outboundReloadHook     func(string)
@@ -78,7 +80,42 @@ func NewProxyOutboundHandlerWithSingboxFactory(configMgr *config.ProxyOutboundCo
 		outboundMgr:     outboundMgr,
 		singboxFactory:  factory,
 		subService:      subscription.NewServiceWithSingboxFactory(configMgr, outboundMgr, factory),
+		lifecycleCtx:    context.Background(),
 	}
+}
+
+// SetLifecycleContext injects the API server lifecycle context used to cancel
+// long-running tests and subscription fetches during shutdown.
+func (h *ProxyOutboundHandler) SetLifecycleContext(ctx context.Context) {
+	if h == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = h.serverContext()
+	}
+	h.lifecycleMu.Lock()
+	h.lifecycleCtx = ctx
+	h.lifecycleMu.Unlock()
+}
+
+func (h *ProxyOutboundHandler) serverContext() context.Context {
+	if h == nil {
+		return context.Background()
+	}
+	h.lifecycleMu.RLock()
+	ctx := h.lifecycleCtx
+	h.lifecycleMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (h *ProxyOutboundHandler) requestContext(c *gin.Context) (context.Context, context.CancelFunc) {
+	if c == nil || c.Request == nil {
+		return mergeRequestContext(context.Background(), h.serverContext())
+	}
+	return mergeRequestContext(c.Request.Context(), h.serverContext())
 }
 
 // SetUsageContext injects activity providers used by outbound/port usage views.
@@ -970,7 +1007,9 @@ func (h *ProxyOutboundHandler) UpdateProxySubscriptionNow(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
-	result, err := h.subService.UpdateSubscription(c.Request.Context(), effectiveSub)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	result, err := h.subService.UpdateSubscription(reqCtx, effectiveSub)
 	now := time.Now()
 	if err != nil {
 		sub.AutoUpdateLastAttemptAt = now
@@ -1005,6 +1044,8 @@ func (h *ProxyOutboundHandler) UpdateAllProxySubscriptions(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request", err.Error())
 		return
 	}
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
 	type itemResult struct {
 		Subscription ProxySubscriptionDTO       `json:"subscription"`
 		Result       *subscription.UpdateResult `json:"result,omitempty"`
@@ -1027,7 +1068,7 @@ func (h *ProxyOutboundHandler) UpdateAllProxySubscriptions(c *gin.Context) {
 			items = append(items, itemResult{Subscription: h.toSubscriptionDTO(sub), Error: err.Error()})
 			continue
 		}
-		result, err := h.subService.UpdateSubscription(c.Request.Context(), effectiveSub)
+		result, err := h.subService.UpdateSubscription(reqCtx, effectiveSub)
 		if err != nil {
 			failed++
 			sub.AutoUpdateLastAttemptAt = now
@@ -1334,7 +1375,9 @@ func (h *ProxyOutboundHandler) doTestOutbound(c *gin.Context, name, serverID str
 	}
 
 	// Perform health check with timeout
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	ctx, cancel := context.WithTimeout(reqCtx, 30*time.Second)
 	defer cancel()
 	result := h.executeTCPTest(ctx, name)
 	if serverID != "" && h.outboundMgr != nil {
@@ -1995,7 +2038,9 @@ func (h *ProxyOutboundHandler) BatchTestProxyOutbounds(c *gin.Context) {
 		if err := writeBatchProxyTestStreamEvent(encoder, flusher, BatchProxyTestStreamEvent{Event: "start", Type: req.Type, Total: len(names), Concurrency: concurrency}); err != nil {
 			return
 		}
-		response, err := h.executeBatchProxyTests(c.Request.Context(), names, req, allowPrivate, func(item BatchProxyTestItem, progress batchProxyTestProgress) error {
+		reqCtx, reqCancel := h.requestContext(c)
+		defer reqCancel()
+		response, err := h.executeBatchProxyTests(reqCtx, names, req, allowPrivate, func(item BatchProxyTestItem, progress batchProxyTestProgress) error {
 			eventItem := item
 			return writeBatchProxyTestStreamEvent(encoder, flusher, BatchProxyTestStreamEvent{Event: "item", Type: req.Type, Total: len(names), Current: progress.Current, Success: progress.Success, Failed: progress.Failed, Concurrency: concurrency, Item: &eventItem})
 		})
@@ -2005,7 +2050,9 @@ func (h *ProxyOutboundHandler) BatchTestProxyOutbounds(c *gin.Context) {
 		_ = writeBatchProxyTestStreamEvent(encoder, flusher, BatchProxyTestStreamEvent{Event: "done", Type: response.Type, Total: response.Total, Current: response.Total, Success: response.Success, Failed: response.Failed, Concurrency: concurrency})
 		return
 	}
-	response, err := h.executeBatchProxyTests(c.Request.Context(), names, req, allowPrivate, nil)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	response, err := h.executeBatchProxyTests(reqCtx, names, req, allowPrivate, nil)
 	if err != nil {
 		respondError(c, http.StatusRequestTimeout, "Batch test failed", err.Error())
 		return
@@ -2421,7 +2468,9 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "Outbound manager not initialized", "")
 		return
 	}
-	testCtx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	testCtx, cancel := context.WithTimeout(reqCtx, 30*time.Second)
 	defer cancel()
 
 	result := DetailedTestResult{
@@ -2652,7 +2701,7 @@ func (h *ProxyOutboundHandler) DetailedTestProxyOutbound(c *gin.Context) {
 // For Hysteria2 with port hopping, it tests a random port from the configured range.
 func (h *ProxyOutboundHandler) testPing(ctx context.Context, cfg *config.ProxyOutbound) PingTestResult {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = h.serverContext()
 	}
 	result := PingTestResult{
 		Host: cfg.Server,
@@ -3043,7 +3092,7 @@ func (h *ProxyOutboundHandler) testHTTPThroughProxy(ctx context.Context, cfg *co
 
 func (h *ProxyOutboundHandler) testHTTPWithClient(ctx context.Context, client *http.Client, cfg *config.ProxyOutbound, target HTTPTestTarget) HTTPTestResult {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = h.serverContext()
 	}
 	result := HTTPTestResult{
 		Target:  target.Name,
@@ -3094,7 +3143,10 @@ func (h *ProxyOutboundHandler) testHTTPWithClient(ctx context.Context, client *h
 }
 
 // testDownloadSpeed tests download speed through the proxy.
-func (h *ProxyOutboundHandler) testDownloadSpeed(dialer singboxcore.Dialer, speedURL string) SpeedTestResult {
+func (h *ProxyOutboundHandler) testDownloadSpeed(ctx context.Context, dialer singboxcore.Dialer, speedURL string) SpeedTestResult {
+	if ctx == nil {
+		ctx = h.serverContext()
+	}
 	result := SpeedTestResult{
 		URL: speedURL,
 	}
@@ -3115,7 +3167,7 @@ func (h *ProxyOutboundHandler) testDownloadSpeed(dialer singboxcore.Dialer, spee
 		return result
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 
@@ -3181,7 +3233,7 @@ func (h *ProxyOutboundHandler) testCustomHTTP(ctx context.Context, dialer singbo
 
 func (h *ProxyOutboundHandler) testCustomHTTPWithClient(ctx context.Context, client *http.Client, req *CustomHTTPRequest) HTTPTestResult {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = h.serverContext()
 	}
 	result := HTTPTestResult{
 		URL:     req.URL,
@@ -3289,7 +3341,9 @@ func (h *ProxyOutboundHandler) TestMCBEUDP(c *gin.Context) {
 		}
 	}
 
-	testCtx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	testCtx, cancel := context.WithTimeout(reqCtx, 12*time.Second)
 	defer cancel()
 	result := h.testMCBEServer(testCtx, cfg, address)
 	if req.ServerID != "" && h.outboundMgr != nil {
@@ -3382,7 +3436,7 @@ func (h *ProxyOutboundHandler) GetProxyOutboundLatencyHistory(c *gin.Context) {
 // matters for cold first-hit measurements.
 func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.ProxyOutbound, address string) UDPTestResult {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = h.serverContext()
 	}
 
 	testStart := time.Now()
@@ -4242,7 +4296,9 @@ func (h *ProxyOutboundHandler) FetchSubscription(c *gin.Context) {
 			respondError(c, http.StatusBadRequest, "代理节点未启用: "+proxyName, "")
 			return
 		}
-		dialer, err := h.singboxFactory.CreateDialer(c.Request.Context(), cfg)
+		reqCtx, reqCancel := h.requestContext(c)
+		defer reqCancel()
+		dialer, err := h.singboxFactory.CreateDialer(reqCtx, cfg)
 		if err != nil {
 			respondError(c, http.StatusInternalServerError, "创建代理连接失败: "+err.Error(), "")
 			return
@@ -4274,7 +4330,9 @@ func (h *ProxyOutboundHandler) FetchSubscription(c *gin.Context) {
 	}
 
 	// Fetch subscription
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
+	reqCtx, reqCancel := h.requestContext(c)
+	defer reqCancel()
+	httpReq, err := http.NewRequestWithContext(reqCtx, "GET", req.URL, nil)
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "无效的订阅地址: "+err.Error(), "")
 		return

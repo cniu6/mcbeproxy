@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"runtime"
@@ -48,6 +49,9 @@ func (a *APIServer) getWebIndexAPI(c *gin.Context) {
 		}
 	}
 
+	reqCtx, reqCancel := a.requestContext(c)
+	defer reqCancel()
+
 	wiCache.mu.Lock()
 	now := time.Now()
 	wiCache.requestedAt = now
@@ -59,7 +63,7 @@ func (a *APIServer) getWebIndexAPI(c *gin.Context) {
 	} else {
 		wiCache.mu.Unlock()
 		// Build fresh base response (without history)
-		baseData = a.buildWebIndexResponse()
+		baseData = a.buildWebIndexResponse(reqCtx)
 		wiCache.mu.Lock()
 		wiCache.data = baseData
 		wiCache.updatedAt = time.Now()
@@ -80,7 +84,7 @@ func (a *APIServer) getWebIndexAPI(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json; charset=utf-8", final)
 }
 
-func (a *APIServer) buildWebIndexResponse() []byte {
+func (a *APIServer) buildWebIndexResponse(ctx context.Context) []byte {
 	var (
 		sysStats *monitor.SystemStats
 		statsErr error
@@ -122,7 +126,7 @@ func (a *APIServer) buildWebIndexResponse() []byte {
 	}
 
 	// Fetch pings concurrently
-	pings := a.collectServerPings(servers, shouldExposeServerLatencyOverview)
+	pings := a.collectServerPings(ctx, servers, shouldExposeServerLatencyOverview)
 
 	wg.Wait()
 

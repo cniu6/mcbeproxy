@@ -35,6 +35,7 @@ type UDPListener struct {
 	lastPongLatency int64 // milliseconds
 	pingInFlight    atomic.Bool
 	closed          atomic.Bool
+	remoteWG        sync.WaitGroup
 }
 
 type listenerPacketJob struct {
@@ -519,8 +520,13 @@ func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.S
 
 	sess.RemoteConn = remoteConn
 
-	// Start goroutine to receive responses from remote server
-	go l.receiveFromRemote(sess)
+	// Start goroutine to receive responses from remote server. The listener
+	// owns this goroutine, so Stop waits for it after closing the session conn.
+	l.remoteWG.Add(1)
+	go func() {
+		defer l.remoteWG.Done()
+		l.receiveFromRemote(sess)
+	}()
 
 	return nil
 }
@@ -611,13 +617,41 @@ func (l *UDPListener) GetCachedPong() []byte {
 	return l.cachedPong
 }
 
+func (l *UDPListener) closeServerSessions() {
+	if l.sessionMgr == nil {
+		return
+	}
+	for _, sess := range l.sessionMgr.GetAllSessions() {
+		if sess != nil && sess.ServerID == l.serverID {
+			_ = l.sessionMgr.Remove(sess.ClientAddr)
+		}
+	}
+}
+
+func (l *UDPListener) waitRemoteReceivers(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		l.remoteWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+		logger.Warn("UDPListener: timed out waiting %s for remote receivers to stop (server=%s)", timeout, l.serverID)
+	}
+}
+
 // Stop closes the UDP listener.
 func (l *UDPListener) Stop() error {
 	l.closed.Store(true)
+	var err error
 	if l.conn != nil {
-		return l.conn.Close()
+		err = l.conn.Close()
 	}
-	return nil
+	l.closeServerSessions()
+	l.waitRemoteReceivers(2 * time.Second)
+	return err
 }
 
 // LocalAddr returns the local address the listener is bound to.
