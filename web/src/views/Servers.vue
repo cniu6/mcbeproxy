@@ -375,7 +375,7 @@
                     <tr v-for="sess in editServerLiveSessions" :key="sess.id">
                       <td>{{ sess.display_name || '连接建立中' }}</td>
                       <td>{{ sess.client_addr }}</td>
-                      <td>{{ formatLiveSessionDuration(sess.duration_seconds) }}</td>
+                      <td>{{ formatLiveSessionOnlineDuration(sess) }}</td>
                       <td>
                         <n-space size="small" align="center" :wrap="false">
                           <span>{{ formatLiveSessionIdle(sess) }}</span>
@@ -2093,6 +2093,15 @@ const formatLiveSessionDuration = (seconds) => {
   if (value < 60) return `${value}s`
   if (value < 3600) return `${Math.floor(value / 60)}m ${value % 60}s`
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`
+}
+
+const formatLiveSessionOnlineDuration = (session) => {
+  const startedAt = session?.start_time ? new Date(session.start_time).getTime() : 0
+  if (Number.isFinite(startedAt) && startedAt > 0) {
+    const seconds = Math.max(0, Math.floor((countdownNow.value - startedAt) / 1000))
+    return formatLiveSessionDuration(seconds)
+  }
+  return formatLiveSessionDuration(session?.duration_seconds || 0)
 }
 
 const formatLiveSessionIdle = (session) => {

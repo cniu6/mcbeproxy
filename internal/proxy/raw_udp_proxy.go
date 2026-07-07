@@ -50,12 +50,12 @@ const (
 	// traffic, repeatedly decompressing/JWT-parsing every reliable datagram adds
 	// latency but can no longer make ACL enforcement reliable.
 	RawUDPLoginParseMaxAttempts = 32
-	RawUDPLoginParseWindow      = 3 * time.Second
+	RawUDPLoginParseWindow      = 10 * time.Second
 	// Legacy pre-1.19.30 Login has no compression byte, so unknown compression IDs
 	// get a small fallback budget. Encrypted post-login packets also look like
 	// unknown IDs; after this budget we stop parsing to protect the hot path.
 	RawUDPLegacyLoginFallbackMaxAttempts = 4
-	RawUDPLegacyLoginFallbackWindow      = 500 * time.Millisecond
+	RawUDPLegacyLoginFallbackWindow      = 10 * time.Second
 	// RawUDPSlowWriteThreshold marks local/proxy UDP writes slow enough to show
 	// up as player-visible queueing during transfer/resource bursts.
 	RawUDPSlowWriteThreshold = 20 * time.Millisecond
@@ -80,13 +80,9 @@ const (
 	// goroutine/connection leaks when a client disappears without sending a
 	// RakNet DisconnectNotification (e.g., NAT timeout, crash, kill -9).
 	MaxRawUDPStaleTimeout = 24 * time.Hour
-	// ClientSilentDisconnectTimeout is the maximum client-side silence before
-	// a client is considered disconnected, regardless of server-to-client
-	// traffic. RakNet connected clients send ping/pong every ~5 seconds, so
-	// 90 seconds of complete client silence is a strong indicator of
-	// disconnect (crash, network loss, NAT timeout). This is capped by the
-	// configured idle_timeout if it is shorter.
-	ClientSilentDisconnectTimeout = 90 * time.Second
+	// RawUDPStallClientSilenceCeiling is only for UI/diagnostic stall labeling.
+	// It must not cap RawUDP session cleanup; idle_timeout remains authoritative.
+	RawUDPStallClientSilenceCeiling = 90 * time.Second
 	// RawUDPDirectionalStallThreshold is short enough to catch lobby/transfer
 	// stalls while the player is still stuck, not after the next full cleanup cycle.
 	RawUDPDirectionalStallThreshold = 5 * time.Second
@@ -396,7 +392,7 @@ func rawUDPStallReason(clientInfo *rawUDPClientInfo, sinceClientMs, sinceTargetM
 		return ""
 	}
 	thresholdMs := RawUDPDirectionalStallThreshold.Milliseconds()
-	silentMs := ClientSilentDisconnectTimeout.Milliseconds()
+	silentMs := RawUDPStallClientSilenceCeiling.Milliseconds()
 	switch {
 	case clientInfo.packetsDown.Load() == 0 && sinceTargetMs >= thresholdMs && sinceClientMs < silentMs:
 		return "target_no_packet_yet"
@@ -421,6 +417,23 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 			return true
 		}
 		clientKey, _ := key.(string)
+		clientAddr := clientKey
+		if clientInfo.clientAddr != nil {
+			clientAddr = clientInfo.clientAddr.String()
+		}
+		connectedAt := clientInfo.startTime
+		durationSeconds := int64(0)
+		if !connectedAt.IsZero() {
+			durationSeconds = int64(now.Sub(connectedAt).Seconds())
+			if durationSeconds < 0 {
+				durationSeconds = 0
+			}
+		}
+		clientInfo.mu.Lock()
+		playerName := clientInfo.playerName
+		playerUUID := clientInfo.playerUUID
+		playerXUID := clientInfo.playerXUID
+		clientInfo.mu.Unlock()
 		sinceClientMs := rawUDPStatAgeMsOrSince(clientInfo.lastClientPacket.Load(), clientInfo.startTime, now)
 		sinceTargetMs := rawUDPStatAgeMsOrSince(clientInfo.lastTargetPacket.Load(), clientInfo.startTime, now)
 		upBytes := clientInfo.bytesUp.Load()
@@ -433,6 +446,13 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 		upBPS, downBPS := rawUDPCurrentRates(clientInfo, upBytes, downBytes, now)
 		stats = append(stats, config.RawUDPClientStatsDTO{
 			Client:              clientKey,
+			ClientAddr:          clientAddr,
+			SessionKey:          clientInfo.sessionKey,
+			PlayerName:          playerName,
+			PlayerUUID:          playerUUID,
+			PlayerXUID:          playerXUID,
+			ConnectedAt:         connectedAt,
+			DurationSeconds:     durationSeconds,
 			Route:               rawUDPRouteName(clientInfo.proxyNode),
 			Target:              p.effectiveTargetAddrString(),
 			UpPackets:           clientInfo.packetsUp.Load(),
@@ -2145,12 +2165,6 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 }
 
 func (p *RawUDPProxy) effectiveClientDisconnectTimeout() time.Duration {
-	if p.clientInactiveTimeout == 0 {
-		return ClientSilentDisconnectTimeout
-	}
-	if p.clientInactiveTimeout > ClientSilentDisconnectTimeout {
-		return ClientSilentDisconnectTimeout
-	}
 	return p.clientInactiveTimeout
 }
 
@@ -2257,9 +2271,8 @@ func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
 func (p *RawUDPProxy) updateTimeouts() {
 	// idle_timeout = -1 means never disconnect due to brief inactivity.
 	// RakNet has its own keepalive (connected ping/pong) and disconnect
-	// mechanism (DisconnectNotification). effectiveClientDisconnectTimeout
-	// still applies a 90s upstream-silence ceiling so proxy resources are
-	// not leaked when clients vanish without a clean disconnect.
+	// mechanism (DisconnectNotification). MaxRawUDPStaleTimeout still prevents
+	// permanent resource leaks when clients vanish without a clean disconnect.
 	if p.config != nil && p.config.IdleTimeout == -1 {
 		p.clientInactiveTimeout = 0
 		return

@@ -177,18 +177,21 @@
           </template>
           <div class="table-wrapper">
             <n-table v-if="activeSessions[s.id]?.length" size="small" :bordered="false" :single-line="false" style="min-width: 600px">
-              <thead><tr><th>玩家</th><th>客户端</th><th>连接时间</th><th>流量</th><th>操作</th></tr></thead>
+              <thead><tr><th>玩家</th><th>客户端</th><th>在线时长</th><th>流量</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="sess in activeSessions[s.id]" :key="sess.id">
-                  <td><n-button text type="primary" @click="goToPlayer(sess.display_name)">{{ sess.display_name }}</n-button></td>
+                  <td>
+                    <n-button v-if="hasSessionPlayerName(sess)" text type="primary" @click="goToPlayer(sess.display_name)">{{ sess.display_name }}</n-button>
+                    <n-tag v-else size="small" type="warning" :bordered="false">解析中</n-tag>
+                  </td>
                   <td>{{ sess.client_addr }}</td>
-                  <td>{{ formatTime(sess.start_time) }}</td>
+                  <td>{{ formatSessionOnlineDuration(sess) }}</td>
                   <td>↑{{ formatBytes(sess.bytes_up) }} ↓{{ formatBytes(sess.bytes_down) }}</td>
                   <td>
                     <n-space size="small" wrap>
-                      <n-button size="tiny" type="warning" @click="showKickDialog(sess)">踢出</n-button>
-                      <n-button size="tiny" @click="addToWhitelist(sess.display_name)">白名单</n-button>
-                      <n-button size="tiny" type="error" @click="addToBlacklist(sess.display_name)">封禁</n-button>
+                      <n-button size="tiny" type="warning" :disabled="!hasSessionPlayerName(sess)" @click="showKickDialog(sess)">踢出</n-button>
+                      <n-button size="tiny" :disabled="!hasSessionPlayerName(sess)" @click="addToWhitelist(sess.display_name)">白名单</n-button>
+                      <n-button size="tiny" type="error" :disabled="!hasSessionPlayerName(sess)" @click="addToBlacklist(sess.display_name)">封禁</n-button>
                     </n-space>
                   </td>
                 </tr>
@@ -403,8 +406,18 @@ const getLatencyHistorySamples = (serverId) => {
   return Array.isArray(samples) ? samples : []
 }
 
-const getServerLatencyCountdownText = (server) => {
-  return formatServerAutoPingCountdown(server)
+const hasSessionPlayerName = (session) => String(session?.display_name || '').trim() !== ''
+
+const formatSessionOnlineDuration = (session) => {
+  const startedAt = session?.start_time ? new Date(session.start_time).getTime() : 0
+  if (Number.isFinite(startedAt) && startedAt > 0) {
+    const seconds = Math.max(0, Math.floor((countdownNow.value - startedAt) / 1000))
+    return formatDuration(seconds)
+  }
+  return formatDuration(Number(session?.duration_seconds || 0))
+}
+
+const getServerLatencyCountdownText = (server) => {  return formatServerAutoPingCountdown(server)
 }
 
 const openServerLatencyHistoryModal = (server) => {
@@ -448,7 +461,15 @@ const addToWhitelist = async (name) => {
   else message.error(res.msg || '操作失败')
 }
 
-const showKickDialog = (sess) => { kickTarget.value = sess; kickReason.value = ''; kickDialogVisible.value = true }
+const showKickDialog = (sess) => {
+  if (!hasSessionPlayerName(sess)) {
+    message.warning('玩家名还在解析中，暂不能操作')
+    return
+  }
+  kickTarget.value = sess
+  kickReason.value = ''
+  kickDialogVisible.value = true
+}
 
 const confirmKick = async () => {
   if (!kickTarget.value) return

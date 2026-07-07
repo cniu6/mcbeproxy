@@ -973,15 +973,174 @@ func (a *APIServer) getServerLatency(c *gin.Context) {
 
 // Session and Player Handlers
 
+func rawUDPClientIdentityKey(raw config.RawUDPClientStatsDTO) string {
+	if v := strings.TrimSpace(raw.SessionKey); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(raw.Client); v != "" {
+		return v
+	}
+	return strings.TrimSpace(raw.ClientAddr)
+}
+
+func rawUDPClientLastSeen(raw config.RawUDPClientStatsDTO, now time.Time) time.Time {
+	var idleMs int64
+	for _, value := range []int64{raw.SinceClientMs, raw.SinceTargetMs} {
+		if value <= 0 {
+			continue
+		}
+		if idleMs == 0 || value < idleMs {
+			idleMs = value
+		}
+	}
+	if idleMs > 0 {
+		return now.Add(-time.Duration(idleMs) * time.Millisecond)
+	}
+	return now
+}
+
+func rawUDPClientDurationSeconds(raw config.RawUDPClientStatsDTO, now time.Time) int64 {
+	if !raw.ConnectedAt.IsZero() {
+		duration := int64(now.Sub(raw.ConnectedAt).Seconds())
+		if duration > 0 {
+			return duration
+		}
+		return 0
+	}
+	if raw.DurationSeconds > 0 {
+		return raw.DurationSeconds
+	}
+	return 0
+}
+
+func rawUDPClientStartTime(raw config.RawUDPClientStatsDTO, now time.Time) time.Time {
+	if !raw.ConnectedAt.IsZero() {
+		return raw.ConnectedAt
+	}
+	if raw.DurationSeconds > 0 {
+		return now.Add(-time.Duration(raw.DurationSeconds) * time.Second)
+	}
+	return now
+}
+
+func applyRawUDPClientStatsToSessionDTO(dto session.SessionDTO, raw config.RawUDPClientStatsDTO, now time.Time) session.SessionDTO {
+	if clientAddr := strings.TrimSpace(raw.ClientAddr); clientAddr != "" {
+		dto.ClientAddr = clientAddr
+	}
+	if playerName := strings.TrimSpace(raw.PlayerName); playerName != "" {
+		dto.DisplayName = playerName
+	}
+	if playerUUID := strings.TrimSpace(raw.PlayerUUID); playerUUID != "" {
+		dto.UUID = playerUUID
+	}
+	if playerXUID := strings.TrimSpace(raw.PlayerXUID); playerXUID != "" {
+		dto.XUID = playerXUID
+	}
+	if !raw.ConnectedAt.IsZero() || raw.DurationSeconds > 0 {
+		dto.StartTime = rawUDPClientStartTime(raw, now)
+		dto.Duration = rawUDPClientDurationSeconds(raw, now)
+	}
+	lastSeen := rawUDPClientLastSeen(raw, now)
+	if dto.LastSeen.IsZero() || lastSeen.After(dto.LastSeen) {
+		dto.LastSeen = lastSeen
+	}
+	if raw.UpBytes > dto.BytesUp {
+		dto.BytesUp = raw.UpBytes
+	}
+	if raw.DownBytes > dto.BytesDown {
+		dto.BytesDown = raw.DownBytes
+	}
+	idleSeconds := int64(now.Sub(dto.LastSeen).Seconds())
+	if idleSeconds < 0 {
+		idleSeconds = 0
+	}
+	dto.IdleSeconds = idleSeconds
+	return dto
+}
+
+func rawUDPClientStatsToSessionDTO(serverID string, raw config.RawUDPClientStatsDTO, now time.Time) session.SessionDTO {
+	key := rawUDPClientIdentityKey(raw)
+	if key == "" {
+		key = fmt.Sprintf("raw_udp:%s:%s", serverID, raw.ClientAddr)
+	}
+	startTime := rawUDPClientStartTime(raw, now)
+	lastSeen := rawUDPClientLastSeen(raw, now)
+	idleSeconds := int64(now.Sub(lastSeen).Seconds())
+	if idleSeconds < 0 {
+		idleSeconds = 0
+	}
+	return session.SessionDTO{
+		ID:          key,
+		ClientAddr:  strings.TrimSpace(raw.ClientAddr),
+		ServerID:    serverID,
+		UUID:        strings.TrimSpace(raw.PlayerUUID),
+		DisplayName: strings.TrimSpace(raw.PlayerName),
+		XUID:        strings.TrimSpace(raw.PlayerXUID),
+		BytesUp:     raw.UpBytes,
+		BytesDown:   raw.DownBytes,
+		StartTime:   startTime,
+		LastSeen:    lastSeen,
+		Duration:    rawUDPClientDurationSeconds(raw, now),
+		IdleSeconds: idleSeconds,
+	}
+}
+
+func (a *APIServer) indexRawUDPClients(servers []config.ServerConfigDTO) (map[string]config.RawUDPClientStatsDTO, map[string][]config.RawUDPClientStatsDTO) {
+	byKey := make(map[string]config.RawUDPClientStatsDTO)
+	byServer := make(map[string][]config.RawUDPClientStatsDTO)
+	if len(servers) == 0 && a != nil && a.proxyController != nil {
+		servers = a.proxyController.GetAllServerStatuses()
+	}
+	for _, server := range servers {
+		for _, raw := range server.RawUDPClients {
+			key := rawUDPClientIdentityKey(raw)
+			if key != "" {
+				byKey[key] = raw
+			}
+			byServer[server.ID] = append(byServer[server.ID], raw)
+		}
+	}
+	return byKey, byServer
+}
+
+func (a *APIServer) buildActiveSessionDTOs(servers []config.ServerConfigDTO) []session.SessionDTO {
+	if a == nil || a.sessionMgr == nil {
+		return []session.SessionDTO{}
+	}
+	now := time.Now()
+	rawByKey, rawByServer := a.indexRawUDPClients(servers)
+	sessions := a.sessionMgr.GetAllSessions()
+	dtos := make([]session.SessionDTO, 0, len(sessions))
+	seenRaw := make(map[string]bool)
+	for _, sess := range sessions {
+		dto := sess.ToDTO()
+		if raw, ok := rawByKey[strings.TrimSpace(dto.ClientAddr)]; ok {
+			dto = applyRawUDPClientStatsToSessionDTO(dto, raw, now)
+			if key := rawUDPClientIdentityKey(raw); key != "" {
+				seenRaw[key] = true
+			}
+		}
+		dtos = append(dtos, dto)
+	}
+	for serverID, raws := range rawByServer {
+		for _, raw := range raws {
+			key := rawUDPClientIdentityKey(raw)
+			if key != "" && seenRaw[key] {
+				continue
+			}
+			dtos = append(dtos, rawUDPClientStatsToSessionDTO(serverID, raw, now))
+			if key != "" {
+				seenRaw[key] = true
+			}
+		}
+	}
+	return dtos
+}
+
 // getSessions returns the list of all active sessions.
 // GET /api/sessions
 func (a *APIServer) getSessions(c *gin.Context) {
-	sessions := a.sessionMgr.GetAllSessions()
-	dtos := make([]session.SessionDTO, 0, len(sessions))
-	for _, sess := range sessions {
-		dtos = append(dtos, sess.ToDTO())
-	}
-	respondSuccess(c, dtos)
+	respondSuccess(c, a.buildActiveSessionDTOs(nil))
 }
 
 // getSessionHistory returns historical session records from database.
@@ -1247,12 +1406,9 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 	servers := a.proxyController.GetAllServerStatuses()
 
 	// Build active sessions snapshot
-	sessions := a.sessionMgr.GetAllSessions()
-	sessionDTOs := make([]session.SessionDTO, 0, len(sessions))
+	sessionDTOs := a.buildActiveSessionDTOs(servers)
 	activeSessions := make(map[string][]session.SessionDTO)
-	for _, sess := range sessions {
-		dto := sess.ToDTO()
-		sessionDTOs = append(sessionDTOs, dto)
+	for _, dto := range sessionDTOs {
 		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)
 	}
 

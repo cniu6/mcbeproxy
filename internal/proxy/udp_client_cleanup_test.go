@@ -11,15 +11,15 @@ import (
 
 func TestRawUDPProxy_EffectiveClientDisconnectTimeout_IdleNever(t *testing.T) {
 	p := &RawUDPProxy{clientInactiveTimeout: 0}
-	if got := p.effectiveClientDisconnectTimeout(); got != ClientSilentDisconnectTimeout {
-		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want %v", got, ClientSilentDisconnectTimeout)
+	if got := p.effectiveClientDisconnectTimeout(); got != 0 {
+		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want disabled", got)
 	}
 }
 
 func TestRawUDPProxy_EffectiveClientDisconnectTimeout_Configured(t *testing.T) {
 	p := &RawUDPProxy{clientInactiveTimeout: 5 * time.Minute}
-	if got := p.effectiveClientDisconnectTimeout(); got != ClientSilentDisconnectTimeout {
-		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want capped %v", got, ClientSilentDisconnectTimeout)
+	if got := p.effectiveClientDisconnectTimeout(); got != 5*time.Minute {
+		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want configured 5m", got)
 	}
 
 	p.clientInactiveTimeout = 30 * time.Second
@@ -28,7 +28,7 @@ func TestRawUDPProxy_EffectiveClientDisconnectTimeout_Configured(t *testing.T) {
 	}
 }
 
-func TestRawUDPProxy_SweepInactiveClients_IdleNeverCleansSilentClient(t *testing.T) {
+func TestRawUDPProxy_SweepInactiveClients_IdleNeverKeepsSilentClientUntilStaleCap(t *testing.T) {
 	sm := session.NewSessionManager(time.Hour)
 	cfg := &config.ServerConfig{ID: "idle-never", IdleTimeout: -1}
 	p := NewRawUDPProxy("idle-never", cfg, nil, sm)
@@ -40,7 +40,7 @@ func TestRawUDPProxy_SweepInactiveClients_IdleNeverCleansSilentClient(t *testing
 	}
 	defer targetConn.Close()
 
-	old := time.Now().Add(-ClientSilentDisconnectTimeout - time.Second).UnixNano()
+	old := time.Now().Add(-10 * time.Minute).UnixNano()
 	client := &rawUDPClientInfo{
 		clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132},
 		targetConn: targetConn,
@@ -52,8 +52,16 @@ func TestRawUDPProxy_SweepInactiveClients_IdleNeverCleansSilentClient(t *testing
 	p.clients.Store("127.0.0.1:19132", client)
 
 	p.sweepInactiveClients(time.Now(), p.effectiveClientDisconnectTimeout())
+	if p.GetActiveClientCount() != 1 {
+		t.Fatalf("expected idle_timeout=-1 to keep silent client, got %d clients", p.GetActiveClientCount())
+	}
+
+	stale := time.Now().Add(-MaxRawUDPStaleTimeout - time.Second).UnixNano()
+	client.lastSeen.Store(stale)
+	client.lastClientPacket.Store(stale)
+	p.sweepInactiveClients(time.Now(), p.effectiveClientDisconnectTimeout())
 	if p.GetActiveClientCount() != 0 {
-		t.Fatalf("expected silent client to be removed with idle_timeout=-1, still have %d clients", p.GetActiveClientCount())
+		t.Fatalf("expected max stale cap to remove client, still have %d clients", p.GetActiveClientCount())
 	}
 }
 
