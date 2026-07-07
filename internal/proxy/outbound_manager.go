@@ -2010,43 +2010,92 @@ func (m *outboundManagerImpl) Stop() error {
 // that have changed or been added.
 // Requirements: 8.2
 func (m *outboundManagerImpl) Reload() error {
+	// Phase 1: Collect outbounds needing sing-box creation under read lock (fast).
+	type pendingCreate struct {
+		name string
+		cfg  *config.ProxyOutbound
+	}
+	var pending []pendingCreate
+
+	m.mu.RLock()
+	for name, cfg := range m.outbounds {
+		if !cfg.Enabled {
+			continue
+		}
+		if _, exists := m.singboxOutbounds[name]; !exists {
+			pending = append(pending, pendingCreate{name: name, cfg: cfg.Clone()})
+		}
+	}
+	m.mu.RUnlock()
+
+	// Phase 2: Create sing-box outbounds WITHOUT holding any lock.
+	// This is the potentially slow part (network I/O, TLS handshakes, etc.)
+	// that previously blocked ALL other outbound reads (ListGroups, etc.)
+	// for extended periods when a subscription has many nodes.
+	type createResult struct {
+		name     string
+		outbound singboxcore.UDPOutbound
+		err      error
+	}
+	results := make([]createResult, 0, len(pending))
+	for _, p := range pending {
+		outbound, err := m.singboxFactory.CreateUDPOutbound(context.Background(), p.cfg)
+		if err != nil && outbound != nil {
+			outbound.Close()
+			outbound = nil
+		}
+		results = append(results, createResult{name: p.name, outbound: outbound, err: err})
+	}
+
+	// Phase 3: Update caches under write lock (fast operations only).
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Track which outbounds need to be recreated
+	// Retire disabled outbounds.
 	for name, cfg := range m.outbounds {
 		if !cfg.Enabled {
-			// Retire disabled outbounds; active PacketConns drain naturally.
 			m.retireSingboxOutboundLocked(name)
-			continue
-		}
-
-		// Check if we need to recreate the outbound
-		// For now, we recreate if the outbound doesn't exist in cache
-		if _, exists := m.singboxOutbounds[name]; !exists {
-			singboxOutbound, err := m.singboxFactory.CreateUDPOutbound(context.Background(), cfg)
-			if err != nil {
-				cfg.SetHealthy(false)
-				cfg.SetLastError(fmt.Sprintf("failed to create outbound: %v", err))
-				cfg.SetLastCheck(time.Now())
-				logger.Error("Failed to recreate sing-box outbound %s: %v", name, err)
-				continue
-			}
-			m.singboxOutbounds[name] = singboxOutbound
-			m.singboxOutboundConfigs[name] = cfg
-			m.singboxLastUsed[name] = time.Now()
-			cfg.SetHealthy(true)
-			cfg.SetLastError("")
-			cfg.SetLastCheck(time.Now())
 		}
 	}
 
-	// Remove sing-box outbounds for deleted configurations
+	// Remove sing-box outbounds for deleted configurations.
 	for name := range m.singboxOutbounds {
 		if _, exists := m.outbounds[name]; !exists {
 			m.retireSingboxOutboundLocked(name)
 		}
 	}
+
+	// Store newly created outbounds or mark failures.
+	for _, r := range results {
+		cfg, exists := m.outbounds[r.name]
+		if !exists || !cfg.Enabled {
+			if r.outbound != nil {
+				r.outbound.Close()
+			}
+			continue
+		}
+		if _, cached := m.singboxOutbounds[r.name]; cached {
+			// Someone else already created a cached outbound; discard ours.
+			if r.outbound != nil {
+				r.outbound.Close()
+			}
+			continue
+		}
+		if r.err != nil {
+			cfg.SetHealthy(false)
+			cfg.SetLastError(fmt.Sprintf("failed to create outbound: %v", r.err))
+			cfg.SetLastCheck(time.Now())
+			logger.Error("Failed to recreate sing-box outbound %s: %v", r.name, r.err)
+			continue
+		}
+		m.singboxOutbounds[r.name] = r.outbound
+		m.singboxOutboundConfigs[r.name] = cfg
+		m.singboxLastUsed[r.name] = time.Now()
+		cfg.SetHealthy(true)
+		cfg.SetLastError("")
+		cfg.SetLastCheck(time.Now())
+	}
+
 	m.closeReadyRetiredSingboxOutboundsLocked()
 
 	return nil
