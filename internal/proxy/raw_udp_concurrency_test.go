@@ -193,6 +193,8 @@ func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return true }
 
 func TestRawUDPProxy_SameIPHandshakeDoesNotRemoveEstablishedClient(t *testing.T) {
+	// 已建立会话在短于 sameIPEstablishedHandshakeGrace 的沉默期内，OCR 重连不应踢掉旧链路
+	// （保护同公网 IP 下仍可能短暂卡顿的在线玩家）。
 	sm := session.NewSessionManager(time.Hour)
 	cfg := &config.ServerConfig{ID: "same-ip-established", IdleTimeout: 300}
 	p := NewRawUDPProxy("same-ip-established", cfg, nil, sm)
@@ -212,6 +214,7 @@ func TestRawUDPProxy_SameIPHandshakeDoesNotRemoveEstablishedClient(t *testing.T)
 		startTime:  time.Now().Add(-time.Minute),
 	}
 	oldClient.sessionCreated.Store(true)
+	// 沉默略长于未建会话 handshake grace，但仍短于已建会话 grace → 应保留
 	stale := time.Now().Add(-sameIPHandshakeGrace - time.Second).UnixNano()
 	oldClient.lastClientPacket.Store(stale)
 	oldClient.lastSeen.Store(stale)
@@ -222,10 +225,123 @@ func TestRawUDPProxy_SameIPHandshakeDoesNotRemoveEstablishedClient(t *testing.T)
 	p.cleanupStaleSameIPClients(newAddr, ocr1)
 
 	if p.GetActiveClientCount() != 1 {
-		t.Fatalf("expected established same-IP client to survive, got %d active", p.GetActiveClientCount())
+		t.Fatalf("expected established same-IP client to survive short silence, got %d active", p.GetActiveClientCount())
 	}
 	if _, ok := p.clients.Load(oldKey); !ok {
-		t.Fatal("established same-IP client was removed")
+		t.Fatal("established same-IP client was removed too early")
+	}
+}
+
+func TestRawUDPProxy_SameIPOCRRemovesEstablishedSilentClient(t *testing.T) {
+	// 已建立会话沉默超过 sameIPEstablishedHandshakeGrace 后，OCR 重连应踢掉旧链路
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "same-ip-est-ocr", IdleTimeout: 300}
+	p := NewRawUDPProxy("same-ip-est-ocr", cfg, nil, sm)
+
+	oldAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50011}
+	oldKey := oldAddr.String()
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+
+	oldClient := &rawUDPClientInfo{
+		clientAddr: oldAddr,
+		targetConn: targetConn,
+		sessionKey: p.makeSessionKey(oldAddr),
+		startTime:  time.Now().Add(-time.Minute),
+	}
+	oldClient.sessionCreated.Store(true)
+	stale := time.Now().Add(-sameIPEstablishedHandshakeGrace - time.Second).UnixNano()
+	oldClient.lastClientPacket.Store(stale)
+	oldClient.lastSeen.Store(stale)
+	p.clients.Store(oldKey, oldClient)
+
+	newAddr := &net.UDPAddr{IP: oldAddr.IP, Port: 50012}
+	ocr1 := append([]byte{raknetOpenConnectionReq1}, make([]byte, 8)...)
+	p.cleanupStaleSameIPClients(newAddr, ocr1)
+
+	if p.GetActiveClientCount() != 0 {
+		t.Fatalf("expected established silent client removed by OCR reconnect, got %d active", p.GetActiveClientCount())
+	}
+}
+
+func TestRawUDPProxy_SameIPSilentRemovesEstablishedClient(t *testing.T) {
+	// 已建立会话沉默超过 sameIPReconnectGrace，即使新包不是 OCR 也应被替换
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "same-ip-est-silent", IdleTimeout: 300}
+	p := NewRawUDPProxy("same-ip-est-silent", cfg, nil, sm)
+
+	oldAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50021}
+	oldKey := oldAddr.String()
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+
+	oldClient := &rawUDPClientInfo{
+		clientAddr: oldAddr,
+		targetConn: targetConn,
+		sessionKey: p.makeSessionKey(oldAddr),
+		startTime:  time.Now().Add(-time.Minute),
+	}
+	oldClient.sessionCreated.Store(true)
+	oldClient.loginParsed.Store(true)
+	stale := time.Now().Add(-sameIPReconnectGrace - time.Second).UnixNano()
+	oldClient.lastClientPacket.Store(stale)
+	oldClient.lastSeen.Store(stale)
+	p.clients.Store(oldKey, oldClient)
+
+	newAddr := &net.UDPAddr{IP: oldAddr.IP, Port: 50022}
+	// 非 OCR 包（例如可靠帧）
+	p.cleanupStaleSameIPClients(newAddr, []byte{0x80, 0x00})
+
+	if p.GetActiveClientCount() != 0 {
+		t.Fatalf("expected established client silent >15s to be removed, got %d active", p.GetActiveClientCount())
+	}
+}
+
+func TestRawUDPProxy_SameIPTakeoverWorksWithIdleNever(t *testing.T) {
+	// idle_timeout=-1 时 sweep 不会因沉默清链路，同 IP 接管是唯一快速回收路径
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "same-ip-idle-never", IdleTimeout: -1}
+	p := NewRawUDPProxy("same-ip-idle-never", cfg, nil, sm)
+	p.updateTimeouts()
+
+	oldAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50031}
+	oldKey := oldAddr.String()
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+
+	oldClient := &rawUDPClientInfo{
+		clientAddr: oldAddr,
+		targetConn: targetConn,
+		sessionKey: p.makeSessionKey(oldAddr),
+		startTime:  time.Now().Add(-time.Minute),
+	}
+	oldClient.sessionCreated.Store(true)
+	stale := time.Now().Add(-sameIPEstablishedHandshakeGrace - time.Second).UnixNano()
+	oldClient.lastClientPacket.Store(stale)
+	oldClient.lastSeen.Store(stale)
+	p.clients.Store(oldKey, oldClient)
+
+	// sweep 在 idle_timeout=-1 下应保留
+	p.sweepInactiveClients(time.Now(), p.effectiveClientDisconnectTimeout())
+	if p.GetActiveClientCount() != 1 {
+		t.Fatalf("expected idle_timeout=-1 sweep to keep client, got %d", p.GetActiveClientCount())
+	}
+
+	newAddr := &net.UDPAddr{IP: oldAddr.IP, Port: 50032}
+	ocr1 := append([]byte{raknetOpenConnectionReq1}, make([]byte, 8)...)
+	p.cleanupStaleSameIPClients(newAddr, ocr1)
+
+	if p.GetActiveClientCount() != 0 {
+		t.Fatalf("expected same-IP OCR takeover under idle_timeout=-1, got %d active", p.GetActiveClientCount())
 	}
 }
 

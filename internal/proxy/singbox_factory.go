@@ -27,7 +27,6 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -423,6 +422,11 @@ func (f *hy2PortHoppingConnFactory) selectRandomPort() int {
 }
 
 // portHoppingPacketConn wraps a PacketConn with port hopping capability.
+//
+// It intentionally does NOT implement quic-go's OOBCapablePacketConn (ReadMsgUDP,
+// SyscallConn, etc.). If it did, quic-go on Linux would call ipv4.NewPacketConn(c),
+// which requires c to be a net.Conn — our wrapper is only a net.PacketConn and
+// would panic with "portHoppingPacketConn is not net.Conn".
 type portHoppingPacketConn struct {
 	net.PacketConn
 	serverIP    net.IP
@@ -449,59 +453,6 @@ func (c *portHoppingPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err err
 	c.mu.Unlock()
 
 	return c.PacketConn.WriteTo(p, targetAddr)
-}
-
-func (c *portHoppingPacketConn) SetReadBuffer(bytes int) error {
-	if setter, ok := c.PacketConn.(interface{ SetReadBuffer(int) error }); ok {
-		return setter.SetReadBuffer(bytes)
-	}
-	return errors.New("underlying packet conn does not support SetReadBuffer")
-}
-
-func (c *portHoppingPacketConn) SetWriteBuffer(bytes int) error {
-	if setter, ok := c.PacketConn.(interface{ SetWriteBuffer(int) error }); ok {
-		return setter.SetWriteBuffer(bytes)
-	}
-	return errors.New("underlying packet conn does not support SetWriteBuffer")
-}
-
-func (c *portHoppingPacketConn) SyscallConn() (syscall.RawConn, error) {
-	if conn, ok := c.PacketConn.(interface {
-		SyscallConn() (syscall.RawConn, error)
-	}); ok {
-		return conn.SyscallConn()
-	}
-	return nil, errors.New("underlying packet conn does not support SyscallConn")
-}
-
-func (c *portHoppingPacketConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
-	if conn, ok := c.PacketConn.(interface {
-		ReadMsgUDP([]byte, []byte) (int, int, int, *net.UDPAddr, error)
-	}); ok {
-		return conn.ReadMsgUDP(b, oob)
-	}
-	return 0, 0, 0, nil, errors.New("underlying packet conn does not support ReadMsgUDP")
-}
-
-func (c *portHoppingPacketConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (n, oobn int, err error) {
-	c.mu.Lock()
-	if time.Since(c.lastHop) >= c.hopInterval {
-		oldPort := c.currentPort
-		portRange := c.portEnd - c.portStart + 1
-		c.currentPort = c.portStart + int(time.Now().UnixNano()%int64(portRange))
-		c.lastHop = time.Now()
-		logger.Debug("Hysteria2 port hop: %d -> %d", oldPort, c.currentPort)
-	}
-	targetAddr := &net.UDPAddr{IP: c.serverIP, Port: c.currentPort}
-	c.mu.Unlock()
-
-	if conn, ok := c.PacketConn.(interface {
-		WriteMsgUDP([]byte, []byte, *net.UDPAddr) (int, int, error)
-	}); ok {
-		return conn.WriteMsgUDP(b, oob, targetAddr)
-	}
-	n, err = c.PacketConn.WriteTo(b, targetAddr)
-	return n, 0, err
 }
 
 func resolveOutboundServerIP(ctx context.Context, host string) (net.IP, string, error) {

@@ -138,6 +138,12 @@
     <!-- 分组筛选 -->
     <n-card size="small" class="toolbar-card">
       <div class="filter-stack">
+        <n-space align="center" wrap class="filter-row filter-row-compact">
+          <span class="filter-label">行内测试</span>
+          <n-input v-model:value="batchMcbeAddress" placeholder="UDP 目标 mco.cubecraft.net:19132" class="filter-mcbe" size="small" clearable />
+          <n-select v-model:value="batchHttpTarget" :options="batchHttpTargetOptions" size="small" style="width: 150px" />
+          <n-input v-if="batchHttpTarget === 'custom'" v-model:value="batchHttpCustomUrl" placeholder="HTTP URL" class="filter-http-url" size="small" clearable />
+        </n-space>
         <n-space align="center" wrap class="filter-row">
           <span class="filter-label">协议</span>
           <n-select
@@ -188,10 +194,10 @@
       </div>
     </n-card>
 
-    <n-card>
+    <n-card class="proxy-outbound-list-card">
       <div class="table-wrapper">
         <n-data-table
-          class="proxy-table"
+          class="proxy-table proxy-table-compact"
           :columns="columns"
           :data="sortedOutbounds"
           :bordered="false"
@@ -761,7 +767,19 @@
         
         <!-- Ping 测试 -->
         <template v-if="testResultData.ping_test">
-          <n-h4 style="margin-top: 0">Ping 测试 (代理服务器)</n-h4>
+          <div class="detail-section-title">
+            <n-h4 style="margin: 0">Ping 测试 (代理服务器)</n-h4>
+            <n-button
+              quaternary
+              circle
+              size="tiny"
+              :loading="isDetailRetestLoading('ping')"
+              title="重新测试 Ping"
+              @click="retestDetailSection('ping')"
+            >
+              <template #icon><n-icon :component="RefreshOutline" /></template>
+            </n-button>
+          </div>
           <n-descriptions :column="3" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="服务器">{{ testResultData.ping_test.host }}</n-descriptions-item>
             <n-descriptions-item label="延迟">{{ testResultData.ping_test.latency_ms }} ms</n-descriptions-item>
@@ -775,7 +793,19 @@
         </template>
 
         <template v-if="testResultData.udp_test">
-          <n-h4>UDP 测试 (MCBE 通过代理)</n-h4>
+          <div class="detail-section-title">
+            <n-h4 style="margin: 0">UDP 测试 (MCBE 通过代理)</n-h4>
+            <n-button
+              quaternary
+              circle
+              size="tiny"
+              :loading="isDetailRetestLoading('udp')"
+              title="重新测试 UDP"
+              @click="retestDetailSection('udp')"
+            >
+              <template #icon><n-icon :component="RefreshOutline" /></template>
+            </n-button>
+          </div>
           <n-descriptions :column="2" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="目标">{{ testResultData.udp_test.target }}</n-descriptions-item>
             <n-descriptions-item label="延迟">{{ testResultData.udp_test.latency_ms }} ms</n-descriptions-item>
@@ -795,13 +825,25 @@
         <template v-if="testResultData.http_tests && testResultData.http_tests.length > 0">
           <n-h4>HTTP 测试 (通过代理)</n-h4>
           <div class="table-wrapper">
-            <n-data-table :columns="httpTestColumns" :data="testResultData.http_tests" :bordered="true" size="small" style="margin-bottom: 16px" :scroll-x="600" />
+            <n-data-table :columns="httpTestColumns" :data="testResultData.http_tests" :bordered="true" size="small" style="margin-bottom: 16px" :scroll-x="680" />
           </div>
         </template>
 
         <!-- 自定义 HTTP -->
         <template v-if="testResultData.custom_http">
-          <n-h4>自定义 HTTP 请求</n-h4>
+          <div class="detail-section-title">
+            <n-h4 style="margin: 0">自定义 HTTP 请求</n-h4>
+            <n-button
+              quaternary
+              circle
+              size="tiny"
+              :loading="isDetailRetestLoading('custom_http')"
+              title="重新测试自定义 HTTP"
+              @click="retestDetailSection('custom_http')"
+            >
+              <template #icon><n-icon :component="RefreshOutline" /></template>
+            </n-button>
+          </div>
           <n-descriptions :column="2" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="URL" :span="2">{{ testResultData.custom_http.url }}</n-descriptions-item>
             <n-descriptions-item label="状态">
@@ -909,7 +951,8 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, h, watch, nextTick } from 'vue'
-import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
+import { NTag, NButton, NSpace, NPopconfirm, NIcon, useMessage } from 'naive-ui'
+import { RefreshOutline } from '@vicons/ionicons5'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
@@ -921,6 +964,86 @@ const props = defineProps({
 })
 
 const message = useMessage()
+
+// 测试结果 toast：多行详情、失败停留 10s、可手动关闭
+const showProxyTestToast = (ok, title, detailLines = []) => {
+  const lines = [title, ...detailLines.filter((line) => line != null && String(line).trim() !== '')]
+  const text = lines.join('\n')
+  const opts = {
+    closable: true,
+    duration: ok ? 3500 : 10000,
+    keepAliveOnHover: true
+  }
+  const render = () => h('div', {
+    class: 'proxy-test-toast',
+    style: 'white-space: pre-line; line-height: 1.55; max-width: 440px; word-break: break-word;'
+  }, text)
+  if (ok) message.success(render, opts)
+  else message.error(render, opts)
+}
+
+const formatTcpToastLines = (name, res) => {
+  const d = res?.data || {}
+  const ok = !!(res?.success && d.success)
+  const lines = [
+    `节点: ${name}`,
+    '类型: TCP 连通',
+    ok ? `延迟: ${d.latency_ms ?? 0} ms` : '延迟: -',
+    d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null)
+  ]
+  showProxyTestToast(ok, ok ? `${name} · TCP 成功` : `${name} · TCP 失败`, lines)
+  return ok
+}
+
+const formatUdpToastLines = (name, res) => {
+  const d = res?.data || {}
+  // test-mcbe: data 本身就是 UDPTestResult；API 层 success 与 data.success 都要看
+  const ok = !!(res?.success && d.success)
+  const lines = [
+    `节点: ${name}`,
+    '类型: UDP (MCBE)',
+    d.target ? `目标: ${d.target}` : null,
+    ok ? `延迟: ${d.latency_ms ?? 0} ms` : '延迟: -',
+    d.server_name ? `服务器名: ${d.server_name}` : null,
+    d.players ? `玩家: ${d.players}` : null,
+    d.version ? `版本: ${d.version}` : null,
+    d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null)
+  ]
+  showProxyTestToast(ok, ok ? `${name} · UDP 成功` : `${name} · UDP 失败`, lines)
+  return ok
+}
+
+const formatHttpToastLines = (name, res) => {
+  const d = res?.data || {}
+  const httpTests = Array.isArray(d.http_tests) ? d.http_tests : []
+  const custom = d.custom_http
+  const best = httpTests.find((t) => t.success) || (custom?.success ? custom : null)
+  const ok = !!(res?.success && (d.success || best?.success))
+  const lines = [
+    `节点: ${name}`,
+    '类型: HTTP',
+    ...httpTests.map((t) => {
+      const status = t.success ? '成功' : '失败'
+      const lat = t.latency_ms > 0 ? `${t.latency_ms}ms` : '-'
+      const code = t.status_code ? ` HTTP ${t.status_code}` : ''
+      const err = t.error ? ` · ${t.error}` : ''
+      return `· ${t.target || t.url || 'HTTP'}: ${status} ${lat}${code}${err}`
+    }),
+    custom
+      ? (() => {
+          const status = custom.success ? '成功' : '失败'
+          const lat = custom.latency_ms > 0 ? `${custom.latency_ms}ms` : '-'
+          const code = custom.status_code ? ` HTTP ${custom.status_code}` : ''
+          const err = custom.error ? ` · ${custom.error}` : ''
+          return `· 自定义 ${custom.url || ''}: ${status} ${lat}${code}${err}`
+        })()
+      : null,
+    !ok && d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null),
+    !ok && httpTests.length === 0 && !custom ? '无 HTTP 测试结果返回' : null
+  ]
+  showProxyTestToast(ok, ok ? `${name} · HTTP 成功` : `${name} · HTTP 失败`, lines)
+  return ok
+}
 const outbounds = ref([])
 const loading = ref(false)
 const highlightName = ref('')
@@ -934,6 +1057,7 @@ const savingAutoSelectBlock = ref(false)
 const testingName = ref(null)
 const testResultData = ref(null)
 const testLoading = ref('正在测试...')
+const detailRetestLoading = ref({})
 const importText = ref('')
 const checkedRowKeys = ref([])
 const pagination = ref({
@@ -972,16 +1096,24 @@ const proxyHistoryRangeOptions = [
 
 const proxyTableColumnStorageKey = 'proxy-outbounds.main-table.visible-columns'
 const proxyTableColumnOptions = [
-  { label: '协议', value: 'type', width: 210 },
-  { label: '质量', value: 'quality', width: 250 },
-  { label: '历史趋势', value: 'history', width: 330 },
-  { label: '运行态', value: 'runtime', width: 260 },
-  { label: '当前使用', value: 'usage_refs', width: 420 },
-  { label: '状态', value: 'status', width: 210 }
+  { label: '协议', value: 'type', width: 128 },
+  { label: 'TCP', value: 'tcp', width: 72 },
+  { label: 'HTTP', value: 'http', width: 72 },
+  { label: 'UDP', value: 'udp', width: 72 },
+  { label: '状态', value: 'status', width: 100 },
+  { label: '历史趋势', value: 'history', width: 200 },
+  { label: '运行态', value: 'runtime', width: 140 },
+  { label: '当前使用', value: 'usage_refs', width: 220 }
 ]
-const proxyTableDefaultVisibleColumnKeys = proxyTableColumnOptions.map(option => option.value)
+// 默认与「代理服务器」节点选择表一致：协议 + 三类延迟 + 状态；历史/运行态/引用按需展开
+const proxyTableAllColumnKeys = proxyTableColumnOptions.map(option => option.value)
+const proxyTableDefaultVisibleColumnKeys = ['type', 'tcp', 'http', 'udp', 'status']
 const normalizeProxyTableVisibleColumnKeys = (keys) => {
-  return Array.from(new Set((Array.isArray(keys) ? keys : []).filter(key => proxyTableDefaultVisibleColumnKeys.includes(key))))
+  const raw = Array.isArray(keys) ? [...keys] : []
+  if (raw.includes('quality')) {
+    raw.push('tcp', 'http', 'udp')
+  }
+  return Array.from(new Set(raw.filter(key => proxyTableAllColumnKeys.includes(key))))
 }
 const readProxyTableVisibleColumnKeys = () => {
   if (typeof window === 'undefined') return [...proxyTableDefaultVisibleColumnKeys]
@@ -997,10 +1129,10 @@ const proxyTableVisibleColumnKeys = ref(readProxyTableVisibleColumnKeys())
 const visibleProxyTableColumnSet = computed(() => new Set(normalizeProxyTableVisibleColumnKeys(proxyTableVisibleColumnKeys.value)))
 const isProxyTableColumnVisible = (key) => visibleProxyTableColumnSet.value.has(key)
 const proxyTableScrollX = computed(() => {
-  const total = 48 + 280 + 210 + proxyTableColumnOptions.reduce((sum, option) => {
+  const total = 40 + 200 + 248 + proxyTableColumnOptions.reduce((sum, option) => {
     return sum + (isProxyTableColumnVisible(option.value) ? option.width : 0)
   }, 0)
-  return Math.max(total + 80, 980)
+  return Math.max(total + 48, 860)
 })
 const resetProxyTableVisibleColumns = () => {
   proxyTableVisibleColumnKeys.value = [...proxyTableDefaultVisibleColumnKeys]
@@ -2133,6 +2265,169 @@ const getUsageNodeDisplayName = (nodeName) => {
   return nodeName === 'direct' ? '直连' : nodeName
 }
 
+const rowInlineTestLoading = ref({})
+
+const rowInlineTestKey = (name, type) => `${name}::${type}`
+
+const isRowInlineTestLoading = (name, type) => !!rowInlineTestLoading.value[rowInlineTestKey(name, type)]
+
+const buildRowHttpTestPayload = (name) => {
+  if (batchHttpTarget.value === 'custom') {
+    return {
+      name,
+      include_ping: false,
+      custom_http: { url: batchHttpCustomUrl.value || 'https://www.google.com', method: 'GET' }
+    }
+  }
+  return { name, include_ping: false, targets: [batchHttpTarget.value] }
+}
+
+const runRowInlineTest = async (name, type) => {
+  const key = rowInlineTestKey(name, type)
+  if (rowInlineTestLoading.value[key]) return
+  rowInlineTestLoading.value = { ...rowInlineTestLoading.value, [key]: true }
+  try {
+    let res
+    if (type === 'tcp') {
+      res = await api('/api/proxy-outbounds/test', 'POST', { name })
+      const ok = formatTcpToastLines(name, res)
+      if (ok) {
+        updateOutboundData(name, { latency_ms: res.data.latency_ms, healthy: true })
+      } else {
+        updateOutboundData(name, { latency_ms: 0, healthy: false })
+      }
+    } else if (type === 'http') {
+      res = await api('/api/proxy-outbounds/detailed-test', 'POST', buildRowHttpTestPayload(name))
+      const ok = formatHttpToastLines(name, res)
+      if (ok) {
+        const httpTest = res.data.http_tests?.find(t => t.success) || res.data.custom_http
+        updateOutboundData(name, { http_latency_ms: httpTest?.latency_ms || 0 })
+      } else {
+        updateOutboundData(name, { http_latency_ms: 0 })
+      }
+    } else {
+      res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: batchMcbeAddress.value })
+      const ok = formatUdpToastLines(name, res)
+      if (ok) {
+        updateOutboundData(name, { udp_available: true, udp_latency_ms: res.data.latency_ms })
+      } else {
+        updateOutboundData(name, { udp_available: false, udp_latency_ms: 0 })
+      }
+    }
+    await refreshProxyHistoryViews()
+  } catch (e) {
+    showProxyTestToast(false, `${name} · ${type.toUpperCase()} 失败`, [
+      `节点: ${name}`,
+      `类型: ${type.toUpperCase()}`,
+      `错误: ${e?.message || '未知错误'}`
+    ])
+  } finally {
+    const next = { ...rowInlineTestLoading.value }
+    delete next[key]
+    rowInlineTestLoading.value = next
+  }
+}
+
+const renderProxyTableEllipsis = (value, extraClass = '') => {
+  const text = String(value ?? '').trim() || '-'
+  return h('span', { class: ['proxy-table-ellipsis', extraClass], title: text }, text)
+}
+
+const renderCompactProtocolCell = (row) => {
+  const tags = [h(NTag, { type: 'info', size: 'small' }, () => (row.type || '').toUpperCase())]
+  if (row.network === 'ws') tags.push(h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'WS'))
+  if (row.network === 'grpc') tags.push(h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'gRPC'))
+  if (row.reality) tags.push(h(NTag, { type: 'success', size: 'small', bordered: false }, () => 'R'))
+  if (row.port_hopping) tags.push(h(NTag, { size: 'small', bordered: false }, () => 'Hop'))
+  if (row.tls) tags.push(h(NTag, { type: row.insecure ? 'warning' : 'success', size: 'small', bordered: false }, () => 'TLS'))
+  return h('div', { class: 'proxy-protocol-cell' }, [
+    h('div', { class: 'proxy-protocol-tags' }, tags),
+    renderProxyTableEllipsis(`${row.server}:${row.port}`)
+  ])
+}
+
+const renderCompactNodeCell = (row) => {
+  const nameClass = row.name === highlightName.value ? 'proxy-node-name proxy-node-name-highlight' : 'proxy-node-name'
+  const meta = [
+    row.group ? `组 ${row.group}` : '',
+    row.subscription_name ? `订 ${row.subscription_name}` : '',
+    row.auto_select_blocked ? '封禁' : ''
+  ].filter(Boolean).join(' · ')
+  return h('div', { class: 'proxy-node-cell' }, [
+    renderProxyTableEllipsis(row.name, nameClass),
+    meta ? h('div', { class: 'proxy-node-meta', title: meta }, meta) : null
+  ])
+}
+
+const renderCompactStatusCell = (row) => {
+  return h('div', { class: 'proxy-status-cell' }, [
+    h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启' : '停'),
+    renderStatusTag(row)
+  ])
+}
+
+const renderCompactRuntimeCell = (row) => {
+  return h('div', { class: 'proxy-runtime-cell' }, [
+    h('div', { class: 'proxy-runtime-line' }, [
+      h('span', { class: 'proxy-runtime-label' }, '连'),
+      h('strong', null, String(row.conn_count || 0)),
+      h('span', { class: 'proxy-runtime-label' }, '流'),
+      h('span', null, `↑${formatBytes(row.bytes_up || 0)} ↓${formatBytes(row.bytes_down || 0)}`)
+    ])
+  ])
+}
+
+const renderCompactUsageRefs = (row) => {
+  const refs = Array.isArray(row.usage_refs) ? row.usage_refs : []
+  if (refs.length === 0) {
+    return h('span', { class: 'table-secondary-text' }, '-')
+  }
+  const current = refs.filter(ref => ref.is_current).length
+  const preview = refs.slice(0, 2).map(ref => `${getUsageRefKindLabel(ref.kind)}:${ref.name}`).join('、')
+  const more = refs.length > 2 ? ` +${refs.length - 2}` : ''
+  const text = `${refs.length}引用${current > 0 ? `·当前${current}` : ''} ${preview}${more}`
+  return renderProxyTableEllipsis(text)
+}
+
+const renderRowInlineTestButtons = (row) => {
+  const name = row.name
+  return h(NSpace, { size: 4, wrap: false, class: 'proxy-row-test-btns' }, () => [
+    h(NButton, {
+      size: 'tiny',
+      loading: isRowInlineTestLoading(name, 'tcp'),
+      onClick: (e) => { e?.stopPropagation?.(); runRowInlineTest(name, 'tcp') }
+    }, () => 'TCP'),
+    h(NButton, {
+      size: 'tiny',
+      loading: isRowInlineTestLoading(name, 'http'),
+      onClick: (e) => { e?.stopPropagation?.(); runRowInlineTest(name, 'http') }
+    }, () => 'HTTP'),
+    h(NButton, {
+      size: 'tiny',
+      loading: isRowInlineTestLoading(name, 'udp'),
+      onClick: (e) => { e?.stopPropagation?.(); runRowInlineTest(name, 'udp') }
+    }, () => 'UDP')
+  ])
+}
+
+const renderProxyRowActions = (row) => {
+  return h(NSpace, { size: 4, wrap: false, align: 'center', class: 'proxy-row-actions' }, () => [
+    renderRowInlineTestButtons(row),
+    h(NButton, { size: 'tiny', type: 'info', ghost: true, onClick: (e) => { e?.stopPropagation?.(); openTestOptions(row.name) } }, () => '详测'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e?.stopPropagation?.(); openEditModal(row) } }, () => '编辑'),
+    row.auto_select_blocked
+      ? h(NPopconfirm, { onPositiveClick: () => clearAutoSelectBlock(row.name) }, {
+          trigger: () => h(NButton, { size: 'tiny', type: 'success', ghost: true }, () => '解封'),
+          default: () => '确定解除该节点的自动选择封禁吗？'
+        })
+      : h(NButton, { size: 'tiny', type: 'error', ghost: true, onClick: (e) => { e?.stopPropagation?.(); openAutoSelectBlockModal(row) } }, () => '封禁'),
+    h(NPopconfirm, { onPositiveClick: () => deleteOutbound(row.name) }, {
+      trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删'),
+      default: () => '确定删除该节点吗？'
+    })
+  ])
+}
+
 const renderUsageRefs = (row) => {
   const refs = Array.isArray(row.usage_refs) ? row.usage_refs : []
   if (refs.length === 0) {
@@ -2176,23 +2471,15 @@ const renderUsageRefs = (row) => {
 
 const columns = computed(() => {
   const columnList = [
-    { type: 'selection', fixed: 'left' },
+    { type: 'selection', fixed: 'left', width: 40 },
     {
       title: '节点',
       key: 'name',
-      width: 280,
+      width: 200,
       fixed: 'left',
+      ellipsis: { tooltip: true },
       sorter: (a, b) => a.name.localeCompare(b.name),
-      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-        h('div', { class: row.name === highlightName.value ? 'node-name node-name-highlight' : 'node-name' }, row.name),
-        h('div', { class: 'table-secondary-text' }, `${row.server}:${row.port}`),
-        h(NSpace, { size: 4, wrap: true }, () => [
-          row.group ? h(NTag, { type: 'info', size: 'small', bordered: false }, () => row.group) : null,
-          row.subscription_name ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => `订阅: ${row.subscription_name}`) : null,
-          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null,
-          row.chain && row.chain.length > 0 ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => `链式 ${row.chain.length}跳`) : null
-        ])
-      ])
+      render: (row) => renderCompactNodeCell(row)
     }
   ]
 
@@ -2200,74 +2487,46 @@ const columns = computed(() => {
     columnList.push({
       title: '协议',
       key: 'type',
-      width: 210,
-      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-        h(NSpace, { size: 4, wrap: true }, () => [
-          h(NTag, { type: 'info', size: 'small' }, () => row.type.toUpperCase()),
-          row.reality ? h(NTag, { type: 'success', size: 'small', bordered: false }, () => 'Reality') : null,
-          row.flow === 'xtls-rprx-vision' ? h(NTag, { type: 'primary', size: 'small', bordered: false }, () => 'Vision') : null,
-          row.network === 'ws' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'WS') : null,
-          row.network === 'httpupgrade' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'HTTPU') : null,
-          row.network === 'xhttp' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'XHTTP') : null,
-          row.network === 'grpc' ? h(NTag, { type: 'warning', size: 'small', bordered: false }, () => 'gRPC') : null,
-          row.port_hopping ? h(NTag, { size: 'small', bordered: false }, () => 'Hop') : null,
-          row.tls ? h(NTag, { type: row.insecure ? 'warning' : 'success', size: 'small', bordered: false }, () => row.insecure ? 'TLS*' : 'TLS') : null
-        ]),
-        h('div', { class: 'table-secondary-text' }, row.sni ? `SNI ${row.sni}` : (row.alpn ? `ALPN ${row.alpn}` : '-'))
-      ])
+      width: 128,
+      render: (row) => renderCompactProtocolCell(row)
     })
   }
 
-  if (isProxyTableColumnVisible('quality')) {
+  if (isProxyTableColumnVisible('tcp')) {
     columnList.push({
-      title: '质量',
-      key: 'quality',
-      width: 250,
-      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-        h(NSpace, { size: 6, wrap: true }, () => [
-          h('span', { class: 'metric-label' }, 'TCP'),
-          renderLatencyTag(row.latency_ms, 200, 500),
-          h('span', { class: 'metric-label' }, 'HTTP'),
-          renderLatencyTag(row.http_latency_ms, 500, 1500),
-          h('span', { class: 'metric-label' }, 'UDP'),
-          renderUdpTag(row)
-        ]),
-        h('div', { class: 'table-secondary-text' }, row.last_check ? `最后检测 ${formatTime(row.last_check)}` : '尚未进行连通性检测')
-      ])
+      title: 'TCP',
+      key: 'latency_ms',
+      width: 72,
+      sorter: (a, b) => (a.latency_ms || 9999) - (b.latency_ms || 9999),
+      render: (row) => renderLatencyTag(row.latency_ms, 200, 500)
     })
   }
 
-  if (isProxyTableColumnVisible('history')) {
+  if (isProxyTableColumnVisible('http')) {
     columnList.push({
-      title: '历史趋势',
-      key: 'history',
-      width: 330,
-      render: (row) => renderProxyHistoryStack(row, 150)
+      title: 'HTTP',
+      key: 'http_latency_ms',
+      width: 72,
+      sorter: (a, b) => (a.http_latency_ms || 9999) - (b.http_latency_ms || 9999),
+      render: (row) => renderLatencyTag(row.http_latency_ms, 500, 1500)
     })
   }
 
-  if (isProxyTableColumnVisible('runtime')) {
+  if (isProxyTableColumnVisible('udp')) {
     columnList.push({
-      title: '运行态',
-      key: 'runtime',
-      width: 260,
-      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-        h(NSpace, { size: 4, wrap: true }, () => [
-          h(NTag, { type: (row.conn_count || 0) > 0 ? 'success' : 'default', size: 'small', bordered: false }, () => `连接 ${row.conn_count || 0}`),
-          h(NTag, { size: 'small', bordered: false }, () => `活跃 ${formatDuration(row.active_duration_seconds)}`)
-        ]),
-        h('div', { class: 'table-secondary-text' }, `↑ ${formatBytes(row.bytes_up || 0)} / ↓ ${formatBytes(row.bytes_down || 0)}`),
-        h('div', { class: 'table-secondary-text' }, formatLastActive(row.last_active))
-      ])
-    })
-  }
-
-  if (isProxyTableColumnVisible('usage_refs')) {
-    columnList.push({
-      title: '当前使用',
-      key: 'usage_refs',
-      width: 420,
-      render: (row) => renderUsageRefs(row)
+      title: 'UDP',
+      key: 'udp_available',
+      width: 72,
+      sorter: (a, b) => {
+        const score = (o) => {
+          if (o.udp_available === true && o.udp_latency_ms > 0) return o.udp_latency_ms
+          if (o.udp_available === true) return 10000
+          if (o.udp_available === false) return 99999
+          return 50000
+        }
+        return score(a) - score(b)
+      },
+      render: (row) => renderUdpTag(row)
     })
   }
 
@@ -2275,36 +2534,46 @@ const columns = computed(() => {
     columnList.push({
       title: '状态',
       key: 'status',
-      width: 260,
-      render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
-        h(NSpace, { size: 4, wrap: true }, () => [
-          h(NTag, { type: row.enabled ? 'success' : 'default', size: 'small', bordered: false }, () => row.enabled ? '启用中' : '已禁用'),
-          renderStatusTag(row),
-          row.auto_select_blocked ? h(NTag, { type: 'error', size: 'small', bordered: false }, () => '自动封禁') : null
-        ]),
-        row.auto_select_blocked ? h('div', { class: 'table-error-text', title: formatAutoSelectBlockSummary(row) }, formatAutoSelectBlockSummary(row)) : null,
-        h('div', { class: row.last_error ? 'table-error-text' : 'table-secondary-text', title: row.last_error || '' }, row.last_error || '无最近错误')
-      ])
+      width: 100,
+      render: (row) => renderCompactStatusCell(row)
+    })
+  }
+
+  if (isProxyTableColumnVisible('history')) {
+    columnList.push({
+      title: '趋势',
+      key: 'history',
+      width: 200,
+      render: (row) => renderProxyHistoryStack(row, 56)
+    })
+  }
+
+  if (isProxyTableColumnVisible('runtime')) {
+    columnList.push({
+      title: '运行',
+      key: 'runtime',
+      width: 140,
+      render: (row) => renderCompactRuntimeCell(row)
+    })
+  }
+
+  if (isProxyTableColumnVisible('usage_refs')) {
+    columnList.push({
+      title: '引用',
+      key: 'usage_refs',
+      width: 220,
+      ellipsis: { tooltip: true },
+      render: (row) => renderCompactUsageRefs(row)
     })
   }
 
   columnList.push({
     title: '操作',
     key: 'actions',
-    width: 290,
+    width: 248,
     fixed: 'right',
-    render: (row) => h(NSpace, { size: 6, wrap: true }, () => [
-      h(NButton, { size: 'small', type: 'primary', ghost: true, onClick: () => openTestOptions(row.name) }, () => '测试'),
-      h(NButton, { size: 'small', type: 'warning', ghost: true, onClick: () => testMCBE(row.name) }, () => 'UDP'),
-      h(NButton, { size: 'small', onClick: () => openEditModal(row) }, () => '编辑'),
-      row.auto_select_blocked
-        ? h(NPopconfirm, { onPositiveClick: () => clearAutoSelectBlock(row.name) }, {
-            trigger: () => h(NButton, { size: 'small', type: 'success', ghost: true }, () => '解封'),
-            default: () => '确定解除该节点的自动选择封禁吗？'
-          })
-        : h(NButton, { size: 'small', type: 'error', ghost: true, onClick: () => openAutoSelectBlockModal(row) }, () => '封禁'),
-      h(NPopconfirm, { onPositiveClick: () => deleteOutbound(row.name) }, { trigger: () => h(NButton, { size: 'small', type: 'error', ghost: true }, () => '删除'), default: () => '确定删除该节点吗？' })
-    ])
+    className: 'proxy-actions-column',
+    render: (row) => renderProxyRowActions(row)
   })
 
   return columnList
@@ -2361,14 +2630,33 @@ const latencyOverviewColumns = computed(() => [
   }
 ])
 
-const httpTestColumns = [
+const httpTestColumns = computed(() => [
   { title: '目标', key: 'target', width: 100 },
   { title: 'URL', key: 'url', width: 200, ellipsis: { tooltip: true } },
   { title: '状态码', key: 'status_code', width: 80 },
   { title: '延迟', key: 'latency_ms', width: 80, render: r => `${r.latency_ms} ms` },
   { title: '状态', key: 'success', width: 80, render: r => h(NTag, { type: r.success ? 'success' : 'error', size: 'small' }, () => r.success ? '成功' : '失败') },
-  { title: '错误', key: 'error', ellipsis: { tooltip: true } }
-]
+  { title: '错误', key: 'error', ellipsis: { tooltip: true } },
+  {
+    title: '重测',
+    key: 'retest',
+    width: 56,
+    render: (row) => {
+      const targetKey = row.target || row.url || ''
+      const loadingKey = `http:${targetKey}`
+      return h(NButton, {
+        quaternary: true,
+        circle: true,
+        size: 'tiny',
+        loading: isDetailRetestLoading(loadingKey),
+        title: `重新测试 ${targetKey || 'HTTP'}`,
+        onClick: () => retestDetailHttpTarget(row)
+      }, {
+        icon: () => h(NIcon, null, { default: () => h(RefreshOutline) })
+      })
+    }
+  }
+])
 
 const formatHeaders = (headers) => {
   return Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join('\n')
@@ -3068,6 +3356,189 @@ const runDetailedTest = async () => {
   }
 }
 
+const isDetailRetestLoading = (key) => !!detailRetestLoading.value[key]
+
+const setDetailRetestLoading = (key, loading) => {
+  detailRetestLoading.value = { ...detailRetestLoading.value, [key]: loading }
+}
+
+const recomputeDetailOverallSuccess = (data) => {
+  if (!data) return false
+  const checks = []
+  if (data.ping_test) checks.push(!!data.ping_test.success)
+  if (data.udp_test) checks.push(!!data.udp_test.success)
+  if (Array.isArray(data.http_tests) && data.http_tests.length > 0) {
+    checks.push(data.http_tests.some((t) => t.success))
+  }
+  if (data.custom_http) checks.push(!!data.custom_http.success)
+  if (checks.length === 0) return !!data.success
+  return checks.every(Boolean)
+}
+
+const applyDetailResultToOutbound = (partial) => {
+  const name = testingName.value
+  if (!name || !partial) return
+  const updates = {}
+  if (partial.ping_test?.success) {
+    updates.latency_ms = partial.ping_test.latency_ms
+    updates.healthy = true
+  } else if (partial.ping_test) {
+    updates.latency_ms = 0
+    updates.healthy = false
+  }
+  if (partial.udp_test?.success) {
+    updates.udp_available = true
+    updates.udp_latency_ms = partial.udp_test.latency_ms
+  } else if (partial.udp_test) {
+    updates.udp_available = false
+    updates.udp_latency_ms = 0
+  }
+  const httpTest = partial.http_tests?.find((t) => t.success) || partial.custom_http
+  if (httpTest?.success) {
+    updates.http_latency_ms = httpTest.latency_ms
+  } else if ((partial.http_tests && partial.http_tests.length > 0) || partial.custom_http) {
+    updates.http_latency_ms = 0
+  }
+  if (Object.keys(updates).length > 0) {
+    updateOutboundData(name, updates)
+  }
+}
+
+const mergeDetailTestData = (patch) => {
+  const next = { ...(testResultData.value || {}), ...patch }
+  if (patch.http_tests_replace_target && Array.isArray(testResultData.value?.http_tests)) {
+    const updated = patch.http_tests_replace_target
+    next.http_tests = testResultData.value.http_tests.map((row) => {
+      if (updated.target && row.target === updated.target) return updated
+      if (!updated.target && updated.url && row.url === updated.url) return updated
+      return row
+    })
+    delete next.http_tests_replace_target
+  }
+  next.success = recomputeDetailOverallSuccess(next)
+  testResultData.value = next
+}
+
+const retestDetailSection = async (section) => {
+  const name = testingName.value
+  if (!name || !testResultData.value) return
+  if (isDetailRetestLoading(section)) return
+  setDetailRetestLoading(section, true)
+  try {
+    if (section === 'ping') {
+      const res = await api('/api/proxy-outbounds/detailed-test', 'POST', {
+        name,
+        include_ping: true,
+        include_udp: false,
+        targets: []
+      })
+      if (res?.success && res.data?.ping_test) {
+        mergeDetailTestData({ ping_test: res.data.ping_test })
+        applyDetailResultToOutbound({ ping_test: res.data.ping_test })
+        const ok = !!res.data.ping_test.success
+        showProxyTestToast(ok, ok ? `${name} · Ping 成功` : `${name} · Ping 失败`, [
+          `节点: ${name}`,
+          '类型: Ping',
+          `服务器: ${res.data.ping_test.host || '-'}`,
+          ok ? `延迟: ${res.data.ping_test.latency_ms} ms` : '延迟: -',
+          res.data.ping_test.error ? `错误: ${res.data.ping_test.error}` : null
+        ])
+        await refreshProxyHistoryViews()
+      } else {
+        showProxyTestToast(false, `${name} · Ping 失败`, [`错误: ${res?.msg || '无结果'}`])
+      }
+      return
+    }
+
+    if (section === 'udp') {
+      const address = testResultData.value?.udp_test?.target || mcbeTestAddress.value
+      const res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address })
+      if (res?.success && res.data) {
+        mergeDetailTestData({ udp_test: res.data })
+        applyDetailResultToOutbound({ udp_test: res.data })
+        formatUdpToastLines(name, res)
+        await refreshProxyHistoryViews()
+      } else {
+        showProxyTestToast(false, `${name} · UDP 失败`, [`错误: ${res?.msg || '无结果'}`])
+      }
+      return
+    }
+
+    if (section === 'custom_http') {
+      const fallbackUrl = testResultData.value?.custom_http?.url || ''
+      const url = (enableCustomHttp.value && customHttpConfig.value.url) ? customHttpConfig.value.url : fallbackUrl
+      if (!url) {
+        showProxyTestToast(false, `${name} · 自定义 HTTP 失败`, ['错误: 未配置自定义 HTTP URL，请先在详测选项中开启'])
+        return
+      }
+      const res = await api('/api/proxy-outbounds/detailed-test', 'POST', {
+        name,
+        include_ping: false,
+        include_udp: false,
+        targets: [],
+        custom_http: {
+          url,
+          method: customHttpConfig.value.method || 'GET',
+          headers: parseHeaders(customHttpConfig.value.headersText),
+          body: customHttpConfig.value.body,
+          direct_test: !!customHttpConfig.value.directTest
+        }
+      })
+      if (res?.success && res.data?.custom_http) {
+        mergeDetailTestData({ custom_http: res.data.custom_http })
+        applyDetailResultToOutbound({ custom_http: res.data.custom_http })
+        formatHttpToastLines(name, { success: true, data: { success: res.data.custom_http.success, custom_http: res.data.custom_http } })
+        await refreshProxyHistoryViews()
+      } else {
+        showProxyTestToast(false, `${name} · 自定义 HTTP 失败`, [`错误: ${res?.msg || '无结果'}`])
+      }
+    }
+  } catch (e) {
+    showProxyTestToast(false, `${name} · 重测失败`, [`错误: ${e?.message || '未知错误'}`])
+  } finally {
+    setDetailRetestLoading(section, false)
+  }
+}
+
+const retestDetailHttpTarget = async (row) => {
+  const name = testingName.value
+  const targetKey = row?.target
+  if (!name || !targetKey) {
+    showProxyTestToast(false, 'HTTP 重测失败', ['错误: 缺少 HTTP 目标标识，无法单独重测'])
+    return
+  }
+  const loadingKey = `http:${targetKey}`
+  if (isDetailRetestLoading(loadingKey)) return
+  setDetailRetestLoading(loadingKey, true)
+  try {
+    const res = await api('/api/proxy-outbounds/detailed-test', 'POST', {
+      name,
+      include_ping: false,
+      include_udp: false,
+      targets: [targetKey]
+    })
+    const updated = res?.data?.http_tests?.find((t) => t.target === targetKey) || res?.data?.http_tests?.[0]
+    if (res?.success && updated) {
+      mergeDetailTestData({ http_tests_replace_target: updated })
+      applyDetailResultToOutbound({ http_tests: [updated] })
+      formatHttpToastLines(name, { success: true, data: { success: updated.success, http_tests: [updated] } })
+      await refreshProxyHistoryViews()
+    } else {
+      showProxyTestToast(false, `${name} · HTTP 失败`, [
+        `目标: ${targetKey}`,
+        `错误: ${res?.msg || '无结果'}`
+      ])
+    }
+  } catch (e) {
+    showProxyTestToast(false, `${name} · HTTP 重测失败`, [
+      `目标: ${targetKey}`,
+      `错误: ${e?.message || '未知错误'}`
+    ])
+  } finally {
+    setDetailRetestLoading(loadingKey, false)
+  }
+}
+
 // 导入功能
 const subscriptionUrl = ref('')
 const fetchingSubscription = ref(false)
@@ -3116,26 +3587,32 @@ const subProxyTest = async (name, type) => {
     let res
     if (type === 'tcp') {
       res = await api('/api/proxy-outbounds/test', 'POST', { name })
-      if (res.success) {
-        updateOutboundData(name, { latency_ms: res.data?.latency_ms })
-        message.success(`${name} TCP: ${res.data?.latency_ms}ms`)
-      } else { message.error(res.msg || '测试失败') }
+      const ok = formatTcpToastLines(name, res)
+      if (ok) updateOutboundData(name, { latency_ms: res.data?.latency_ms, healthy: true })
+      else updateOutboundData(name, { latency_ms: 0, healthy: false })
     } else if (type === 'http') {
       res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, include_ping: false, targets: ['cloudflare'] })
-      if (res.success) {
+      const ok = formatHttpToastLines(name, res)
+      if (ok) {
         const httpMs = res.data?.http_tests?.[0]?.latency_ms || 0
         updateOutboundData(name, { http_latency_ms: httpMs })
-        message.success(`${name} HTTP: ${httpMs}ms`)
-      } else { message.error(res.msg || '测试失败') }
+      } else {
+        updateOutboundData(name, { http_latency_ms: 0 })
+      }
     } else {
       res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { name, address: 'mco.cubecraft.net:19132' })
-      if (res.success) {
-        updateOutboundData(name, { udp_available: !!res.data?.success, udp_latency_ms: res.data?.latency_ms || 0 })
-        message.success(`${name} UDP: ${res.data?.success ? (res.data?.latency_ms ? res.data.latency_ms + 'ms' : '可用') : '不可用'}`)
-      } else { message.error(res.msg || '测试失败') }
+      const ok = formatUdpToastLines(name, res)
+      if (ok) updateOutboundData(name, { udp_available: true, udp_latency_ms: res.data?.latency_ms || 0 })
+      else updateOutboundData(name, { udp_available: false, udp_latency_ms: 0 })
     }
     await refreshProxyHistoryViews()
-  } catch (e) { message.error('测试出错: ' + e.message) }
+  } catch (e) {
+    showProxyTestToast(false, `${name} · ${type.toUpperCase()} 失败`, [
+      `节点: ${name}`,
+      `类型: ${type.toUpperCase()}`,
+      `错误: ${e?.message || '未知错误'}`
+    ])
+  }
 }
 
 const filteredSubProxyList = computed(() => {
@@ -3810,6 +4287,90 @@ watch([() => props.initialSearch, () => props.initialHighlight], ([search, highl
 }
 .filter-search {
   width: 260px;
+}
+.filter-mcbe {
+  width: 240px;
+}
+.filter-http-url {
+  width: 200px;
+}
+.detail-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.detail-section-title :deep(h4) {
+  margin: 0;
+}
+.proxy-outbound-list-card {
+  min-width: 0;
+}
+.proxy-table-ellipsis {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proxy-node-cell {
+  min-width: 0;
+}
+.proxy-node-name {
+  font-weight: 650;
+  color: var(--n-text-color-1);
+  font-size: 12px;
+}
+.proxy-node-name-highlight {
+  display: inline-block;
+  background: #63e2b7;
+  padding: 1px 4px;
+  border-radius: 4px;
+  color: #000;
+}
+.proxy-node-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--n-text-color-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.proxy-protocol-cell {
+  min-width: 0;
+}
+.proxy-protocol-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 2px;
+}
+.proxy-status-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.proxy-runtime-cell {
+  font-size: 11px;
+  line-height: 1.35;
+}
+.proxy-runtime-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.proxy-runtime-label {
+  color: var(--n-text-color-3);
+}
+.proxy-row-actions {
+  flex-wrap: nowrap !important;
+}
+:deep(.proxy-table-compact .n-data-table-th),
+:deep(.proxy-table-compact .n-data-table-td) {
+  padding: 4px 8px !important;
 }
 .table-wrapper {
   width: 100%;

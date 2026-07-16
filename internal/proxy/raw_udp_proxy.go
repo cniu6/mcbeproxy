@@ -2193,14 +2193,28 @@ func (p *RawUDPProxy) isReplaceableSameIPClient(info *rawUDPClientInfo, incoming
 	if info.kicked.Load() {
 		return true, "kicked"
 	}
-	if info.loginParsed.Load() || info.sessionCreated.Load() {
+
+	established := info.loginParsed.Load() || info.sessionCreated.Load()
+	isOCR := len(incoming) > 0 && isRakNetOpenConnectionRequest(incoming[0])
+
+	// 未建会话：握手阶段用较短 grace，尽快回收半开连接。
+	if !established {
+		if silence > sameIPReconnectGrace {
+			return true, fmt.Sprintf("silent_for_%v", silence.Round(time.Second))
+		}
+		if isOCR && silence > sameIPHandshakeGrace {
+			return true, fmt.Sprintf("handshake_reconnect_after_%v", silence.Round(time.Second))
+		}
 		return false, ""
 	}
-	if silence > sameIPReconnectGrace {
-		return true, fmt.Sprintf("silent_for_%v", silence.Round(time.Second))
+
+	// 已建立会话：确认客户端沉默后允许同 IP 新端口接管。
+	// 旧客户端若仍在发包（silence≈0）则不会被踢，避免 CGNAT 误伤。
+	if isOCR && silence > sameIPEstablishedHandshakeGrace {
+		return true, fmt.Sprintf("established_handshake_reconnect_after_%v", silence.Round(time.Second))
 	}
-	if len(incoming) > 0 && isRakNetOpenConnectionRequest(incoming[0]) && silence > sameIPHandshakeGrace {
-		return true, fmt.Sprintf("handshake_reconnect_after_%v", silence.Round(time.Second))
+	if silence > sameIPReconnectGrace {
+		return true, fmt.Sprintf("established_silent_for_%v", silence.Round(time.Second))
 	}
 	return false, ""
 }

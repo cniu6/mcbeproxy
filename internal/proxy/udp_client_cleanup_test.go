@@ -98,6 +98,72 @@ func TestRawUDPProxy_CleanupStaleSameIPClients(t *testing.T) {
 	}
 }
 
+func TestRawUDPProxy_CleanupStaleSameIPClients_EstablishedSilent(t *testing.T) {
+	// 已建立会话沉默超过 sameIPReconnectGrace 后应被同 IP 新连接接管
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "same-ip-est", IdleTimeout: 300}
+	p := NewRawUDPProxy("same-ip-est", cfg, nil, sm)
+
+	oldKey := "127.0.0.1:50101"
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+	oldClient := &rawUDPClientInfo{
+		clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50101},
+		targetConn: targetConn,
+		sessionKey: oldKey,
+		startTime:  time.Now().Add(-time.Minute),
+	}
+	oldClient.sessionCreated.Store(true)
+	stale := time.Now().Add(-sameIPReconnectGrace - time.Second).UnixNano()
+	oldClient.lastClientPacket.Store(stale)
+	oldClient.lastSeen.Store(stale)
+	p.clients.Store(oldKey, oldClient)
+
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50102}
+	p.cleanupStaleSameIPClients(newAddr, []byte{0x80})
+
+	if p.GetActiveClientCount() != 0 {
+		t.Fatalf("expected established silent same-IP client removed, still have %d", p.GetActiveClientCount())
+	}
+}
+
+func TestRawUDPProxy_CleanupStaleSameIPClients_IdleNeverTakeover(t *testing.T) {
+	// idle_timeout=-1 下 sweep 不清，但同 IP OCR 接管仍应生效
+	sm := session.NewSessionManager(time.Hour)
+	cfg := &config.ServerConfig{ID: "same-ip-never", IdleTimeout: -1}
+	p := NewRawUDPProxy("same-ip-never", cfg, nil, sm)
+	p.updateTimeouts()
+
+	oldKey := "127.0.0.1:50201"
+	targetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dummy target: %v", err)
+	}
+	defer targetConn.Close()
+	oldClient := &rawUDPClientInfo{
+		clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50201},
+		targetConn: targetConn,
+		sessionKey: oldKey,
+		startTime:  time.Now().Add(-time.Minute),
+	}
+	oldClient.loginParsed.Store(true)
+	stale := time.Now().Add(-sameIPEstablishedHandshakeGrace - time.Second).UnixNano()
+	oldClient.lastClientPacket.Store(stale)
+	oldClient.lastSeen.Store(stale)
+	p.clients.Store(oldKey, oldClient)
+
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50202}
+	ocr1 := append([]byte{raknetOpenConnectionReq1}, make([]byte, 8)...)
+	p.cleanupStaleSameIPClients(newAddr, ocr1)
+
+	if p.GetActiveClientCount() != 0 {
+		t.Fatalf("expected same-IP takeover under idle_timeout=-1, still have %d", p.GetActiveClientCount())
+	}
+}
+
 func TestPlainUDPProxy_IdleTimeoutNeverDoesNotExpireClient(t *testing.T) {
 	cfg := &config.ServerConfig{ID: "plain-idle-never", IdleTimeout: -1}
 	p := NewPlainUDPProxy("plain-idle-never", cfg)
