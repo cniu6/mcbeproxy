@@ -231,6 +231,11 @@ type chainUDPOutbound struct {
 	cacheOnce sync.Once
 }
 
+// chainSOCKS5BusyWait 是 SOCKS5 末跳缓存仍被占用时，等待释放再开并行 ASSOCIATE
+// 的最长时间。ping 拨号不会走到这个等待（见 ListenPacket 里的 IsPingDial 快速
+// 失败分支），所以这里只需要覆盖真实并发玩家的排队体验，不宜设太长。
+var chainSOCKS5BusyWait = 2 * time.Second
+
 // cachedChainConn wraps a PacketConn for reuse. Close() does NOT close the
 // underlying connection — it just marks lastUsed so the idle sweeper can
 // clean it up later.
@@ -559,12 +564,13 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 	// Wait for the cached conn to become available if it's currently in use.
 	// This prevents creating multiple concurrent SOCKS5 ASSOCIATEs to the same
 	// remote server, which can cause the server to drop packets for the older
-	// association. SOCKS5 must never fall back to a second ASSOCIATE for the
-	// same destination; other protocols may create a parallel conn after a wait
-	// because they don't share the same relay-mapping failure mode.
+	// association. Ping dials (IsPingDial(ctx)) never reach this wait — they
+	// fail fast above instead of risking a parallel ASSOCIATE that stomps a
+	// player's mapping — so this timeout only governs how long a second real
+	// concurrent player waits before getting its own ASSOCIATE.
 	waitTimeout := 5 * time.Second
 	if isSocks5LastHop {
-		waitTimeout = 2 * time.Second
+		waitTimeout = chainSOCKS5BusyWait
 	}
 	waitDeadline := time.Now().Add(waitTimeout)
 
@@ -588,6 +594,12 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 			break // no cached conn — create new one
 		}
 		if atomic.LoadInt32(&cached.activeUsers) > 0 {
+			// ping 探测：缓存仍被占用时立即失败，让上层跳过本次 ping，
+			// 绝不为 ping 再开一条并行 ASSOCIATE 挤掉玩家。
+			if IsPingDial(ctx) {
+				c.cacheMu.Unlock()
+				return nil, fmt.Errorf("chain UDP cache busy for %s (skip ping dial)", cacheKey)
+			}
 			// Conn is busy — wait briefly for short-lived users (ping/tests) to
 			// release it. If the owner is a real game client it may stay active
 			// for minutes or hours, so after the wait boundary create a parallel

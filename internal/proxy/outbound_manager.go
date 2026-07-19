@@ -1548,7 +1548,8 @@ func (m *outboundManagerImpl) DialPacketConnForPing(ctx context.Context, outboun
 	if err := m.prepareDialPacketConn(outboundName); err != nil {
 		return nil, err
 	}
-	return m.dialPacketConnOnceNoHealthMark(ctx, outboundName, destination)
+	// 标记为 ping 拨号：chain UDP 缓存忙时快速失败，避免与玩家会话抢 ASSOCIATE。
+	return m.dialPacketConnOnceNoHealthMark(ContextWithPingDial(ctx), outboundName, destination)
 }
 
 // dialWithRetry implements exponential backoff retry logic for DialPacketConn.

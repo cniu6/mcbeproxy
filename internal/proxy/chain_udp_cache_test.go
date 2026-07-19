@@ -459,10 +459,14 @@ func TestChainUDPCache_EvictOnTimeoutWithActiveUsers(t *testing.T) {
 }
 
 // TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate verifies that a busy
-// SOCKS5 cached conn is not reused by another active client. After a short
-// wait boundary, a second real client gets its own UDP ASSOCIATE while the
-// first client's relay mapping remains usable.
+// SOCKS5 cached conn is not reused by another active client. After the busy
+// wait boundary (covers concurrent ping hold), a second real client gets its
+// own UDP ASSOCIATE while the first client's relay mapping remains usable.
 func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
+	oldWait := chainSOCKS5BusyWait
+	chainSOCKS5BusyWait = 800 * time.Millisecond
+	defer func() { chainSOCKS5BusyWait = oldWait }()
+
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -493,8 +497,8 @@ func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	}
 	wrapper1 := pc1.(*chainConnWrapper)
 
-	// Second call while activeUsers=1 should wait briefly, then create a
-	// separate ASSOCIATE for the second real client instead of blocking entry.
+	// Second call while activeUsers=1 should wait near the SOCKS5 busy
+	// boundary, then create a separate ASSOCIATE for the second client.
 	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
 	elapsed := time.Since(start)
@@ -506,8 +510,8 @@ func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	if wrapper2.cached == wrapper1.cached {
 		t.Fatal("second active client reused the first client's PacketConn")
 	}
-	if elapsed < 400*time.Millisecond {
-		t.Fatalf("expected to wait near the 500ms busy boundary, waited %v", elapsed)
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("expected to wait near the SOCKS5 busy boundary, waited %v", elapsed)
 	}
 
 	// Verify the cache now points to the newer conn, while the old active conn
@@ -548,6 +552,48 @@ func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	}
 
 	pc1.Close()
+}
+
+// TestChainUDPCache_PingDialSkipsWhenBusy verifies ping dials fail fast when the
+// cached SOCKS5 conn is held by a real client, instead of creating a parallel
+// ASSOCIATE that can stomp the player's UDP mapping.
+func TestChainUDPCache_PingDialSkipsWhenBusy(t *testing.T) {
+	realServer, stopReal := startFakeRakNetServer(t)
+	defer stopReal()
+
+	socks5A := startSOCKS5Server(t, "", "")
+	socks5AHost, socks5APort := splitHostPort(t, socks5A.String())
+
+	chainOutbound, err := CreateChainUDPOutbound([]*config.ProxyOutbound{
+		{
+			Name:    "hop1-ping-busy",
+			Type:    config.ProtocolSOCKS5,
+			Server:  socks5AHost,
+			Port:    socks5APort,
+			Enabled: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create chain outbound: %v", err)
+	}
+	defer chainOutbound.Close()
+
+	dest := realServer.String()
+	pc1, err := chainOutbound.ListenPacket(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("first ListenPacket: %v", err)
+	}
+	defer pc1.Close()
+
+	start := time.Now()
+	_, err = chainOutbound.ListenPacket(ContextWithPingDial(context.Background()), dest)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected ping dial to fail while cache is busy")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("ping dial should fail fast when busy, waited %v", elapsed)
+	}
 }
 
 // TestChainUDPCache_MultipleSequentialReuse verifies that the cache

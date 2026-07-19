@@ -302,15 +302,36 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 	logger.Info("SOCKS5 UDP ASSOCIATE: server=%s bnd=%s relay=%s",
 		ctrl.RemoteAddr(), bnd, relayAddr)
 
+	// UDP 中继 socket 选择策略：
+	// 1) 优先直连 relay（SOCKS5 标准允许 TCP 控制面与 UDP 源 IP 不同，
+	//    关联靠首包 UDP 源地址注册）。链式场景下若再对公网 relay 做一层
+	//    本地 SOCKS5 UDP ASSOCIATE，会在 127.0.0.1:1080 这类单 ASSOCIATE
+	//    加速器上挤掉其它玩家/其它服务器的回程，表现为 up>0 down=0。
+	// 2) 仅当 relay 是回环/未指定，或直连失败时，才回退到 chain ListenPacket
+	//    （relay 只挂在上一跳后面、本机路由不到的情况）。
 	var udpConn net.PacketConn
-	if chainDialer, ok := s.dialer.(*chainNxDialer); ok && chainDialer.udpOutbound != nil {
-		relayDest := M.ParseSocksaddr(relayAddr.String())
-		pc, lerr := chainDialer.udpOutbound.ListenPacket(ctx, relayDest.String())
-		if lerr == nil {
-			udpConn = pc
-			logger.Debug("SOCKS5 UDP ASSOCIATE: relay socket via chain dialer: relay=%s localUDP=%s", relayAddr, udpConn.LocalAddr())
+	relayIsLoopback := relayAddr.IP != nil && (relayAddr.IP.IsLoopback() || relayAddr.IP.IsUnspecified())
+	if !relayIsLoopback {
+		directConn, derr := net.DialUDP("udp", nil, relayAddr)
+		if derr == nil {
+			udpConn = &connectedPacketConn{UDPConn: directConn, peer: relayAddr}
+			_ = directConn.SetReadBuffer(2 * 1024 * 1024)
+			_ = directConn.SetWriteBuffer(2 * 1024 * 1024)
+			logger.Info("SOCKS5 UDP ASSOCIATE: using direct UDP to relay=%s (TCP control stays on dialer chain)", relayAddr)
 		} else {
-			logger.Debug("SOCKS5 UDP ASSOCIATE: chain dialer ListenPacket failed (%v), falling back to direct UDP", lerr)
+			logger.Debug("SOCKS5 UDP ASSOCIATE: direct UDP to relay=%s failed (%v), will try chain ListenPacket", relayAddr, derr)
+		}
+	}
+	if udpConn == nil {
+		if chainDialer, ok := s.dialer.(*chainNxDialer); ok && chainDialer.udpOutbound != nil {
+			relayDest := M.ParseSocksaddr(relayAddr.String())
+			pc, lerr := chainDialer.udpOutbound.ListenPacket(ctx, relayDest.String())
+			if lerr == nil {
+				udpConn = pc
+				logger.Info("SOCKS5 UDP ASSOCIATE: relay socket via chain dialer: relay=%s localUDP=%s", relayAddr, udpConn.LocalAddr())
+			} else {
+				logger.Debug("SOCKS5 UDP ASSOCIATE: chain dialer ListenPacket failed (%v), falling back to direct UDP", lerr)
+			}
 		}
 	}
 	if udpConn == nil {
@@ -344,6 +365,12 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	// replacement, so cached SOCKS5 associations must be marked dead instead
 	// of reconnecting in place; otherwise a dead cached entry can become alive
 	// again and be reused with changed control/UDP state.
+	//
+	// disableReactiveReconnect 只应对「会被 chain UDP cache 共享/复用」的连接
+	// 生效（s.disableSOCKS5ReactiveReconnect，仅链式代理各跳会设为 true）。对
+	// 独立出站（非链式，每个 RawUDP 客户端各自独占一条 PacketConn，不共享）而
+	// 言，原地重连是安全的，也是它唯一的自愈手段——不能一律禁用，否则上游控制
+	// 连接一断就直接把玩家踢下线，高并发下会明显增加掉线率。
 	s5pc := &socks5UDPPacketConn{
 		destination:               resolvedDest,
 		stopCh:                    make(chan struct{}),

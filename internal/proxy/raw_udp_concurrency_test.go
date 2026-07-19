@@ -19,6 +19,13 @@ type countingRawUDPOutboundManager struct {
 	active      map[string]int64
 	conns       []*countingPacketConn
 	connFactory func() *countingPacketConn
+
+	// delayDials, dialStartedCh, releaseDialCh let tests simulate a slow
+	// upstream dial: when delayDials is true, DialPacketConn blocks (signaling
+	// dialStartedCh once) until releaseDialCh is closed or ctx is cancelled.
+	delayDials    bool
+	dialStartedCh chan struct{}
+	releaseDialCh chan struct{}
 }
 
 func (m *countingRawUDPOutboundManager) AddOutbound(cfg *config.ProxyOutbound) error { return nil }
@@ -41,6 +48,25 @@ func (m *countingRawUDPOutboundManager) GetOutboundLatencyHistory(name, sortBy s
 	return nil
 }
 func (m *countingRawUDPOutboundManager) DialPacketConn(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
+	m.mu.Lock()
+	delay := m.delayDials
+	started := m.dialStartedCh
+	release := m.releaseDialCh
+	m.mu.Unlock()
+	if delay {
+		if started != nil {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.dials++
@@ -582,5 +608,163 @@ func TestRawUDPProxy_ListenHotLoopDoesNotWaitForSlowUpstreamWrite(t *testing.T) 
 			t.Fatal("hot loop did not create client for second datagram")
 		case <-ticker.C:
 		}
+	}
+}
+
+// TestRawUDPProxy_NewClientSlowDialDoesNotBlockExistingClients guards against
+// a head-of-line-blocking regression: getOrCreateClient runs on the single
+// hot receive-loop goroutine (see Listen()), so a synchronous proxy dial for
+// a brand new player used to stall traffic for every other already-connected
+// player on the same server for as long as the dial took (up to its full
+// timeout). New clients must now be dialed asynchronously whenever at least
+// one other client is already active, so a slow/stuck node only delays the
+// new player — never existing ones.
+func TestRawUDPProxy_NewClientSlowDialDoesNotBlockExistingClients(t *testing.T) {
+	fastConnA := newCountingPacketConn()
+	slowConnB := newCountingPacketConn()
+	var connMu sync.Mutex
+	callCount := 0
+
+	mgr := &countingRawUDPOutboundManager{
+		connFactory: func() *countingPacketConn {
+			connMu.Lock()
+			defer connMu.Unlock()
+			callCount++
+			if callCount == 1 {
+				return fastConnA
+			}
+			return slowConnB
+		},
+	}
+	dialStarted := make(chan struct{}, 4)
+	releaseDial := make(chan struct{})
+	mgr.dialStartedCh = dialStarted
+	mgr.releaseDialCh = releaseDial
+
+	cfg := &config.ServerConfig{
+		ID:            "async-dial-test",
+		Target:        "127.0.0.1",
+		Port:          19132,
+		ListenAddr:    "127.0.0.1:0",
+		ProxyMode:     "raw_udp",
+		ProxyOutbound: "node-a",
+		IdleTimeout:   300,
+	}
+	p := NewRawUDPProxy("async-dial-test", cfg, nil, session.NewSessionManager(time.Hour))
+	p.SetOutboundManager(mgr)
+	if err := p.Start(); err != nil {
+		t.Fatalf("start raw udp proxy: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- p.Listen(ctx) }()
+
+	cleanup := func() {
+		cancel() // unblocks any goroutine parked on mgr's ctx.Done() branch.
+		_ = p.Stop()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Listen did not exit during cleanup")
+		}
+	}
+	defer cleanup()
+
+	// Client A connects first, while the mock isn't delaying dials yet, so it
+	// takes the existing synchronous fast path and becomes fully active.
+	clientA, err := net.DialUDP("udp", nil, p.listener.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial proxy listener (A): %v", err)
+	}
+	defer clientA.Close()
+	clientAKey := clientA.LocalAddr().String()
+	if _, err := clientA.Write([]byte{0x80, 0x00, 0x00, 0x00, 0xfe}); err != nil {
+		t.Fatalf("client A send: %v", err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		val, ok := p.clients.Load(clientAKey)
+		ci, isCI := val.(*rawUDPClientInfo)
+		return ok && isCI && !ci.pending.Load()
+	}, "client A never became active")
+
+	// Now make any further dial stall until releaseDial is closed, so client
+	// B's connection attempt gets stuck mid-dial.
+	mgr.mu.Lock()
+	mgr.delayDials = true
+	mgr.mu.Unlock()
+
+	clientB, err := net.DialUDP("udp", nil, p.listener.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial proxy listener (B): %v", err)
+	}
+	defer clientB.Close()
+	clientBKey := clientB.LocalAddr().String()
+	if _, err := clientB.Write([]byte{0x80, 0x00, 0x00, 0x00, 0xfe}); err != nil {
+		t.Fatalf("client B send: %v", err)
+	}
+
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("client B dial never started")
+	}
+
+	// Client B must show up as a pending placeholder immediately, without
+	// waiting for its stuck dial.
+	waitUntil(t, time.Second, func() bool {
+		val, ok := p.clients.Load(clientBKey)
+		ci, isCI := val.(*rawUDPClientInfo)
+		return ok && isCI && ci.pending.Load()
+	}, "client B was not registered as a pending placeholder")
+
+	// While B's dial is stuck, client A's traffic must keep flowing through
+	// the hot loop with low latency — proving the loop isn't blocked on B.
+	start := time.Now()
+	if _, err := clientA.Write([]byte{0x80, 0x00, 0x00, 0x01, 0xfe}); err != nil {
+		t.Fatalf("client A second send: %v", err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		val, ok := p.clients.Load(clientAKey)
+		ci, isCI := val.(*rawUDPClientInfo)
+		return ok && isCI && ci.packetsUp.Load() >= 2
+	}, "client A's second packet was not processed while client B's dial was stuck")
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("client A traffic delayed by client B's slow dial: %v", elapsed)
+	}
+
+	// A retry/duplicate packet from client B while still pending must be
+	// dropped silently — no panic, and critically no second dial attempt.
+	if _, err := clientB.Write([]byte{0x80, 0x00, 0x00, 0x01, 0xfe}); err != nil {
+		t.Fatalf("client B retry send: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// Release the stuck dial; client B should finish connecting normally.
+	close(releaseDial)
+	waitUntil(t, 2*time.Second, func() bool {
+		val, ok := p.clients.Load(clientBKey)
+		ci, isCI := val.(*rawUDPClientInfo)
+		return ok && isCI && !ci.pending.Load() && ci.targetConn != nil
+	}, "client B never finished connecting after dial release")
+
+	if dials, _ := mgr.counts(); dials != 2 {
+		t.Fatalf("expected exactly 2 real dials (A and B); retries while pending must not trigger extra dials, got %d", dials)
+	}
+}
+
+// waitUntil polls cond until it returns true or timeout elapses, failing the
+// test with msg on timeout.
+func waitUntil(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s", msg)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

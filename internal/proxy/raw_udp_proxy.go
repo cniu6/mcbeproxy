@@ -45,6 +45,12 @@ const (
 	// RawUDPUpstreamWriteQueueSize buffers short per-client bursts without letting a
 	// blocked outbound consume unbounded memory or add seconds of queueing latency.
 	RawUDPUpstreamWriteQueueSize = 64
+	// RawUDPPendingDialQueueCap bounds how many datagrams get buffered on a
+	// still-connecting (pending) client while its proxy dial runs in the
+	// background (see createPendingClientAndDialAsync). Handshake bursts are
+	// only a handful of packets; capping this keeps a pathologically slow or
+	// stuck dial from letting one client's buffer grow unbounded.
+	RawUDPPendingDialQueueCap = 16
 	// RawUDPLoginParseMaxAttempts bounds best-effort Login/identity parsing.
 	// RawUDP is a byte-forwarding mode: once a player is already exchanging game
 	// traffic, repeatedly decompressing/JWT-parsing every reliable datagram adds
@@ -86,6 +92,11 @@ const (
 	// RawUDPDirectionalStallThreshold is short enough to catch lobby/transfer
 	// stalls while the player is still stuck, not after the next full cleanup cycle.
 	RawUDPDirectionalStallThreshold = 5 * time.Second
+	// RawUDPBlackholeRecoverAfter：上行有包、下行始终为 0 超过该时长，判定为
+	// SOCKS5/上游黑洞，主动拆掉会话让客户端用新 ASSOCIATE 重连。
+	RawUDPBlackholeRecoverAfter = 8 * time.Second
+	// RawUDPBlackholeMinUpPackets：至少发出这么多包才判定黑洞，避免刚握手误杀。
+	RawUDPBlackholeMinUpPackets = 3
 )
 
 var (
@@ -245,6 +256,23 @@ type rawUDPClientInfo struct {
 	lastUpLogAt       atomic.Int64
 	lastDownLogAt     atomic.Int64
 	lastReuseLogAt    atomic.Int64
+	// blackholeRecovered：已因「上行有包、下行始终为 0」触发过一次强制拆线，
+	// 避免同一会话重复打日志/抖动。
+	blackholeRecovered atomic.Bool
+	// pending：占位记录，代表这个客户端的目标连接正在后台异步建立
+	// （见 createPendingClientAndDialAsync）。除 clientAddr/startTime/
+	// sessionKey/lastSeen/lastClientPacket 外的字段此时均为零值，
+	// 尤其 targetConn 为 nil；调用方必须先检查 pending 再读取其它字段。
+	// 该占位对象创建后除 lastSeen/lastClientPacket 外不会再被修改，
+	// 建连完成后会被一个全新初始化好的 *rawUDPClientInfo 整体替换
+	// （sync.Map.CompareAndSwap），因此不存在半初始化状态被并发读到的问题。
+	pending atomic.Bool
+	// pendingMu/pendingPackets：pending=true 期间到达的包（比如握手的
+	// OCR2）先缓存在这里，等异步 dial 完成后一次性转发，而不是直接丢弃——
+	// 避免依赖客户端自己重传才能续上（有些握手包客户端只发一次）。仅在
+	// pending 期间使用；建连完成后这个字段不再被访问。
+	pendingMu      sync.Mutex
+	pendingPackets [][]byte
 }
 
 func rawUDPClonePacket(packet []byte) []byte {
@@ -790,6 +818,16 @@ type RawUDPProxy struct {
 	// Basic unconnected ping rate limiting (per source IP, port-less).
 	lastUnconnectedPing sync.Map // map[string]int64 unixnano
 	recentlyKicked      sync.Map // map[string]*rawUDPKickReplay by clientAddr.String()
+
+	// dialInFlight 记录当前正在为真实客户端建立目标连接（dialThroughProxy）的
+	// 数量。pingTargetServer 的忙检查基于「已建立」的 outbound 连接数
+	// (GetOutboundConnectionCount)，但客户端从收到首包到 dial 完成/计数生效之间
+	// 存在窗口——如果 ping 恰好在这个窗口触发，会对同一个独立(非链式)出站节点
+	// 同时发起第二个 SOCKS5 UDP ASSOCIATE，一些本地加速器/落地对并发 ASSOCIATE
+	// 处理不佳，会导致其中一条连接的下行被顶掉（up>0 down=0 的黑洞）。
+	// dialInFlight 在真实客户端 dial 开始前自增、结束后自减，ping 在真正发起
+	// 拨号前会检查它，从而把这个竞争窗口关掉。
+	dialInFlight atomic.Int32
 }
 
 // ACLManager interface for access control
@@ -1242,6 +1280,21 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 	// Check if client already exists
 	if val, ok := p.clients.Load(clientKey); ok {
 		existingClient := val.(*rawUDPClientInfo)
+		if existingClient.pending.Load() {
+			// 目标连接正在后台异步建立（见 createPendingClientAndDialAsync）。
+			// 把包缓存起来，等建连完成后一次性转发，而不是直接丢——有些握手
+			// 包（如 OCR2）客户端只发一次，指望重传并不总是可靠。这里只刷新
+			// 时间戳，避免建连较慢时被清理协程误判为「早已沉默」而提前回收。
+			now := time.Now().UnixNano()
+			existingClient.lastSeen.Store(now)
+			existingClient.lastClientPacket.Store(now)
+			existingClient.pendingMu.Lock()
+			if len(existingClient.pendingPackets) < RawUDPPendingDialQueueCap {
+				existingClient.pendingPackets = append(existingClient.pendingPackets, append([]byte(nil), incoming...))
+			}
+			existingClient.pendingMu.Unlock()
+			return nil, false
+		}
 		if logger.IsLevelEnabled(logger.LevelDebug) && existingClient.shouldLogReuse(time.Now()) {
 			logger.Debug("RawUDP client reused: server=%s client=%s target=%s route=%s packetCount=%d bytesUp=%d bytesDown=%d targetConn=%T listenerLocal=%s targetAddr=%s",
 				p.serverID,
@@ -1276,6 +1329,27 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 
 	p.cleanupStaleSameIPClients(clientAddr, incoming)
 
+	// getOrCreateClient runs on the single hot receive-loop goroutine (see
+	// Listen()) — it's the only place that reads from the listener socket.
+	// A synchronous proxy dial here (dialThroughProxy has up to a 15s
+	// internal timeout) blocks that loop, so while a NEW player's dial is
+	// slow/stuck every OTHER already-connected player on this same server
+	// stops receiving/sending traffic for the whole duration — a classic
+	// head-of-line-blocking stall under concurrent load.
+	//
+	// When at least one other client is already active we offload the dial
+	// to a background goroutine instead (buffering the triggering packet and
+	// any retries so nothing is lost — see createPendingClientAndDialAsync),
+	// so the hot loop can keep serving everyone else immediately. The very
+	// first client on an otherwise-idle server still dials synchronously
+	// (unchanged fast path — nobody else could be blocked by it anyway, and
+	// this keeps getOrCreateClient's synchronous return contract for that
+	// common case, which some tests/tools rely on).
+	if p.shouldUseProxy() && p.GetActiveClientCount() > 0 {
+		p.createPendingClientAndDialAsync(clientKey, clientAddr, incoming)
+		return nil, false
+	}
+
 	logger.Debug("RawUDP: Creating new client for %s", clientKey)
 
 	var targetConn net.PacketConn
@@ -1285,8 +1359,12 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 
 	// Create connection to target (direct or via proxy)
 	if p.shouldUseProxy() {
-		// Use proxy outbound
+		// Use proxy outbound。dialInFlight 标记建连窗口，防止 ping 恰好在
+		// dial 完成前（outbound 连接数尚未计入）对同一独立节点抢发第二个
+		// SOCKS5 UDP ASSOCIATE。
+		p.dialInFlight.Add(1)
 		targetConn, selectedNode, err = p.dialThroughProxy()
+		p.dialInFlight.Add(-1)
 		if err != nil {
 			logger.Error("Failed to connect to target %s via proxy (client=%s server=%s active_proxy_clients=%d): %v",
 				p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), err)
@@ -1375,6 +1453,137 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 		p.GetActiveClientCount())
 
 	return clientInfo, true
+}
+
+// createPendingClientAndDialAsync registers an immediate placeholder for
+// clientKey and performs the (possibly slow) proxy dial on a background
+// goroutine instead of the hot receive-loop goroutine. See the call site in
+// getOrCreateClient for the head-of-line-blocking rationale.
+//
+// The placeholder is written once, here, before being published via
+// p.clients.Store, and none of its fields are ever mutated in place
+// afterwards (lastSeen/lastClientPacket excepted, which are lock-free
+// atomics) — so concurrent readers (stats/dashboard, other packets from the
+// same client) can never observe a half-initialized target connection. Once
+// the dial finishes, finishPendingClientDial publishes a brand new, fully
+// populated *rawUDPClientInfo that atomically replaces the placeholder.
+func (p *RawUDPProxy) createPendingClientAndDialAsync(clientKey string, clientAddr *net.UDPAddr, incoming []byte) {
+	now := time.Now()
+	placeholder := &rawUDPClientInfo{
+		clientAddr: clientAddr,
+		startTime:  now,
+		sessionKey: p.makeSessionKey(clientAddr),
+	}
+	placeholder.pending.Store(true)
+	placeholder.lastSeen.Store(now.UnixNano())
+	placeholder.lastClientPacket.Store(now.UnixNano())
+	// Buffer the packet that triggered client creation too, so it's flushed
+	// once the dial completes instead of being silently dropped.
+	placeholder.pendingPackets = append(placeholder.pendingPackets, append([]byte(nil), incoming...))
+	p.clients.Store(clientKey, placeholder)
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer logger.CapturePanic(fmt.Sprintf("raw-udp-async-dial server=%s client=%s", p.serverID, clientKey))
+		p.finishPendingClientDial(clientKey, clientAddr, placeholder)
+	}()
+}
+
+// finishPendingClientDial runs on its own goroutine (spawned by
+// createPendingClientAndDialAsync) and dials the target through the proxy
+// outbound without holding up the shared receive loop. On success it
+// atomically swaps the pending placeholder for a fully-initialized client and
+// starts the normal forwarding goroutines; on failure, or if the placeholder
+// was superseded/removed while dialing (e.g. the player gave up and the
+// same-IP cleanup or idle sweep already reclaimed the slot), it cleans up and
+// does nothing further — the client's own RakNet retries will trigger a fresh
+// attempt.
+func (p *RawUDPProxy) finishPendingClientDial(clientKey string, clientAddr *net.UDPAddr, placeholder *rawUDPClientInfo) {
+	p.dialInFlight.Add(1)
+	targetConn, selectedNode, err := p.dialThroughProxy()
+	p.dialInFlight.Add(-1)
+	if err != nil {
+		logger.Error("Failed to connect to target %s via proxy (client=%s server=%s active_proxy_clients=%d): %v",
+			p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), err)
+		p.removeClientIfMatch(clientKey, placeholder)
+		return
+	}
+
+	targetAddr := p.effectiveTargetPacketAddr()
+	if targetAddr == nil && p.config != nil {
+		resolvedAddr, _, resolveErr := buildUDPDestinationAddr(p.context(), p.config.GetTargetAddr(), true)
+		if resolveErr != nil {
+			_ = targetConn.Close()
+			logger.Error("Failed to resolve target %s for raw UDP proxy client %s: %v", p.config.GetTargetAddr(), clientKey, resolveErr)
+			p.removeClientIfMatch(clientKey, placeholder)
+			return
+		}
+		targetAddr = resolvedAddr
+	}
+	if targetConn == nil || targetAddr == nil {
+		if targetConn != nil {
+			_ = targetConn.Close()
+		}
+		logger.Error("Failed to create raw UDP target connection asynchronously: nil conn/addr (client=%s server=%s target=%s)",
+			clientKey, p.serverID, p.effectiveTargetAddrString())
+		p.removeClientIfMatch(clientKey, placeholder)
+		return
+	}
+
+	now := time.Now()
+	clientInfo := &rawUDPClientInfo{
+		clientAddr:      clientAddr,
+		targetConn:      targetConn,
+		targetAddr:      targetAddr,
+		upstreamWriteCh: make(chan []byte, RawUDPUpstreamWriteQueueSize),
+		upstreamDone:    make(chan struct{}),
+		startTime:       placeholder.startTime,
+		sessionKey:      placeholder.sessionKey,
+		proxyNode:       selectedNode,
+	}
+	clientInfo.lastSeen.Store(now.UnixNano())
+	clientInfo.lastClientPacket.Store(placeholder.lastClientPacket.Load())
+
+	// Flush everything buffered while pending into the new client's upstream
+	// queue BEFORE publishing it, so ordering is preserved: any packet the
+	// hot loop enqueues after it observes the swap is guaranteed to land
+	// after these. clientInfo isn't visible to anyone else yet, so this is
+	// race-free from clientInfo's side.
+	placeholder.pendingMu.Lock()
+	buffered := placeholder.pendingPackets
+	placeholder.pendingPackets = nil
+	placeholder.pendingMu.Unlock()
+	for _, pkt := range buffered {
+		if err := clientInfo.enqueueUpstreamPacket(pkt); err != nil {
+			logger.Debug("RawUDP: dropping buffered packet for %s while publishing async client: %v", clientKey, err)
+		}
+	}
+
+	// Atomically replace the placeholder with the ready-to-use client. If the
+	// map entry changed underneath us (superseded by same-IP cleanup, idle
+	// sweep, or a brand new reconnect), discard this connection instead of
+	// clobbering whatever now owns the slot.
+	if !p.clients.CompareAndSwap(clientKey, placeholder, clientInfo) {
+		_ = targetConn.Close()
+		logger.Debug("RawUDP: async dial finished but client %s was superseded, discarding connection", clientKey)
+		return
+	}
+
+	p.wg.Add(2)
+	go func() {
+		defer logger.CapturePanic(fmt.Sprintf("raw-udp-forwardResponses server=%s client=%s", p.serverID, clientKey))
+		p.forwardResponses(clientAddr, clientInfo)
+	}()
+	go p.forwardUpstreamWrites(clientKey, clientInfo)
+
+	route := "direct"
+	if selectedNode != "" {
+		route = selectedNode
+	}
+	logger.Info("RawUDP: new proxy client server=%s client=%s route=%s active_proxy_clients=%d",
+		p.serverID, clientKey, route, p.GetActiveClientCount())
+	logger.Info("Raw UDP client connected: %s -> %s (via proxy: %s)", clientAddr.String(), p.effectiveTargetAddrString(), selectedNode)
 }
 
 // ensureSession creates a SessionManager entry for this client once a real
@@ -1752,6 +1961,22 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				}
 				if isTimeoutError(err) {
 					clientInfo.readTargetTimeouts.Add(1)
+					// 黑洞检测：已有上行、始终无下行，多半是 SOCKS5 ASSOCIATE
+					// 被挤掉或上游不回包。主动拆线让客户端用新 ASSOCIATE 重连，
+					// 避免干等到 idle_timeout（常见 5 分钟）。
+					if clientInfo.packetsDown.Load() == 0 &&
+						clientInfo.packetsUp.Load() >= int64(RawUDPBlackholeMinUpPackets) &&
+						time.Since(clientInfo.startTime) >= RawUDPBlackholeRecoverAfter &&
+						clientInfo.blackholeRecovered.CompareAndSwap(false, true) {
+						logger.Warn("RawUDP: blackhole detected (up_packets=%d down=0 after %v), closing for fresh ASSOCIATE: server=%s client=%s route=%s target=%s",
+							clientInfo.packetsUp.Load(),
+							time.Since(clientInfo.startTime).Round(time.Second),
+							p.serverID,
+							clientAddr.String(),
+							rawUDPRouteName(clientInfo.proxyNode),
+							p.effectiveTargetAddrString())
+						return
+					}
 				}
 				// Check if client is still active using lastClientPacket (upstream only).
 				// lastSeen includes downstream traffic which can mask client
@@ -4019,6 +4244,14 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 		if hasActiveClient {
 			return p.getCachedLatencyNoRefresh()
 		}
+	}
+
+	// A real client dial is currently in flight for this server (first packet
+	// arrived but outbound conn count hasn't incremented yet). Skip the ping
+	// dial entirely rather than racing a second concurrent SOCKS5 UDP
+	// ASSOCIATE against it on the same outbound.
+	if p.dialInFlight.Load() > 0 {
+		return p.getCachedLatencyNoRefresh()
 	}
 
 	// No active client — create a new connection
