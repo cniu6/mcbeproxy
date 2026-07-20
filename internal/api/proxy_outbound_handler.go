@@ -2703,6 +2703,25 @@ func (h *ProxyOutboundHandler) testPing(ctx context.Context, cfg *config.ProxyOu
 	if ctx == nil {
 		ctx = h.serverContext()
 	}
+
+	// chain 容器节点自身没有 Server/Port（Validate 允许为空），直接拿去解析
+	// 会得到「failed to resolve : no such host」。从本机视角，链式节点的连
+	// 通性取决于第一跳，所以把 ping 目标换成链路第一跳的真实服务器地址。
+	if cfg.IsChainProxy() {
+		firstHop := h.resolveChainFirstHop(cfg)
+		if firstHop == nil {
+			return PingTestResult{
+				Host:    cfg.Server,
+				Success: false,
+				Error:   fmt.Sprintf("chain node %s: cannot resolve first hop for ping test", cfg.Name),
+			}
+		}
+		result := h.testPing(ctx, firstHop)
+		// 标注实际探测的是第一跳，避免面板上误以为测的是节点本身。
+		result.Host = fmt.Sprintf("%s (chain first hop: %s)", firstHop.Server, firstHop.Name)
+		return result
+	}
+
 	result := PingTestResult{
 		Host: cfg.Server,
 	}
@@ -2748,6 +2767,47 @@ func (h *ProxyOutboundHandler) testPing(ctx context.Context, cfg *config.ProxyOu
 	result.Success = true
 	result.LatencyMs = latency.Milliseconds()
 	return result
+}
+
+// resolveChainFirstHop 返回链式节点从本机出发的第一跳（非 chain 类型）配置。
+// 嵌套链会递归展开第一项，并用 visited 防环；找不到或全是空名时返回 nil。
+func (h *ProxyOutboundHandler) resolveChainFirstHop(cfg *config.ProxyOutbound) *config.ProxyOutbound {
+	visited := map[string]bool{cfg.Name: true}
+	current := cfg
+	for depth := 0; depth < 8; depth++ {
+		names := current.GetChain()
+		var next *config.ProxyOutbound
+		for _, name := range names {
+			name = strings.TrimSpace(name)
+			if name == "" || visited[name] {
+				continue
+			}
+			visited[name] = true
+			hop, ok := h.configMgr.GetOutbound(name)
+			if !ok {
+				continue
+			}
+			next = hop
+			break
+		}
+		if next == nil {
+			// chain 列表为空/全部无效：若当前节点自身有 Server 则它就是第一跳
+			// （带 Chain 字段的普通节点在链耗尽时自己是最后一跳，但没有前置跳
+			// 时它同时也是第一跳）。
+			if current != cfg && !current.IsChainProxy() {
+				return current
+			}
+			if current.Server != "" {
+				return current
+			}
+			return nil
+		}
+		if !next.IsChainProxy() {
+			return next
+		}
+		current = next
+	}
+	return nil
 }
 
 // parsePortRange parses a port range string like "20000-55000" into start and end ports.

@@ -62,6 +62,13 @@ func startUDPEcho(t *testing.T) *net.UDPAddr {
 // startSOCKS5Server starts an in-process SOCKS5 server supporting CONNECT and
 // UDP ASSOCIATE. If username is non-empty, username/password auth is required.
 func startSOCKS5Server(t *testing.T, username, password string) net.Addr {
+	return startSOCKS5ServerWithHook(t, username, password, nil)
+}
+
+// startSOCKS5ServerWithHook 与 startSOCKS5Server 相同，但每处理一个 UDP
+// ASSOCIATE 请求就调用一次 onUDPAssoc，供测试统计某一跳被建了几条 UDP 关联
+// （用来区分末跳 UDP 走的是本机直连 relay 还是链隧道）。
+func startSOCKS5ServerWithHook(t *testing.T, username, password string, onUDPAssoc func()) net.Addr {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -74,13 +81,17 @@ func startSOCKS5Server(t *testing.T, username, password string) net.Addr {
 			if err != nil {
 				return
 			}
-			go handleSOCKS5Conn(t, c, username, password)
+			go handleSOCKS5ConnWithHook(t, c, username, password, onUDPAssoc)
 		}
 	}()
 	return ln.Addr()
 }
 
 func handleSOCKS5Conn(t *testing.T, c net.Conn, username, password string) {
+	handleSOCKS5ConnWithHook(t, c, username, password, nil)
+}
+
+func handleSOCKS5ConnWithHook(t *testing.T, c net.Conn, username, password string, onUDPAssoc func()) {
 	defer c.Close()
 
 	// Greeting
@@ -139,6 +150,9 @@ func handleSOCKS5Conn(t *testing.T, c net.Conn, username, password string) {
 		go io.Copy(upstream, c)
 		io.Copy(c, upstream)
 	case socks5CmdUDPAssoc:
+		if onUDPAssoc != nil {
+			onUDPAssoc()
+		}
 		relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			c.Write([]byte{socks5Version, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})

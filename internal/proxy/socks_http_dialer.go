@@ -302,36 +302,70 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 	logger.Info("SOCKS5 UDP ASSOCIATE: server=%s bnd=%s relay=%s",
 		ctrl.RemoteAddr(), bnd, relayAddr)
 
-	// UDP 中继 socket 选择策略：
-	// 1) 优先直连 relay（SOCKS5 标准允许 TCP 控制面与 UDP 源 IP 不同，
-	//    关联靠首包 UDP 源地址注册）。链式场景下若再对公网 relay 做一层
-	//    本地 SOCKS5 UDP ASSOCIATE，会在 127.0.0.1:1080 这类单 ASSOCIATE
-	//    加速器上挤掉其它玩家/其它服务器的回程，表现为 up>0 down=0。
-	// 2) 仅当 relay 是回环/未指定，或直连失败时，才回退到 chain ListenPacket
-	//    （relay 只挂在上一跳后面、本机路由不到的情况）。
+	// UDP 中继 socket 选择策略（链式场景两种末跳服务器行为都真实存在，
+	// 必须自适应，不能写死其中一种）：
+	//
+	// a) 有些末跳 SOCKS5 允许 UDP 源 IP 与 TCP 控制面不同（关联靠首包 UDP
+	//    源地址注册）——本机直连 relay 可用。直连能避免对上一跳（如
+	//    127.0.0.1:1080 这类单 ASSOCIATE 加速器）再做一层 UDP ASSOCIATE、
+	//    挤掉其它玩家回程（表现为 up>0 down=0）。
+	// b) 有些末跳 SOCKS5 只接受与控制连接同源 IP 的 UDP 包。链式下控制连接
+	//    从上一跳出口进来，本机直连发过去会被静默丢弃——永远 i/o timeout、
+	//    一个字节都收不到。这种节点必须把 UDP 也通过链隧道发。
+	//
+	// 因此链式场景下：先建直连 socket 并用一发 RakNet unconnected ping 实测
+	// relay 是否回包（本程序的 UDP 目标恒为 MCBE 服务器，必回 pong）；不通
+	// 则改走链隧道。结果按「末跳服务器地址」缓存（见 socks5DirectRelayMemo），
+	// 后续 ASSOCIATE 不再重复探测。非链式（单跳）SOCKS5 保持原直连行为不变。
 	var udpConn net.PacketConn
 	relayIsLoopback := relayAddr.IP != nil && (relayAddr.IP.IsLoopback() || relayAddr.IP.IsUnspecified())
-	if !relayIsLoopback {
+	if socks5DirectRelayAllowLoopback {
+		relayIsLoopback = false
+	}
+	chainDialer, isChainHop := s.dialer.(*chainNxDialer)
+	canChainTunnel := isChainHop && chainDialer.udpOutbound != nil
+
+	memoKey := serverAddr.String()
+	directKnown, directWorks := false, true
+	if canChainTunnel {
+		directWorks, directKnown = loadSOCKS5DirectRelayMemo(memoKey)
+		if !directKnown {
+			directWorks = true // 未知：先试直连并实测
+		}
+	}
+
+	if !relayIsLoopback && directWorks {
 		directConn, derr := net.DialUDP("udp", nil, relayAddr)
 		if derr == nil {
-			udpConn = &connectedPacketConn{UDPConn: directConn, peer: relayAddr}
+			direct := &connectedPacketConn{UDPConn: directConn, peer: relayAddr}
 			_ = directConn.SetReadBuffer(2 * 1024 * 1024)
 			_ = directConn.SetWriteBuffer(2 * 1024 * 1024)
-			logger.Info("SOCKS5 UDP ASSOCIATE: using direct UDP to relay=%s (TCP control stays on dialer chain)", relayAddr)
+			if canChainTunnel && !directKnown {
+				if probeSOCKS5DirectRelay(direct, resolvedDest) {
+					storeSOCKS5DirectRelayMemo(memoKey, true)
+					udpConn = direct
+					logger.Info("SOCKS5 UDP ASSOCIATE: direct relay probe OK, using direct UDP to relay=%s (server=%s)", relayAddr, memoKey)
+				} else {
+					storeSOCKS5DirectRelayMemo(memoKey, false)
+					_ = direct.Close()
+					logger.Info("SOCKS5 UDP ASSOCIATE: direct relay probe got no reply from relay=%s (server=%s likely requires chain-source UDP), tunneling UDP via chain", relayAddr, memoKey)
+				}
+			} else {
+				udpConn = direct
+				logger.Info("SOCKS5 UDP ASSOCIATE: using direct UDP to relay=%s (TCP control stays on dialer chain)", relayAddr)
+			}
 		} else {
 			logger.Debug("SOCKS5 UDP ASSOCIATE: direct UDP to relay=%s failed (%v), will try chain ListenPacket", relayAddr, derr)
 		}
 	}
-	if udpConn == nil {
-		if chainDialer, ok := s.dialer.(*chainNxDialer); ok && chainDialer.udpOutbound != nil {
-			relayDest := M.ParseSocksaddr(relayAddr.String())
-			pc, lerr := chainDialer.udpOutbound.ListenPacket(ctx, relayDest.String())
-			if lerr == nil {
-				udpConn = pc
-				logger.Info("SOCKS5 UDP ASSOCIATE: relay socket via chain dialer: relay=%s localUDP=%s", relayAddr, udpConn.LocalAddr())
-			} else {
-				logger.Debug("SOCKS5 UDP ASSOCIATE: chain dialer ListenPacket failed (%v), falling back to direct UDP", lerr)
-			}
+	if udpConn == nil && canChainTunnel {
+		relayDest := M.ParseSocksaddr(relayAddr.String())
+		pc, lerr := chainDialer.udpOutbound.ListenPacket(ctx, relayDest.String())
+		if lerr == nil {
+			udpConn = pc
+			logger.Info("SOCKS5 UDP ASSOCIATE: relay socket via chain dialer: relay=%s localUDP=%s", relayAddr, udpConn.LocalAddr())
+		} else {
+			logger.Debug("SOCKS5 UDP ASSOCIATE: chain dialer ListenPacket failed (%v), falling back to direct UDP", lerr)
 		}
 	}
 	if udpConn == nil {
@@ -349,6 +383,99 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 		relayAddr, udpConn.LocalAddr(), resolvedDest)
 
 	return ctrl, udpConn, relayAddr, resolvedDest, nil
+}
+
+// socks5DirectRelayMemo 记录「链式末跳 SOCKS5 服务器是否接受本机直连 relay
+// 的 UDP 包」的探测结果，key 为末跳服务器地址（host:port）。带 TTL：节点侧
+// 配置/防火墙可能变化，过期后下一次 ASSOCIATE 会重新实测。
+var socks5DirectRelayMemo sync.Map // map[string]socks5DirectRelayMemoEntry
+
+// socks5DirectRelayAllowLoopback 仅测试用：允许把回环地址的 relay 当作可
+// 直连目标。生产中 relay 是回环/未指定地址时直连没有意义，必须走链隧道。
+var socks5DirectRelayAllowLoopback = false
+
+const socks5DirectRelayMemoTTL = 10 * time.Minute
+
+type socks5DirectRelayMemoEntry struct {
+	directWorks bool
+	expiresAt   time.Time
+}
+
+func loadSOCKS5DirectRelayMemo(serverAddr string) (directWorks bool, known bool) {
+	v, ok := socks5DirectRelayMemo.Load(serverAddr)
+	if !ok {
+		return false, false
+	}
+	entry := v.(socks5DirectRelayMemoEntry)
+	if time.Now().After(entry.expiresAt) {
+		socks5DirectRelayMemo.Delete(serverAddr)
+		return false, false
+	}
+	return entry.directWorks, true
+}
+
+func storeSOCKS5DirectRelayMemo(serverAddr string, directWorks bool) {
+	socks5DirectRelayMemo.Store(serverAddr, socks5DirectRelayMemoEntry{
+		directWorks: directWorks,
+		expiresAt:   time.Now().Add(socks5DirectRelayMemoTTL),
+	})
+}
+
+// probeSOCKS5DirectRelay 实测「本机直连 relay」这条 UDP 路是否真的通：通过
+// relay 向最终目标（MCBE 服务器）发 RakNet unconnected ping，只要 relay 转
+// 回任何一个 UDP 包（pong）就算通。收不到任何回包（多为末跳服务器只认与
+// 控制连接同源 IP 的 UDP，直连包被静默丢弃）则判定不通。
+//
+// 用真实目标做探测而不是第三方地址（如 8.8.8.8:53），因为部分游戏代理节点
+// 会过滤非游戏端口；MCBE 服务器对 unconnected ping 必回 pong。若目标服务器
+// 恰好宕机会被误判为不通——此时改走链隧道同样连不上目标，不会更糟，且结果
+// 带 TTL、之后会重测。总预算约 1 秒（两次发包，各等 ~500ms）。
+func probeSOCKS5DirectRelay(relayConn net.PacketConn, dest M.Socksaddr) bool {
+	defer func() {
+		_ = relayConn.SetDeadline(time.Time{})
+	}()
+
+	// RakNet unconnected ping: 0x01 + timestamp(8B BE) + MAGIC(16B) + GUID(8B)
+	ping := make([]byte, 0, 33)
+	ping = append(ping, raknetUnconnectedPing)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], uint64(time.Now().UnixMilli()))
+	ping = append(ping, ts[:]...)
+	ping = append(ping, raknetMagic...)
+	var guid [8]byte
+	binary.BigEndian.PutUint64(guid[:], uint64(time.Now().UnixNano()))
+	ping = append(ping, guid[:]...)
+
+	// SOCKS5 UDP 封装：RSV(2) + FRAG(1) + ATYP/ADDR/PORT + payload
+	datagram := append([]byte{0x00, 0x00, 0x00}, appendSocksaddr(nil, dest)...)
+	datagram = append(datagram, ping...)
+
+	buf := make([]byte, 1500)
+	for attempt := 0; attempt < 2; attempt++ {
+		_ = relayConn.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := relayConn.WriteTo(datagram, nil); err != nil {
+			return false
+		}
+		_ = relayConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		for {
+			n, _, err := relayConn.ReadFrom(buf)
+			if err != nil {
+				break // 超时/出错：进入下一次尝试
+			}
+			if n > 0 {
+				// relay 回了任何包就证明直连路是通的（不必解析 pong 内容）。
+				// 把 socket 缓冲里可能剩下的回包排干，避免脏数据流入正式会话。
+				_ = relayConn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+				for {
+					if _, _, derr := relayConn.ReadFrom(buf); derr != nil {
+						break
+					}
+				}
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // dialSOCKS5UDP sets up a SOCKS5 UDP ASSOCIATE relay for dest and returns a
