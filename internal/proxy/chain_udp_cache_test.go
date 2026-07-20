@@ -459,14 +459,10 @@ func TestChainUDPCache_EvictOnTimeoutWithActiveUsers(t *testing.T) {
 }
 
 // TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate verifies that a busy
-// SOCKS5 cached conn is not reused by another active client. After the busy
-// wait boundary (covers concurrent ping hold), a second real client gets its
-// own UDP ASSOCIATE while the first client's relay mapping remains usable.
+// SOCKS5 cached conn is not reused by another active client. A second real
+// client immediately gets its own UDP ASSOCIATE (no waiting for the busy
+// conn to free up) while the first client's relay mapping remains usable.
 func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
-	oldWait := chainSOCKS5BusyWait
-	chainSOCKS5BusyWait = 800 * time.Millisecond
-	defer func() { chainSOCKS5BusyWait = oldWait }()
-
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -497,8 +493,9 @@ func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	}
 	wrapper1 := pc1.(*chainConnWrapper)
 
-	// Second call while activeUsers=1 should wait near the SOCKS5 busy
-	// boundary, then create a separate ASSOCIATE for the second client.
+	// Second call while activeUsers=1 should immediately create a separate
+	// ASSOCIATE for the second client instead of waiting for the first to
+	// free up.
 	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
 	elapsed := time.Since(start)
@@ -510,8 +507,8 @@ func TestChainUDPCache_SOCKS5BusyCreatesParallelAssociate(t *testing.T) {
 	if wrapper2.cached == wrapper1.cached {
 		t.Fatal("second active client reused the first client's PacketConn")
 	}
-	if elapsed < 500*time.Millisecond {
-		t.Fatalf("expected to wait near the SOCKS5 busy boundary, waited %v", elapsed)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected an independent conn without waiting, took %v", elapsed)
 	}
 
 	// Verify the cache now points to the newer conn, while the old active conn
@@ -1493,11 +1490,14 @@ func TestChainUDPCache_SOCKS5ReuseCountEvicts(t *testing.T) {
 	_ = pc5.Close()
 }
 
-// TestChainUDPCache_WaitsForBusyConn verifies that when a cached SOCKS5 UDP
-// connection is in use (activeUsers > 0), the next ListenPacket waits for it
-// to be released rather than creating a new connection. This prevents
-// multiple concurrent SOCKS5 ASSOCIATEs to the same remote server.
-func TestChainUDPCache_WaitsForBusyConn(t *testing.T) {
+// TestChainUDPCache_BusyConnGetsIndependentConnImmediately verifies that when
+// a cached SOCKS5 UDP connection is in use (activeUsers > 0), the next
+// ListenPacket immediately gets its own independent connection instead of
+// waiting for the busy one to be released. Waiting used to take up to a few
+// seconds, which could exceed how long a real MC client waits before giving
+// up on a join attempt; giving each concurrent player their own connection
+// right away avoids that stall.
+func TestChainUDPCache_BusyConnGetsIndependentConnImmediately(t *testing.T) {
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -1523,53 +1523,52 @@ func TestChainUDPCache_WaitsForBusyConn(t *testing.T) {
 	ping := []byte{0x99, 0x01, 0x02, 0x03}
 	buf := make([]byte, 1500)
 
-	// First call creates and caches a connection
+	// First call creates and caches a connection; keep it active (don't close).
 	pc1, err := chainOutbound.ListenPacket(ctx, dest)
 	if err != nil {
 		t.Fatalf("first ListenPacket: %v", err)
 	}
+	defer pc1.Close()
+	wrapper1 := pc1.(*chainConnWrapper)
 
-	// Start a goroutine that holds pc1 for 200ms then releases it
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		_ = pc1.Close()
-	}()
-
-	// Second call should wait for pc1 to be released, then reuse it
+	// Second call while pc1 is still active should return immediately with
+	// its own independent connection, not wait for pc1 to be released.
 	start := time.Now()
 	pc2, err := chainOutbound.ListenPacket(ctx, dest)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("second ListenPacket: %v", err)
 	}
-
-	// Should have waited at least ~200ms for the conn to be released
-	if elapsed < 100*time.Millisecond {
-		t.Fatalf("expected to wait ~200ms for busy conn, but only waited %v", elapsed)
+	defer pc2.Close()
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected an independent conn without waiting, took %v", elapsed)
 	}
-	t.Logf("Waited %v for busy conn to be released", elapsed)
+	wrapper2 := pc2.(*chainConnWrapper)
+	if wrapper2.cached == wrapper1.cached {
+		t.Fatal("second concurrent client reused the first client's still-active PacketConn")
+	}
+	t.Logf("Got independent conn immediately (%v), no wait for busy conn", elapsed)
 
-	// Verify the reused conn works
+	// Verify the new conn works.
 	_ = pc2.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := pc2.WriteTo(ping, realServer); err != nil {
-		t.Fatalf("write on reused conn: %v", err)
+		t.Fatalf("write on independent conn: %v", err)
 	}
 	_ = pc2.SetReadDeadline(time.Now().Add(3 * time.Second))
 	n, _, err := pc2.ReadFrom(buf)
 	if err != nil {
-		t.Fatalf("read on reused conn: %v", err)
+		t.Fatalf("read on independent conn: %v", err)
 	}
 	if n != len(ping) {
 		t.Fatalf("expected %d bytes, got %d", len(ping), n)
 	}
-	t.Logf("Reused conn after wait: ok (%d bytes)", n)
-	_ = pc2.Close()
+	t.Logf("Independent conn works: ok (%d bytes)", n)
 }
 
-// TestChainUDPCache_WaitTimeoutCreatesParallelConn verifies that when the wait
-// timeout is reached for a busy SOCKS5 conn, a second real client gets a new
-// ASSOCIATE and the original active conn remains usable.
-func TestChainUDPCache_WaitTimeoutCreatesParallelConn(t *testing.T) {
+// TestChainUDPCache_ConcurrentBusyCreatesParallelConn verifies that when a
+// cached SOCKS5 conn is busy, a second real client immediately gets a new
+// ASSOCIATE and the original active conn remains usable throughout.
+func TestChainUDPCache_ConcurrentBusyCreatesParallelConn(t *testing.T) {
 	realServer, stopReal := startFakeRakNetServer(t)
 	defer stopReal()
 
@@ -1620,8 +1619,8 @@ func TestChainUDPCache_WaitTimeoutCreatesParallelConn(t *testing.T) {
 		t.Fatalf("second ListenPacket: %v", err)
 	}
 	defer pc2.Close()
-	if elapsed < 400*time.Millisecond {
-		t.Fatalf("expected to wait near the 500ms busy boundary, waited %v", elapsed)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("expected an independent conn without waiting, took %v", elapsed)
 	}
 
 	// Critical: pc1 should still work after pc2 is created.

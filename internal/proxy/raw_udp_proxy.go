@@ -14,6 +14,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -44,7 +45,10 @@ const (
 	RawUDPUpstreamWriteTimeout = 250 * time.Millisecond
 	// RawUDPUpstreamWriteQueueSize buffers short per-client bursts without letting a
 	// blocked outbound consume unbounded memory or add seconds of queueing latency.
-	RawUDPUpstreamWriteQueueSize = 64
+	// 256 (was 64) gives more headroom to survive brief upstream hiccups (e.g. a
+	// SOCKS5/chain reconnect window) without dropping packets; per-client memory
+	// cost stays small since this only holds pointers to pooled buffers.
+	RawUDPUpstreamWriteQueueSize = 256
 	// RawUDPPendingDialQueueCap bounds how many datagrams get buffered on a
 	// still-connecting (pending) client while its proxy dial runs in the
 	// background (see createPendingClientAndDialAsync). Handshake bursts are
@@ -252,10 +256,11 @@ type rawUDPClientInfo struct {
 	// Consecutive write timeout counter — if writes keep timing out the
 	// upstream relay is dead. After a threshold we close the session
 	// instead of silently dropping packets forever.
-	writeTimeoutCount atomic.Int64
-	lastUpLogAt       atomic.Int64
-	lastDownLogAt     atomic.Int64
-	lastReuseLogAt    atomic.Int64
+	writeTimeoutCount  atomic.Int64
+	lastUpLogAt        atomic.Int64
+	lastDownLogAt      atomic.Int64
+	lastReuseLogAt     atomic.Int64
+	lastQueueFullLogAt atomic.Int64
 	// blackholeRecovered：已因「上行有包、下行始终为 0」触发过一次强制拆线，
 	// 避免同一会话重复打日志/抖动。
 	blackholeRecovered atomic.Bool
@@ -321,6 +326,154 @@ func (c *rawUDPClientInfo) drainUpstreamWriteQueue() {
 			putRawUDPBuffer(packet)
 		default:
 			return
+		}
+	}
+}
+
+// rawUDPLoginJob is a single pre-login packet awaiting best-effort Login/ACL
+// parsing off the shared hot loop (see dispatchLoginPhasePacket).
+type rawUDPLoginJob struct {
+	clientInfo *rawUDPClientInfo
+	packet     []byte
+	clientAddr *net.UDPAddr
+}
+
+// rawUDPLoginJobQueueSize bounds each shard's backlog. A full shard falls
+// back to processing synchronously on the hot loop (see
+// dispatchLoginPhasePacket), so this only needs to absorb short join bursts,
+// not sustain an unbounded backlog.
+const rawUDPLoginJobQueueSize = 32
+
+// rawUDPLoginWorkerCount returns how many login-parse shard workers run per
+// RawUDPProxy instance. Packets from the same client always land on the same
+// shard (see rawUDPLoginShardIndex), so this only needs enough shards to
+// spread CPU/IO-heavy login+ACL work across cores during a join burst — it
+// does not need to scale with player count.
+func rawUDPLoginWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 16 {
+		workers = 16
+	}
+	return workers
+}
+
+// rawUDPLoginShardIndex hashes the client's address to a stable shard index
+// so every packet from the same client is always processed by the same
+// worker. This preserves per-client ordering (needed for split-packet
+// reassembly and the Login/ACL state machine) while different clients'
+// login parsing runs fully in parallel across shards.
+func rawUDPLoginShardIndex(clientAddr *net.UDPAddr, shardCount int) int {
+	if shardCount <= 1 || clientAddr == nil {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(clientAddr.String()))
+	return int(h.Sum32() % uint32(shardCount))
+}
+
+// startRawUDPLoginWorkers spins up the shard workers used to keep one slow
+// client's Login/ACL parsing (which can hit the ACL database) from stalling
+// packet delivery for every other player on this server. Client creation and
+// lookup (getOrCreateClient) intentionally stays on the single hot-loop
+// goroutine — only the CPU/IO-heavy post-creation Login parsing that runs
+// here is parallelized, so no new concurrent-create races are introduced.
+func (p *RawUDPProxy) startRawUDPLoginWorkers() *sync.WaitGroup {
+	shardCount := rawUDPLoginWorkerCount()
+	p.loginJobChans = make([]chan *rawUDPLoginJob, shardCount)
+	var wg sync.WaitGroup
+	for i := 0; i < shardCount; i++ {
+		ch := make(chan *rawUDPLoginJob, rawUDPLoginJobQueueSize)
+		p.loginJobChans[i] = ch
+		wg.Add(1)
+		go func(jobs chan *rawUDPLoginJob) {
+			defer wg.Done()
+			defer logger.CapturePanic("raw-udp-login-worker-" + p.serverID)
+			for job := range jobs {
+				p.processLoginPhasePacket(job.clientInfo, job.packet, job.clientAddr)
+			}
+		}(ch)
+	}
+	return &wg
+}
+
+// dispatchLoginPhasePacket routes a pre-login packet to its client's shard
+// worker so Login/ACL parsing runs off the hot loop. If the shard is full
+// (should be rare — 32 slots, each job normally finishes in well under a
+// millisecond) it falls back to processing synchronously right here, so the
+// hot loop never silently drops a login/ACL-relevant packet and never blocks
+// waiting for queue space. If workers were never started (e.g. a test calls
+// helpers directly without Listen()), it also falls back to synchronous
+// processing.
+//
+// Ordering caveat: packets for the same client always hash to the same
+// shard (rawUDPLoginShardIndex), so under normal load they're processed by
+// that one worker strictly in arrival order. But if the shard is currently
+// full, THIS call jumps straight to processLoginPhasePacket on the caller's
+// own goroutine — ahead of whatever is still sitting in the (now full)
+// shard channel for the same or other clients. A real MC login handshake
+// is only a handful of packets, far under the 32-slot buffer, so this can't
+// happen in practice; it's only reachable via a pathological burst (e.g. a
+// client spamming dozens of pre-login packets while its shard is jammed by
+// another client's slow ACL check). See
+// TestRawUDPLoginWorkers_ShardOverflowCanReorderSyncFallback.
+func (p *RawUDPProxy) dispatchLoginPhasePacket(clientInfo *rawUDPClientInfo, packet []byte, clientAddr *net.UDPAddr) {
+	if len(p.loginJobChans) == 0 {
+		p.processLoginPhasePacket(clientInfo, packet, clientAddr)
+		return
+	}
+	idx := rawUDPLoginShardIndex(clientAddr, len(p.loginJobChans))
+	select {
+	case p.loginJobChans[idx] <- &rawUDPLoginJob{clientInfo: clientInfo, packet: packet, clientAddr: clientAddr}:
+	default:
+		p.processLoginPhasePacket(clientInfo, packet, clientAddr)
+	}
+}
+
+// processLoginPhasePacket runs best-effort Login/ACL parsing for one
+// pre-login packet and enqueues it upstream afterwards. This is the same
+// logic that used to run inline in Listen()'s hot loop; it is unchanged
+// except for being callable from a shard worker goroutine.
+func (p *RawUDPProxy) processLoginPhasePacket(clientInfo *rawUDPClientInfo, upstreamPacket []byte, clientAddr *net.UDPAddr) {
+	p.handlePacketWithLoginCheck(upstreamPacket, clientInfo)
+	if clientInfo.kicked.Load() {
+		putRawUDPBuffer(upstreamPacket)
+		return
+	}
+	clientInfo.clearPendingACKSeqs()
+
+	if err := clientInfo.enqueueUpstreamPacket(upstreamPacket); err != nil {
+		putRawUDPBuffer(upstreamPacket)
+		clientInfo.writeTargetErrors.Add(1)
+		if errors.Is(err, errRawUDPUpstreamQueueFull) {
+			drops := clientInfo.upstreamQueueDrops.Add(1)
+			// 队列满代表包已经在丢，运维需要能直接从日志看到，不能
+			// 只有 Debug 才可见；同一客户端限频（5s一条），但仍打
+			// 印累计丢包数，方便判断是偶发抖动还是持续故障。
+			if clientInfo.shouldLogQueueFull(time.Now()) {
+				logger.Warn("RawUDP upstream write queue full (packets are being dropped): server=%s client=%s target=%s route=%s bytes=%d firstByte=%s packetCount=%d queue=%d cap=%d totalDrops=%d",
+					p.serverID,
+					clientAddr.String(),
+					p.effectiveTargetAddrString(),
+					rawUDPRouteName(clientInfo.proxyNode),
+					len(upstreamPacket),
+					rawUDPFirstByteHex(upstreamPacket),
+					clientInfo.packetCount.Load(),
+					len(clientInfo.upstreamWriteCh),
+					cap(clientInfo.upstreamWriteCh),
+					drops)
+			}
+		} else {
+			logger.Debug("RawUDP upstream write skipped: server=%s client=%s target=%s route=%s bytes=%d firstByte=%s err=%v",
+				p.serverID,
+				clientAddr.String(),
+				p.effectiveTargetAddrString(),
+				rawUDPRouteName(clientInfo.proxyNode),
+				len(upstreamPacket),
+				rawUDPFirstByteHex(upstreamPacket),
+				err)
 		}
 	}
 }
@@ -590,6 +743,18 @@ func (c *rawUDPClientInfo) shouldLogReuse(now time.Time) bool {
 	return c.lastReuseLogAt.CompareAndSwap(prev, nowNano)
 }
 
+// shouldLogQueueFull 限频输出「上行队列已满」告警：队列丢包代表这个客户端
+// 的包已经在丢，值得让运维立刻看到，但同一客户端持续丢包时不应刷屏，最多
+// 每 5 秒打一条。
+func (c *rawUDPClientInfo) shouldLogQueueFull(now time.Time) bool {
+	nowNano := now.UnixNano()
+	prev := c.lastQueueFullLogAt.Load()
+	if nowNano-prev < int64(5*time.Second) {
+		return false
+	}
+	return c.lastQueueFullLogAt.CompareAndSwap(prev, nowNano)
+}
+
 func (c *rawUDPClientInfo) packetCountForDirection(direction string) int64 {
 	if c == nil {
 		return 0
@@ -828,6 +993,13 @@ type RawUDPProxy struct {
 	// dialInFlight 在真实客户端 dial 开始前自增、结束后自减，ping 在真正发起
 	// 拨号前会检查它，从而把这个竞争窗口关掉。
 	dialInFlight atomic.Int32
+
+	// loginJobChans 是登录阶段解析的分片 worker 队列（见 startRawUDPLoginWorkers）。
+	// 客户端建连/查找仍留在主热循环里同步执行；只有登录包的解析/ACL 检查这段
+	// CPU/IO 较重的工作会被分流到这些 worker，避免一个玩家的登录卡顿（比如 ACL
+	// 数据库查询慢）拖慢同服务器所有其它玩家的包收发。只在 Listen() 里赋值一次，
+	// 之后只被同一个热循环 goroutine 读取，不需要额外加锁。
+	loginJobChans []chan *rawUDPLoginJob
 }
 
 // ACLManager interface for access control
@@ -1120,6 +1292,17 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 		p.cleanupInactiveClients()
 	}()
 
+	// Start login-parse shard workers (see startRawUDPLoginWorkers). These
+	// take the CPU/IO-heavy Login+ACL parsing off this hot loop; closing
+	// their channels here on return lets them drain and exit cleanly.
+	loginWorkersWG := p.startRawUDPLoginWorkers()
+	defer func() {
+		for _, ch := range p.loginJobChans {
+			close(ch)
+		}
+		loginWorkersWG.Wait()
+	}()
+
 	// Main packet forwarding loop
 	buffer := make([]byte, MaxUDPPacketSize)
 
@@ -1228,35 +1411,38 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Copy before enqueueing because the listener buffer is reused on the next read.
 			upstreamPacket := rawUDPClonePacket(buffer[:n])
 
-			// If Login parsing is not done yet, check whether this packet contains Login.
+			// If Login parsing is not done yet, hand the packet off to a shard
+			// worker (see dispatchLoginPhasePacket) instead of parsing inline:
+			// Login/ACL checks can be CPU-heavy (JWT/decompression) or even hit
+			// the ACL database, and doing that inline here would stall every
+			// other player's packets on this server while one client logs in.
+			// The worker takes care of enqueueing upstream itself once done.
 			if !loginParseDone {
-				// Try to detect and parse Login packet.
-				// This will kick the player if they're on the blacklist.
-				p.handlePacketWithLoginCheck(upstreamPacket, clientInfo)
-
-				// Check if player was kicked (lock-free).
-				if clientInfo.kicked.Load() {
-					putRawUDPBuffer(upstreamPacket)
-					continue
-				}
-				clientInfo.clearPendingACKSeqs()
+				p.dispatchLoginPhasePacket(clientInfo, upstreamPacket, clientAddr)
+				continue
 			}
 
 			if err := clientInfo.enqueueUpstreamPacket(upstreamPacket); err != nil {
 				putRawUDPBuffer(upstreamPacket)
 				clientInfo.writeTargetErrors.Add(1)
 				if errors.Is(err, errRawUDPUpstreamQueueFull) {
-					clientInfo.upstreamQueueDrops.Add(1)
-					logger.Debug("RawUDP upstream write queue full: server=%s client=%s target=%s route=%s bytes=%d firstByte=%s packetCount=%d queue=%d cap=%d",
-						p.serverID,
-						clientAddr.String(),
-						p.effectiveTargetAddrString(),
-						rawUDPRouteName(clientInfo.proxyNode),
-						n,
-						rawUDPFirstByteHex(buffer[:n]),
-						clientInfo.packetCount.Load(),
-						len(clientInfo.upstreamWriteCh),
-						cap(clientInfo.upstreamWriteCh))
+					drops := clientInfo.upstreamQueueDrops.Add(1)
+					// 队列满代表包已经在丢，运维需要能直接从日志看到，不能
+					// 只有 Debug 才可见；同一客户端限频（5s一条），但仍打
+					// 印累计丢包数，方便判断是偶发抖动还是持续故障。
+					if clientInfo.shouldLogQueueFull(time.Now()) {
+						logger.Warn("RawUDP upstream write queue full (packets are being dropped): server=%s client=%s target=%s route=%s bytes=%d firstByte=%s packetCount=%d queue=%d cap=%d totalDrops=%d",
+							p.serverID,
+							clientAddr.String(),
+							p.effectiveTargetAddrString(),
+							rawUDPRouteName(clientInfo.proxyNode),
+							n,
+							rawUDPFirstByteHex(buffer[:n]),
+							clientInfo.packetCount.Load(),
+							len(clientInfo.upstreamWriteCh),
+							cap(clientInfo.upstreamWriteCh),
+							drops)
+					}
 				} else {
 					logger.Debug("RawUDP upstream write skipped: server=%s client=%s target=%s route=%s bytes=%d firstByte=%s err=%v",
 						p.serverID,

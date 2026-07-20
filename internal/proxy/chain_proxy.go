@@ -231,11 +231,6 @@ type chainUDPOutbound struct {
 	cacheOnce sync.Once
 }
 
-// chainSOCKS5BusyWait 是 SOCKS5 末跳缓存仍被占用时，等待释放再开并行 ASSOCIATE
-// 的最长时间。ping 拨号不会走到这个等待（见 ListenPacket 里的 IsPingDial 快速
-// 失败分支），所以这里只需要覆盖真实并发玩家的排队体验，不宜设太长。
-var chainSOCKS5BusyWait = 2 * time.Second
-
 // cachedChainConn wraps a PacketConn for reuse. Close() does NOT close the
 // underlying connection — it just marks lastUsed so the idle sweeper can
 // clean it up later.
@@ -561,19 +556,6 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 		}
 	}
 
-	// Wait for the cached conn to become available if it's currently in use.
-	// This prevents creating multiple concurrent SOCKS5 ASSOCIATEs to the same
-	// remote server, which can cause the server to drop packets for the older
-	// association. Ping dials (IsPingDial(ctx)) never reach this wait — they
-	// fail fast above instead of risking a parallel ASSOCIATE that stomps a
-	// player's mapping — so this timeout only governs how long a second real
-	// concurrent player waits before getting its own ASSOCIATE.
-	waitTimeout := 5 * time.Second
-	if isSocks5LastHop {
-		waitTimeout = chainSOCKS5BusyWait
-	}
-	waitDeadline := time.Now().Add(waitTimeout)
-
 	// maxReuseCount is now unlimited (0). We rely on three mechanisms to
 	// detect and evict dead SOCKS5 UDP relay connections:
 	//  1. IsRemoteClosed() — checks if the TCP control connection was closed
@@ -600,43 +582,15 @@ func (c *chainUDPOutbound) ListenPacket(ctx context.Context, destination string)
 				c.cacheMu.Unlock()
 				return nil, fmt.Errorf("chain UDP cache busy for %s (skip ping dial)", cacheKey)
 			}
-			// Conn is busy — wait briefly for short-lived users (ping/tests) to
-			// release it. If the owner is a real game client it may stay active
-			// for minutes or hours, so after the wait boundary create a parallel
-			// UDP association and preserve the active conn. RawUDP health pings
-			// are skipped while an outbound has active clients, so this fallback is
-			// for real concurrent players rather than background probes.
-			if time.Now().After(waitDeadline) {
-				logger.Info("ChainUDPOutbound: cached conn for %s still busy after %s wait, creating parallel conn for concurrent client (old conn preserved)", cacheKey, waitTimeout)
-				break
-			}
-			// Channel-based wait: releaseCh is closed when activeUsers
-			// drops to 0, waking us instantly. This replaces the old
-			// 10ms busy-wait polling and reduces wake latency from
-			// ~5ms avg to ~0.01ms.
-			cached.mu.Lock()
-			ch := cached.releaseCh
-			if ch == nil {
-				ch = make(chan struct{})
-				cached.releaseCh = ch
-			}
-			cached.mu.Unlock()
-			remaining := time.Until(waitDeadline)
-			if remaining <= 0 {
-				logger.Info("ChainUDPOutbound: cached conn for %s reached busy wait boundary, creating parallel conn for concurrent client (old conn preserved)", cacheKey)
-				break
-			}
-			c.cacheMu.Unlock()
-			select {
-			case <-ch:
-				// Conn was released — re-acquire lock and re-check.
-				c.cacheMu.Lock()
-				continue
-			case <-time.After(remaining):
-				// Wait timed out.
-				c.cacheMu.Lock()
-				continue
-			}
+			// Conn 正被其它真实玩家占用：不再排队等待释放，直接为当前调用者
+			// 建一条独立连接（老连接原样保留，继续给它的持有者用）。之前这里
+			// 会先等待最多 2~5 秒才 fallback，但 MC 客户端自己的连接超时往往
+			// 比这个等待还短——同一目标服务器有 2 个以上玩家几乎同时连入时，
+			// 后到的玩家可能在等待期内就已经被客户端判定为连接失败/进不去。
+			// 用「每个并发玩家独立握手」换掉「排队等待」，代价是多一次握手
+			// 延迟，收益是不再互相卡住。
+			logger.Info("ChainUDPOutbound: cached conn for %s busy, creating independent conn for concurrent client (old conn preserved)", cacheKey)
+			break
 		}
 
 		// Conn is available — check if it's still usable

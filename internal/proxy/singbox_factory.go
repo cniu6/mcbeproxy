@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -2973,6 +2974,12 @@ type hysteria2PacketConn struct {
 	recvCtx    context.Context
 	recvCancel context.CancelFunc
 	recvOnce   sync.Once
+	// readTimer is reused across ReadFrom calls instead of allocating a new
+	// timer via time.After on every single call. MC traffic is many small,
+	// frequent UDP packets, so on a long-lived connection this avoids steady
+	// timer/GC churn. Guarded by mu; see ReadFrom for the Reset/Stop-drain
+	// contract required to reuse a time.Timer safely.
+	readTimer *time.Timer
 }
 
 // hy2RecvResult holds the result of a Hysteria2 receive operation.
@@ -3026,26 +3033,44 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 		return 0, nil, errors.New("connection closed")
 	}
 	deadline := c.readDeadline
+	if c.readTimer == nil {
+		// 首次创建时用 0 直接触发一次并立刻消费掉，让 channel 处于「空」
+		// 状态，后面才能安全地反复 Reset 复用（time.Timer 的 Reset 要求
+		// 在“已停止或已触发且 channel 已排空”的计时器上调用）。
+		c.readTimer = time.NewTimer(0)
+		<-c.readTimer.C
+	}
+	timer := c.readTimer
 	c.mu.Unlock()
 
 	// Start the persistent receiver goroutine (only once)
 	c.startReceiver()
 
-	// Apply timeout if deadline is set, otherwise use a default timeout
-	var timeout <-chan time.Time
+	// Apply timeout if deadline is set, otherwise use a default timeout.
+	// Reuse the per-connection timer instead of time.After: this ReadFrom is
+	// called once per UDP packet for the lifetime of the session, and
+	// time.After would allocate + schedule a brand new timer every single
+	// call, adding steady GC/scheduler pressure on long-running connections.
+	var timeoutDur time.Duration
 	if !deadline.IsZero() {
-		d := time.Until(deadline)
-		if d <= 0 {
-			return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: fmt.Errorf("i/o timeout")}
+		timeoutDur = time.Until(deadline)
+		if timeoutDur <= 0 {
+			return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 		}
-		timeout = time.After(d)
 	} else {
 		// Default timeout of 30 seconds if no deadline is set
-		timeout = time.After(30 * time.Second)
+		timeoutDur = 30 * time.Second
 	}
+	timer.Reset(timeoutDur)
 
 	select {
 	case r := <-c.recvCh:
+		// 收到数据时手动停表：Stop() 返回 false 说明计时器已经先一步触发
+		// 过了（小概率竞态），此时把已经写进 channel 的那个值排空，保证
+		// 下次进来 Reset 前 channel 一定是空的，否则会读到陈旧的到期事件。
+		if !timer.Stop() {
+			<-timer.C
+		}
 		if r.err != nil {
 			errStr := r.err.Error()
 			// EOF means the UDP session was closed
@@ -3069,9 +3094,9 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 		}
 		return n, c.destination.UDPAddr(), nil
 
-	case <-timeout:
+	case <-timer.C:
 		logger.Debug("Hysteria2: read timeout for %s", c.destination.String())
-		return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: fmt.Errorf("i/o timeout")}
+		return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 	}
 }
 
@@ -3106,6 +3131,10 @@ func (c *hysteria2PacketConn) Close() error {
 	// Cancel the receiver goroutine first
 	if c.recvCancel != nil {
 		c.recvCancel()
+	}
+
+	if c.readTimer != nil {
+		c.readTimer.Stop()
 	}
 
 	if c.conn != nil {

@@ -1312,6 +1312,16 @@ func (p *ProxyServer) pingAllNodesForServer(serverCfg *config.ServerConfig, glob
 			defer wg.Done()
 			defer releaseAutoPingSlot(sem, globalSem)
 
+			// 节点可能被其它 server 的活跃玩家共用（同一个出站节点名可以
+			// 被多个 server 配置引用）。若该节点当前有真实连接在用，跳过
+			// 探测：UDP/SOCKS5 探测会新建一条独立的 UDP ASSOCIATE，部分
+			// 上游服务器把新 ASSOCIATE 视为替换旧的，会顶掉正在游戏的玩家
+			// 的映射，导致其下行流量瞬间归零。跳过时不写入任何延迟数据，
+			// 保留上次已知值，而不是当作探测失败写 0。
+			if p.autoPingNodeBusy(nodeName) {
+				return
+			}
+
 			latencyMs := p.probeServerThroughNode(serverCfg.ID, nodeName, targetAddr, destAddr, sortBy)
 			recordedAt := time.Now()
 			if latencyMs > 0 {
@@ -1438,6 +1448,13 @@ func (p *ProxyServer) pingAllNodesForProxyPort(portCfg *config.ProxyPortConfig, 
 		go func(nodeName string) {
 			defer wg.Done()
 			defer releaseAutoPingSlot(sem, globalSem)
+
+			// 同一节点也可能被其它 server/proxy port 的活跃连接占用，
+			// 理由与 pingAllNodesForServer 中一致：跳过忙碌节点，避免新
+			// 建的探测连接顶掉正在使用中的玩家连接。
+			if p.autoPingNodeBusy(nodeName) {
+				return
+			}
 
 			latencyMs := p.probeProxyPortThroughNode(selectorID, nodeName, targetAddr, destAddr, sortBy)
 			recordedAt := time.Now()
@@ -1827,6 +1844,23 @@ func (p *ProxyServer) probeServerThroughNode(serverID, nodeName, targetAddr stri
 	}
 }
 
+// autoPingNodeBusy reports whether nodeName currently has any real
+// connection in use (by any server sharing this outbound node), in which
+// case a standalone background latency probe should be skipped rather than
+// risking a second UDP session/ASSOCIATE that can invalidate the active
+// player's upstream mapping. Mirrors RawUDPProxy.skipProxyPingIfNodeBusy,
+// which already applies this rule to its own internal ping path.
+func (p *ProxyServer) autoPingNodeBusy(nodeName string) bool {
+	if p == nil || nodeName == "" || nodeName == DirectNodeName || p.outboundMgr == nil {
+		return false
+	}
+	counter, ok := p.outboundMgr.(outboundConnCountProvider)
+	if !ok {
+		return false
+	}
+	return counter.GetOutboundConnectionCount(nodeName) > 0
+}
+
 func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr string, destAddr net.Addr) int64 {
 	if p.outboundMgr == nil {
 		return -1
@@ -1835,11 +1869,19 @@ func (p *ProxyServer) pingServerThroughNode(serverID, nodeName, targetAddr strin
 	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
 	defer cancel()
 
+	// 用不标记健康状态的探测拨号：这里 ping 的是具体服务器的目标地址,
+	// 探测失败很可能只是那台 MC 服务器本身卡顿/离线,不代表出站节点本身
+	// 有问题。若仍用会标记健康的 DialPacketConnNoRetry,一次目标服卡顿
+	// 就会把该节点全局标为 unhealthy,连带其它复用同一节点的服务器新玩家
+	// 都会被拒绝接入。与 raw_udp_proxy.go 的 dialThroughProxyForPing 保持
+	// 一致。
 	var (
 		conn net.PacketConn
 		err  error
 	)
-	if noRetryDialer, ok := p.outboundMgr.(outboundPacketConnNoRetryDialer); ok {
+	if pingDialer, ok := p.outboundMgr.(outboundPacketConnPingDialer); ok {
+		conn, err = pingDialer.DialPacketConnForPing(ctx, nodeName, targetAddr)
+	} else if noRetryDialer, ok := p.outboundMgr.(outboundPacketConnNoRetryDialer); ok {
 		conn, err = noRetryDialer.DialPacketConnNoRetry(ctx, nodeName, targetAddr)
 	} else {
 		conn, err = p.outboundMgr.DialPacketConn(ctx, nodeName, targetAddr)
