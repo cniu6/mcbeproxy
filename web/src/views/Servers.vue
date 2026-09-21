@@ -38,7 +38,59 @@
           <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
           <n-gi><n-form-item label="Xbox 验证"><n-switch v-model:value="form.xbox_auth_enabled" /></n-form-item></n-gi>
           <n-gi :span="2" v-if="isRaknetProtocol"><n-form-item label="代理模式"><n-select v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="空闲超时"><n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
+          <template v-if="isNetherNetMode">
+            <n-gi :span="2">
+              <n-alert type="warning">NetherNet 需要 HTTPS 信令、TLS 证书/私钥和上游 HTTPS 信令 URL；Raw UDP 仍只用于 RakNet。</n-alert>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="信令监听">
+                <n-input v-model:value="form.nethernet_listen_addr" placeholder="0.0.0.0:19132" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="上游信令">
+                <n-input v-model:value="form.nethernet_upstream" placeholder="https://上游域名:端口" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="TLS 证书">
+                <n-input v-model:value="form.nethernet_cert_file" placeholder="server.crt" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="TLS 私钥">
+                <n-input v-model:value="form.nethernet_key_file" placeholder="server.key" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="Identity 文件">
+                <n-input v-model:value="form.nethernet_identity_file" placeholder="data/nethernet/服务器ID.pem" />
+                <template #feedback>留空则自动使用 data/nethernet/&lt;服务器ID&gt;.pem。</template>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="ICE 策略">
+                <n-select v-model:value="form.nethernet_ice_gather_policy" :options="netherNetIcePolicyOptions" />
+              </n-form-item>
+            </n-gi>
+            <n-gi :span="2">
+              <n-form-item label="ICE/TURN JSON">
+                <n-input v-model:value="form.nethernet_ice_servers_json" type="textarea" :rows="3" placeholder='[{"urls":["turn:turn.example:3478"],"username":"user","password":"pass"}]' />
+                <template #feedback>relay 策略必须提供可用 TURN；敏感凭据只保存在服务器配置中。</template>
+              </n-form-item>
+            </n-gi>
+            <n-gi :span="2">
+              <n-form-item label="允许匿名">
+                <n-switch v-model:value="form.nethernet_allow_anonymous" />
+                <template #feedback>仅建议测试环境开启。</template>
+              </n-form-item>
+            </n-gi>
+          </template>
+          <n-gi>
+            <n-form-item label="空闲超时">
+              <n-input-number v-model:value="form.idle_timeout" :min="0" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
           <n-gi><n-form-item label="DNS刷新"><n-input-number v-model:value="form.resolve_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
           <n-gi>
             <n-form-item label="UDP Socket缓冲">
@@ -1160,7 +1212,12 @@ const proxyModeOptions = [
   { label: 'Raw UDP (反检测推荐)', value: 'raw_udp' },
   { label: 'Passthrough', value: 'passthrough' },
   { label: 'Transparent', value: 'transparent' },
-  { label: 'RakNet', value: 'raknet' }
+  { label: 'RakNet', value: 'raknet' },
+  { label: 'NetherNet (HTTPS + WebRTC)', value: 'nethernet' }
+]
+const netherNetIcePolicyOptions = [
+  { label: '全部候选（默认）', value: '' },
+  { label: '仅中继 TURN（生产推荐）', value: 'relay' }
 ]
 const latencyModeBaseOptions = [
   { label: '普通 (默认)', value: 'normal' },
@@ -1214,7 +1271,8 @@ const baseDefaultForm = {
   auto_ping_top_candidates: 10,
   auto_ping_full_scan_mode: '',
   auto_ping_full_scan_time: '04:00',
-  auto_ping_full_scan_interval_hours: 24
+  auto_ping_full_scan_interval_hours: 24,
+  nethernet_listen_addr: '', nethernet_cert_file: '', nethernet_key_file: '', nethernet_identity_file: '', nethernet_upstream: '', nethernet_ice_gather_policy: '', nethernet_ice_servers_json: '', nethernet_allow_anonymous: false
 }
 
 const makeDefaultForm = () => ({
@@ -1237,7 +1295,7 @@ const normalizeServerProxyMode = (protocol, mode) => {
   if (!normalizedMode || normalizedMode === 'transparent') {
     return ''
   }
-  return ['raw_udp', 'passthrough', 'raknet', 'mitm'].includes(normalizedMode) ? normalizedMode : ''
+  return ['raw_udp', 'passthrough', 'raknet', 'mitm', 'nethernet'].includes(normalizedMode) ? normalizedMode : ''
 }
 const getServerModeTag = (server) => {
   const protocol = normalizeProtocolValue(server?.protocol)
@@ -1249,7 +1307,8 @@ const getServerModeTag = (server) => {
     passthrough: { label: 'Pass', type: 'info' },
     transparent: { label: 'Trans', type: 'warning' },
     raknet: { label: 'RakNet', type: 'default' },
-    mitm: { label: 'MITM', type: 'error' }
+    mitm: { label: 'MITM', type: 'error' },
+    nethernet: { label: 'NetherNet', type: 'warning' }
   }
   const normalizedMode = String(server?.proxy_mode || '').trim().toLowerCase()
   return modeMap[normalizedMode] || { label: server?.proxy_mode || 'Trans', type: 'default' }
@@ -1283,7 +1342,10 @@ const normalizeServerForm = (server = {}) => {
     },
     protocol: normalizeProtocolValue(server.protocol ?? defaults.protocol),
     proxy_outbound: normalizeProxyOutboundValue(server.proxy_outbound ?? defaults.proxy_outbound),
-    proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? defaults.proxy_mode)
+    proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? defaults.proxy_mode),
+    nethernet_ice_servers_json: Array.isArray(server.nethernet_ice_servers)
+      ? JSON.stringify(server.nethernet_ice_servers, null, 2)
+      : String(server.nethernet_ice_servers_json ?? defaults.nethernet_ice_servers_json)
   }
 }
 const buildUDPSpeederPayload = (udpSpeeder) => {
@@ -1315,6 +1377,16 @@ const buildServerPayload = (server) => {
     payload.auto_ping_full_scan_mode = ''
   }
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
+  if (payload.nethernet_ice_servers_json) {
+    try {
+      payload.nethernet_ice_servers = JSON.parse(payload.nethernet_ice_servers_json)
+    } catch {
+      payload.nethernet_ice_servers = []
+    }
+  } else {
+    payload.nethernet_ice_servers = []
+  }
+  delete payload.nethernet_ice_servers_json
   delete payload.status
   delete payload.connections
   delete payload.active_connections
@@ -1410,6 +1482,7 @@ const generateDefaultMOTD = (name, port) => {
 }
 const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
+const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
 const hasEnabledUDPSpeeder = computed(() => !!form.value?.udp_speeder?.enabled)
 const showUDPSpeederAdvanced = computed(() => hasEnabledUDPSpeeder.value || (form.value?.latency_mode || 'normal') === 'fec_tunnel')
 const nodeBlockReasonOptions = ['被封禁IP', '报VPN', '不稳定', '延迟高', '频繁失败']
@@ -2196,6 +2269,10 @@ const renderRawUDPStatsTooltip = (stats, clients = []) => {
     `距目标包: ${formatRawUDPDurationMs(stats.since_target_ms)}`,
     `写目标耗时: ${formatRawUDPWriteMs(stats.last_write_target_ms, stats.max_write_target_ms, stats.slow_write_target_count)}`,
     `写客户端耗时: ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`,
+    `包间隔峰值: 客户端 ${formatRawUDPDurationMs(stats.max_client_packet_gap_ms)} / 目标 ${formatRawUDPDurationMs(stats.max_target_packet_gap_ms)}`,
+    `窗口写入峰值: 目标 ${formatRawUDPDurationMs(stats.recent_max_write_target_ms)} / 客户端 ${formatRawUDPDurationMs(stats.recent_max_write_client_ms)}`,
+    `包间隔峰值: 客户端 ${formatRawUDPDurationMs(stats.max_client_packet_gap_ms)} / 目标 ${formatRawUDPDurationMs(stats.max_target_packet_gap_ms)}`,
+    `窗口写入峰值: 目标 ${formatRawUDPDurationMs(stats.recent_max_write_target_ms)} / 客户端 ${formatRawUDPDurationMs(stats.recent_max_write_client_ms)}`,
     `上行队列: ${formatRawUDPQueue(stats)}`,
     `Login解析: ${formatRawUDPParseState(stats)}`,
     `写目标超时/错误: ${stats.write_target_timeouts || 0}/${stats.write_target_errors || 0}`,
@@ -2226,7 +2303,8 @@ const renderRawUDPStatsCell = (row) => {
   const slowClientWrites = Number(stats.slow_write_client_count || 0) > 0
   const queueDrops = Number(stats.upstream_queue_drops || 0) > 0
   const tagType = stalled ? 'error' : errorCount > 0 || slowClientWrites || queueDrops ? 'warning' : 'success'
-  const label = stalled ? formatRawUDPStallReason(stats.stall_reason) : slowClientWrites ? '写客户端慢' : queueDrops ? '队列丢包' : 'RawUDP OK'
+  const loginReady = !!stats.login_parsed && !!String(stats.player_name || '').trim()
+  const label = stalled ? formatRawUDPStallReason(stats.stall_reason) : slowClientWrites ? '写客户端慢' : queueDrops ? '队列丢包' : !loginReady ? '握手中/未认证' : 'RawUDP 链路正常'
   const packetLine = clients.length > 1 ? `${clients.length}客户端 · ↑${stats.up_packets || 0} ↓${stats.down_packets || 0}` : `↑${stats.up_packets || 0} ↓${stats.down_packets || 0}`
   return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
     trigger: () => h('div', { class: 'raw-udp-summary' }, [
@@ -4729,10 +4807,32 @@ const onNameChange = () => {
 
 const saveServer = async () => {
   if (savingServer.value) return
-  if (!form.value.id || !form.value.name || !form.value.target) { message.warning('请填写必填项'); return }
+  if (!form.value.id || !form.value.name) { message.warning('请填写必填项'); return }
+  if (!isNetherNetMode.value && !form.value.target) { message.warning('请填写目标地址'); return }
   if (udpSpeederValidationError.value) { message.warning(udpSpeederValidationError.value); return }
   const latencyModeError = getLatencyModeDisabledReason(form.value.latency_mode || 'normal')
   if (latencyModeError) { message.warning(latencyModeError); return }
+  if (isNetherNetMode.value) {
+    const upstream = String(form.value.nethernet_upstream || '').trim().toLowerCase()
+    const icePolicy = String(form.value.nethernet_ice_gather_policy || '').trim().toLowerCase()
+    const iceJSON = String(form.value.nethernet_ice_servers_json || '').trim()
+    if (!form.value.nethernet_listen_addr || !form.value.nethernet_cert_file || !form.value.nethernet_key_file || !upstream.startsWith('https://')) {
+      message.warning('NetherNet 需要信令监听地址、TLS证书、TLS私钥和 https:// 上游信令 URL')
+      return
+    }
+    if (iceJSON) {
+      try {
+        if (!Array.isArray(JSON.parse(iceJSON))) throw new Error('ICE/TURN 必须是数组')
+      } catch (err) {
+        message.warning(`ICE/TURN JSON 无效: ${err?.message || err}`)
+        return
+      }
+    }
+    if (icePolicy === 'relay' && !iceJSON) {
+      message.warning('relay ICE 策略必须配置 ICE/TURN JSON')
+      return
+    }
+  }
 
   // 如果是多节点/分组模式，确保负载均衡配置完整
   if (isGroupOrMultiNode.value) {

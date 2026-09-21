@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -55,6 +56,7 @@ const (
 	ProxyModeRakNet      = "raknet"
 	ProxyModeRawUDP      = "raw_udp"
 	ProxyModeMITM        = "mitm"
+	ProxyModeNetherNet   = "nethernet"
 )
 
 func normalizeProtocol(protocol string) string {
@@ -75,7 +77,7 @@ func normalizeServerProxyMode(protocol, mode string) string {
 	switch normalizedMode {
 	case "", ProxyModeTransparent:
 		return ""
-	case ProxyModePassthrough, ProxyModeRakNet, ProxyModeRawUDP, ProxyModeMITM:
+	case ProxyModePassthrough, ProxyModeRakNet, ProxyModeRawUDP, ProxyModeMITM, ProxyModeNetherNet:
 		return normalizedMode
 	default:
 		return ""
@@ -115,6 +117,13 @@ func normalizeLatencyMode(mode string) string {
 	return v
 }
 
+// NetherNetICEServer describes one STUN/TURN server used for ICE gathering.
+type NetherNetICEServer struct {
+	Username string   `json:"username,omitempty"`
+	Password string   `json:"password,omitempty"`
+	URLs     []string `json:"urls"`
+}
+
 // ServerConfig represents a proxy target server configuration.
 type ServerConfig struct {
 	ID         string `json:"id"`
@@ -128,26 +137,35 @@ type ServerConfig struct {
 	// LegacyDisabled is the deprecated "disabled" field. It is read only for
 	// backward compatibility with old config files and migrated to Hidden in
 	// Normalize(); it is never written back (omitempty + cleared to nil).
-	LegacyDisabled      *bool             `json:"disabled,omitempty"`
-	UDPSpeeder          *UDPSpeederConfig `json:"udp_speeder,omitempty"`
-	SendRealIP          bool              `json:"send_real_ip"`
-	ResolveInterval     int               `json:"resolve_interval"`       // seconds
-	IdleTimeout         int               `json:"idle_timeout"`           // seconds
-	BufferSize          int               `json:"buffer_size"`            // UDP buffer size, -1 for auto
-	UDPSocketBufferSize int               `json:"udp_socket_buffer_size"` // UDP socket buffer size in bytes (0=auto, -1=OS default)
-	DisabledMessage     string            `json:"disabled_message"`       // Custom message when server is disabled
-	CustomMOTD          string            `json:"custom_motd"`            // Custom MOTD for ping response (empty = forward from remote)
-	ProxyMode           string            `json:"proxy_mode"`             // "transparent" (default) or "raknet" (full RakNet proxy)
-	ACLServerID         string            `json:"acl_server_id,omitempty"`
-	RawUDPKickStrategy  string            `json:"raw_udp_kick_strategy,omitempty"`
-	XboxAuthEnabled     bool              `json:"xbox_auth_enabled"`      // Enable Xbox Live authentication for remote connections
-	XboxTokenPath       string            `json:"xbox_token_path"`        // Custom token file path for Xbox Live tokens (optional)
-	ProxyOutbound       string            `json:"proxy_outbound"`         // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
-	ShowRealLatency     bool              `json:"show_real_latency"`      // Show real latency through proxy in server list ping
-	LoadBalance         string            `json:"load_balance"`           // Load balance strategy: least-latency, round-robin, random, least-connections
-	LoadBalanceSort     string            `json:"load_balance_sort"`      // Latency sort type: udp, tcp, http
-	ProtocolVersion     int               `json:"protocol_version"`       // Override protocol version in Login packet (0 = don't modify)
-	LatencyMode         string            `json:"latency_mode,omitempty"` // "normal" (default), "aggressive", or "fec_tunnel"
+	LegacyDisabled             *bool                `json:"disabled,omitempty"`
+	UDPSpeeder                 *UDPSpeederConfig    `json:"udp_speeder,omitempty"`
+	SendRealIP                 bool                 `json:"send_real_ip"`
+	ResolveInterval            int                  `json:"resolve_interval"`                // seconds
+	IdleTimeout                int                  `json:"idle_timeout"`                    // seconds
+	BufferSize                 int                  `json:"buffer_size"`                     // UDP buffer size, -1 for auto
+	UDPSocketBufferSize        int                  `json:"udp_socket_buffer_size"`          // UDP socket buffer size in bytes (0=auto, -1=OS default)
+	DisabledMessage            string               `json:"disabled_message"`                // Custom message when server is disabled
+	CustomMOTD                 string               `json:"custom_motd"`                     // Custom MOTD for ping response (empty = forward from remote)
+	ProxyMode                  string               `json:"proxy_mode"`                      // transparent, raknet, raw_udp, mitm, or nethernet
+	NetherNetListenAddr        string               `json:"nethernet_listen_addr,omitempty"` // HTTPS signaling bind address
+	NetherNetCertFile          string               `json:"nethernet_cert_file,omitempty"`
+	NetherNetKeyFile           string               `json:"nethernet_key_file,omitempty"`
+	NetherNetUpstream          string               `json:"nethernet_upstream,omitempty"` // HTTPS signaling URL, e.g. https://host:port
+	NetherNetIdentityFile      string               `json:"nethernet_identity_file,omitempty"`
+	NetherNetICEGatherPolicy   string               `json:"nethernet_ice_gather_policy,omitempty"` // all or relay
+	NetherNetDisableTrickleICE bool                 `json:"nethernet_disable_trickle_ice,omitempty"`
+	NetherNetICEServers        []NetherNetICEServer `json:"nethernet_ice_servers,omitempty"`
+	NetherNetAllowAnonymous    bool                 `json:"nethernet_allow_anonymous,omitempty"`
+	ACLServerID                string               `json:"acl_server_id,omitempty"`
+	RawUDPKickStrategy         string               `json:"raw_udp_kick_strategy,omitempty"`
+	XboxAuthEnabled            bool                 `json:"xbox_auth_enabled"`      // Enable Xbox Live authentication for remote connections
+	XboxTokenPath              string               `json:"xbox_token_path"`        // Custom token file path for Xbox Live tokens (optional)
+	ProxyOutbound              string               `json:"proxy_outbound"`         // Proxy outbound node name, "@group" for group selection, empty or "direct" for direct connection
+	ShowRealLatency            bool                 `json:"show_real_latency"`      // Show real latency through proxy in server list ping
+	LoadBalance                string               `json:"load_balance"`           // Load balance strategy: least-latency, round-robin, random, least-connections
+	LoadBalanceSort            string               `json:"load_balance_sort"`      // Latency sort type: udp, tcp, http
+	ProtocolVersion            int                  `json:"protocol_version"`       // Override protocol version in Login packet (0 = don't modify)
+	LatencyMode                string               `json:"latency_mode,omitempty"` // "normal" (default), "aggressive", or "fec_tunnel"
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"`         // Per-server ping interval in minutes
@@ -307,6 +325,10 @@ func (sc *ServerConfig) Normalize() {
 	sc.Protocol = normalizeProtocol(sc.Protocol)
 	sc.ProxyOutbound = normalizeProxyOutboundValue(sc.ProxyOutbound)
 	sc.ProxyMode = normalizeServerProxyMode(sc.Protocol, sc.ProxyMode)
+	if sc.GetProxyMode() == ProxyModeNetherNet {
+		// endpoint.Handler/Client reject trickle candidates; keep this explicit in config.
+		sc.NetherNetDisableTrickleICE = true
+	}
 	sc.AutoPingFullScanMode = normalizeAutoPingFullScanMode(sc.AutoPingFullScanMode)
 	if !sc.SupportsAutoPing() {
 		sc.AutoPingEnabled = false
@@ -349,14 +371,16 @@ func (sc *ServerConfig) Validate() error {
 	if sc.Name == "" {
 		return errors.New("name is required")
 	}
-	if sc.Target == "" {
-		return errors.New("target is required")
-	}
-	if sc.Port <= 0 || sc.Port > 65535 {
-		return fmt.Errorf("port must be between 1 and 65535, got %d", sc.Port)
-	}
-	if sc.ListenAddr == "" {
-		return errors.New("listen_addr is required")
+	if sc.GetProxyMode() != ProxyModeNetherNet {
+		if sc.Target == "" {
+			return errors.New("target is required")
+		}
+		if sc.Port <= 0 || sc.Port > 65535 {
+			return fmt.Errorf("port must be between 1 and 65535, got %d", sc.Port)
+		}
+		if sc.ListenAddr == "" {
+			return errors.New("listen_addr is required")
+		}
 	}
 	protocol := normalizeProtocol(sc.Protocol)
 	if protocol == "" {
@@ -383,6 +407,30 @@ func (sc *ServerConfig) Validate() error {
 	}
 	if !isValidRawUDPKickStrategy(sc.RawUDPKickStrategy) {
 		return fmt.Errorf("invalid raw_udp_kick_strategy: %s", sc.RawUDPKickStrategy)
+	}
+	if sc.GetProxyMode() == ProxyModeNetherNet {
+		if sc.NetherNetListenAddr == "" || sc.NetherNetCertFile == "" || sc.NetherNetKeyFile == "" {
+			return errors.New("nethernet requires nethernet_listen_addr, nethernet_cert_file and nethernet_key_file")
+		}
+		if _, _, err := net.SplitHostPort(sc.NetherNetListenAddr); err != nil {
+			return fmt.Errorf("nethernet_listen_addr must be host:port: %w", err)
+		}
+		upstream, err := url.Parse(strings.TrimSpace(sc.NetherNetUpstream))
+		if err != nil || upstream.Scheme != "https" || upstream.Hostname() == "" || upstream.Port() == "" || upstream.Path != "" || upstream.RawQuery != "" {
+			return errors.New("nethernet_upstream must be an https://host:port URL without a path")
+		}
+		policy := strings.ToLower(strings.TrimSpace(sc.NetherNetICEGatherPolicy))
+		if policy != "" && policy != "all" && policy != "relay" {
+			return fmt.Errorf("nethernet_ice_gather_policy must be all or relay, got %q", sc.NetherNetICEGatherPolicy)
+		}
+		for i, server := range sc.NetherNetICEServers {
+			if len(server.URLs) == 0 {
+				return fmt.Errorf("nethernet_ice_servers[%d].urls cannot be empty", i)
+			}
+		}
+		if policy == "relay" && len(sc.NetherNetICEServers) == 0 {
+			return errors.New("nethernet_ice_servers is required when nethernet_ice_gather_policy=relay")
+		}
 	}
 	if sc.UDPSpeeder != nil && sc.UDPSpeeder.Enabled {
 		switch protocol {
@@ -455,76 +503,90 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 }
 
 type RawUDPClientStatsDTO struct {
-	Client              string    `json:"client"`
-	ClientAddr          string    `json:"client_addr"`
-	SessionKey          string    `json:"session_key,omitempty"`
-	PlayerName          string    `json:"player_name,omitempty"`
-	PlayerUUID          string    `json:"player_uuid,omitempty"`
-	PlayerXUID          string    `json:"player_xuid,omitempty"`
-	ConnectedAt         time.Time `json:"connected_at,omitempty"`
-	DurationSeconds     int64     `json:"duration_seconds"`
-	Route               string    `json:"route"`
-	Target              string    `json:"target"`
-	UpPackets           int64     `json:"up_packets"`
-	DownPackets         int64     `json:"down_packets"`
-	UpBytes             int64     `json:"up_bytes"`
-	DownBytes           int64     `json:"down_bytes"`
-	UpBytesPerSecond    int64     `json:"up_bytes_per_second"`
-	DownBytesPerSecond  int64     `json:"down_bytes_per_second"`
-	SinceClientMs       int64     `json:"since_client_ms"`
-	SinceTargetMs       int64     `json:"since_target_ms"`
-	WriteTargetErrors   int64     `json:"write_target_errors"`
-	WriteTargetTimeouts int64     `json:"write_target_timeouts"`
-	WriteClientErrors   int64     `json:"write_client_errors"`
-	WriteClientTimeouts int64     `json:"write_client_timeouts"`
-	ReadTargetTimeouts  int64     `json:"read_target_timeouts"`
-	UpstreamQueueLen    int       `json:"upstream_queue_len"`
-	UpstreamQueueCap    int       `json:"upstream_queue_cap"`
-	UpstreamQueueDrops  int64     `json:"upstream_queue_drops"`
-	LoginParseAttempts  int64     `json:"login_parse_attempts"`
-	LoginParseDone      bool      `json:"login_parse_done"`
-	Encrypted           bool      `json:"encrypted"`
-	LastWriteTargetMs   int64     `json:"last_write_target_ms"`
-	MaxWriteTargetMs    int64     `json:"max_write_target_ms"`
-	SlowWriteTarget     int64     `json:"slow_write_target_count"`
-	LastWriteClientMs   int64     `json:"last_write_client_ms"`
-	MaxWriteClientMs    int64     `json:"max_write_client_ms"`
-	SlowWriteClient     int64     `json:"slow_write_client_count"`
-	StallReason         string    `json:"stall_reason,omitempty"`
+	Client                 string    `json:"client"`
+	ClientAddr             string    `json:"client_addr"`
+	SessionKey             string    `json:"session_key,omitempty"`
+	PlayerName             string    `json:"player_name,omitempty"`
+	PlayerUUID             string    `json:"player_uuid,omitempty"`
+	PlayerXUID             string    `json:"player_xuid,omitempty"`
+	ConnectedAt            time.Time `json:"connected_at,omitempty"`
+	DurationSeconds        int64     `json:"duration_seconds"`
+	Route                  string    `json:"route"`
+	Target                 string    `json:"target"`
+	UpPackets              int64     `json:"up_packets"`
+	DownPackets            int64     `json:"down_packets"`
+	UpBytes                int64     `json:"up_bytes"`
+	DownBytes              int64     `json:"down_bytes"`
+	UpBytesPerSecond       int64     `json:"up_bytes_per_second"`
+	DownBytesPerSecond     int64     `json:"down_bytes_per_second"`
+	SinceClientMs          int64     `json:"since_client_ms"`
+	SinceTargetMs          int64     `json:"since_target_ms"`
+	WriteTargetErrors      int64     `json:"write_target_errors"`
+	WriteTargetTimeouts    int64     `json:"write_target_timeouts"`
+	WriteClientErrors      int64     `json:"write_client_errors"`
+	WriteClientTimeouts    int64     `json:"write_client_timeouts"`
+	ReadTargetTimeouts     int64     `json:"read_target_timeouts"`
+	UpstreamQueueLen       int       `json:"upstream_queue_len"`
+	UpstreamQueueCap       int       `json:"upstream_queue_cap"`
+	UpstreamQueueDrops     int64     `json:"upstream_queue_drops"`
+	LoginParseAttempts     int64     `json:"login_parse_attempts"`
+	LoginParseDone         bool      `json:"login_parse_done"`
+	LoginParsed            bool      `json:"login_parsed"`
+	Encrypted              bool      `json:"encrypted"`
+	LastWriteTargetMs      int64     `json:"last_write_target_ms"`
+	MaxWriteTargetMs       int64     `json:"max_write_target_ms"`
+	SlowWriteTarget        int64     `json:"slow_write_target_count"`
+	LastWriteClientMs      int64     `json:"last_write_client_ms"`
+	MaxWriteClientMs       int64     `json:"max_write_client_ms"`
+	SlowWriteClient        int64     `json:"slow_write_client_count"`
+	StallReason            string    `json:"stall_reason,omitempty"`
+	MaxClientPacketGapMs   int64     `json:"max_client_packet_gap_ms"`
+	MaxTargetPacketGapMs   int64     `json:"max_target_packet_gap_ms"`
+	RecentMaxWriteTargetMs int64     `json:"recent_max_write_target_ms"`
+	RecentMaxWriteClientMs int64     `json:"recent_max_write_client_ms"`
 }
 
 // ServerConfigDTO is the data transfer object for server config API responses.
 type ServerConfigDTO struct {
-	ID                  string                 `json:"id"`
-	Name                string                 `json:"name"`
-	Target              string                 `json:"target"`
-	Port                int                    `json:"port"`
-	ListenAddr          string                 `json:"listen_addr"`
-	Protocol            string                 `json:"protocol"`
-	Enabled             bool                   `json:"enabled"`
-	Hidden              bool                   `json:"hidden"` // Whether this server is hidden from the public status page (/api/web/index)
-	UDPSpeeder          *UDPSpeederConfigDTO   `json:"udp_speeder,omitempty"`
-	SendRealIP          bool                   `json:"send_real_ip"`
-	ResolveInterval     int                    `json:"resolve_interval"`
-	IdleTimeout         int                    `json:"idle_timeout"`
-	BufferSize          int                    `json:"buffer_size"`
-	UDPSocketBufferSize int                    `json:"udp_socket_buffer_size"`
-	DisabledMessage     string                 `json:"disabled_message"`
-	CustomMOTD          string                 `json:"custom_motd"`
-	ProxyMode           string                 `json:"proxy_mode"` // "transparent", "passthrough", or "raknet"
-	ACLServerID         string                 `json:"acl_server_id,omitempty"`
-	RawUDPKickStrategy  string                 `json:"raw_udp_kick_strategy,omitempty"`
-	XboxAuthEnabled     bool                   `json:"xbox_auth_enabled"`
-	XboxTokenPath       string                 `json:"xbox_token_path"`
-	ProxyOutbound       string                 `json:"proxy_outbound"`         // Proxy outbound node name or "@group" for group selection
-	ShowRealLatency     bool                   `json:"show_real_latency"`      // Show real latency through proxy
-	LoadBalance         string                 `json:"load_balance"`           // Load balance strategy
-	LoadBalanceSort     string                 `json:"load_balance_sort"`      // Latency sort type
-	LatencyMode         string                 `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
-	Status              string                 `json:"status"`                 // running, stopped
-	ActiveSessions      int                    `json:"active_sessions"`
-	ActiveProxyClients  int                    `json:"active_proxy_clients"`
-	RawUDPClients       []RawUDPClientStatsDTO `json:"raw_udp_clients,omitempty"`
+	ID                         string                 `json:"id"`
+	Name                       string                 `json:"name"`
+	Target                     string                 `json:"target"`
+	Port                       int                    `json:"port"`
+	ListenAddr                 string                 `json:"listen_addr"`
+	Protocol                   string                 `json:"protocol"`
+	Enabled                    bool                   `json:"enabled"`
+	Hidden                     bool                   `json:"hidden"` // Whether this server is hidden from the public status page (/api/web/index)
+	UDPSpeeder                 *UDPSpeederConfigDTO   `json:"udp_speeder,omitempty"`
+	SendRealIP                 bool                   `json:"send_real_ip"`
+	ResolveInterval            int                    `json:"resolve_interval"`
+	IdleTimeout                int                    `json:"idle_timeout"`
+	BufferSize                 int                    `json:"buffer_size"`
+	UDPSocketBufferSize        int                    `json:"udp_socket_buffer_size"`
+	DisabledMessage            string                 `json:"disabled_message"`
+	CustomMOTD                 string                 `json:"custom_motd"`
+	ProxyMode                  string                 `json:"proxy_mode"` // transparent, raknet, raw_udp, mitm, or nethernet
+	NetherNetListenAddr        string                 `json:"nethernet_listen_addr,omitempty"`
+	NetherNetCertFile          string                 `json:"nethernet_cert_file,omitempty"`
+	NetherNetKeyFile           string                 `json:"nethernet_key_file,omitempty"`
+	NetherNetUpstream          string                 `json:"nethernet_upstream,omitempty"`
+	NetherNetIdentityFile      string                 `json:"nethernet_identity_file,omitempty"`
+	NetherNetICEGatherPolicy   string                 `json:"nethernet_ice_gather_policy,omitempty"`
+	NetherNetDisableTrickleICE bool                   `json:"nethernet_disable_trickle_ice,omitempty"`
+	NetherNetICEServers        []NetherNetICEServer   `json:"nethernet_ice_servers,omitempty"`
+	NetherNetAllowAnonymous    bool                   `json:"nethernet_allow_anonymous,omitempty"`
+	ACLServerID                string                 `json:"acl_server_id,omitempty"`
+	RawUDPKickStrategy         string                 `json:"raw_udp_kick_strategy,omitempty"`
+	XboxAuthEnabled            bool                   `json:"xbox_auth_enabled"`
+	XboxTokenPath              string                 `json:"xbox_token_path"`
+	ProxyOutbound              string                 `json:"proxy_outbound"`         // Proxy outbound node name or "@group" for group selection
+	ShowRealLatency            bool                   `json:"show_real_latency"`      // Show real latency through proxy
+	LoadBalance                string                 `json:"load_balance"`           // Load balance strategy
+	LoadBalanceSort            string                 `json:"load_balance_sort"`      // Latency sort type
+	LatencyMode                string                 `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
+	Status                     string                 `json:"status"`                 // running, stopped
+	ActiveSessions             int                    `json:"active_sessions"`
+	ActiveProxyClients         int                    `json:"active_proxy_clients"`
+	RawUDPClients              []RawUDPClientStatsDTO `json:"raw_udp_clients,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval
@@ -556,6 +618,15 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		DisabledMessage:               sc.DisabledMessage,
 		CustomMOTD:                    sc.CustomMOTD,
 		ProxyMode:                     sc.GetProxyMode(),
+		NetherNetListenAddr:           sc.NetherNetListenAddr,
+		NetherNetCertFile:             sc.NetherNetCertFile,
+		NetherNetKeyFile:              sc.NetherNetKeyFile,
+		NetherNetUpstream:             sc.NetherNetUpstream,
+		NetherNetIdentityFile:         sc.NetherNetIdentityFile,
+		NetherNetICEGatherPolicy:      sc.NetherNetICEGatherPolicy,
+		NetherNetDisableTrickleICE:    sc.NetherNetDisableTrickleICE,
+		NetherNetICEServers:           sc.NetherNetICEServers,
+		NetherNetAllowAnonymous:       sc.NetherNetAllowAnonymous,
 		ACLServerID:                   sc.GetACLServerID(),
 		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
 		XboxAuthEnabled:               sc.XboxAuthEnabled,
@@ -667,6 +738,10 @@ func (sc *ServerConfig) GetGroupName() string {
 
 func (sc *ServerConfig) SupportsAutoPing() bool {
 	if sc == nil {
+		return false
+	}
+	if sc.GetProxyMode() == ProxyModeNetherNet {
+		// NetherNet has no RakNet PingContext equivalent; auto-ping would be misleading.
 		return false
 	}
 	if sc.IsGroupSelection() {

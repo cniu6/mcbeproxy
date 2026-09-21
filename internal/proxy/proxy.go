@@ -2210,6 +2210,20 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			}
 			listener = mitmProxy
 			logger.Info("Using MITM proxy mode for server %s", serverCfg.ID)
+		case "nethernet":
+			netherNetProxy := NewNetherNetProxy(
+				serverCfg.ID,
+				cfgForListener,
+				p.sessionMgr,
+			)
+			if p.aclManager != nil {
+				netherNetProxy.SetACLManager(p.aclManager)
+			}
+			if p.outboundMgr != nil {
+				netherNetProxy.SetOutboundManager(p.outboundMgr)
+			}
+			listener = netherNetProxy
+			logger.Info("Using NetherNet MITM proxy mode for server %s", serverCfg.ID)
 		case "raknet":
 			// Use full RakNet proxy (can extract player info)
 			raknetProxy := NewRakNetProxy(
@@ -2950,7 +2964,9 @@ func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 	if p.sessionMgr != nil {
 		sessions := p.sessionMgr.GetAllSessions()
 		for _, sess := range sessions {
-			sessionCounts[sess.ServerID]++
+			if sess != nil && strings.TrimSpace(sess.GetDisplayName()) != "" {
+				sessionCounts[sess.ServerID]++
+			}
 		}
 	}
 

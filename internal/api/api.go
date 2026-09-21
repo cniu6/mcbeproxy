@@ -1124,6 +1124,11 @@ func (a *APIServer) buildActiveSessionDTOs(servers []config.ServerConfigDTO) []s
 	}
 	for serverID, raws := range rawByServer {
 		for _, raw := range raws {
+			// Raw UDP may expose a short-lived pre-login diagnostic client. It is
+			// not a player and must not appear in the online sessions list.
+			if !raw.LoginParsed || strings.TrimSpace(raw.PlayerName) == "" {
+				continue
+			}
 			key := rawUDPClientIdentityKey(raw)
 			if key != "" && seenRaw[key] {
 				continue

@@ -262,7 +262,7 @@ const getProxyModeLabel = (server) => {
     return 'Plain'
   }
   const mode = String(server?.proxy_mode || '').trim().toLowerCase()
-  const modeMap = { raw_udp: 'Raw UDP', passthrough: 'Pass', transparent: 'Trans', raknet: 'RakNet', mitm: 'MITM' }
+  const modeMap = { raw_udp: 'Raw UDP (RakNet)', passthrough: 'Pass', transparent: 'Trans', raknet: 'RakNet', mitm: 'MITM', nethernet: 'NetherNet' }
   return modeMap[mode] || server?.proxy_mode || 'Trans'
 }
 
@@ -272,7 +272,7 @@ const getProxyModeType = (server) => {
     return 'default'
   }
   const mode = String(server?.proxy_mode || '').trim().toLowerCase()
-  const typeMap = { raw_udp: 'success', passthrough: 'info', transparent: 'warning', raknet: 'default', mitm: 'error' }
+  const typeMap = { raw_udp: 'success', passthrough: 'info', transparent: 'warning', raknet: 'default', mitm: 'error', nethernet: 'warning' }
   return typeMap[mode] || 'default'
 }
 

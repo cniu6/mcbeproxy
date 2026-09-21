@@ -1613,6 +1613,51 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 	return nil, fmt.Errorf("%w: %s after %d attempts: %v", ErrAllRetriesFailed, outboundName, MaxRetryAttempts, lastErr)
 }
 
+// DialTCPContext creates a TCP connection through one configured outbound.
+// It is intentionally an optional concrete capability so existing OutboundManager mocks remain unchanged.
+func (m *outboundManagerImpl) DialTCPContext(ctx context.Context, outboundName, destination string) (net.Conn, error) {
+	if strings.TrimSpace(outboundName) == "" || strings.EqualFold(strings.TrimSpace(outboundName), DirectNodeName) {
+		return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", destination)
+	}
+	selected := strings.TrimSpace(outboundName)
+	if strings.HasPrefix(selected, "@") || strings.Contains(selected, ",") {
+		cfg, err := m.SelectOutboundWithFailover(selected, config.LoadBalanceLeastLatency, config.LoadBalanceSortTCP, nil)
+		if err != nil {
+			return nil, err
+		}
+		selected = cfg.Name
+	}
+	m.mu.RLock()
+	cfg, ok := m.outbounds[selected]
+	m.mu.RUnlock()
+	if !ok || cfg == nil {
+		return nil, ErrOutboundNotFound
+	}
+	dialer, err := m.singboxFactory.CreateDialer(ctx, cfg.Clone())
+	if err != nil {
+		return nil, fmt.Errorf("create signaling outbound %s: %w", selected, err)
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", destination)
+	if err != nil {
+		_ = dialer.Close()
+		return nil, fmt.Errorf("dial signaling outbound %s: %w", selected, err)
+	}
+	return &managedTCPConn{Conn: conn, closeDialer: dialer.Close}, nil
+}
+
+type managedTCPConn struct {
+	net.Conn
+	closeDialer func() error
+}
+
+func (c *managedTCPConn) Close() error {
+	connErr := c.Conn.Close()
+	if c.closeDialer != nil {
+		_ = c.closeDialer()
+	}
+	return connErr
+}
+
 // dialPacketConnOnce performs a single connection attempt without retry.
 func (m *outboundManagerImpl) dialPacketConnOnce(ctx context.Context, outboundName string, destination string) (net.PacketConn, error) {
 	return m.dialPacketConnOnceInternal(ctx, outboundName, destination, true)

@@ -106,7 +106,12 @@ type directDialer struct {
 func NewSingboxCoreFactory() singboxcore.Factory {
 	return singboxcore.FactoryFuncs{
 		CreateUDPOutboundFunc: func(_ context.Context, cfg *config.ProxyOutbound) (singboxcore.UDPOutbound, error) {
-			return CreateSingboxOutbound(cfg)
+			outbound, err := CreateSingboxOutbound(cfg)
+			if outbound == nil {
+				// 防止具体 nil 指针转换成非 nil 接口，导致 Reload 清理时调用 nil receiver。
+				return nil, err
+			}
+			return outbound, err
 		},
 		CreateDialerFunc: func(_ context.Context, cfg *config.ProxyOutbound) (singboxcore.Dialer, error) {
 			return CreateSingboxDialer(cfg)
@@ -1961,6 +1966,12 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 
 // Close closes the sing-box outbound.
 func (s *SingboxOutbound) Close() error {
+	// Factory interfaces may carry a typed-nil *SingboxOutbound when creation fails.
+	// Treat that cleanup path as already closed instead of dereferencing the receiver.
+	if s == nil {
+		return nil
+	}
+
 	s.hy2Mu.Lock()
 	defer s.hy2Mu.Unlock()
 	if s.hy2Client != nil {

@@ -90,6 +90,9 @@ const (
 	// goroutine/connection leaks when a client disappears without sending a
 	// RakNet DisconnectNotification (e.g., NAT timeout, crash, kill -9).
 	MaxRawUDPStaleTimeout = 24 * time.Hour
+	// RawUDPPreLoginTimeout limits handshakes that never yield a parseable Login,
+	// even when idle_timeout=-1 is used for established players.
+	RawUDPPreLoginTimeout = 90 * time.Second
 	// RawUDPStallClientSilenceCeiling is only for UI/diagnostic stall labeling.
 	// It must not cap RawUDP session cleanup; idle_timeout remains authoritative.
 	RawUDPStallClientSilenceCeiling = 90 * time.Second
@@ -195,63 +198,68 @@ const MaxSplitPacketBytes = 1024 * 1024
 
 // rawUDPClientInfo stores information about a connected client
 type rawUDPClientInfo struct {
-	clientAddr            *net.UDPAddr
-	targetConn            net.PacketConn // Can be *net.UDPConn or proxy PacketConn
-	targetAddr            net.Addr       // Target address for WriteTo
-	upstreamWriteCh       chan []byte
-	upstreamDone          chan struct{}
-	upstreamMu            sync.Mutex
-	upstreamOnce          sync.Once
-	upstreamClosed        bool
-	startTime             time.Time    // Connection start time
-	lastSeen              atomic.Int64 // Unix nano timestamp for lock-free access (any direction)
-	lastClientPacket      atomic.Int64 // Unix nano — last packet FROM client (upstream only)
-	lastTargetPacket      atomic.Int64 // Unix nano — last packet FROM target (downstream only)
-	bytesUp               atomic.Int64 // Lock-free counter
-	bytesDown             atomic.Int64 // Lock-free counter
-	lastRateAt            atomic.Int64 // Unix nano timestamp for rolling rate sampling
-	lastRateUpBytes       atomic.Int64
-	lastRateDownBytes     atomic.Int64
-	recentUpBytesPerSec   atomic.Int64
-	recentDownBytesPerSec atomic.Int64
-	bytesUpSynced         atomic.Int64 // Portion of bytesUp already credited to a session
-	bytesDownSynced       atomic.Int64 // Portion of bytesDown already credited to a session
-	packetCount           atomic.Int64 // Lock-free counter
-	packetsUp             atomic.Int64
-	packetsDown           atomic.Int64
-	writeTargetErrors     atomic.Int64
-	writeTargetTimeouts   atomic.Int64
-	writeClientErrors     atomic.Int64
-	writeClientTimeouts   atomic.Int64
-	readTargetTimeouts    atomic.Int64
-	upstreamQueueDrops    atomic.Int64
-	lastWriteTargetMs     atomic.Int64
-	maxWriteTargetMs      atomic.Int64
-	slowWriteTargetCount  atomic.Int64
-	lastWriteClientMs     atomic.Int64
-	maxWriteClientMs      atomic.Int64
-	slowWriteClientCount  atomic.Int64
-	playerName            string // Extracted from Login packet
-	playerUUID            string
-	playerXUID            string
-	proxyNode             string                        // Name of the proxy node used (empty if direct)
-	loginParsed           atomic.Bool                   // Whether Login was successfully parsed
-	loginParseDone        atomic.Bool                   // Whether best-effort Login parsing should stop
-	loginParseAttempts    atomic.Int64                  // Complete game-packet parse attempts
-	sessionCreated        atomic.Bool                   // Whether a SessionManager entry exists for this client
-	sessionKey            string                        // Client address key used by SessionManager
-	splitPackets          map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
-	compressionID         atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
-	sendDatagramSeq       atomic.Uint32                 // Best-effort outgoing datagram sequence for injected packets (24-bit)
-	sendMessageIndex      atomic.Uint32                 // Best-effort outgoing messageIndex for reliable packets (24-bit)
-	sendOrderIndex        atomic.Uint32                 // Best-effort outgoing orderIndex for reliable ordered packets (24-bit)
-	encrypted             atomic.Bool                   // Whether we observed encrypted MC packets (0xfe + unknown ID)
-	kicked                atomic.Bool                   // Whether this client was kicked
-	lastKickReplayAt      atomic.Int64
-	kickCleanupScheduled  atomic.Bool
-	pendingACKSeqs        []uint32
-	mu                    sync.Mutex // Only for splitPackets and player info writes
-	kickMessage           string
+	clientAddr             *net.UDPAddr
+	targetConn             net.PacketConn // Can be *net.UDPConn or proxy PacketConn
+	targetAddr             net.Addr       // Target address for WriteTo
+	upstreamWriteCh        chan []byte
+	upstreamDone           chan struct{}
+	upstreamMu             sync.Mutex
+	upstreamOnce           sync.Once
+	upstreamClosed         bool
+	startTime              time.Time    // Connection start time
+	lastSeen               atomic.Int64 // Unix nano timestamp for lock-free access (any direction)
+	lastClientPacket       atomic.Int64 // Unix nano — last packet FROM client (upstream only)
+	lastTargetPacket       atomic.Int64 // Unix nano — last packet FROM target (downstream only)
+	bytesUp                atomic.Int64 // Lock-free counter
+	bytesDown              atomic.Int64 // Lock-free counter
+	lastRateAt             atomic.Int64 // Unix nano timestamp for rolling rate sampling
+	lastRateUpBytes        atomic.Int64
+	lastRateDownBytes      atomic.Int64
+	recentUpBytesPerSec    atomic.Int64
+	recentDownBytesPerSec  atomic.Int64
+	bytesUpSynced          atomic.Int64 // Portion of bytesUp already credited to a session
+	bytesDownSynced        atomic.Int64 // Portion of bytesDown already credited to a session
+	packetCount            atomic.Int64 // Lock-free counter
+	packetsUp              atomic.Int64
+	packetsDown            atomic.Int64
+	writeTargetErrors      atomic.Int64
+	writeTargetTimeouts    atomic.Int64
+	writeClientErrors      atomic.Int64
+	writeClientTimeouts    atomic.Int64
+	readTargetTimeouts     atomic.Int64
+	upstreamQueueDrops     atomic.Int64
+	lastWriteTargetMs      atomic.Int64
+	maxWriteTargetMs       atomic.Int64
+	slowWriteTargetCount   atomic.Int64
+	lastWriteClientMs      atomic.Int64
+	maxWriteClientMs       atomic.Int64
+	slowWriteClientCount   atomic.Int64
+	maxClientPacketGapMs   atomic.Int64
+	maxTargetPacketGapMs   atomic.Int64
+	writeMetricWindowAt    atomic.Int64
+	recentMaxWriteTargetMs atomic.Int64
+	recentMaxWriteClientMs atomic.Int64
+	playerName             string // Extracted from Login packet
+	playerUUID             string
+	playerXUID             string
+	proxyNode              string                        // Name of the proxy node used (empty if direct)
+	loginParsed            atomic.Bool                   // Whether Login was successfully parsed
+	loginParseDone         atomic.Bool                   // Whether best-effort Login parsing should stop
+	loginParseAttempts     atomic.Int64                  // Complete game-packet parse attempts
+	sessionCreated         atomic.Bool                   // Whether a SessionManager entry exists for this client
+	sessionKey             string                        // Client address key used by SessionManager
+	splitPackets           map[uint16]*splitPacketBuffer // splitID -> buffer for reassembly
+	compressionID          atomic.Uint32                 // Compression ID observed from client's Login packet (0x00/0x01/0xff)
+	sendDatagramSeq        atomic.Uint32                 // Best-effort outgoing datagram sequence for injected packets (24-bit)
+	sendMessageIndex       atomic.Uint32                 // Best-effort outgoing messageIndex for reliable packets (24-bit)
+	sendOrderIndex         atomic.Uint32                 // Best-effort outgoing orderIndex for reliable ordered packets (24-bit)
+	encrypted              atomic.Bool                   // Whether we observed encrypted MC packets (0xfe + unknown ID)
+	kicked                 atomic.Bool                   // Whether this client was kicked
+	lastKickReplayAt       atomic.Int64
+	kickCleanupScheduled   atomic.Bool
+	pendingACKSeqs         []uint32
+	mu                     sync.Mutex // Only for splitPackets and player info writes
+	kickMessage            string
 
 	// Consecutive write timeout counter — if writes keep timing out the
 	// upstream relay is dead. After a threshold we close the session
@@ -548,6 +556,43 @@ func rawUDPDurationMs(d time.Duration) int64 {
 	return ms
 }
 
+const rawUDPWriteMetricWindow = 30 * time.Second
+
+func atomicMaxInt64(dst *atomic.Int64, value int64) {
+	for {
+		current := dst.Load()
+		if value <= current || dst.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func rawUDPRecordPacketGap(last, maxGap *atomic.Int64, now time.Time) {
+	previous := last.Swap(now.UnixNano())
+	if previous > 0 {
+		atomicMaxInt64(maxGap, rawUDPDurationMs(now.Sub(time.Unix(0, previous))))
+	}
+}
+
+func rawUDPRecordRecentWrite(clientInfo *rawUDPClientInfo, target bool, elapsed time.Duration, now time.Time) {
+	if clientInfo == nil {
+		return
+	}
+	windowAt := clientInfo.writeMetricWindowAt.Load()
+	if windowAt == 0 || now.Sub(time.Unix(0, windowAt)) >= rawUDPWriteMetricWindow {
+		if clientInfo.writeMetricWindowAt.CompareAndSwap(windowAt, now.UnixNano()) {
+			clientInfo.recentMaxWriteTargetMs.Store(0)
+			clientInfo.recentMaxWriteClientMs.Store(0)
+		}
+	}
+	ms := rawUDPDurationMs(elapsed)
+	if target {
+		atomicMaxInt64(&clientInfo.recentMaxWriteTargetMs, ms)
+	} else {
+		atomicMaxInt64(&clientInfo.recentMaxWriteClientMs, ms)
+	}
+}
+
 func rawUDPRecordWriteLatency(last, max, slow *atomic.Int64, elapsed time.Duration) {
 	if last == nil || max == nil || slow == nil {
 		return
@@ -626,42 +671,47 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 		}
 		upBPS, downBPS := rawUDPCurrentRates(clientInfo, upBytes, downBytes, now)
 		stats = append(stats, config.RawUDPClientStatsDTO{
-			Client:              clientKey,
-			ClientAddr:          clientAddr,
-			SessionKey:          clientInfo.sessionKey,
-			PlayerName:          playerName,
-			PlayerUUID:          playerUUID,
-			PlayerXUID:          playerXUID,
-			ConnectedAt:         connectedAt,
-			DurationSeconds:     durationSeconds,
-			Route:               rawUDPRouteName(clientInfo.proxyNode),
-			Target:              p.effectiveTargetAddrString(),
-			UpPackets:           clientInfo.packetsUp.Load(),
-			DownPackets:         clientInfo.packetsDown.Load(),
-			UpBytes:             upBytes,
-			DownBytes:           downBytes,
-			UpBytesPerSecond:    upBPS,
-			DownBytesPerSecond:  downBPS,
-			SinceClientMs:       sinceClientMs,
-			SinceTargetMs:       sinceTargetMs,
-			WriteTargetErrors:   clientInfo.writeTargetErrors.Load(),
-			WriteTargetTimeouts: clientInfo.writeTargetTimeouts.Load(),
-			WriteClientErrors:   clientInfo.writeClientErrors.Load(),
-			WriteClientTimeouts: clientInfo.writeClientTimeouts.Load(),
-			ReadTargetTimeouts:  clientInfo.readTargetTimeouts.Load(),
-			UpstreamQueueLen:    queueLen,
-			UpstreamQueueCap:    queueCap,
-			UpstreamQueueDrops:  clientInfo.upstreamQueueDrops.Load(),
-			LoginParseAttempts:  clientInfo.loginParseAttempts.Load(),
-			LoginParseDone:      clientInfo.loginParseDone.Load(),
-			Encrypted:           clientInfo.encrypted.Load(),
-			LastWriteTargetMs:   clientInfo.lastWriteTargetMs.Load(),
-			MaxWriteTargetMs:    clientInfo.maxWriteTargetMs.Load(),
-			SlowWriteTarget:     clientInfo.slowWriteTargetCount.Load(),
-			LastWriteClientMs:   clientInfo.lastWriteClientMs.Load(),
-			MaxWriteClientMs:    clientInfo.maxWriteClientMs.Load(),
-			SlowWriteClient:     clientInfo.slowWriteClientCount.Load(),
-			StallReason:         rawUDPStallReason(clientInfo, sinceClientMs, sinceTargetMs),
+			Client:                 clientKey,
+			ClientAddr:             clientAddr,
+			SessionKey:             clientInfo.sessionKey,
+			PlayerName:             playerName,
+			PlayerUUID:             playerUUID,
+			PlayerXUID:             playerXUID,
+			ConnectedAt:            connectedAt,
+			DurationSeconds:        durationSeconds,
+			Route:                  rawUDPRouteName(clientInfo.proxyNode),
+			Target:                 p.effectiveTargetAddrString(),
+			UpPackets:              clientInfo.packetsUp.Load(),
+			DownPackets:            clientInfo.packetsDown.Load(),
+			UpBytes:                upBytes,
+			DownBytes:              downBytes,
+			UpBytesPerSecond:       upBPS,
+			DownBytesPerSecond:     downBPS,
+			SinceClientMs:          sinceClientMs,
+			SinceTargetMs:          sinceTargetMs,
+			WriteTargetErrors:      clientInfo.writeTargetErrors.Load(),
+			WriteTargetTimeouts:    clientInfo.writeTargetTimeouts.Load(),
+			WriteClientErrors:      clientInfo.writeClientErrors.Load(),
+			WriteClientTimeouts:    clientInfo.writeClientTimeouts.Load(),
+			ReadTargetTimeouts:     clientInfo.readTargetTimeouts.Load(),
+			UpstreamQueueLen:       queueLen,
+			UpstreamQueueCap:       queueCap,
+			UpstreamQueueDrops:     clientInfo.upstreamQueueDrops.Load(),
+			LoginParseAttempts:     clientInfo.loginParseAttempts.Load(),
+			LoginParseDone:         clientInfo.loginParseDone.Load(),
+			LoginParsed:            clientInfo.loginParsed.Load(),
+			Encrypted:              clientInfo.encrypted.Load(),
+			LastWriteTargetMs:      clientInfo.lastWriteTargetMs.Load(),
+			MaxWriteTargetMs:       clientInfo.maxWriteTargetMs.Load(),
+			SlowWriteTarget:        clientInfo.slowWriteTargetCount.Load(),
+			LastWriteClientMs:      clientInfo.lastWriteClientMs.Load(),
+			MaxWriteClientMs:       clientInfo.maxWriteClientMs.Load(),
+			SlowWriteClient:        clientInfo.slowWriteClientCount.Load(),
+			MaxClientPacketGapMs:   clientInfo.maxClientPacketGapMs.Load(),
+			MaxTargetPacketGapMs:   clientInfo.maxTargetPacketGapMs.Load(),
+			RecentMaxWriteTargetMs: clientInfo.recentMaxWriteTargetMs.Load(),
+			RecentMaxWriteClientMs: clientInfo.recentMaxWriteClientMs.Load(),
+			StallReason:            rawUDPStallReason(clientInfo, sinceClientMs, sinceTargetMs),
 		})
 		return true
 	})
@@ -1376,16 +1426,16 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Update stats (lock-free)
 			now := time.Now().UnixNano()
 			clientInfo.lastSeen.Store(now)
-			clientInfo.lastClientPacket.Store(now)
+			rawUDPRecordPacketGap(&clientInfo.lastClientPacket, &clientInfo.maxClientPacketGapMs, time.Unix(0, now))
 			clientInfo.bytesUp.Add(int64(n))
 			clientInfo.packetsUp.Add(1)
 			clientInfo.packetCount.Add(1)
 
-			// Once the client sends a reliable frame the RakNet connection is
-			// established; make sure a session exists so the player is tracked
-			// (online status + traffic + playtime) even if the Login packet can
-			// never be decoded. Identity is back-filled later when login parses.
-			if n > 0 && buffer[0] >= 0x80 && buffer[0] <= 0x8f {
+			// A reliable RakNet frame means the UDP connection has reached the
+			// established data phase. Create the session before Login parsing so
+			// players with split/encrypted/unknown-compression Login packets still
+			// appear online and retain traffic/playtime statistics.
+			if buffer[0] >= raknetFrameReliable && buffer[0] <= raknetFrameReliable|0x0f {
 				p.ensureSession(clientInfo)
 			}
 
@@ -1473,7 +1523,7 @@ func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte
 			// 时间戳，避免建连较慢时被清理协程误判为「早已沉默」而提前回收。
 			now := time.Now().UnixNano()
 			existingClient.lastSeen.Store(now)
-			existingClient.lastClientPacket.Store(now)
+			rawUDPRecordPacketGap(&existingClient.lastClientPacket, &existingClient.maxClientPacketGapMs, time.Unix(0, now))
 			existingClient.pendingMu.Lock()
 			if len(existingClient.pendingPackets) < RawUDPPendingDialQueueCap {
 				existingClient.pendingPackets = append(existingClient.pendingPackets, append([]byte(nil), incoming...))
@@ -2035,7 +2085,9 @@ func (p *RawUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *rawUDP
 			writeStart := time.Now()
 			clientInfo.targetConn.SetWriteDeadline(writeStart.Add(RawUDPUpstreamWriteTimeout))
 			_, err := writePacketConn(clientInfo.targetConn, packet, clientInfo.targetAddr)
-			rawUDPRecordWriteLatency(&clientInfo.lastWriteTargetMs, &clientInfo.maxWriteTargetMs, &clientInfo.slowWriteTargetCount, time.Since(writeStart))
+			writeElapsed := time.Since(writeStart)
+			rawUDPRecordWriteLatency(&clientInfo.lastWriteTargetMs, &clientInfo.maxWriteTargetMs, &clientInfo.slowWriteTargetCount, writeElapsed)
+			rawUDPRecordRecentWrite(clientInfo, true, writeElapsed, time.Now())
 			if err != nil {
 				logger.Debug("RawUDP packet write failed: server=%s client=%s target=%s route=%s direction=client_to_target bytes=%d firstByte=%s packetCount=%d bytesUp=%d bytesDown=%d targetConn=%T listenerLocal=%s targetAddr=%s err=%v",
 					p.serverID,
@@ -2134,7 +2186,8 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					// and let the inactivity reaper handle truly dead peers.
 					if isRecoverableConnError(err) {
 						lastClientPktNano := clientInfo.lastClientPacket.Load()
-						if time.Since(time.Unix(0, lastClientPktNano)) > p.effectiveClientDisconnectTimeout() {
+						effectiveTimeout := p.effectiveClientDisconnectTimeout()
+						if effectiveTimeout > 0 && time.Since(time.Unix(0, lastClientPktNano)) > effectiveTimeout {
 							return
 						}
 						continue
@@ -2147,6 +2200,22 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				}
 				if isTimeoutError(err) {
 					clientInfo.readTargetTimeouts.Add(1)
+					// 已建立连接曾经双向有流量，但随后客户端和目标都静默，说明
+					// UDP/NAT/上游关联已经半死；不要等完整 idle_timeout（通常5分钟），
+					// 立即释放，让客户端用新的源端口和上游关联重连。
+					if clientInfo.loginParsed.Load() &&
+						clientInfo.packetsUp.Load() >= int64(RawUDPBlackholeMinUpPackets) &&
+						clientInfo.packetsDown.Load() >= int64(RawUDPBlackholeMinUpPackets) {
+						lastClient := time.Unix(0, clientInfo.lastClientPacket.Load())
+						lastTarget := time.Unix(0, clientInfo.lastTargetPacket.Load())
+						if time.Since(lastClient) >= RawUDPDirectionalStallThreshold &&
+							time.Since(lastTarget) >= RawUDPDirectionalStallThreshold {
+							logger.Warn("RawUDP: bidirectional stall detected, closing for fresh association: server=%s client=%s route=%s target=%s up_packets=%d down_packets=%d silent_client=%v silent_target=%v",
+								p.serverID, clientAddr.String(), rawUDPRouteName(clientInfo.proxyNode), p.effectiveTargetAddrString(),
+								clientInfo.packetsUp.Load(), clientInfo.packetsDown.Load(), time.Since(lastClient).Round(time.Second), time.Since(lastTarget).Round(time.Second))
+							return
+						}
+					}
 					// 黑洞检测：已有上行、始终无下行，多半是 SOCKS5 ASSOCIATE
 					// 被挤掉或上游不回包。主动拆线让客户端用新 ASSOCIATE 重连，
 					// 避免干等到 idle_timeout（常见 5 分钟）。
@@ -2165,10 +2234,11 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 					}
 				}
 				// Check if client is still active using lastClientPacket (upstream only).
-				// lastSeen includes downstream traffic which can mask client
-				// disconnect when the server keeps sending data.
+				// A zero timeout means idle_timeout=-1: keep the session until an explicit
+				// disconnect or the separate stale-session guard removes it.
 				lastClientPktNano := clientInfo.lastClientPacket.Load()
-				if time.Since(time.Unix(0, lastClientPktNano)) > p.effectiveClientDisconnectTimeout() {
+				effectiveTimeout := p.effectiveClientDisconnectTimeout()
+				if effectiveTimeout > 0 && time.Since(time.Unix(0, lastClientPktNano)) > effectiveTimeout {
 					logger.Info("RawUDP session closed (client silent for %v): server=%s client=%s active_proxy_clients=%d",
 						time.Since(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, clientAddr.String(), p.GetActiveClientCount())
 					return
@@ -2195,7 +2265,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			// overflow on the target connection under heavy traffic.
 			writeStart := time.Now()
 			_, err = p.writeToClient(clientAddr, buffer[:n], UDPWriteTimeout)
-			rawUDPRecordWriteLatency(&clientInfo.lastWriteClientMs, &clientInfo.maxWriteClientMs, &clientInfo.slowWriteClientCount, time.Since(writeStart))
+			writeElapsed := time.Since(writeStart)
+			rawUDPRecordWriteLatency(&clientInfo.lastWriteClientMs, &clientInfo.maxWriteClientMs, &clientInfo.slowWriteClientCount, writeElapsed)
+			rawUDPRecordRecentWrite(clientInfo, false, writeElapsed, time.Now())
 
 			if err != nil {
 				// ICMP from the client side (NAT rebinding, brief unreachable)
@@ -2255,7 +2327,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			clientInfo.packetsDown.Add(1)
 			downAt := time.Now()
 			clientInfo.lastSeen.Store(downAt.UnixNano())
-			clientInfo.lastTargetPacket.Store(downAt.UnixNano())
+			rawUDPRecordPacketGap(&clientInfo.lastTargetPacket, &clientInfo.maxTargetPacketGapMs, downAt)
 			p.debugRawUDPPacket(clientInfo, "target_to_client", buffer[:n], downAt)
 
 			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
@@ -2537,7 +2609,15 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 		lastSeenNano := clientInfo.lastSeen.Load()
 		lastClientPktNano := clientInfo.lastClientPacket.Load()
 
-		if effectiveClientTimeout > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > effectiveClientTimeout {
+		preLoginExpired := !clientInfo.loginParsed.Load() && !clientInfo.sessionCreated.Load() &&
+			(clientInfo.loginParseAttempts.Load() > 0 || clientInfo.packetsUp.Load() > 0 || clientInfo.packetsDown.Load() > 0) &&
+			now.Sub(clientInfo.startTime) > RawUDPPreLoginTimeout
+		if preLoginExpired {
+			p.removeClient(key.(string))
+			removed++
+			logger.Info("RawUDP session closed (pre-login timeout %v): server=%s client=%s active_proxy_clients=%d",
+				now.Sub(clientInfo.startTime).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
+		} else if effectiveClientTimeout > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > effectiveClientTimeout {
 			p.removeClient(key.(string))
 			removed++
 			logger.Info("RawUDP session closed (client silent for %v): server=%s client=%s active_proxy_clients=%d",
@@ -2894,19 +2974,39 @@ func (p *RawUDPProxy) getCachedAdvertisementForAPI() []byte {
 }
 
 func (p *RawUDPProxy) getCachedAdvertisementForClient() []byte {
-	// Prefer custom MOTD for clients (matches other proxy modes).
+	p.latencyMu.RLock()
+	cached := append([]byte(nil), p.cachedPong...)
+	p.latencyMu.RUnlock()
+
+	if len(cached) > 0 {
+		if p.config != nil {
+			if custom := p.config.GetCustomMOTD(); custom != "" {
+				// 自定义 MOTD 只负责展示文案；协议号和版本必须跟随上游，避免旧广告阻止新客户端。
+				return mergeMOTDCompatibility([]byte(custom), cached)
+			}
+		}
+		return cached
+	}
+
 	if p.config != nil {
 		if custom := p.config.GetCustomMOTD(); custom != "" {
 			return []byte(custom)
 		}
 	}
-	p.latencyMu.RLock()
-	cached := p.cachedPong
-	p.latencyMu.RUnlock()
-	if len(cached) > 0 {
-		return cached
-	}
 	return defaultAdvertisementForServer(p.serverID)
+}
+
+// mergeMOTDCompatibility keeps custom display fields while inheriting the
+// upstream protocol/version fields used by the Bedrock client for compatibility.
+func mergeMOTDCompatibility(custom, upstream []byte) []byte {
+	customParts := strings.Split(string(custom), ";")
+	upstreamParts := strings.Split(string(upstream), ";")
+	if len(customParts) < 4 || len(upstreamParts) < 4 || customParts[0] != "MCPE" || upstreamParts[0] != "MCPE" {
+		return append([]byte(nil), upstream...)
+	}
+	customParts[2] = upstreamParts[2]
+	customParts[3] = upstreamParts[3]
+	return []byte(strings.Join(customParts, ";"))
 }
 
 func (p *RawUDPProxy) maybeRefreshPingCacheAsync(force bool) {
@@ -4146,7 +4246,7 @@ func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo
 
 	var gameBuf bytes.Buffer
 	encoder := mcpacket.NewEncoder(&gameBuf)
-	encoder.EnableCompression(compression)
+	encoder.EnableCompression(compression, 0)
 	if err := encoder.Encode([][]byte{packetPayload}); err != nil {
 		logger.Error("Failed to encode %s packet: %v", packetName, err)
 		return
@@ -4355,6 +4455,12 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	}
 	if p.shouldUseProxy() && p.config != nil && p.outboundMgr != nil {
 		proxyOutbound := p.config.GetProxyOutbound()
+		// 任何活跃玩家会话都证明节点可达；不要在其他服务器的定时探测中
+		// 再创建独立 SOCKS5 UDP ASSOCIATE，避免节点/落地映射相互抢占。
+		if p.outboundMgr.GetActiveConnectionCount() > 0 {
+			logger.Debug("RawUDP pingTargetServer skipped: active outbound connections exist, server=%s target=%s", p.serverID, p.effectiveTargetAddrString())
+			return p.getCachedLatencyNoRefresh()
+		}
 		if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
 			strategy := p.config.GetLoadBalance()
 			sortBy := p.config.GetLoadBalanceSort()

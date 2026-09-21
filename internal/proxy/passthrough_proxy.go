@@ -1532,7 +1532,7 @@ func (p *PassthroughProxy) sendDisconnectDirect(conn *raknet.Conn, message strin
 	if compression == nil {
 		compression = packet.FlateCompression
 	}
-	encoder.EnableCompression(compression)
+	encoder.EnableCompression(compression, 0)
 	if err := encoder.Encode([][]byte{packetBuf.Bytes()}); err != nil {
 		return fmt.Errorf("encode packet: %w", err)
 	}
@@ -1689,7 +1689,7 @@ func (p *PassthroughProxy) sendPacket(conn *raknet.Conn, pk packet.Packet, compr
 	if compression == nil {
 		compression = packet.FlateCompression
 	}
-	encoder.EnableCompression(compression)
+	encoder.EnableCompression(compression, 0)
 
 	// Encode the packet (Encoder handles batching, compression, and header)
 	if err := encoder.Encode([][]byte{packetBuf.Bytes()}); err != nil {
