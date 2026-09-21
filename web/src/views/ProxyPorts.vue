@@ -2039,8 +2039,9 @@ const formProxyColumns = [
 const formProxyColumnsWithActions = computed(() => [
   { type: 'selection' },
   ...formProxyColumns,
-  { title: '操作', key: 'actions', width: 130, fixed: 'right', render: r => h(NSpace, { size: 'small' }, () => [
+  { title: '操作', key: 'actions', width: 190, fixed: 'right', render: r => h(NSpace, { size: 'small' }, () => [
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'tcp') } }, () => 'TCP'),
+    h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'http') } }, () => 'HTTP'),
     h(NButton, { size: 'tiny', onClick: (e) => { e.stopPropagation(); testSingleProxy(r.name, 'udp') } }, () => 'UDP'),
     h(NButton, { size: 'tiny', type: 'primary', onClick: (e) => { e.stopPropagation(); formSelectedNodes.value = [r.name] } }, () => '选择')
   ])}
