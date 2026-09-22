@@ -989,7 +989,7 @@ const formatTcpToastLines = (name, res) => {
     `节点: ${name}`,
     '类型: TCP 连通',
     ok ? `延迟: ${d.latency_ms ?? 0} ms` : '延迟: -',
-    d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null)
+    d.error ? `错误: ${d.error}` : (!ok && res?.success === false && res?.msg ? `错误: ${res.msg}` : null)
   ]
   showProxyTestToast(ok, ok ? `${name} · TCP 成功` : `${name} · TCP 失败`, lines)
   return ok
@@ -1007,7 +1007,7 @@ const formatUdpToastLines = (name, res) => {
     d.server_name ? `服务器名: ${d.server_name}` : null,
     d.players ? `玩家: ${d.players}` : null,
     d.version ? `版本: ${d.version}` : null,
-    d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null)
+    d.error ? `错误: ${d.error}` : (!ok && res?.success === false && res?.msg ? `错误: ${res.msg}` : null)
   ]
   showProxyTestToast(ok, ok ? `${name} · UDP 成功` : `${name} · UDP 失败`, lines)
   return ok
@@ -1038,7 +1038,7 @@ const formatHttpToastLines = (name, res) => {
           return `· 自定义 ${custom.url || ''}: ${status} ${lat}${code}${err}`
         })()
       : null,
-    !ok && d.error ? `错误: ${d.error}` : (!ok && res?.msg ? `错误: ${res.msg}` : null),
+    !ok && d.error ? `错误: ${d.error}` : (!ok && res?.success === false && res?.msg ? `错误: ${res.msg}` : null),
     !ok && httpTests.length === 0 && !custom ? '无 HTTP 测试结果返回' : null
   ]
   showProxyTestToast(ok, ok ? `${name} · HTTP 成功` : `${name} · HTTP 失败`, lines)

@@ -350,15 +350,16 @@ type CreateProxyOutboundRequest struct {
 	RealitySpiderX   string `json:"reality_spider_x,omitempty"`
 
 	// Transport fields (WebSocket, gRPC, etc.)
-	Network                  string     `json:"network,omitempty"`
-	WSPath                   string     `json:"ws_path,omitempty"`
-	WSHost                   string     `json:"ws_host,omitempty"`
-	XHTTPMode                string     `json:"xhttp_mode,omitempty"`
-	GRPCServiceName          string     `json:"grpc_service_name,omitempty"`
-	GRPCAuthority            string     `json:"grpc_authority,omitempty"`
-	AutoSelectBlocked        bool       `json:"auto_select_blocked,omitempty"`
-	AutoSelectBlockReason    string     `json:"auto_select_block_reason,omitempty"`
-	AutoSelectBlockExpiresAt *time.Time `json:"auto_select_block_expires_at,omitempty"`
+	Network                  string                 `json:"network,omitempty"`
+	WSPath                   string                 `json:"ws_path,omitempty"`
+	WSHost                   string                 `json:"ws_host,omitempty"`
+	XHTTPMode                string                 `json:"xhttp_mode,omitempty"`
+	GRPCServiceName          string                 `json:"grpc_service_name,omitempty"`
+	GRPCAuthority            string                 `json:"grpc_authority,omitempty"`
+	ProviderOptions          map[string]interface{} `json:"provider_options,omitempty"`
+	AutoSelectBlocked        bool                   `json:"auto_select_blocked,omitempty"`
+	AutoSelectBlockReason    string                 `json:"auto_select_block_reason,omitempty"`
+	AutoSelectBlockExpiresAt *time.Time             `json:"auto_select_block_expires_at,omitempty"`
 
 	// Chain proxy: ordered list of outbound names forming the proxy chain
 	Chain []string `json:"chain,omitempty"`
@@ -409,6 +410,7 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		XHTTPMode:                r.XHTTPMode,
 		GRPCServiceName:          r.GRPCServiceName,
 		GRPCAuthority:            r.GRPCAuthority,
+		ProviderOptions:          r.ProviderOptions,
 		AutoSelectBlocked:        r.AutoSelectBlocked,
 		AutoSelectBlockReason:    r.AutoSelectBlockReason,
 		AutoSelectBlockExpiresAt: r.AutoSelectBlockExpiresAt,
@@ -1209,6 +1211,10 @@ func (h *ProxyOutboundHandler) applySensitiveFieldDefaults(name string, cfg *con
 	if !exists || existing == nil {
 		return
 	}
+	// 响应不回传专有密钥；同协议编辑省略时保留独立副本。
+	if cfg.ProviderOptions == nil && cfg.Type == existing.Type {
+		cfg.ProviderOptions = existing.Clone().ProviderOptions
+	}
 	if cfg.Password == "" {
 		cfg.Password = existing.Password
 	}
@@ -1594,7 +1600,7 @@ func buildHTTPTestTargets(requested []string) []HTTPTestTarget {
 		seen[key] = struct{}{}
 		switch key {
 		case "cloudflare":
-			targets = append(targets, HTTPTestTarget{Name: "Cloudflare", URL: "https://1.1.1.1/cdn-cgi/trace"})
+			targets = append(targets, HTTPTestTarget{Name: "Cloudflare", URL: "https://cloudflare.com/cdn-cgi/trace"})
 		case "google":
 			targets = append(targets, HTTPTestTarget{Name: "Google", URL: "https://www.google.com/generate_204"})
 		case "baidu":

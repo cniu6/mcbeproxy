@@ -1,7 +1,12 @@
 package subscription
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"mcpeserverproxy/internal/config"
@@ -242,6 +247,38 @@ func TestParseSubscriptionContent_XHTTPClashYAML(t *testing.T) {
 	}
 	if got := parsed[0].Outbound; got.Network != "xhttp" || got.WSPath != "/split-http" || got.WSHost != "edge.example.net" || got.XHTTPMode != "packet-up" {
 		t.Fatalf("unexpected clash xhttp parse result: %+v", got)
+	}
+}
+
+type subscriptionRetryRoundTripper struct {
+	calls int
+}
+
+func (r *subscriptionRetryRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	r.calls++
+	if r.calls == 1 {
+		return nil, errors.New("read: connection reset by peer")
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("proxies:\n")),
+	}, nil
+}
+
+func TestFetchSubscriptionBodyRetriesConnectionReset(t *testing.T) {
+	roundTripper := &subscriptionRetryRoundTripper{}
+	client := &http.Client{Transport: roundTripper}
+
+	body, _, err := fetchSubscriptionBody(context.Background(), client, "https://example.com/sub", "test-agent")
+	if err != nil {
+		t.Fatalf("fetchSubscriptionBody returned error: %v", err)
+	}
+	if string(body) != "proxies:\n" {
+		t.Fatalf("body = %q, want proxies YAML", body)
+	}
+	if roundTripper.calls != 2 {
+		t.Fatalf("request attempts = %d, want 2", roundTripper.calls)
 	}
 }
 

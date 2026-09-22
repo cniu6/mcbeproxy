@@ -974,6 +974,9 @@ func TestBuildHTTPTestTargets_DeduplicatesAndPreservesOrder(t *testing.T) {
 	if targets[0].Name != "Google" || targets[1].Name != "Cloudflare" || targets[2].Name != "Baidu" {
 		t.Fatalf("unexpected target order: %#v", targets)
 	}
+	if targets[1].URL != "https://cloudflare.com/cdn-cgi/trace" {
+		t.Fatalf("cloudflare target URL = %q, want hostname URL", targets[1].URL)
+	}
 }
 
 func TestHTTPTestClient_ReusesConnectionForSameHost(t *testing.T) {

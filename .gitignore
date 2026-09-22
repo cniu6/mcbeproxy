@@ -34,3 +34,11 @@ data.db
 .claude/settings.local.json
 data.db
 internal/db/test_*.db
+
+# Local IDE state and one-off diagnostic snapshots
+.mindfs/
+latency_overview.json
+log_today*.json
+outbounds.json
+pprof_goroutines.txt
+sess_hist.json

@@ -7,9 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -56,6 +58,11 @@ type Service struct {
 	outboundMgr    proxy.OutboundManager
 	singboxFactory singboxcore.Factory
 }
+
+const (
+	subscriptionFetchAttempts  = 3
+	subscriptionFetchRetryBase = 500 * time.Millisecond
+)
 
 type noCascadeDeleter interface {
 	DeleteOutboundNoCascade(name string) error
@@ -114,28 +121,15 @@ func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscriptio
 	if dialerToClose != nil {
 		defer dialerToClose.Close()
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("invalid subscription url: %w", err)
-	}
 	userAgent := strings.TrimSpace(sub.UserAgent)
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0"
 	}
-	request.Header.Set("User-Agent", userAgent)
-	response, err := httpClient.Do(request)
+	body, userInfo, err := fetchSubscriptionBody(ctx, httpClient, sub.URL, userAgent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch subscription: %w", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("subscription server returned HTTP %d", response.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 10*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read subscription content: %w", err)
-	}
-	uploadBytes, downloadBytes, totalBytes, expireAt := parseSubscriptionUserInfoHeader(response.Header.Get("Subscription-Userinfo"))
+	uploadBytes, downloadBytes, totalBytes, expireAt := parseSubscriptionUserInfoHeader(userInfo)
 	return &FetchResult{
 		Content:                   body,
 		ProxyUsed:                 proxyName,
@@ -144,6 +138,76 @@ func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscriptio
 		SubscriptionTotalBytes:    totalBytes,
 		SubscriptionExpireAt:      expireAt,
 	}, nil
+}
+
+func fetchSubscriptionBody(ctx context.Context, client *http.Client, rawURL, userAgent string) ([]byte, string, error) {
+	var lastErr error
+	for attempt := 0; attempt < subscriptionFetchAttempts; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid subscription url: %w", err)
+		}
+		request.Header.Set("User-Agent", userAgent)
+
+		response, err := client.Do(request)
+		if err != nil {
+			lastErr = err
+		} else {
+			userInfo := response.Header.Get("Subscription-Userinfo")
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 10*1024*1024))
+			response.Body.Close()
+			if response.StatusCode == http.StatusOK && readErr == nil {
+				return body, userInfo, nil
+			}
+			if response.StatusCode != http.StatusOK {
+				lastErr = fmt.Errorf("subscription server returned HTTP %d", response.StatusCode)
+				if !isRetryableSubscriptionStatus(response.StatusCode) {
+					return nil, "", lastErr
+				}
+			} else {
+				lastErr = fmt.Errorf("failed to read subscription content: %w", readErr)
+			}
+		}
+
+		if !isRetryableSubscriptionError(ctx, lastErr) || attempt+1 >= subscriptionFetchAttempts {
+			break
+		}
+		if err := waitForSubscriptionRetry(ctx, attempt); err != nil {
+			return nil, "", err
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("subscription fetch failed without a specific error")
+	}
+	return nil, "", lastErr
+}
+
+func isRetryableSubscriptionStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func isRetryableSubscriptionError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false
+		}
+	}
+	return !errors.Is(err, context.Canceled)
+}
+
+func waitForSubscriptionRetry(ctx context.Context, attempt int) error {
+	delay := subscriptionFetchRetryBase * time.Duration(1<<attempt)
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubscription) (*UpdateResult, error) {
@@ -473,12 +537,13 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 		return ParsedOutbound{}, false
 	}
 	outbound := &config.ProxyOutbound{
-		Name:    fallbackName(name, server, port),
-		Type:    normalizeProtocol(typeName),
-		Server:  server,
-		Port:    port,
-		TLS:     typeName == "https",
-		Enabled: true,
+		Name:            fallbackName(name, server, port),
+		Type:            normalizeProtocol(typeName),
+		Server:          server,
+		Port:            port,
+		TLS:             typeName == "https",
+		Enabled:         true,
+		ProviderOptions: cloneProviderOptions(item),
 	}
 	switch outbound.Type {
 	case config.ProtocolShadowsocks:
@@ -509,11 +574,28 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 		outbound.UpMbps = parseMbps(firstNonEmpty(getString(item, "up"), getString(item, "up-mbps"), getString(item, "up_mbps")))
 		outbound.DownMbps = parseMbps(firstNonEmpty(getString(item, "down"), getString(item, "down-mbps"), getString(item, "down_mbps")))
 		outbound.TLS = true
+	case config.ProtocolShadowsocksR:
+		outbound.Method = firstNonEmpty(getString(item, "cipher"), getString(item, "method"))
+		outbound.Password = getString(item, "password")
+	case config.ProtocolTUIC:
+		outbound.UUID = getString(item, "uuid")
+		outbound.Password = firstNonEmpty(getString(item, "password"), getString(item, "token"))
+		outbound.TLS = true
+	case config.ProtocolWireGuard:
+		// WireGuard 的私钥、peer 公钥、allowed-ips 等保留在 ProviderOptions。
+	case config.ProtocolNaive:
+		outbound.Username = getString(item, "username")
+		outbound.Password = getString(item, "password")
+		outbound.TLS = true
 	default:
 		return ParsedOutbound{}, false
 	}
 	outbound.TLS = getBoolDefault(item, "tls", outbound.TLS)
 	outbound.SNI = firstNonEmpty(getString(item, "sni"), getString(item, "servername"), getString(item, "serverName"))
+	// VLESS/VMess 的上游字段是 servername；双字段冲突时必须与 Mihomo 一致。
+	if outbound.Type == config.ProtocolVLESS || outbound.Type == config.ProtocolVMess {
+		outbound.SNI = firstNonEmpty(getString(item, "servername"), getString(item, "serverName"), getString(item, "sni"))
+	}
 	outbound.Insecure = getBoolAlt(item, "skip-cert-verify", "skip_cert_verify", "insecure")
 	outbound.ALPN = getCSVString(item, "alpn")
 	outbound.Fingerprint = firstNonEmpty(getString(item, "client-fingerprint"), getString(item, "fingerprint"))
@@ -632,7 +714,6 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 	if realityOpts, ok := getMap(item, "reality-opts"); ok {
 		outbound.Reality = true
 		outbound.TLS = true
-		outbound.Insecure = true
 		outbound.RealityPublicKey = firstNonEmpty(getString(realityOpts, "public-key"), getString(realityOpts, "public_key"))
 		outbound.RealityShortID = firstNonEmpty(getString(realityOpts, "short-id"), getString(realityOpts, "short_id"))
 		outbound.RealitySpiderX = firstNonEmpty(getString(realityOpts, "spider-x"), getString(realityOpts, "spider_x"), getString(realityOpts, "spx"))
@@ -671,6 +752,14 @@ func parseLink(link string) (ParsedOutbound, bool) {
 		return ParsedOutbound{}, false
 	}
 	switch {
+	case hasSchemePrefix(trimmed, "ssr"):
+		return parseShadowsocksR(trimmed)
+	case hasSchemePrefix(trimmed, "tuic"):
+		return parseTUIC(trimmed)
+	case hasSchemePrefix(trimmed, "wireguard", "wg"):
+		return parseWireGuard(trimmed)
+	case hasSchemePrefix(trimmed, "naive", "naiveproxy"):
+		return parseNaive(trimmed)
 	case hasSchemePrefix(trimmed, "vmess"):
 		return parseVmess(trimmed)
 	case hasSchemePrefix(trimmed, "ss"):
@@ -692,6 +781,188 @@ func parseLink(link string) (ParsedOutbound, bool) {
 	default:
 		return ParsedOutbound{}, false
 	}
+}
+
+func parseShadowsocksR(link string) (ParsedOutbound, bool) {
+	payload := strings.TrimPrefix(link, "ssr://")
+	decoded, ok := decodeBase64String(payload)
+	if !ok {
+		return ParsedOutbound{}, false
+	}
+	mainPart, queryPart := decoded, ""
+	if idx := strings.Index(decoded, "/?"); idx >= 0 {
+		mainPart, queryPart = decoded[:idx], decoded[idx+2:]
+	}
+	fields := strings.Split(mainPart, ":")
+	if len(fields) < 6 {
+		return ParsedOutbound{}, false
+	}
+	port, _ := strconv.Atoi(fields[1])
+	if fields[0] == "" || port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	password, _ := decodeBase64String(fields[5])
+	if password == "" {
+		password = decodePercent(fields[5])
+	}
+	query, _ := url.ParseQuery(queryPart)
+	name, _ := url.QueryUnescape(query.Get("remarks"))
+	options := map[string]interface{}{
+		"type": "ssr", "server": fields[0], "port": port, "password": password,
+		"cipher": fields[3], "protocol": fields[2], "obfs": fields[4],
+		"obfs-param":     decodePercent(query.Get("obfsparam")),
+		"protocol-param": decodePercent(query.Get("protoparam")),
+	}
+	outbound := &config.ProxyOutbound{
+		Name: fallbackName(name, fields[0], port), Type: config.ProtocolShadowsocksR,
+		Server: fields[0], Port: port, Password: password, Method: fields[3],
+		ProviderOptions: options, Enabled: true,
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
+func parseTUIC(link string) (ParsedOutbound, bool) {
+	parsed, err := url.Parse(link)
+	if err != nil || parsed.Hostname() == "" {
+		return ParsedOutbound{}, false
+	}
+	port, _ := strconv.Atoi(parsed.Port())
+	if port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	query := parsed.Query()
+	uuid, password := query.Get("uuid"), query.Get("password")
+	if parsed.User != nil {
+		if uuid == "" {
+			uuid = parsed.User.Username()
+		}
+		if value, ok := parsed.User.Password(); ok && password == "" {
+			password = value
+		}
+	}
+	if uuid == "" {
+		uuid = query.Get("id")
+	}
+	if password == "" {
+		password = query.Get("token")
+	}
+	options := map[string]interface{}{
+		"type": "tuic", "server": parsed.Hostname(), "port": port,
+		"uuid": uuid, "password": password, "sni": firstNonEmpty(query.Get("sni"), query.Get("serverName")),
+		"udp-relay-mode":        firstNonEmpty(query.Get("udp-relay-mode"), query.Get("udp_relay_mode")),
+		"congestion-controller": firstNonEmpty(query.Get("congestion-controller"), query.Get("congestion_controller")),
+	}
+	outbound := &config.ProxyOutbound{
+		Name: fallbackName(parsed.Fragment, parsed.Hostname(), port), Type: config.ProtocolTUIC,
+		Server: parsed.Hostname(), Port: port, UUID: uuid, Password: password, TLS: true,
+		SNI: options["sni"].(string), ProviderOptions: options, Enabled: true,
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
+func parseWireGuard(link string) (ParsedOutbound, bool) {
+	parsed, err := url.Parse(link)
+	if err != nil || parsed.Hostname() == "" {
+		return ParsedOutbound{}, false
+	}
+	port, _ := strconv.Atoi(parsed.Port())
+	if port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	query := parsed.Query()
+	options := map[string]interface{}{
+		"type": "wireguard", "server": parsed.Hostname(), "port": port,
+		"private-key": query.Get("privatekey"), "public-key": firstNonEmpty(query.Get("publickey"), query.Get("peer-public-key")),
+		"udp": true,
+	}
+	// Mihomo 使用 ip/ipv6，而不是 sing-box 风格的 local-address。
+	for _, value := range strings.Split(query.Get("address"), ",") {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			prefix, prefixErr := netip.ParsePrefix(value)
+			if prefixErr != nil {
+				return ParsedOutbound{}, false
+			}
+			addr = prefix.Addr()
+		}
+		key := "ip"
+		if addr.Is6() {
+			key = "ipv6"
+		}
+		options[key] = value
+	}
+	for _, key := range []string{"mtu", "persistent-keepalive"} {
+		if value := query.Get(key); value != "" {
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return ParsedOutbound{}, false
+			}
+			options[key] = n
+		}
+	}
+	if value := query.Get("reserved"); value != "" {
+		parts := strings.Split(value, ",")
+		if len(parts) != 3 {
+			return ParsedOutbound{}, false
+		}
+		reserved := make([]int, 3)
+		for i, part := range parts {
+			n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 8)
+			if err != nil {
+				return ParsedOutbound{}, false
+			}
+			reserved[i] = int(n)
+		}
+		options["reserved"] = reserved
+	}
+	if parsed.User != nil {
+		options["private-key"] = parsed.User.Username()
+	}
+	outbound := &config.ProxyOutbound{
+		Name: fallbackName(parsed.Fragment, parsed.Hostname(), port), Type: config.ProtocolWireGuard,
+		Server: parsed.Hostname(), Port: port, ProviderOptions: options, Enabled: true,
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
+func parseNaive(link string) (ParsedOutbound, bool) {
+	parsed, err := url.Parse(link)
+	if err != nil || parsed.Hostname() == "" || parsed.User == nil {
+		return ParsedOutbound{}, false
+	}
+	port, _ := strconv.Atoi(parsed.Port())
+	if port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	password, _ := parsed.User.Password()
+	query := parsed.Query()
+	options := map[string]interface{}{
+		"type": "naive", "server": parsed.Hostname(), "port": port,
+		"username": parsed.User.Username(), "password": password,
+		"sni": firstNonEmpty(query.Get("sni"), query.Get("servername")),
+	}
+	outbound := &config.ProxyOutbound{
+		Name: fallbackName(parsed.Fragment, parsed.Hostname(), port), Type: config.ProtocolNaive,
+		Server: parsed.Hostname(), Port: port, Username: parsed.User.Username(), Password: password,
+		TLS: true, SNI: options["sni"].(string), ProviderOptions: options, Enabled: true,
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
 }
 
 func parseVmess(link string) (ParsedOutbound, bool) {
@@ -1139,9 +1410,21 @@ func computeSourceKey(outbound *config.ProxyOutbound) string {
 		strings.TrimSpace(outbound.XHTTPMode),
 		strings.TrimSpace(outbound.GRPCServiceName),
 		strings.TrimSpace(outbound.GRPCAuthority),
+		providerOptionsKey(outbound.ProviderOptions),
 	}, "|")
 	hash := sha1.Sum([]byte(payload))
 	return hex.EncodeToString(hash[:])
+}
+
+func providerOptionsKey(options map[string]interface{}) string {
+	if len(options) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(options)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func uniqueOutboundName(baseName string, subscriptionName string, used map[string]struct{}) string {
@@ -1319,15 +1602,34 @@ func normalizeProtocol(value string) string {
 	switch value {
 	case "ss":
 		return config.ProtocolShadowsocks
+	case "ssr":
+		return config.ProtocolShadowsocksR
 	case "socks", "socks5", "socks5h":
 		return config.ProtocolSOCKS5
 	case "http", "https":
 		return config.ProtocolHTTP
 	case "hy2", "hysteria", "hysteria2":
 		return config.ProtocolHysteria2
+	case "naiveproxy":
+		return config.ProtocolNaive
 	default:
 		return value
 	}
+}
+
+func cloneProviderOptions(item map[string]interface{}) map[string]interface{} {
+	if len(item) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(item)
+	if err != nil {
+		return nil
+	}
+	var clone map[string]interface{}
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil
+	}
+	return clone
 }
 
 func parsePositiveInt(value string) int {

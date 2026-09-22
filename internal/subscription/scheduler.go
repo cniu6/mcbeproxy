@@ -13,6 +13,7 @@ import (
 const (
 	defaultAutoUpdateCheckInterval  = time.Minute
 	defaultAutoUpdateRequestTimeout = 90 * time.Second
+	autoUpdateRetryInterval         = 15 * time.Minute
 )
 
 type subscriptionUpdater interface {
@@ -148,6 +149,13 @@ func (s *Scheduler) updateOne(ctx context.Context, sub *config.ProxySubscription
 func subscriptionAutoUpdateDue(sub *config.ProxySubscription, now time.Time) (bool, string, error) {
 	if sub == nil || !sub.Enabled || !sub.IsAutoUpdateEnabled() {
 		return false, "", nil
+	}
+	if !sub.AutoUpdateLastAttemptAt.IsZero() && strings.TrimSpace(sub.LastError) != "" {
+		nextRetryAt := sub.AutoUpdateLastAttemptAt.Add(autoUpdateRetryInterval)
+		if now.Before(nextRetryAt) {
+			return false, "", nil
+		}
+		return true, fmt.Sprintf("retry/%s", autoUpdateRetryInterval), nil
 	}
 	switch sub.GetAutoUpdateMode() {
 	case config.ProxySubscriptionAutoUpdateModeDaily:

@@ -13,15 +13,19 @@ import (
 
 // Protocol types supported by ProxyOutbound
 const (
-	ProtocolShadowsocks = "shadowsocks"
-	ProtocolVMess       = "vmess"
-	ProtocolTrojan      = "trojan"
-	ProtocolVLESS       = "vless"
-	ProtocolSOCKS5      = "socks5"
-	ProtocolHTTP        = "http"
-	ProtocolHysteria2   = "hysteria2"
-	ProtocolAnyTLS      = "anytls"
-	ProtocolChain       = "chain"
+	ProtocolShadowsocks  = "shadowsocks"
+	ProtocolShadowsocksR = "shadowsocksr"
+	ProtocolVMess        = "vmess"
+	ProtocolTrojan       = "trojan"
+	ProtocolVLESS        = "vless"
+	ProtocolSOCKS5       = "socks5"
+	ProtocolHTTP         = "http"
+	ProtocolHysteria2    = "hysteria2"
+	ProtocolAnyTLS       = "anytls"
+	ProtocolTUIC         = "tuic"
+	ProtocolWireGuard    = "wireguard"
+	ProtocolNaive        = "naive"
+	ProtocolChain        = "chain"
 )
 
 // Supported Shadowsocks encryption methods
@@ -128,10 +132,30 @@ type ProxyOutbound struct {
 	// The node's own Server/Port are used as the final hop before the target.
 	Chain []string `json:"chain,omitempty"`
 
+	// ProviderOptions preserves the original Clash/Mihomo fields. New protocol
+	// options must survive subscription refreshes even before the local model
+	// grows a dedicated field for every upstream-specific option.
+	ProviderOptions map[string]interface{} `json:"provider_options,omitempty"`
+
 	// Runtime state (not serialized)
 	mu            sync.RWMutex          `json:"-"`
 	runtime       *proxyOutboundRuntime `json:"-"`
 	runtimeInitMu sync.Mutex            `json:"-"`
+}
+
+func cloneProviderOptions(options map[string]interface{}) map[string]interface{} {
+	if len(options) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(options)
+	if err != nil {
+		return nil
+	}
+	var clone map[string]interface{}
+	if err := json.Unmarshal(data, &clone); err != nil {
+		return nil
+	}
+	return clone
 }
 
 // Validate checks if all required fields are present and valid based on protocol type.
@@ -178,8 +202,16 @@ func (p *ProxyOutbound) Validate() error {
 		return p.validateHysteria2()
 	case ProtocolAnyTLS:
 		return p.validateAnyTLS()
+	case ProtocolShadowsocksR:
+		return p.validateShadowsocksR()
+	case ProtocolTUIC:
+		return p.validateTUIC()
+	case ProtocolWireGuard:
+		return p.validateWireGuard()
+	case ProtocolNaive:
+		return p.validateNaive()
 	default:
-		return fmt.Errorf("invalid field: type must be one of shadowsocks, vmess, trojan, vless, socks5, http, hysteria2, anytls, chain, got %s", p.Type)
+		return fmt.Errorf("invalid field: type must be one of shadowsocks, shadowsocksr, vmess, trojan, vless, socks5, http, hysteria2, anytls, tuic, wireguard, naive, chain, got %s", p.Type)
 	}
 }
 
@@ -252,6 +284,34 @@ func (p *ProxyOutbound) validateTransport() error {
 func (p *ProxyOutbound) validateHysteria2() error {
 	if p.Password == "" {
 		return errors.New("missing required field: password (required for hysteria2)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateShadowsocksR() error {
+	if p.Password == "" && p.ProviderOptions == nil {
+		return errors.New("missing required field: password (required for shadowsocksr)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateTUIC() error {
+	if p.Password == "" && p.UUID == "" && p.ProviderOptions == nil {
+		return errors.New("missing required field: password or uuid (required for tuic)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateWireGuard() error {
+	if p.ProviderOptions == nil {
+		return errors.New("missing required field: provider_options (required for wireguard)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateNaive() error {
+	if p.Username == "" || p.Password == "" {
+		return errors.New("missing required field: username and password (required for naive)")
 	}
 	return nil
 }
@@ -340,6 +400,7 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		XHTTPMode:                p.XHTTPMode,
 		GRPCServiceName:          p.GRPCServiceName,
 		GRPCAuthority:            p.GRPCAuthority,
+		ProviderOptions:          cloneProviderOptions(p.ProviderOptions),
 		TCPLatencyMs:             p.TCPLatencyMs,
 		HTTPLatencyMs:            p.HTTPLatencyMs,
 		UDPLatencyMs:             p.UDPLatencyMs,
@@ -669,7 +730,8 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.XHTTPMode == other.XHTTPMode &&
 		p.GRPCServiceName == other.GRPCServiceName &&
 		p.GRPCAuthority == other.GRPCAuthority &&
-		reflect.DeepEqual(p.Chain, other.Chain)
+		reflect.DeepEqual(p.Chain, other.Chain) &&
+		reflect.DeepEqual(p.ProviderOptions, other.ProviderOptions)
 }
 
 // IsChainProxy returns true if this outbound has a chain configuration.

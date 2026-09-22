@@ -73,6 +73,7 @@ type SingboxOutbound struct {
 	hy2Mu           sync.Mutex // Protects hy2Client for reconnection
 	anytlsClient    *anytls.Client
 	anytlsUOTClient *uot.Client
+	mihomo          *mihomoOutbound
 	// For chain UDP caching, SOCKS5 control-close must mark the cached
 	// association dead instead of reconnecting it in place.
 	disableSOCKS5ReactiveReconnect bool
@@ -181,6 +182,13 @@ var _ N.Dialer = (anytlsProxyDialer)(nil)
 func CreateSingboxOutbound(cfg *config.ProxyOutbound) (*SingboxOutbound, error) {
 	if cfg == nil {
 		return nil, errors.New("proxy outbound configuration cannot be nil")
+	}
+	if supportsMihomo(cfg) {
+		delegated, err := newMihomoOutbound(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mihomo outbound: %w", err)
+		}
+		return &SingboxOutbound{config: cfg, mihomo: delegated}, nil
 	}
 
 	outbound := &SingboxOutbound{
@@ -750,6 +758,10 @@ func (s *SingboxOutbound) ListenPacket(ctx context.Context, destination string) 
 	dest, err := parseDestination(destination)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse destination: %w", err)
+	}
+
+	if s.mihomo != nil {
+		return s.mihomo.ListenPacket(ctx, destination)
 	}
 
 	// Get server address
@@ -1983,6 +1995,11 @@ func (s *SingboxOutbound) Close() error {
 		s.anytlsClient = nil
 		s.anytlsUOTClient = nil
 	}
+	if s.mihomo != nil {
+		err := s.mihomo.Close()
+		s.mihomo = nil
+		return err
+	}
 	return nil
 }
 
@@ -2599,12 +2616,20 @@ type SingboxDialer struct {
 	hy2Mu        sync.Mutex
 	hy2Closed    bool
 	anytlsClient *anytls.Client // Cached AnyTLS client for TCP connections
+	mihomo       *mihomoOutbound
 }
 
 // CreateSingboxDialer creates a TCP dialer that routes through the proxy.
 func CreateSingboxDialer(cfg *config.ProxyOutbound) (*SingboxDialer, error) {
 	if cfg == nil {
 		return nil, errors.New("proxy outbound configuration cannot be nil")
+	}
+	if supportsMihomo(cfg) {
+		delegated, err := newMihomoOutbound(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mihomo dialer: %w", err)
+		}
+		return &SingboxDialer{config: cfg, mihomo: delegated}, nil
 	}
 
 	return &SingboxDialer{
@@ -2625,6 +2650,11 @@ func (d *SingboxDialer) Close() error {
 	if d.anytlsClient != nil {
 		d.anytlsClient.Close()
 		d.anytlsClient = nil
+	}
+	if d.mihomo != nil {
+		err := d.mihomo.Close()
+		d.mihomo = nil
+		return err
 	}
 	return nil
 }
@@ -2708,6 +2738,10 @@ func (d *SingboxDialer) getOrCreateAnyTLSClient() (*anytls.Client, error) {
 
 // DialContext establishes a TCP connection through the proxy.
 func (d *SingboxDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if d.mihomo != nil {
+		return d.mihomo.DialContext(ctx, network, address)
+	}
+
 	// Parse destination
 	dest, err := parseDestination(address)
 	if err != nil {

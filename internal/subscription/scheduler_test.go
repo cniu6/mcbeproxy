@@ -173,6 +173,44 @@ func TestSchedulerRunOncePersistsAttemptAndError(t *testing.T) {
 	}
 }
 
+func TestSchedulerRunOnceRetriesAfterFailureBackoff(t *testing.T) {
+	dir := t.TempDir()
+	mgr := config.NewProxySubscriptionConfigManager(filepath.Join(dir, "proxy_subscriptions.json"))
+	sub := &config.ProxySubscription{
+		ID:             "sub-1",
+		Name:           "Daily",
+		URL:            "https://example.com/sub",
+		Enabled:        true,
+		AutoUpdateMode: config.ProxySubscriptionAutoUpdateModeDaily,
+		AutoUpdateTime: "04:00",
+	}
+	if err := mgr.AddSubscription(sub); err != nil {
+		t.Fatalf("AddSubscription returned error: %v", err)
+	}
+
+	updater := &fakeSubscriptionUpdater{err: errors.New("temporary failure")}
+	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
+	scheduler := NewScheduler(mgr, updater, func() int { return 0 })
+	scheduler.now = func() time.Time { return now }
+
+	scheduler.runOnce(context.Background())
+	if len(updater.calls) != 1 {
+		t.Fatalf("expected initial update attempt, got %d", len(updater.calls))
+	}
+
+	now = now.Add(14 * time.Minute)
+	scheduler.runOnce(context.Background())
+	if len(updater.calls) != 1 {
+		t.Fatalf("expected retry backoff to suppress update, got %d calls", len(updater.calls))
+	}
+
+	now = now.Add(time.Minute)
+	scheduler.runOnce(context.Background())
+	if len(updater.calls) != 2 {
+		t.Fatalf("expected update retry after 15 minutes, got %d calls", len(updater.calls))
+	}
+}
+
 func TestSchedulerRunOnceInvokesAfterUpdateHook(t *testing.T) {
 	dir := t.TempDir()
 	mgr := config.NewProxySubscriptionConfigManager(filepath.Join(dir, "proxy_subscriptions.json"))
