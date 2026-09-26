@@ -105,9 +105,16 @@ type GoroutineManager struct {
 
 type trackedGoroutine struct {
 	info         GoroutineInfo
-	cancelFunc   func() // Optional cancel function
+	cancelFunc   func()       // Optional cancel function
+	lastActive   atomic.Int64 // unix nano; atomic so the per-packet UpdateActivity needs no exclusive lock
+	isBackground bool         // Background tasks are expected to run long
+}
+
+// goroutineSnapshot is a copy of a trackedGoroutine taken for GetStats.
+type goroutineSnapshot struct {
+	info         GoroutineInfo
 	lastActive   time.Time
-	isBackground bool // Background tasks are expected to run long
+	isBackground bool
 }
 
 var (
@@ -150,7 +157,7 @@ func (gm *GoroutineManager) TrackWithOptions(name, component, description string
 	gm.mu.Lock()
 	defer gm.mu.Unlock()
 
-	gm.goroutines[id] = &trackedGoroutine{
+	g := &trackedGoroutine{
 		info: GoroutineInfo{
 			ID:           id,
 			Name:         name,
@@ -161,9 +168,10 @@ func (gm *GoroutineManager) TrackWithOptions(name, component, description string
 			IsBackground: isBackground,
 		},
 		cancelFunc:   cancelFunc,
-		lastActive:   now,
 		isBackground: isBackground,
 	}
+	g.lastActive.Store(now.UnixNano())
+	gm.goroutines[id] = g
 
 	return id
 }
@@ -185,11 +193,17 @@ func (gm *GoroutineManager) UpdateActivity(id int64) {
 		return
 	}
 
-	gm.mu.Lock()
-	defer gm.mu.Unlock()
-
-	if g, ok := gm.goroutines[id]; ok {
-		g.lastActive = time.Now()
+	// Called per packet by relay loops: a shared lock for the lookup and at
+	// most one atomic store per second (leak detection works in minutes).
+	gm.mu.RLock()
+	g := gm.goroutines[id]
+	gm.mu.RUnlock()
+	if g == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	if now-g.lastActive.Load() >= int64(time.Second) {
+		g.lastActive.Store(now)
 	}
 }
 
@@ -204,7 +218,7 @@ func (gm *GoroutineManager) SetState(id int64, state string) {
 
 	if g, ok := gm.goroutines[id]; ok {
 		g.info.State = state
-		g.lastActive = time.Now()
+		g.lastActive.Store(time.Now().UnixNano())
 	}
 }
 
@@ -240,11 +254,11 @@ func (gm *GoroutineManager) Cancel(id int64) bool {
 func (gm *GoroutineManager) GetStats(includeStacks bool) *GoroutineStats {
 	now := time.Now()
 	gm.mu.RLock()
-	tracked := make([]trackedGoroutine, 0, len(gm.goroutines))
+	tracked := make([]goroutineSnapshot, 0, len(gm.goroutines))
 	for _, g := range gm.goroutines {
-		tracked = append(tracked, trackedGoroutine{
+		tracked = append(tracked, goroutineSnapshot{
 			info:         g.info,
-			lastActive:   g.lastActive,
+			lastActive:   time.Unix(0, g.lastActive.Load()),
 			isBackground: g.isBackground,
 		})
 	}

@@ -499,10 +499,10 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	// 言，原地重连是安全的，也是它唯一的自愈手段——不能一律禁用，否则上游控制
 	// 连接一断就直接把玩家踢下线，高并发下会明显增加掉线率。
 	s5pc := &socks5UDPPacketConn{
-		destination:               resolvedDest,
-		stopCh:                    make(chan struct{}),
-		disableProactiveReconnect: true,
-		disableReactiveReconnect:  s.disableSOCKS5ReactiveReconnect,
+		destination:              resolvedDest,
+		destAddr:                 resolvedDest.UDPAddr(),
+		stopCh:                   make(chan struct{}),
+		disableReactiveReconnect: s.disableSOCKS5ReactiveReconnect,
 		reconnectFn: func() (net.Conn, net.PacketConn, net.Addr, error) {
 			reconnectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -536,29 +536,15 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	return s5pc, nil
 }
 
-// proactiveReconnectInterval is how often we proactively rebuild the SOCKS5 UDP
-// ASSOCIATE to prevent latency buildup from stale associations. Many SOCKS5
-// servers accumulate state or degrade routing quality over time; rotating the
-// association every 2 minutes keeps latency stable. This is shorter than the
-// typical server idle timeout (3-5 min), so proactive reconnect also prevents
-// disruptive reactive reconnects.
-const proactiveReconnectInterval = 2 * time.Minute
-
-// monitorCtrlConn does two things:
-//  1. Proactively reconnects every proactiveReconnectInterval using
-//     make-before-break: create new association first, then atomically swap,
-//     then close old — gap is nanoseconds.
-//  2. Reactively reconnects when the server closes the TCP control connection
-//     (break-before-make, since old conn is already dead).
-//
-// This keeps latency stable over long sessions and survives server-side idle
-// timeouts transparently.
+// monitorCtrlConn watches the TCP control connection. A SOCKS5 UDP
+// association lives exactly as long as its control connection, so when the
+// server closes it the association is rebuilt (or, for cached chain entries,
+// marked dead so the cache replaces it). The read blocks without a deadline:
+// Close closes the control connection, which unblocks it.
 func (c *socks5UDPPacketConn) monitorCtrlConn() {
 	buf := make([]byte, 128)
 	backoff := 1 * time.Second
 	maxBackoff := 10 * time.Second
-	proactiveTimer := time.NewTimer(proactiveReconnectInterval)
-	defer proactiveTimer.Stop()
 
 	for {
 		if c.closed.Load() {
@@ -568,24 +554,8 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 		if st == nil {
 			return
 		}
-
-		// Set a short read deadline so we can check the proactive timer.
-		_ = st.ctrlConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_ = st.ctrlConn.SetReadDeadline(time.Time{})
 		_, err := st.ctrlConn.Read(buf)
-
-		// Check proactive timer first (non-blocking).
-		select {
-		case <-proactiveTimer.C:
-			if !c.disableProactiveReconnect && !c.closed.Load() {
-				c.doProactiveReconnect(st)
-				proactiveTimer.Reset(proactiveReconnectInterval)
-			}
-			continue
-		case <-c.stopCh:
-			return
-		default:
-		}
-
 		if err == nil {
 			continue
 		}
@@ -606,36 +576,55 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 		}
 		logger.Info("SOCKS5 UDP: TCP control connection closed, attempting reconnect: err=%v", err)
 		c.doReactiveReconnect(st, &backoff, maxBackoff)
-		proactiveTimer.Reset(proactiveReconnectInterval)
 	}
 }
 
-// doProactiveReconnect performs a make-before-break reconnect: create the new
-// association while the old one is still alive, then atomically swap and close
-// old. This minimizes the gap to just the atomic pointer store (~nanoseconds).
-func (c *socks5UDPPacketConn) doProactiveReconnect(oldState *connState) {
-	newCtrl, newUdp, newRelay, err := c.reconnectFn()
-	if err != nil {
-		logger.Debug("SOCKS5 UDP: proactive reconnect failed, keeping old conn: err=%v", err)
+// beginReconnect makes WriteTo/ReadFrom wait for the new association instead
+// of failing on the closed one.
+func (c *socks5UDPPacketConn) beginReconnect() {
+	c.reconnectMu.Lock()
+	if c.reconnectCh == nil {
+		c.reconnectCh = make(chan struct{})
+	}
+	c.reconnectMu.Unlock()
+	c.reconnecting.Store(true)
+}
+
+// endReconnect wakes every waiter at once (no polling interval to sit out).
+func (c *socks5UDPPacketConn) endReconnect() {
+	c.reconnecting.Store(false)
+	c.reconnectMu.Lock()
+	if c.reconnectCh != nil {
+		close(c.reconnectCh)
+		c.reconnectCh = nil
+	}
+	c.reconnectMu.Unlock()
+}
+
+// waitReconnect blocks until an in-progress reconnect finishes, the conn is
+// closed, or 15s pass.
+func (c *socks5UDPPacketConn) waitReconnect() {
+	if !c.reconnecting.Load() {
 		return
 	}
-	c.reconnecting.Store(true)
-	newState := &connState{
-		udpConn:   newUdp,
-		ctrlConn:  newCtrl,
-		relayAddr: newRelay,
+	c.reconnectMu.Lock()
+	ch := c.reconnectCh
+	c.reconnectMu.Unlock()
+	if ch == nil {
+		return
 	}
-	c.applyConfiguredBuffers(newState)
-	c.state.Store(newState)
-	oldState.udpConn.Close()
-	oldState.ctrlConn.Close()
-	c.reconnecting.Store(false)
-	logger.Info("SOCKS5 UDP: proactive reconnect succeeded (make-before-break)")
+	t := time.NewTimer(15 * time.Second)
+	defer t.Stop()
+	select {
+	case <-ch:
+	case <-c.stopCh:
+	case <-t.C:
+	}
 }
 
 func (c *socks5UDPPacketConn) markRemoteClosed(st *connState) {
 	c.remoteClosed.Store(true)
-	c.reconnecting.Store(false)
+	c.endReconnect()
 	if st != nil {
 		st.udpConn.Close()
 		st.ctrlConn.Close()
@@ -646,7 +635,7 @@ func (c *socks5UDPPacketConn) markRemoteClosed(st *connState) {
 // control connection. Old conn is dead, so we use break-before-make with
 // exponential backoff retry.
 func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.Duration, maxBackoff time.Duration) {
-	c.reconnecting.Store(true)
+	c.beginReconnect()
 	st.udpConn.Close()
 	st.ctrlConn.Close()
 
@@ -660,7 +649,7 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 			}
 			c.applyConfiguredBuffers(newState)
 			c.state.Store(newState)
-			c.reconnecting.Store(false)
+			c.endReconnect()
 			logger.Info("SOCKS5 UDP: reactive reconnect succeeded, resuming")
 			*backoff = 1 * time.Second
 			return
@@ -668,7 +657,7 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 		logger.Debug("SOCKS5 UDP: reactive reconnect failed: err=%v backoff=%v", err, *backoff)
 		select {
 		case <-c.stopCh:
-			c.reconnecting.Store(false)
+			c.endReconnect()
 			return
 		case <-time.After(*backoff):
 		}
@@ -677,8 +666,8 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 			*backoff = maxBackoff
 		}
 	}
-	c.reconnecting.Store(false)
 	c.remoteClosed.Store(true)
+	c.endReconnect()
 	logger.Info("SOCKS5 UDP: reactive reconnect abandoned (closed)")
 }
 
@@ -689,7 +678,15 @@ func (c *socks5UDPPacketConn) IsRemoteClosed() bool {
 	return c.remoteClosed.Load()
 }
 
-// udpKeepalive sends a minimal SOCKS5 UDP datagram every 25 seconds to keep
+// socks5UDPKeepaliveIdle is how long the association must be idle (no real
+// datagram written) before udpKeepalive sends anything. While a game is
+// running RakNet itself sends several packets per second, which already keeps
+// the relay mapping alive; injecting an extra empty datagram towards the game
+// server on the same flow is non-standard and some server-side DDoS filters
+// treat malformed/empty datagrams as hostile.
+const socks5UDPKeepaliveIdle = 20 * time.Second
+
+// udpKeepalive sends a minimal SOCKS5 UDP datagram when the flow is idle to keep
 // the server-side UDP mapping alive. Many SOCKS5 servers (Xray, V2Ray, Clash)
 // expire UDP mappings after 30-60s of inactivity; without keepalive, a player
 // who doesn't send traffic for 30s (loading screen, AFK) will silently lose
@@ -716,6 +713,10 @@ func (c *socks5UDPPacketConn) udpKeepalive() {
 			if c.reconnecting.Load() {
 				continue
 			}
+			if last := c.lastWriteAt.Load(); last > 0 && time.Since(time.Unix(0, last)) < socks5UDPKeepaliveIdle {
+				consecutiveFailures = 0
+				continue
+			}
 			st := c.state.Load()
 			if st == nil {
 				return
@@ -731,8 +732,11 @@ func (c *socks5UDPPacketConn) udpKeepalive() {
 			*datagramPtr = datagram
 			socks5UDPWritePool.Put(datagramPtr)
 			if err != nil {
-				if c.closed.Load() || c.reconnecting.Load() {
+				if c.closed.Load() {
 					return
+				}
+				if c.reconnecting.Load() {
+					continue // the old socket was swapped out; keep keeping the new one alive
 				}
 				consecutiveFailures++
 				logger.Debug("SOCKS5 UDP keepalive failed: relay=%s err=%v consecutive=%d",
@@ -817,19 +821,22 @@ type connState struct {
 }
 
 type socks5UDPPacketConn struct {
-	state                     atomic.Pointer[connState] // swapped atomically during reconnect
-	destination               M.Socksaddr
-	closeOnce                 sync.Once
-	closed                    atomic.Bool // set by Close() to suppress monitor log
-	remoteClosed              atomic.Bool // set when reconnect fails permanently
-	reconnecting              atomic.Bool // set while monitor is rebuilding the association
-	writeMu                   sync.Mutex  // protects SetWriteDeadline + WriteTo from concurrent keepalive
-	stopCh                    chan struct{}
-	reconnectFn               func() (net.Conn, net.PacketConn, net.Addr, error)
-	disableProactiveReconnect bool // set for chain SOCKS5 to avoid multi-ASSOCIATE interference
-	disableReactiveReconnect  bool // set for cached SOCKS5 so dead entries are replaced by the cache
-	readBufferSize            atomic.Int64
-	writeBufferSize           atomic.Int64
+	state                    atomic.Pointer[connState] // swapped atomically during reconnect
+	destination              M.Socksaddr
+	closeOnce                sync.Once
+	closed                   atomic.Bool // set by Close() to suppress monitor log
+	remoteClosed             atomic.Bool // set when reconnect fails permanently
+	reconnecting             atomic.Bool // set while monitor is rebuilding the association
+	reconnectMu              sync.Mutex
+	reconnectCh              chan struct{} // closed when the current reconnect finishes
+	destAddr                 *net.UDPAddr  // destination.UDPAddr(), computed once instead of per packet
+	writeMu                  sync.Mutex    // protects SetWriteDeadline + WriteTo from concurrent keepalive
+	stopCh                   chan struct{}
+	reconnectFn              func() (net.Conn, net.PacketConn, net.Addr, error)
+	disableReactiveReconnect bool // set for cached SOCKS5 so dead entries are replaced by the cache
+	readBufferSize           atomic.Int64
+	writeBufferSize          atomic.Int64
+	lastWriteAt              atomic.Int64 // unix nano of the last successful payload write
 }
 
 func (c *socks5UDPPacketConn) applyConfiguredBuffers(st *connState) {
@@ -856,10 +863,7 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if c.remoteClosed.Load() {
 		return 0, errors.New("socks5: UDP relay closed")
 	}
-	// Wait for reconnect to complete (up to 15s).
-	for i := 0; i < 300 && c.reconnecting.Load() && !c.closed.Load() && !c.remoteClosed.Load(); i++ {
-		time.Sleep(50 * time.Millisecond)
-	}
+	c.waitReconnect()
 	if c.closed.Load() {
 		return 0, errors.New("socks5: connection closed")
 	}
@@ -891,12 +895,14 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		logger.Debug("SOCKS5 UDP write failed: relay=%s err=%v", st.relayAddr, err)
 		return 0, err
 	}
+	c.lastWriteAt.Store(time.Now().UnixNano())
 	return len(p), nil
 }
 
 func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	buf := socks5UDPBufPool.Get().([]byte)
-	defer socks5UDPBufPool.Put(buf)
+	bufPtr := socks5UDPBufPool.Get().(*[socks5UDPMaxDatagram]byte)
+	defer socks5UDPBufPool.Put(bufPtr)
+	buf := bufPtr[:]
 
 	for {
 		if c.closed.Load() {
@@ -916,9 +922,7 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			}
 			if c.reconnecting.Load() {
 				// Old conn was closed during reconnect — wait and retry.
-				for i := 0; i < 300 && c.reconnecting.Load() && !c.closed.Load() && !c.remoteClosed.Load(); i++ {
-					time.Sleep(50 * time.Millisecond)
-				}
+				c.waitReconnect()
 				continue
 			}
 			if !isTimeoutError(err) {
@@ -939,12 +943,16 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		data := buf[3+dataOffset : n]
 		copied := copy(p, data)
-		return copied, c.destination.UDPAddr(), nil
+		return copied, c.destAddr, nil
 	}
 }
 
+// socks5UDPMaxDatagram is the largest UDP payload; the pool holds array
+// pointers so Get/Put do not allocate per packet.
+const socks5UDPMaxDatagram = 65535
+
 var socks5UDPBufPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 65535) },
+	New: func() interface{} { return new([socks5UDPMaxDatagram]byte) },
 }
 
 // socks5UDPHeaderLen returns the length of the ATYP/ADDR/PORT portion of a SOCKS5

@@ -372,6 +372,7 @@ const setupAutoRefresh = (val) => {
   if (seconds > 0) {
     nextLatencyRefreshAt.value = Date.now() + seconds * 1000
     timer = setInterval(() => {
+      if (document.hidden) return // 标签页在后台时不轮询
       nextLatencyRefreshAt.value = Date.now() + seconds * 1000
       loadData()
     }, seconds * 1000)

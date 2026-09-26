@@ -2,10 +2,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
-	"strings"
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
@@ -145,7 +145,7 @@ func (f *Forwarder) ForwardToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, 
 
 	// Try to extract player info from server responses too
 	// Some servers may echo player info in certain packets
-	if !sess.IsLoginExtracted() && len(data) > 10 {
+	if len(data) > 10 && sess.LoginScanActive() {
 		f.tryExtractPlayerInfoFromResponse(sess, data)
 	}
 
@@ -156,6 +156,9 @@ func (f *Forwarder) ForwardToClient(conn *net.UDPConn, clientAddr *net.UDPAddr, 
 
 // tryExtractPlayerInfoFromResponse attempts to extract player info from server response packets.
 func (f *Forwarder) tryExtractPlayerInfoFromResponse(sess *session.Session, data []byte) {
+	if !sess.LoginScanActive() {
+		return
+	}
 	// Check if this packet contains player info patterns
 	if containsLoginData(data) {
 		playerInfo := f.protocolHandler.TryExtractPlayerInfoFromRaw(data)
@@ -174,8 +177,9 @@ func (f *Forwarder) tryExtractPlayerInfoFromResponse(sess *session.Session, data
 // are encrypted and cannot be read by a transparent proxy. This function attempts
 // to extract info from unencrypted portions of the handshake, but success is limited.
 func (f *Forwarder) tryExtractPlayerInfo(sess *session.Session, data []byte) {
-	// Only try to extract if we don't have player info yet
-	if sess.IsLoginExtracted() {
+	// Only inspect the first packets of a connection (where the Login is);
+	// afterwards this would scan every game packet for the whole session.
+	if !sess.ShouldScanForLogin() {
 		return
 	}
 
@@ -238,20 +242,17 @@ func (f *Forwarder) tryExtractPlayerInfo(sess *session.Session, data []byte) {
 
 // containsLoginData checks if the packet might contain login data.
 func containsLoginData(data []byte) bool {
-	// Look for common patterns in login packets
-	dataStr := string(data)
-
-	// Check for JSON patterns in login data
-	if strings.Contains(dataStr, "displayName") ||
-		strings.Contains(dataStr, "identity") ||
-		strings.Contains(dataStr, "extraData") ||
-		strings.Contains(dataStr, "chain") {
+	// Look for common patterns in login packets (bytes.Contains: no string copy).
+	if bytes.Contains(data, []byte("displayName")) ||
+		bytes.Contains(data, []byte("identity")) ||
+		bytes.Contains(data, []byte("extraData")) ||
+		bytes.Contains(data, []byte("chain")) {
 		return true
 	}
 
 	// Check for JWT header pattern (base64 encoded '{"')
 	// "eyJ" is the base64 encoding of '{"' which starts all JWT headers
-	if strings.Contains(dataStr, "eyJ") {
+	if bytes.Contains(data, []byte("eyJ")) {
 		return true
 	}
 

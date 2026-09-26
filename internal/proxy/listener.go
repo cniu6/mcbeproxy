@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
@@ -36,11 +37,13 @@ type UDPListener struct {
 	pingInFlight    atomic.Bool
 	closed          atomic.Bool
 	remoteWG        sync.WaitGroup
+	cfgCache        atomic.Pointer[listenerConfigCache]
 }
 
 type listenerPacketJob struct {
 	data       []byte
 	clientAddr *net.UDPAddr
+	clientKey  string
 	buf        *[]byte
 }
 
@@ -109,82 +112,126 @@ func (l *UDPListener) Start() error {
 }
 
 // Listen starts the packet reception loop. It blocks until the context is cancelled.
+//
+// Packets are handed to worker shards chosen by client address, so each
+// client's datagrams are processed by one worker in arrival order (a shared
+// worker pool reordered them, which RakNet sees as jitter).
 func (l *UDPListener) Listen(ctx context.Context) error {
 	if l.conn == nil {
 		return fmt.Errorf("listener not started")
 	}
 
-	// Use longer timeout to reduce CPU usage from frequent deadline checks
 	const readTimeout = 500 * time.Millisecond
-	packetJobs := make(chan listenerPacketJob, defaultUDPListenerQueueSize())
+	const shardQueueSize = 64
+	shards := make([]chan listenerPacketJob, defaultUDPListenerWorkerCount())
 	var workerWG sync.WaitGroup
-	for i := 0; i < defaultUDPListenerWorkerCount(); i++ {
+	for i := range shards {
+		shards[i] = make(chan listenerPacketJob, shardQueueSize)
 		workerWG.Add(1)
-		go func() {
+		go func(jobs <-chan listenerPacketJob) {
 			defer workerWG.Done()
-			for job := range packetJobs {
-				l.handlePacket(job.data, job.clientAddr, job.buf)
+			for job := range jobs {
+				l.handlePacket(job.data, job.clientAddr, job.clientKey, job.buf)
 			}
-		}()
+		}(shards[i])
 	}
 	defer func() {
-		close(packetJobs)
+		for _, ch := range shards {
+			close(ch)
+		}
 		workerWG.Wait()
 	}()
 
+	var addrCache udpAddrCache
+	var readDeadlineSetAt time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			// Check if closed
+		}
+		if l.closed.Load() {
+			return nil
+		}
+
+		buf := l.bufferPool.Get()
+		// Deadlines are absolute; refresh about twice per timeout, not per packet.
+		if now := time.Now(); now.Sub(readDeadlineSetAt) >= readTimeout/2 {
+			l.conn.SetReadDeadline(now.Add(readTimeout))
+			readDeadlineSetAt = now
+		}
+		n, clientAP, err := l.conn.ReadFromUDPAddrPort(*buf)
+		if err != nil {
+			l.bufferPool.Put(buf)
 			if l.closed.Load() {
 				return nil
 			}
-
-			buf := l.bufferPool.Get()
-			// Set read deadline to allow checking context
-			l.conn.SetReadDeadline(time.Now().Add(readTimeout))
-			n, clientAddr, err := l.conn.ReadFromUDP(*buf)
-			if err != nil {
-				l.bufferPool.Put(buf)
-				// Check if closed or context cancelled
-				if l.closed.Load() {
-					return nil
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-					// Timeout is expected, continue
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
-					// Only log non-timeout errors if not closed
-					if !strings.Contains(err.Error(), "use of closed") {
-						logger.LogPacketForwardError("read", "listener", err)
-					}
-					continue
-				}
-			}
-
-			job := listenerPacketJob{
-				data:       (*buf)[:n],
-				clientAddr: clientAddr,
-				buf:        buf,
-			}
 			select {
-			case packetJobs <- job:
+			case <-ctx.Done():
+				return ctx.Err()
 			default:
-				// Backpressure instead of unbounded goroutine growth under burst load.
-				l.handlePacket(job.data, job.clientAddr, job.buf)
 			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				readDeadlineSetAt = time.Time{}
+				continue
+			}
+			if !strings.Contains(err.Error(), "use of closed") {
+				logger.LogPacketForwardError("read", "listener", err)
+			}
+			continue
+		}
+
+		clientAddr, clientKey := addrCache.lookup(clientAP)
+		job := listenerPacketJob{data: (*buf)[:n], clientAddr: clientAddr, clientKey: clientKey, buf: buf}
+		shard := shards[listenerShardIndex(clientAP, len(shards))]
+		// Backpressure when the shard is behind: handling inline would jump
+		// ahead of this client's queued packets. The kernel socket buffer
+		// absorbs the wait; an established session's forward is one UDP write.
+		select {
+		case shard <- job:
+		case <-ctx.Done():
+			l.bufferPool.Put(buf)
+			return ctx.Err()
 		}
 	}
 }
 
+// listenerShardIndex maps a client address to a worker shard (FNV-1a over
+// the address bytes and port; no allocation).
+func listenerShardIndex(ap netip.AddrPort, shards int) int {
+	h := uint32(2166136261)
+	b := ap.Addr().As16()
+	for _, c := range b {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	p := ap.Port()
+	h = (h ^ uint32(p&0xff)) * 16777619
+	h = (h ^ uint32(p>>8)) * 16777619
+	return int(h % uint32(shards))
+}
+
+// serverConfig returns the server's config, re-reading it from the config
+// manager at most once per second (GetServer copies the whole struct).
+func (l *UDPListener) serverConfig() (*config.ServerConfig, bool) {
+	now := time.Now().UnixNano()
+	if c := l.cfgCache.Load(); c != nil && now-c.at < int64(time.Second) {
+		return c.cfg, true
+	}
+	cfg, ok := l.configMgr.GetServer(l.serverID)
+	if !ok {
+		return nil, false
+	}
+	l.cfgCache.Store(&listenerConfigCache{cfg: cfg, at: now})
+	return cfg, true
+}
+
+type listenerConfigCache struct {
+	cfg *config.ServerConfig
+	at  int64
+}
+
 // handlePacket processes an incoming UDP packet from a client.
-func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, buf *[]byte) {
+func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, clientAddrStr string, buf *[]byte) {
 	defer l.bufferPool.Put(buf)
 
 	if l.closed.Load() {
@@ -192,7 +239,7 @@ func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, buf *[]
 	}
 
 	// Check if server is enabled (refresh config to get latest state)
-	serverCfg, exists := l.configMgr.GetServer(l.serverID)
+	serverCfg, exists := l.serverConfig()
 	if !exists {
 		logger.Warn("Server config not found for %s", l.serverID)
 		return
@@ -218,8 +265,6 @@ func (l *UDPListener) handlePacket(data []byte, clientAddr *net.UDPAddr, buf *[]
 		// For other packets when disabled, just ignore
 		return
 	}
-
-	clientAddrStr := clientAddr.String()
 
 	// Get or create session for this client
 	sess, isNew := l.sessionMgr.GetOrCreate(clientAddrStr, l.serverID)

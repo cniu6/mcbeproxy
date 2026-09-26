@@ -114,21 +114,21 @@ var (
 // rawUDPBufferPool reduces GC pressure by reusing UDP packet buffers.
 // Each buffer is MaxUDPPacketSize (8192) bytes. forwardResponses goroutines
 // get/put buffers from this pool instead of allocating per-client.
+// The pool holds array pointers: converting the slice back with
+// (*[N]byte)(b) is free, whereas Put(&b) boxed a new slice header per packet.
 var rawUDPBufferPool = sync.Pool{
 	New: func() interface{} {
-		b := make([]byte, MaxUDPPacketSize)
-		return &b
+		return new([MaxUDPPacketSize]byte)
 	},
 }
 
 func getRawUDPBuffer() []byte {
-	return *(rawUDPBufferPool.Get().(*[]byte))
+	return rawUDPBufferPool.Get().(*[MaxUDPPacketSize]byte)[:]
 }
 
 func putRawUDPBuffer(b []byte) {
 	if cap(b) >= MaxUDPPacketSize {
-		b = b[:MaxUDPPacketSize]
-		rawUDPBufferPool.Put(&b)
+		rawUDPBufferPool.Put((*[MaxUDPPacketSize]byte)(b[:MaxUDPPacketSize]))
 	}
 }
 
@@ -218,6 +218,8 @@ type rawUDPClientInfo struct {
 	recentUpBytesPerSec    atomic.Int64
 	recentDownBytesPerSec  atomic.Int64
 	bytesUpSynced          atomic.Int64 // Portion of bytesUp already credited to a session
+	sessionSyncUpAt        atomic.Int64 // unix nano of the last hot-path session sync (upstream)
+	sessionSyncDownAt      atomic.Int64 // unix nano of the last hot-path session sync (downstream)
 	bytesDownSynced        atomic.Int64 // Portion of bytesDown already credited to a session
 	packetCount            atomic.Int64 // Lock-free counter
 	packetsUp              atomic.Int64
@@ -876,6 +878,16 @@ func (p *RawUDPProxy) debugRawUDPPacket(clientInfo *rawUDPClientInfo, direction 
 // Delta-syncing against the authoritative clientInfo counter makes the session
 // totals match the real traffic regardless of when the session appeared.
 // Safe for the single Listen-loop writer; CAS guards rare concurrent callers.
+// rawUDPSessionSyncInterval throttles the per-packet session accounting in
+// the forwarding loops. Per-client counters stay exact; the session copy is
+// brought fully up to date by the cleanup ticker and on client removal.
+const rawUDPSessionSyncInterval = time.Second
+
+func rawUDPSessionSyncDue(last *atomic.Int64, nowNano int64) bool {
+	prev := last.Load()
+	return nowNano-prev >= int64(rawUDPSessionSyncInterval) && last.CompareAndSwap(prev, nowNano)
+}
+
 func (c *rawUDPClientInfo) syncBytesUpToSession(sess *session.Session) {
 	total := c.bytesUp.Load()
 	prev := c.bytesUpSynced.Load()
@@ -1009,6 +1021,7 @@ type RawUDPProxy struct {
 	aclManager       ACLManager       // ACL manager for whitelist/blacklist
 	externalVerifier ExternalVerifier // External auth verifier (defined in passthrough_proxy.go)
 	listener         *net.UDPConn
+	nnRelay          *netherNetRelay // NetherNet media shares listener; nil unless nethernet_relay
 	targetAddr       *net.UDPAddr
 	targetPacketAddr net.Addr
 	clients          sync.Map // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
@@ -1140,12 +1153,15 @@ func (p *RawUDPProxy) context() context.Context {
 	return p.ctx
 }
 
-func (p *RawUDPProxy) writeToClient(clientAddr *net.UDPAddr, payload []byte, timeout time.Duration) (int, error) {
+// writeToClient sends one datagram to a client over the shared listener.
+// The listener is shared by every client's forwardResponses goroutine, so no
+// per-packet write deadline is set here: that was one timer update per packet
+// contended across all players, and a UDP send never blocks for long anyway
+// (the kernel drops on a full buffer instead of stalling). timeout is kept for
+// call-site documentation only.
+func (p *RawUDPProxy) writeToClient(clientAddr *net.UDPAddr, payload []byte, _ time.Duration) (int, error) {
 	if p == nil || p.listener == nil {
 		return 0, net.ErrClosed
-	}
-	if timeout > 0 {
-		_ = p.listener.SetWriteDeadline(time.Now().Add(timeout))
 	}
 	return p.listener.WriteToUDP(payload, clientAddr)
 }
@@ -1225,6 +1241,7 @@ func (p *RawUDPProxy) Start() error {
 
 	// Create cancellable context before any background work can observe it.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.nnRelay = startNetherNetRelayIfEnabled(p.serverID, p.config, p.outboundMgr, listener)
 
 	// Initialize cached latency state
 	p.latencyMu.Lock()
@@ -1355,10 +1372,12 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 	// Main packet forwarding loop
 	buffer := make([]byte, MaxUDPPacketSize)
+	_ = p.listener.SetWriteDeadline(time.Time{})
 
-	// Refresh the deadline before every read. UDP deadlines are absolute; a
-	// one-time deadline would eventually expire and make later reads time out
-	// immediately even while traffic is healthy.
+	// UDP deadlines are absolute, so keep pushing it forward — but only about
+	// once a second instead of once per packet (the deadline is 30s away).
+	var readDeadlineSetAt time.Time
+	var addrCache udpAddrCache
 	for {
 		select {
 		case <-ctx.Done():
@@ -1366,15 +1385,17 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 		case <-p.context().Done():
 			return nil
 		default:
-			p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-			n, clientAddr, err := p.listener.ReadFromUDP(buffer)
+			if now := time.Now(); now.Sub(readDeadlineSetAt) >= time.Second {
+				p.listener.SetReadDeadline(now.Add(UDPReadTimeout))
+				readDeadlineSetAt = now
+			}
+			n, clientAddrPort, err := p.listener.ReadFromUDPAddrPort(buffer)
 			if err != nil {
 				if p.closed.Load() {
 					return nil
 				}
 				if isTimeoutError(err) {
-					// Reset deadline for next read attempt
-					p.listener.SetReadDeadline(time.Now().Add(UDPReadTimeout))
+					readDeadlineSetAt = time.Time{}
 					continue
 				}
 				// Transient ICMP-induced errors on the shared listener socket
@@ -1386,6 +1407,13 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
+			clientAddr, clientKey := addrCache.lookup(clientAddrPort)
+
+			// NetherNet media shares this port and must be claimed before RakNet
+			// dispatch (a STUN response starts with 0x01, like an unconnected ping).
+			if p.nnRelay != nil && p.nnRelay.handleDatagram(buffer[:n], clientAddrPort) {
+				continue
+			}
 
 			// Handle RakNet unconnected pings without creating sessions.
 			// IMPORTANT: never dial proxy outbounds per ping (can cause CPU/GC spikes in production).
@@ -1394,9 +1422,14 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				continue
 			}
 
+			// Clamp the MTU the client offers so full-size datagrams still fit
+			// after the proxy node's tunnel header (see raknet_mtu.go).
+			if n > 0 && (buffer[0] == raknetOpenConnectionReq1 || buffer[0] == raknetOpenConnectionReq2) {
+				n = len(clampRakNetHandshakeMTU(buffer[:n], p.config.GetRakNetMTUClamp()))
+			}
+
 			// Check if this is a RakNet disconnect notification from client
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
-				clientKey := clientAddr.String()
 				if val, ok := p.clients.Load(clientKey); ok {
 					logger.Info("RawUDP session closed (client sent RakNet disconnect): client=%s", clientKey)
 					// Forward disconnect to upstream so intermediate proxies and
@@ -1412,7 +1445,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			}
 
 			// Get or create client connection
-			clientInfo, isNew := p.getOrCreateClient(clientAddr, buffer[:n])
+			clientInfo, isNew := p.getOrCreateClientKeyed(clientAddr, clientKey, buffer[:n])
 			if clientInfo == nil {
 				continue
 			}
@@ -1440,9 +1473,12 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			}
 
 			// Update session stats (delta sync so bytes received before the
-			// session existed are credited too instead of being lost)
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
-				clientInfo.syncBytesUpToSession(sess)
+			// session existed are credited too instead of being lost). Throttled:
+			// it takes the global session-map lock and the session mutex.
+			if rawUDPSessionSyncDue(&clientInfo.sessionSyncUpAt, now) {
+				if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
+					clientInfo.syncBytesUpToSession(sess)
+				}
 			}
 
 			// Log new connection
@@ -1511,7 +1547,12 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 // getOrCreateClient gets or creates a client connection
 func (p *RawUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, incoming []byte) (*rawUDPClientInfo, bool) {
-	clientKey := clientAddr.String()
+	return p.getOrCreateClientKeyed(clientAddr, clientAddr.String(), incoming)
+}
+
+// getOrCreateClientKeyed is getOrCreateClient with the map key precomputed
+// (see udpAddrCache), so the hot receive loop does not format it per packet.
+func (p *RawUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey string, incoming []byte) (*rawUDPClientInfo, bool) {
 
 	// Check if client already exists
 	if val, ok := p.clients.Load(clientKey); ok {
@@ -2069,6 +2110,9 @@ func (p *RawUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *rawUDP
 	if clientInfo.clientAddr != nil {
 		clientAddr = clientInfo.clientAddr.String()
 	}
+	// Write deadlines are absolute: refresh only when less than half the timeout
+	// is left, instead of a poller call on every datagram.
+	var writeDeadlineAt time.Time
 
 	for {
 		select {
@@ -2083,7 +2127,10 @@ func (p *RawUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *rawUDP
 			}
 
 			writeStart := time.Now()
-			clientInfo.targetConn.SetWriteDeadline(writeStart.Add(RawUDPUpstreamWriteTimeout))
+			if writeDeadlineAt.Sub(writeStart) < RawUDPUpstreamWriteTimeout/2 {
+				writeDeadlineAt = writeStart.Add(RawUDPUpstreamWriteTimeout)
+				clientInfo.targetConn.SetWriteDeadline(writeDeadlineAt)
+			}
 			_, err := writePacketConn(clientInfo.targetConn, packet, clientInfo.targetAddr)
 			writeElapsed := time.Since(writeStart)
 			rawUDPRecordWriteLatency(&clientInfo.lastWriteTargetMs, &clientInfo.maxWriteTargetMs, &clientInfo.slowWriteTargetCount, writeElapsed)
@@ -2154,9 +2201,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 	buffer := getRawUDPBuffer()
 	defer putRawUDPBuffer(buffer)
 
-	// Refresh the read deadline before each read. Deadlines on Go net.Conn are
-	// absolute, so leaving an old deadline in place causes permanent immediate
-	// timeouts after it expires.
+	// Deadlines are absolute: keep pushing the read deadline forward, but only
+	// about once a second rather than once per packet.
+	var readDeadlineSetAt time.Time
 	for {
 		select {
 		case <-p.context().Done():
@@ -2167,8 +2214,11 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				return
 			}
 
-			clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-			n, _, err := clientInfo.targetConn.ReadFrom(buffer)
+			if now := time.Now(); now.Sub(readDeadlineSetAt) >= time.Second {
+				clientInfo.targetConn.SetReadDeadline(now.Add(UDPReadTimeout))
+				readDeadlineSetAt = now
+			}
+			n, err := readPacketConn(clientInfo.targetConn, buffer)
 			if err != nil {
 				if p.closed.Load() {
 					return
@@ -2243,8 +2293,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 						time.Since(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, clientAddr.String(), p.GetActiveClientCount())
 					return
 				}
-				// Reset deadline for next read attempt
-				clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
+				readDeadlineSetAt = time.Time{}
 				continue
 			}
 
@@ -2258,6 +2307,10 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 
 			if clientInfo.kicked.Load() {
 				return
+			}
+
+			if n > 0 && (buffer[0] == raknetOpenConnectionReply1 || buffer[0] == raknetOpenConnectionReply2) {
+				n = len(clampRakNetHandshakeMTU(buffer[:n], p.config.GetRakNetMTUClamp()))
 			}
 
 			// Forward to client FIRST — minimizes time between reading from
@@ -2332,9 +2385,11 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 
 			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
 
-			// Update session stats with single lock (delta sync)
-			if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
-				clientInfo.syncBytesDownToSession(sess)
+			// Update session stats (delta sync), throttled like the upstream side.
+			if rawUDPSessionSyncDue(&clientInfo.sessionSyncDownAt, downAt.UnixNano()) {
+				if sess, exists := p.sessionMgr.Get(clientInfo.sessionKey); exists {
+					clientInfo.syncBytesDownToSession(sess)
+				}
 			}
 		}
 	}
@@ -2771,6 +2826,14 @@ func (p *RawUDPProxy) cleanupUnconnectedPingLimiter() {
 		}
 		return true
 	})
+	// Kick replays only matter during the cooldown; entries of clients that
+	// never came back were otherwise kept forever.
+	p.recentlyKicked.Range(func(key, value interface{}) bool {
+		if replay, ok := value.(*rawUDPKickReplay); !ok || now.Sub(time.Unix(0, replay.At)) > rawUDPKickCooldown {
+			p.recentlyKicked.Delete(key)
+		}
+		return true
+	})
 }
 
 func (p *RawUDPProxy) updateTimeouts() {
@@ -2813,6 +2876,7 @@ func (p *RawUDPProxy) Stop() error {
 	if p.listener != nil {
 		p.listener.Close()
 	}
+	_ = p.nnRelay.Close()
 
 	// Finalize every client through the same path as normal disconnect so bytes
 	// and LastSeen are flushed to the session before persistence.
@@ -4061,7 +4125,33 @@ func (p *RawUDPProxy) sendDisconnectToClient(clientInfo *rawUDPClientInfo, messa
 	clientInfo.mu.Unlock()
 	p.recentlyKicked.Store(clientInfo.clientAddr.String(), p.snapshotKickReplay(clientInfo, message))
 	p.scheduleKickCleanup(clientInfo)
-	p.injectKickResponse(clientInfo, message, true)
+	p.sendKickAsync(true, func() { p.injectKickResponse(clientInfo, message, true) })
+}
+
+// rawUDPKickSendSlots bounds concurrent paced kick sends. The kick sequence
+// sleeps between variants (tens of ms); it must never run on the receive loop
+// or a login shard, or one retrying kicked client stalls every other player.
+var rawUDPKickSendSlots = make(chan struct{}, 64)
+
+// sendKickAsync runs a paced kick send off the caller's goroutine. Replays
+// (mustSend=false) are dropped when all slots are busy; the first kick of a
+// client is always delivered.
+func (p *RawUDPProxy) sendKickAsync(mustSend bool, send func()) {
+	select {
+	case rawUDPKickSendSlots <- struct{}{}:
+		go func() {
+			defer func() { <-rawUDPKickSendSlots }()
+			defer logger.CapturePanic("raw-udp-kick-" + p.serverID)
+			send()
+		}()
+	default:
+		if mustSend {
+			go func() {
+				defer logger.CapturePanic("raw-udp-kick-" + p.serverID)
+				send()
+			}()
+		}
+	}
 }
 
 func (p *RawUDPProxy) currentKickProfile() rawUDPKickProfile {
@@ -4154,10 +4244,13 @@ func (p *RawUDPProxy) replayKickResponse(clientInfo *rawUDPClientInfo, datagram 
 	if !shouldReplayKick(&clientInfo.lastKickReplayAt) {
 		return
 	}
-	if len(datagram) > 0 {
-		p.sendRakNetACKToClient(clientInfo.clientAddr, datagram)
-	}
-	p.injectKickResponse(clientInfo, p.kickMessageOf(clientInfo), false)
+	datagram = append([]byte(nil), datagram...) // the listener buffer is reused
+	p.sendKickAsync(false, func() {
+		if len(datagram) > 0 {
+			p.sendRakNetACKToClient(clientInfo.clientAddr, datagram)
+		}
+		p.injectKickResponse(clientInfo, p.kickMessageOf(clientInfo), false)
+	})
 }
 
 func (p *RawUDPProxy) replayRecentKick(clientAddr *net.UDPAddr, replay *rawUDPKickReplay, datagram []byte) {
@@ -4170,13 +4263,16 @@ func (p *RawUDPProxy) replayRecentKick(clientAddr *net.UDPAddr, replay *rawUDPKi
 	tempClient.sendDatagramSeq.Store(replay.SendDatagramSeq.Load())
 	tempClient.sendMessageIndex.Store(replay.SendMessageIndex.Load())
 	tempClient.sendOrderIndex.Store(replay.SendOrderIndex.Load())
-	if len(datagram) > 0 {
-		p.sendRakNetACKToClient(clientAddr, datagram)
-	}
-	p.injectKickResponse(tempClient, replay.Message, false)
-	replay.SendDatagramSeq.Store(tempClient.sendDatagramSeq.Load())
-	replay.SendMessageIndex.Store(tempClient.sendMessageIndex.Load())
-	replay.SendOrderIndex.Store(tempClient.sendOrderIndex.Load())
+	datagram = append([]byte(nil), datagram...) // the listener buffer is reused
+	p.sendKickAsync(false, func() {
+		if len(datagram) > 0 {
+			p.sendRakNetACKToClient(clientAddr, datagram)
+		}
+		p.injectKickResponse(tempClient, replay.Message, false)
+		replay.SendDatagramSeq.Store(tempClient.sendDatagramSeq.Load())
+		replay.SendMessageIndex.Store(tempClient.sendMessageIndex.Load())
+		replay.SendOrderIndex.Store(tempClient.sendOrderIndex.Load())
+	})
 }
 
 func (p *RawUDPProxy) scheduleKickCleanup(clientInfo *rawUDPClientInfo) {

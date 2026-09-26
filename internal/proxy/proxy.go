@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -79,7 +80,23 @@ func proxyPortAutoPingResultKey(portID string) string {
 	return proxyPortSelectorID(portID)
 }
 
+// readPacketConn reads one datagram, skipping the per-packet source address
+// allocation of ReadFrom on dialed sockets (their source is always the peer).
+func readPacketConn(conn net.PacketConn, buf []byte) (int, error) {
+	if uc, ok := conn.(*net.UDPConn); ok && uc.RemoteAddr() != nil {
+		return uc.Read(buf)
+	}
+	n, _, err := conn.ReadFrom(buf)
+	return n, err
+}
+
 func writePacketConn(conn net.PacketConn, payload []byte, addr net.Addr) (int, error) {
+	// Direct sockets are dialed (connected): WriteTo would fail with
+	// ErrWriteToConnected on every packet and only then fall back, paying for
+	// an error string per datagram on the hottest path.
+	if uc, ok := conn.(*net.UDPConn); ok && uc.RemoteAddr() != nil {
+		return uc.Write(payload)
+	}
 	n, err := conn.WriteTo(payload, addr)
 	if err == nil {
 		return n, nil
@@ -138,6 +155,9 @@ func shouldFallbackToConnectedWrite(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, net.ErrWriteToConnected) {
+		return true
+	}
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "pre-connected") ||
 		strings.Contains(errText, "use of writeto with") ||
@@ -155,6 +175,7 @@ type ProxyServer struct {
 	config                 *config.GlobalConfig
 	configMgr              *config.ConfigManager
 	sessionMgr             *session.SessionManager
+	sessionPersister       *sessionPersister
 	db                     *db.Database
 	sessionRepo            *db.SessionRepository
 	playerRepo             *db.PlayerRepository
@@ -269,15 +290,17 @@ func NewProxyServer(
 	}
 	proxyPortManager := NewProxyPortManager(proxyPortConfigMgr, outboundMgr)
 
-	// Set up session end callback for persistence
-	sessionMgr.OnSessionEnd = func(sess *session.Session) {
+	// Persist ended sessions off the packet path (see sessionPersister).
+	persister := newSessionPersister(func(sess *session.Session) {
 		persistSession(sess, sessionRepo, playerRepo, errorHandler)
-	}
+	})
+	sessionMgr.OnSessionEnd = persister.Enqueue
 
 	return &ProxyServer{
 		config:                 globalConfig,
 		configMgr:              configMgr,
 		sessionMgr:             sessionMgr,
+		sessionPersister:       persister,
 		db:                     database,
 		sessionRepo:            sessionRepo,
 		playerRepo:             playerRepo,
@@ -2153,6 +2176,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			}
 			cfgCopy := *serverCfg
 			cfgCopy.Target = "127.0.0.1"
+			cfgCopy.TargetIP = ""
 			cfgCopy.Port = port
 			cfgCopy.UDPSpeeder = nil
 			cfgForListener = &cfgCopy
@@ -2422,6 +2446,9 @@ func (p *ProxyServer) Stop() error {
 	sessions := p.sessionMgr.GetAllSessions()
 	for _, sess := range sessions {
 		p.sessionMgr.Remove(sess.ClientAddr)
+	}
+	if p.sessionPersister != nil && !p.sessionPersister.Flush(30*time.Second) {
+		logger.Warn("Timed out flushing session records to the database")
 	}
 
 	// Gracefully close all sing-box outbound connections

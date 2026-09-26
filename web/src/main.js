@@ -1,7 +1,6 @@
 import { createApp } from 'vue'
-import naive from 'naive-ui'
 import App from './App.vue'
 
-const app = createApp(App)
-app.use(naive)
-app.mount('#app')
+// naive-ui components are imported on demand by unplugin-vue-components
+// (see vite.config.js) instead of registering the whole library globally.
+createApp(App).mount('#app')

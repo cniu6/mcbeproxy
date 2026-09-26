@@ -185,11 +185,11 @@ func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
 
 	done := make(chan relayResult, 2)
 	go func() {
-		_, err := io.Copy(remote, localReader)
+		_, err := relayCopy(remote, localReader)
 		done <- relayResult{err: err, halfClosed: closeWriteSide(remote)}
 	}()
 	go func() {
-		_, err := io.Copy(local, remote)
+		_, err := relayCopy(local, remote)
 		done <- relayResult{err: err, halfClosed: closeWriteSide(local)}
 	}()
 
@@ -201,6 +201,19 @@ func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
 	<-done
 	_ = local.Close()
 	_ = remote.Close()
+}
+
+// relayBufPool holds the copy buffers for TCP relays: io.Copy allocated a
+// fresh 32 KiB buffer per direction per connection.
+var relayBufPool = sync.Pool{New: func() any { return new([32 << 10]byte) }}
+
+// relayCopy is io.Copy with a pooled buffer. io.CopyBuffer still prefers
+// WriterTo/ReaderFrom, so TCP-to-TCP keeps the kernel splice path on Linux;
+// the buffer is only used for wrapped (outbound) connections.
+func relayCopy(dst io.Writer, src io.Reader) (int64, error) {
+	buf := relayBufPool.Get().(*[32 << 10]byte)
+	defer relayBufPool.Put(buf)
+	return io.CopyBuffer(dst, src, buf[:])
 }
 
 func closeWriteSide(conn net.Conn) bool {

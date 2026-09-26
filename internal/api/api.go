@@ -926,7 +926,10 @@ func (a *APIServer) buildServerLatencyInfo(serverID string) map[string]interface
 
 	if a.configMgr != nil {
 		if serverCfg, exists := a.configMgr.GetServer(serverID); exists {
-			host := serverCfg.GetResolvedIP()
+			host := strings.TrimSpace(serverCfg.TargetIP)
+			if host == "" {
+				host = serverCfg.GetResolvedIP()
+			}
 			if host == "" {
 				host = serverCfg.Target
 			}
@@ -1501,7 +1504,10 @@ func (a *APIServer) buildServerPingFromConfig(ctx context.Context, server config
 	}
 
 	// Fallback: direct ping using the provided config.
-	host := strings.TrimSpace(server.Target)
+	host := strings.TrimSpace(server.TargetIP)
+	if host == "" {
+		host = strings.TrimSpace(server.Target)
+	}
 	if host != "" {
 		address := host
 		if !strings.Contains(host, ":") {

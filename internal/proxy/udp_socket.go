@@ -12,7 +12,11 @@ import (
 	"mcpeserverproxy/internal/logger"
 )
 
-const defaultUDPSocketBufferSize = 256 * 1024
+// defaultUDPSocketBufferSize is the "auto" SO_RCVBUF/SO_SNDBUF. 1 MiB is the
+// usual size for game UDP relays: enough to absorb a chunk/resource burst
+// (Windows' own default is only 64 KiB) without letting a lagging reader
+// build up seconds of queue. Bigger buffers do not lower latency.
+const defaultUDPSocketBufferSize = 1 * 1024 * 1024
 const aggressiveUDPSocketBufferSize = 1 * 1024 * 1024
 const maxUDPSocketBufferSize = 4 * 1024 * 1024
 

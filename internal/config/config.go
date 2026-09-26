@@ -129,6 +129,10 @@ type ServerConfig struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	Target     string `json:"target"`
+	// TargetIP pins the upstream IP for multi-IP / GeoDNS targets. When set,
+	// no DNS lookup is done at all and every dial (direct or via proxy node)
+	// goes to exactly this IP; Target stays as the display/hostname.
+	TargetIP   string `json:"target_ip,omitempty"`
 	Port       int    `json:"port"`
 	ListenAddr string `json:"listen_addr"`
 	Protocol   string `json:"protocol"`
@@ -156,6 +160,8 @@ type ServerConfig struct {
 	NetherNetDisableTrickleICE bool                 `json:"nethernet_disable_trickle_ice,omitempty"`
 	NetherNetICEServers        []NetherNetICEServer `json:"nethernet_ice_servers,omitempty"`
 	NetherNetAllowAnonymous    bool                 `json:"nethernet_allow_anonymous,omitempty"`
+	NetherNetRelay             bool                 `json:"nethernet_relay,omitempty"`       // Relay NetherNet (signaling on TCP twin of listen_addr, media on the same UDP port) without decrypting; raw_udp/plain_udp only
+	NetherNetPublicAddr        string               `json:"nethernet_public_addr,omitempty"` // ip:port advertised in the relayed SDP answer; empty = the host:port the client dialed
 	ACLServerID                string               `json:"acl_server_id,omitempty"`
 	RawUDPKickStrategy         string               `json:"raw_udp_kick_strategy,omitempty"`
 	XboxAuthEnabled            bool                 `json:"xbox_auth_enabled"`      // Enable Xbox Live authentication for remote connections
@@ -166,6 +172,10 @@ type ServerConfig struct {
 	LoadBalanceSort            string               `json:"load_balance_sort"`      // Latency sort type: udp, tcp, http
 	ProtocolVersion            int                  `json:"protocol_version"`       // Override protocol version in Login packet (0 = don't modify)
 	LatencyMode                string               `json:"latency_mode,omitempty"` // "normal" (default), "aggressive", or "fec_tunnel"
+	// RakNetMTU clamps the RakNet MTU negotiated through raw_udp (like TCP MSS
+	// clamping on tunnels). 0 = auto (1400 when routed via a proxy node, off
+	// for direct), -1 = never rewrite, 576..1492 = explicit clamp.
+	RakNetMTU int `json:"raknet_mtu,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"`         // Per-server ping interval in minutes
@@ -441,6 +451,12 @@ func (sc *ServerConfig) Validate() error {
 			return err
 		}
 	}
+	if ip := strings.TrimSpace(sc.TargetIP); ip != "" && net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid target_ip %q: must be a literal IPv4/IPv6 address", sc.TargetIP)
+	}
+	if sc.RakNetMTU != 0 && sc.RakNetMTU != -1 && (sc.RakNetMTU < MinRakNetMTU || sc.RakNetMTU > MaxRakNetMTU) {
+		return fmt.Errorf("invalid raknet_mtu %d: use 0 (auto), -1 (off) or %d..%d", sc.RakNetMTU, MinRakNetMTU, MaxRakNetMTU)
+	}
 	if !isValidLatencyMode(sc.LatencyMode) {
 		return fmt.Errorf("invalid latency_mode: %s", sc.LatencyMode)
 	}
@@ -465,11 +481,50 @@ func (sc *ServerConfig) Validate() error {
 
 // GetTargetAddr returns the resolved target address with port.
 func (sc *ServerConfig) GetTargetAddr() string {
-	ip := sc.resolvedIP
+	ip := strings.TrimSpace(sc.TargetIP)
+	if ip == "" {
+		ip = sc.resolvedIP
+	}
 	if ip == "" {
 		ip = sc.Target
 	}
 	return net.JoinHostPort(ip, strconv.Itoa(sc.Port))
+}
+
+// DNSLookupHost returns the hostname that needs a DNS lookup, or "" when the
+// target is pinned via target_ip or is already a literal IP.
+func (sc *ServerConfig) DNSLookupHost() string {
+	if sc == nil || strings.TrimSpace(sc.TargetIP) != "" {
+		return ""
+	}
+	host := strings.TrimSpace(sc.Target)
+	if host == "" || net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
+}
+
+const (
+	MinRakNetMTU = 576
+	MaxRakNetMTU = 1492
+	// DefaultProxiedRakNetMTU leaves room for SOCKS5/SS/VMess/etc. headers so
+	// a full-size RakNet datagram never exceeds a 1500-byte path once tunnelled.
+	DefaultProxiedRakNetMTU = 1400
+)
+
+// GetRakNetMTUClamp returns the MTU raw_udp/plain_udp should clamp the RakNet handshake
+// to, or 0 for "do not rewrite".
+func (sc *ServerConfig) GetRakNetMTUClamp() int {
+	if sc == nil || sc.RakNetMTU == -1 {
+		return 0
+	}
+	if sc.RakNetMTU >= MinRakNetMTU && sc.RakNetMTU <= MaxRakNetMTU {
+		return sc.RakNetMTU
+	}
+	if sc.IsDirectConnection() {
+		return 0
+	}
+	return DefaultProxiedRakNetMTU
 }
 
 // SetResolvedIP sets the resolved IP address.
@@ -574,6 +629,8 @@ type ServerConfigDTO struct {
 	NetherNetDisableTrickleICE bool                   `json:"nethernet_disable_trickle_ice,omitempty"`
 	NetherNetICEServers        []NetherNetICEServer   `json:"nethernet_ice_servers,omitempty"`
 	NetherNetAllowAnonymous    bool                   `json:"nethernet_allow_anonymous,omitempty"`
+	NetherNetRelay             bool                   `json:"nethernet_relay,omitempty"`
+	NetherNetPublicAddr        string                 `json:"nethernet_public_addr,omitempty"`
 	ACLServerID                string                 `json:"acl_server_id,omitempty"`
 	RawUDPKickStrategy         string                 `json:"raw_udp_kick_strategy,omitempty"`
 	XboxAuthEnabled            bool                   `json:"xbox_auth_enabled"`
@@ -583,6 +640,9 @@ type ServerConfigDTO struct {
 	LoadBalance                string                 `json:"load_balance"`           // Load balance strategy
 	LoadBalanceSort            string                 `json:"load_balance_sort"`      // Latency sort type
 	LatencyMode                string                 `json:"latency_mode,omitempty"` // "normal", "aggressive", "fec_tunnel"
+	TargetIP                   string                 `json:"target_ip,omitempty"`
+	ResolvedIP                 string                 `json:"resolved_ip,omitempty"`
+	RakNetMTU                  int                    `json:"raknet_mtu,omitempty"`
 	Status                     string                 `json:"status"`                 // running, stopped
 	ActiveSessions             int                    `json:"active_sessions"`
 	ActiveProxyClients         int                    `json:"active_proxy_clients"`
@@ -627,6 +687,8 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		NetherNetDisableTrickleICE:    sc.NetherNetDisableTrickleICE,
 		NetherNetICEServers:           sc.NetherNetICEServers,
 		NetherNetAllowAnonymous:       sc.NetherNetAllowAnonymous,
+		NetherNetRelay:                sc.NetherNetRelay,
+		NetherNetPublicAddr:           sc.NetherNetPublicAddr,
 		ACLServerID:                   sc.GetACLServerID(),
 		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
 		XboxAuthEnabled:               sc.XboxAuthEnabled,
@@ -636,6 +698,9 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		LoadBalance:                   sc.LoadBalance,
 		LoadBalanceSort:               sc.LoadBalanceSort,
 		LatencyMode:                   sc.GetLatencyMode(),
+		TargetIP:                      strings.TrimSpace(sc.TargetIP),
+		ResolvedIP:                    sc.resolvedIP,
+		RakNetMTU:                     sc.RakNetMTU,
 		Status:                        status,
 		ActiveSessions:                activeSessions,
 		AutoPingEnabled:               sc.IsAutoPingEnabled(),
@@ -1104,14 +1169,15 @@ func NewConfigManager(configPath string) (*ConfigManager, error) {
 
 // Load loads server configurations from the JSON file.
 func (cm *ConfigManager) Load() error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
+	cm.mu.RLock()
 	data, err := os.ReadFile(cm.configPath)
+	cm.mu.RUnlock()
 	if err != nil {
 		if os.IsNotExist(err) {
 			// If config file doesn't exist, start with empty config.
+			cm.mu.Lock()
 			cm.servers = make(map[string]*ServerConfig)
+			cm.mu.Unlock()
 			return nil
 		}
 		return fmt.Errorf("failed to read config file: %w", err)
@@ -1134,18 +1200,43 @@ func (cm *ConfigManager) Load() error {
 		}
 	}
 
-	// Clear existing and add new configs
+	// DNS runs without holding cm.mu (and in parallel): a slow or blackholed
+	// resolver used to freeze every config read for len(servers)×10s.
+	cm.resolveTargets(context.Background(), configs)
+
 	newServers := make(map[string]*ServerConfig)
 	for _, config := range configs {
-		// Resolve DNS for each server
-		if ip, err := cm.resolver.Resolve(config.Target); err == nil {
-			config.SetResolvedIP(ip)
-		}
 		newServers[config.ID] = config
 	}
 
+	cm.mu.Lock()
 	cm.servers = newServers
+	cm.mu.Unlock()
 	return nil
+}
+
+// resolveTargets resolves the targets of the given servers concurrently. It
+// must be called without cm.mu held. Servers pinned via target_ip (or whose
+// target is already an IP) are skipped.
+func (cm *ConfigManager) resolveTargets(ctx context.Context, servers []*ServerConfig) {
+	var wg sync.WaitGroup
+	for _, server := range servers {
+		host := server.DNSLookupHost()
+		if host == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(server *ServerConfig, host string) {
+			defer wg.Done()
+			ip, err := cm.resolver.ResolveContext(ctx, host)
+			if err != nil {
+				logger.Warn("DNS resolve failed for server %s (%s): %v — set target_ip to pin an address", server.ID, host, err)
+				return
+			}
+			server.SetResolvedIP(ip)
+		}(server, host)
+	}
+	wg.Wait()
 }
 
 // Reload reloads configurations from the file.
@@ -1191,16 +1282,13 @@ func (cm *ConfigManager) AddServer(config *ServerConfig) error {
 		return err
 	}
 
+	cm.resolveTargets(context.Background(), []*ServerConfig{config})
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	if _, exists := cm.servers[config.ID]; exists {
 		return fmt.Errorf("server with ID %s already exists", config.ID)
-	}
-
-	// Resolve DNS
-	if ip, err := cm.resolver.Resolve(config.Target); err == nil {
-		config.SetResolvedIP(ip)
 	}
 
 	cm.servers[config.ID] = config
@@ -1214,16 +1302,13 @@ func (cm *ConfigManager) UpdateServer(id string, config *ServerConfig) error {
 		return err
 	}
 
+	cm.resolveTargets(context.Background(), []*ServerConfig{config})
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
 	if _, exists := cm.servers[id]; !exists {
 		return fmt.Errorf("server with ID %s not found", id)
-	}
-
-	// Resolve DNS
-	if ip, err := cm.resolver.Resolve(config.Target); err == nil {
-		config.SetResolvedIP(ip)
 	}
 
 	// If ID changed, remove old entry
@@ -1288,28 +1373,47 @@ func (cm *ConfigManager) saveToFile() error {
 
 // RefreshDNS re-resolves DNS for all servers that need refresh.
 func (cm *ConfigManager) RefreshDNS(ctx context.Context) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
+	// Snapshot what is due under the read lock, resolve without any lock, then
+	// write results back only for entries that are still the same object.
+	type due struct {
+		server *ServerConfig
+		probe  *ServerConfig
+	}
+	var pending []due
 	now := time.Now()
+	cm.mu.RLock()
 	for _, server := range cm.servers {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		if server.ResolveInterval <= 0 {
+		if server.ResolveInterval <= 0 || server.DNSLookupHost() == "" {
 			continue
 		}
+		if now.Sub(server.GetLastResolved()) >= time.Duration(server.ResolveInterval)*time.Second {
+			pending = append(pending, due{server: server, probe: &ServerConfig{ID: server.ID, Target: server.Target}})
+		}
+	}
+	cm.mu.RUnlock()
+	if len(pending) == 0 {
+		return
+	}
 
-		interval := time.Duration(server.ResolveInterval) * time.Second
-		if now.Sub(server.GetLastResolved()) >= interval {
-			if ip, err := cm.resolver.ResolveContext(ctx, server.Target); err == nil {
-				server.SetResolvedIP(ip)
-			}
+	probes := make([]*ServerConfig, len(pending))
+	for i := range pending {
+		probes[i] = pending[i].probe
+	}
+	cm.resolveTargets(ctx, probes)
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	for _, item := range pending {
+		ip := item.probe.GetResolvedIP()
+		if ip == "" {
+			continue
+		}
+		if current, ok := cm.servers[item.server.ID]; ok && current == item.server && current.Target == item.probe.Target {
+			current.SetResolvedIP(ip)
 		}
 	}
 }

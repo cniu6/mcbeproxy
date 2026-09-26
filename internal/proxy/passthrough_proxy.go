@@ -883,7 +883,9 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 				// Clear deadline for write operation
 				remoteConn.SetReadDeadline(time.Time{})
 
-				if len(pk) >= 3 && pk[0] == packetHeader && (pk[1] == 0x00 || pk[1] == 0x01 || pk[1] == 0xff) {
+				// Only small batches can be a Disconnect: skip copying and
+				// decompressing chunk-sized game batches on every packet.
+				if len(pk) >= 3 && len(pk) <= rakNetDisconnectScanMaxBytes && pk[0] == packetHeader && (pk[1] == 0x00 || pk[1] == 0x01 || pk[1] == 0xff) {
 					lastParseableRemotePacket = append(lastParseableRemotePacket[:0], pk...)
 					if msg := p.tryParseDisconnectPacket(pk); msg != "" {
 						logger.Info("Remote server sent disconnect: server=%s player=%s client=%s reason=%s", p.serverID, playerName, clientAddr, msg)

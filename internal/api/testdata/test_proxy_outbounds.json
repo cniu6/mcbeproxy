@@ -1,17 +1,17 @@
 [
   {
-    "name": "node-a",
+    "name": "node-b",
     "type": "shadowsocks",
-    "server": "a.example.com",
+    "server": "b.example.com",
     "port": 443,
     "enabled": true,
     "method": "aes-256-gcm",
     "password": "test"
   },
   {
-    "name": "node-b",
+    "name": "node-a",
     "type": "shadowsocks",
-    "server": "b.example.com",
+    "server": "a.example.com",
     "port": 443,
     "enabled": true,
     "method": "aes-256-gcm",

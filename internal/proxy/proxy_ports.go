@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -23,15 +24,15 @@ import (
 )
 
 const (
-	defaultProxyDialTimeout        = 10 * time.Second
-	defaultProxyHandshakeTimeout   = 15 * time.Second
-	proxyPortStopWaitTimeout       = 5 * time.Second
-	maxSocks4FieldLength           = 4096
-	sharedUDPRelayQueueSize        = 256
-	sharedUDPRelayMaxWriteFailures = 3
-	sharedUDPRelayDropLogEvery       = int64(1024)
+	defaultProxyDialTimeout         = 10 * time.Second
+	defaultProxyHandshakeTimeout    = 15 * time.Second
+	proxyPortStopWaitTimeout        = 5 * time.Second
+	maxSocks4FieldLength            = 4096
+	sharedUDPRelayQueueSize         = 256
+	sharedUDPRelayMaxWriteFailures  = 3
+	sharedUDPRelayDropLogEvery      = int64(1024)
 	sharedUDPRelayMaxResponseHeader = 262 // RSV + FRAG + ATYP + 255-byte domain + port
-	sharedUDPRelayMaxDatagramSize  = 65535
+	sharedUDPRelayMaxDatagramSize   = 65535
 )
 
 // ProxyPortManager manages local proxy port listeners.
@@ -1440,8 +1441,10 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 	// enters an error state. Reset after timeout to check stopCh.
 	r.conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
+	var addrCache udpAddrCache
+	destCache := make(map[netip.AddrPort]*sharedUDPRelayDest)
 	for {
-		n, clientAddr, err := r.conn.ReadFromUDP(buf)
+		n, clientAP, err := r.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if isTimeoutError(err) {
 				select {
@@ -1457,56 +1460,44 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		if n < 4 || buf[2] != 0x00 {
 			continue
 		}
+		clientAddr, clientKey := addrCache.lookup(clientAP)
+
+		// Parse only the header length per packet; the destination strings are
+		// built once per (client, destination) and reused while it stays the same.
+		hl, perr := socks5UDPHeaderLen(buf[3:n])
+		if perr != nil {
+			continue
+		}
+		hdr := buf[3 : 3+hl]
+		payload := buf[3+hl : n]
+		dc := destCache[clientAP]
+		if dc == nil || dc.hdr != string(hdr) {
+			if dc == nil {
+				if len(destCache) >= udpAddrCacheMax {
+					clear(destCache)
+				}
+				dc = &sharedUDPRelayDest{ipKey: clientAddr.IP.String()}
+				destCache[clientAP] = dc
+			}
+			destHost, destPort, ok := parseSocks5UDPDest(hdr)
+			if !ok {
+				continue
+			}
+			dc.hdr = string(hdr)
+			dc.destAddr = net.JoinHostPort(destHost, strconv.Itoa(destPort))
+			if ip := net.ParseIP(destHost); ip != nil {
+				dc.destNet = &net.UDPAddr{IP: ip, Port: destPort}
+			} else {
+				dc.destNet = &HostnamePortAddr{Host: destHost, Port: destPort}
+			}
+		}
 
 		// Validate source IP: only accept UDP from IPs with active TCP control connections
-		if !r.isClientIPActive(clientAddr.IP) {
+		if !r.isClientIPKeyActive(dc.ipKey) {
 			logger.Debug("SOCKS5 UDP relay: dropping datagram from unregistered IP %s (proxy_port=%s)", clientAddr.IP, r.cfgID)
 			continue
 		}
-
-		// Parse SOCKS5 UDP header
-		atyp := buf[3]
-		off := 4
-		var destHost string
-		switch atyp {
-		case 0x01:
-			if n < off+4+2 {
-				continue
-			}
-			destHost = strconv.Itoa(int(buf[off])) + "." +
-				strconv.Itoa(int(buf[off+1])) + "." +
-				strconv.Itoa(int(buf[off+2])) + "." +
-				strconv.Itoa(int(buf[off+3]))
-			off += 4
-		case 0x03:
-			if n < off+1 {
-				continue
-			}
-			dlen := int(buf[off])
-			off++
-			if n < off+dlen+2 {
-				continue
-			}
-			destHost = string(buf[off : off+dlen])
-			off += dlen
-		case 0x04:
-			if n < off+16+2 {
-				continue
-			}
-			destHost = net.IP(buf[off : off+16]).String()
-			off += 16
-		default:
-			continue
-		}
-		if n < off+2 {
-			continue
-		}
-		destPort := int(buf[off])<<8 | int(buf[off+1])
-		off += 2
-		payload := buf[off:n]
-		destAddr := destHost + ":" + strconv.Itoa(destPort)
-
-		clientKey := clientAddr.String()
+		destAddr := dc.destAddr
 
 		// For 0-length keepalive payloads, update lastSeen on existing
 		// upstreams so the idle sweeper doesn't close them between pings.
@@ -1532,14 +1523,8 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		entry := r.getOrCreateClientEntry(clientKey)
 		uc := r.getOrCreateUpstream(l, entry, clientKey, destAddr, clientAddr)
 
-		var destNetAddr net.Addr
-		if ip := net.ParseIP(destHost); ip != nil {
-			destNetAddr = &net.UDPAddr{IP: ip, Port: destPort}
-		} else {
-			destNetAddr = &HostnamePortAddr{Host: destHost, Port: destPort}
-		}
 		payloadCopy := append([]byte(nil), payload...)
-		enqueueResult := uc.enqueue(udpRelayPacket{payload: payloadCopy, dest: destNetAddr})
+		enqueueResult := uc.enqueue(udpRelayPacket{payload: payloadCopy, dest: dc.destNet})
 		if enqueueResult.droppedOldest && (enqueueResult.dropCount == 1 || enqueueResult.dropCount%sharedUDPRelayDropLogEvery == 0) {
 			logger.Warn("SOCKS5 UDP relay: upstream queue full, dropped oldest packet for %s (client=%s, proxy_port=%s, drops=%d, queue_depth=%d)",
 				destAddr, clientKey, r.cfgID, enqueueResult.dropCount, enqueueResult.queueDepth)
@@ -1621,6 +1606,7 @@ func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, 
 	go r.forwardUDPResponses(pc, clientAddr, socks5UDPResponseAddr(destAddr), uc.done)
 
 	consecutiveWriteFailures := 0
+	var writeDeadlineAt time.Time // refreshed only when under half the timeout is left
 	for {
 		select {
 		case <-r.stopCh:
@@ -1629,7 +1615,10 @@ func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, 
 		case <-uc.done:
 			return
 		case packet := <-uc.queue:
-			_ = pc.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			if now := time.Now(); writeDeadlineAt.Sub(now) < 50*time.Millisecond {
+				writeDeadlineAt = now.Add(100 * time.Millisecond)
+				_ = pc.SetWriteDeadline(writeDeadlineAt)
+			}
 			n, err := writePacketConn(pc, packet.payload, packet.dest)
 			if err != nil || n != len(packet.payload) {
 				uc.writeErrors.Add(1)
@@ -1696,9 +1685,9 @@ func (r *sharedUDPRelay) forwardUDPResponses(pc net.PacketConn, clientAddr *net.
 		packetStart := sharedUDPRelayMaxResponseHeader - len(header)
 		copy(respBuf[packetStart:sharedUDPRelayMaxResponseHeader], header)
 
-		// Set a short write deadline so a slow client doesn't block response
-		// forwarding and cause upstream buffer overflow.
-		_ = r.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		// No per-packet write deadline: this socket is shared by every upstream's
+		// response goroutine (they would overwrite each other's deadline), and a
+		// UDP send does not block on a slow client anyway.
 		_, _ = r.conn.WriteToUDP(respBuf[packetStart:sharedUDPRelayMaxResponseHeader+n], clientAddr)
 	}
 }
@@ -1809,4 +1798,44 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 
 func secureStringEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// sharedUDPRelayDest caches, per client source address, the strings derived
+// from its last SOCKS5 destination header so the relay read loop does not
+// rebuild them for every datagram.
+type sharedUDPRelayDest struct {
+	ipKey    string // client IP string, the activeIPs key
+	hdr      string // raw ATYP/ADDR/PORT bytes of the last destination
+	destAddr string // "host:port"
+	destNet  net.Addr
+}
+
+// parseSocks5UDPDest decodes a SOCKS5 UDP ATYP/ADDR/PORT header.
+func parseSocks5UDPDest(hdr []byte) (host string, port int, ok bool) {
+	if len(hdr) < 3 {
+		return "", 0, false
+	}
+	var addr []byte
+	switch hdr[0] {
+	case 0x01:
+		addr = hdr[1:5]
+		host = netip.AddrFrom4([4]byte(addr)).String()
+	case 0x04:
+		addr = hdr[1:17]
+		host = net.IP(addr).String()
+	case 0x03:
+		addr = hdr[2 : 2+int(hdr[1])]
+		host = string(addr)
+	default:
+		return "", 0, false
+	}
+	p := hdr[len(hdr)-2:]
+	return host, int(p[0])<<8 | int(p[1]), true
+}
+
+func (r *sharedUDPRelay) isClientIPKeyActive(ipKey string) bool {
+	r.activeIPsMu.Lock()
+	_, ok := r.activeIPs[ipKey]
+	r.activeIPsMu.Unlock()
+	return ok
 }

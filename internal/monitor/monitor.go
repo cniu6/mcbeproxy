@@ -20,7 +20,19 @@ type Monitor struct {
 	lastNetStats   map[string]netSnapshot
 	lastNetStatsAt time.Time
 	lastNetStatsMu sync.Mutex
+
+	// statsMu serialises GetSystemStats and guards its short-lived cache, so a
+	// burst of status requests costs one collection (100ms CPU sample plus a
+	// stop-the-world ReadMemStats) instead of one each.
+	statsMu       sync.Mutex
+	cachedStats   *SystemStats
+	cachedStatsAt time.Time
 }
+
+// systemStatsCacheTTL bounds how often system statistics are really collected.
+// They are exposed on unauthenticated endpoints, and each collection pauses
+// the whole process briefly, which shows up as packet-forwarding jitter.
+const systemStatsCacheTTL = 2 * time.Second
 
 type netSnapshot struct {
 	bytesSent uint64
@@ -287,6 +299,19 @@ func (m *Monitor) GetGoRuntimeStats() *RuntimeStats {
 // GetSystemStats returns all system statistics.
 // Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6
 func (m *Monitor) GetSystemStats() (*SystemStats, error) {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
+	if m.cachedStats != nil && time.Since(m.cachedStatsAt) < systemStatsCacheTTL {
+		return m.cachedStats, nil
+	}
+	stats, err := m.collectSystemStats()
+	if err == nil {
+		m.cachedStats, m.cachedStatsAt = stats, time.Now()
+	}
+	return stats, err
+}
+
+func (m *Monitor) collectSystemStats() (*SystemStats, error) {
 	cpuStats, err := m.GetCPUUsage()
 	if err != nil {
 		return nil, err

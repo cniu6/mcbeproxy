@@ -617,7 +617,7 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 
 // tryExtractPlayerInfo attempts to extract player information from packets.
 func (p *RakNetProxy) tryExtractPlayerInfo(sess *session.Session, data []byte) {
-	if sess.IsLoginExtracted() || len(data) < 10 {
+	if len(data) < 10 || !sess.ShouldScanForLogin() {
 		return
 	}
 	p.searchForPlayerInfo(sess, data)
@@ -625,11 +625,15 @@ func (p *RakNetProxy) tryExtractPlayerInfo(sess *session.Session, data []byte) {
 
 // tryExtractPlayerInfoFromServer attempts to extract player info from server packets.
 func (p *RakNetProxy) tryExtractPlayerInfoFromServer(sess *session.Session, data []byte) {
-	if sess.IsLoginExtracted() || len(data) < 10 {
+	if len(data) < 10 || !sess.LoginScanActive() {
 		return
 	}
 	p.searchForPlayerInfo(sess, data)
 }
+
+// rakNetDisconnectScanMaxBytes bounds which server batches are decompressed
+// to look for a Disconnect reason.
+const rakNetDisconnectScanMaxBytes = 1024
 
 // searchForPlayerInfo searches for player information patterns in packet data.
 func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
@@ -793,7 +797,9 @@ func (p *RakNetProxy) Stop() error {
 // Returns the disconnect message if it's a disconnect packet, empty string otherwise.
 // This is used to log the reason when the remote server disconnects the player.
 func (p *RakNetProxy) tryParseDisconnectPacket(data []byte) string {
-	if len(data) < 3 {
+	// A Disconnect batch is a short reason string; skip large batches (chunk
+	// data etc.) instead of decompressing every server packet to look.
+	if len(data) < 3 || len(data) > rakNetDisconnectScanMaxBytes {
 		return ""
 	}
 

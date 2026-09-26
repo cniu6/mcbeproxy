@@ -15,14 +15,17 @@ type Database struct {
 
 // NewDatabase creates a new database connection.
 func NewDatabase(path string) (*Database, error) {
-	// Add SQLite connection parameters for better concurrency:
-	// - _journal_mode=WAL: Write-Ahead Logging for better concurrent read/write
-	// - _busy_timeout=5000: Wait up to 5 seconds when database is locked
-	// - _synchronous=NORMAL: Balance between safety and performance
-	// - _cache_size=-8000: 8MB cache size (reduced from 64MB to save memory)
-	//   Note: modernc.org/sqlite uses non-Go memory via modernc.org/libc
-	// - _foreign_keys=ON: Enable foreign key constraints
-	connStr := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&_cache_size=-8000&_foreign_keys=ON", path)
+	// SQLite connection pragmas. modernc.org/sqlite only honours the
+	// `_pragma=name(value)` form; the previous mattn-style `_journal_mode=WAL`
+	// parameters were silently ignored (the database ran with journal_mode=delete,
+	// synchronous=FULL and busy_timeout=0).
+	// - journal_mode(WAL): readers do not block the writer
+	// - busy_timeout(5000): wait for a lock instead of failing immediately
+	// - synchronous(NORMAL): safe with WAL, far fewer fsyncs than FULL
+	// - cache_size(-8000): 8MB page cache (non-Go memory via modernc.org/libc)
+	// Foreign keys stay off, as they effectively always were: enabling them
+	// now would reject api_access_log rows for keys not in api_keys.
+	connStr := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-8000)", path)
 
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
@@ -155,6 +158,8 @@ func (d *Database) Initialize() error {
 		"ALTER TABLE sessions ADD COLUMN status TEXT DEFAULT ''",
 		"ALTER TABLE sessions ADD COLUMN status_reason TEXT DEFAULT ''",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
+		// Player history lookups filter by name and sort by start time.
+		"CREATE INDEX IF NOT EXISTS idx_sessions_display_name ON sessions(display_name, start_time)",
 		"ALTER TABLE blacklist ADD COLUMN enabled BOOLEAN DEFAULT TRUE",
 		"UPDATE blacklist SET enabled = TRUE WHERE enabled IS NULL",
 		"ALTER TABLE whitelist ADD COLUMN enabled BOOLEAN DEFAULT TRUE",

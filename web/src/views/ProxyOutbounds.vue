@@ -4222,6 +4222,7 @@ onMounted(async () => {
 	await loadHistoryConfig()
   await refreshManagedData()
   managedDataRefreshTimer = setInterval(() => {
+    if (document.hidden) return // 标签页在后台时不轮询
     refreshManagedData()
   }, 30000)
   // 优先使用 initialHighlight，否则使用 initialSearch

@@ -34,6 +34,12 @@
           <n-gi><n-form-item label="监听地址" required><n-input v-model:value="form.listen_addr" placeholder="0.0.0.0:19132" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标地址" required><n-input v-model:value="form.target" placeholder="目标服务器" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
+          <n-gi v-if="!isNetherNetMode">
+            <n-form-item label="固定目标IP">
+              <n-input v-model:value="form.target_ip" clearable placeholder="留空=DNS解析" />
+              <template #feedback>多IP/分地区解析的服务器可在此指定要连的IP，填了就完全不做DNS解析，直连和走节点都用这个IP。<span v-if="form.resolved_ip && !form.target_ip">当前解析: {{ form.resolved_ip }}</span></template>
+            </n-form-item>
+          </n-gi>
           <n-gi><n-form-item label="协议"><n-select v-model:value="form.protocol" :options="protocolOptions" /></n-form-item></n-gi>
           <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
           <n-gi><n-form-item label="Xbox 验证"><n-switch v-model:value="form.xbox_auth_enabled" /></n-form-item></n-gi>
@@ -98,6 +104,25 @@
               <template #feedback>单位: 字节。0=自动推荐值，-1=不调整系统 socket 缓冲，正数=精确字节数。</template>
             </n-form-item>
           </n-gi>
+          <n-gi>
+            <n-form-item label="RakNet MTU">
+              <n-input-number v-model:value="form.raknet_mtu" :min="-1" :max="1492" style="width: 100%" placeholder="0=自动" />
+              <template #feedback>0=自动(走节点时限制为1400，直连不改)，-1=不改写，576~1492=指定值。走代理卡加载界面时保持自动。</template>
+            </n-form-item>
+          </n-gi>
+          <template v-if="canUseNetherNetRelay">
+            <n-gi>
+              <n-form-item label="NetherNet 中继">
+                <n-switch v-model:value="form.nethernet_relay" />
+                <template #feedback>新版客户端(26.x)走 NetherNet 时透明中继：信令用同号 TCP 端口，媒体与 RakNet 共用 UDP 端口，不解密。需放行 TCP 同号端口；该路径看不到玩家名。</template>
+              </n-form-item>
+            </n-gi>
+            <n-gi v-if="form.nethernet_relay">
+              <n-form-item label="对外地址">
+                <n-input v-model:value="form.nethernet_public_addr" placeholder="留空=客户端连接用的地址，如 139.9.2.172:20002" />
+              </n-form-item>
+            </n-gi>
+          </template>
           <n-gi>
             <n-form-item label="延迟模式">
               <n-select v-model:value="form.latency_mode" :options="latencyModeOptions" />
@@ -1264,6 +1289,8 @@ const baseDefaultForm = {
   custom_motd: '', // 留空则从远程服务器获取
   xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
   udp_socket_buffer_size: 0,
+  target_ip: '',
+  raknet_mtu: 0,
   latency_mode: 'normal',
   load_balance: 'least-latency', load_balance_sort: 'udp',
   auto_ping_enabled: true,
@@ -1272,7 +1299,8 @@ const baseDefaultForm = {
   auto_ping_full_scan_mode: '',
   auto_ping_full_scan_time: '04:00',
   auto_ping_full_scan_interval_hours: 24,
-  nethernet_listen_addr: '', nethernet_cert_file: '', nethernet_key_file: '', nethernet_identity_file: '', nethernet_upstream: '', nethernet_ice_gather_policy: '', nethernet_ice_servers_json: '', nethernet_allow_anonymous: false
+  nethernet_listen_addr: '', nethernet_cert_file: '', nethernet_key_file: '', nethernet_identity_file: '', nethernet_upstream: '', nethernet_ice_gather_policy: '', nethernet_ice_servers_json: '', nethernet_allow_anonymous: false,
+  nethernet_relay: false, nethernet_public_addr: ''
 }
 
 const makeDefaultForm = () => ({
@@ -1377,6 +1405,9 @@ const buildServerPayload = (server) => {
     payload.auto_ping_full_scan_mode = ''
   }
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
+  payload.target_ip = String(payload.target_ip ?? '').trim()
+  payload.raknet_mtu = Number.isFinite(payload.raknet_mtu) ? payload.raknet_mtu : 0
+  delete payload.resolved_ip
   if (payload.nethernet_ice_servers_json) {
     try {
       payload.nethernet_ice_servers = JSON.parse(payload.nethernet_ice_servers_json)
@@ -1483,6 +1514,11 @@ const generateDefaultMOTD = (name, port) => {
 const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
 const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
+// The NetherNet relay rides on a RakNet UDP listener: raw_udp, or protocol=udp (plain UDP).
+const canUseNetherNetRelay = computed(() => {
+  const protocol = String(form.value.protocol || '').toLowerCase()
+  return protocol === 'udp' || (isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'raw_udp')
+})
 const hasEnabledUDPSpeeder = computed(() => !!form.value?.udp_speeder?.enabled)
 const showUDPSpeederAdvanced = computed(() => hasEnabledUDPSpeeder.value || (form.value?.latency_mode || 'normal') === 'fec_tunnel')
 const nodeBlockReasonOptions = ['被封禁IP', '报VPN', '不稳定', '延迟高', '频繁失败']

@@ -30,6 +30,15 @@ const (
 	// still-connecting (pending) client while its proxy dial runs in the
 	// background (see createPendingClientAndDialAsync).
 	plainUDPPendingDialQueueCap = 16
+	// plainUDPBlackholeProbeInterval is the target read deadline used while a
+	// proxied client has not received any downstream packet yet, so blackhole
+	// detection fires within seconds instead of after UDPReadTimeout (30s) —
+	// Minecraft gives up on a connection attempt after roughly 10s.
+	plainUDPBlackholeProbeInterval = time.Second
+	// plainUDPBlackholeRecoverAfter is shorter than RawUDP's: RakNet retries
+	// Open Connection Request every ~0.5-1s for ~10s, so tearing a dead
+	// association down after 3s lets the same attempt retry on a fresh one.
+	plainUDPBlackholeRecoverAfter = 3 * time.Second
 )
 
 var (
@@ -50,6 +59,14 @@ type plainUDPClient struct {
 	targetConn net.PacketConn
 	targetAddr net.Addr
 	lastSeen   atomic.Int64
+	startTime  time.Time
+
+	// Traffic counters: logged when the client is removed and used for
+	// blackhole detection (upstream packets sent, nothing ever received).
+	packetsUp   atomic.Int64
+	packetsDown atomic.Int64
+	bytesUp     atomic.Int64
+	bytesDown   atomic.Int64
 
 	// pending: true while the proxy dial for this client is still running on
 	// createPendingClientAndDialAsync's background goroutine. Packets that
@@ -60,19 +77,19 @@ type plainUDPClient struct {
 	// and the pending buffer — the real client fully replaces it on success.
 	pending        atomic.Bool
 	pendingMu      sync.Mutex
-	pendingPackets []*plainUDPPendingWrite
+	pendingPackets []plainUDPPendingWrite
 
 	// Async upstream write queue: Listen()'s hot receive loop enqueues
 	// instead of writing to targetConn directly, so one client's slow/stuck
 	// upstream can't stall reads for every other client on this listener.
-	upstreamWriteCh chan *plainUDPPendingWrite
+	upstreamWriteCh chan plainUDPPendingWrite
 	upstreamDone    chan struct{}
 	upstreamMu      sync.Mutex
 	upstreamOnce    sync.Once
 	upstreamClosed  bool
 }
 
-func (c *plainUDPClient) enqueueUpstreamPacket(item *plainUDPPendingWrite) error {
+func (c *plainUDPClient) enqueueUpstreamPacket(item plainUDPPendingWrite) error {
 	if c == nil || c.upstreamWriteCh == nil {
 		return errPlainUDPUpstreamQueueClosed
 	}
@@ -113,7 +130,7 @@ func (c *plainUDPClient) drainUpstreamWriteQueue(bp *BufferPool) {
 	for {
 		select {
 		case item := <-c.upstreamWriteCh:
-			if item != nil && bp != nil {
+			if item.buf != nil && bp != nil {
 				bp.Put(item.buf)
 			}
 		default:
@@ -127,6 +144,7 @@ type PlainUDPProxy struct {
 	config      *config.ServerConfig
 	outboundMgr OutboundManager
 	listener    *net.UDPConn
+	nnRelay     *netherNetRelay // NetherNet media shares listener; nil unless nethernet_relay
 	targetAddr  net.Addr
 	clients     sync.Map
 	closed      atomic.Bool
@@ -192,6 +210,7 @@ func (p *PlainUDPProxy) Start() error {
 	// Own lifecycle context, created before any background work can observe
 	// it — see the PlainUDPProxy.ctx doc comment.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.nnRelay = startNetherNetRelayIfEnabled(p.serverID, p.config, p.outboundMgr, conn)
 
 	return nil
 }
@@ -201,6 +220,11 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		return fmt.Errorf("listener not started")
 	}
 
+	// The shared listener is written by every client's response goroutine;
+	// keep it free of per-packet write deadlines (see writes below).
+	_ = p.listener.SetWriteDeadline(time.Time{})
+	var readDeadlineSetAt time.Time
+	var addrCache udpAddrCache
 	for {
 		select {
 		case <-ctx.Done():
@@ -209,14 +233,18 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		}
 
 		buf := p.bufferPool.Get()
-		p.listener.SetReadDeadline(time.Now().Add(plainUDPReadTimeout))
-		n, clientAddr, err := p.listener.ReadFromUDP(*buf)
+		if now := time.Now(); now.Sub(readDeadlineSetAt) >= plainUDPReadTimeout/2 {
+			p.listener.SetReadDeadline(now.Add(plainUDPReadTimeout))
+			readDeadlineSetAt = now
+		}
+		n, clientAddrPort, err := p.listener.ReadFromUDPAddrPort(*buf)
 		if err != nil {
 			p.bufferPool.Put(buf)
 			if p.closed.Load() {
 				return nil
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				readDeadlineSetAt = time.Time{}
 				continue
 			}
 			if !strings.Contains(err.Error(), "use of closed") {
@@ -225,13 +253,20 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 			return nil
 		}
 
+		// NetherNet media shares this port; the relay copies what it claims.
+		if p.nnRelay != nil && p.nnRelay.handleDatagram((*buf)[:n], clientAddrPort) {
+			p.bufferPool.Put(buf)
+			continue
+		}
+
 		// getOrCreateClient always takes ownership of buf: it either hands it
 		// off to the client's async upstream write queue, buffers it while a
 		// proxy dial is still pending, or returns it to the pool itself on
 		// error. The hot loop never writes to targetConn directly anymore —
 		// see forwardUpstreamWrites — so one client's slow/stuck upstream
 		// can't stall reads for every other client on this listener.
-		p.getOrCreateClient(clientAddr, buf, n)
+		clientAddr, clientKey := addrCache.lookup(clientAddrPort)
+		p.getOrCreateClientKeyed(clientAddr, clientKey, buf, n)
 	}
 }
 
@@ -246,6 +281,7 @@ func (p *PlainUDPProxy) Stop() error {
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
+	_ = p.nnRelay.Close()
 	p.clients.Range(func(key, value interface{}) bool {
 		if client, ok := value.(*plainUDPClient); ok {
 			// Must stop the async writer goroutine (if any) before closing
@@ -286,21 +322,26 @@ func (p *PlainUDPProxy) resolvedTargetAddr() (*net.UDPAddr, bool) {
 // on a still-pending client, or returned to the pool here on error. Dialing
 // uses p.context() (Start()/Stop()-owned), not any externally-passed ctx.
 func (p *PlainUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, buf *[]byte, n int) (*plainUDPClient, bool) {
-	clientKey := clientAddr.String()
+	return p.getOrCreateClientKeyed(clientAddr, clientAddr.String(), buf, n)
+}
+
+// getOrCreateClientKeyed is getOrCreateClient with the map key precomputed
+// (see udpAddrCache), so the hot receive loop does not format it per packet.
+func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey string, buf *[]byte, n int) (*plainUDPClient, bool) {
 	if val, ok := p.clients.Load(clientKey); ok {
 		existing := val.(*plainUDPClient)
 		existing.lastSeen.Store(time.Now().UnixNano())
 		if existing.pending.Load() {
 			existing.pendingMu.Lock()
 			if len(existing.pendingPackets) < plainUDPPendingDialQueueCap {
-				existing.pendingPackets = append(existing.pendingPackets, &plainUDPPendingWrite{buf: buf, n: n})
+				existing.pendingPackets = append(existing.pendingPackets, plainUDPPendingWrite{buf: buf, n: n})
 			} else {
 				p.bufferPool.Put(buf)
 			}
 			existing.pendingMu.Unlock()
 			return nil, false
 		}
-		if err := existing.enqueueUpstreamPacket(&plainUDPPendingWrite{buf: buf, n: n}); err != nil {
+		if err := existing.enqueueUpstreamPacket(plainUDPPendingWrite{buf: buf, n: n}); err != nil {
 			p.bufferPool.Put(buf)
 		}
 		return existing, false
@@ -332,7 +373,8 @@ func (p *PlainUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, buf *[]byte, 
 		clientAddr:      clientAddr,
 		targetConn:      targetConn,
 		targetAddr:      targetAddr,
-		upstreamWriteCh: make(chan *plainUDPPendingWrite, plainUDPUpstreamWriteQueueSize),
+		startTime:       time.Now(),
+		upstreamWriteCh: make(chan plainUDPPendingWrite, plainUDPUpstreamWriteQueueSize),
 		upstreamDone:    make(chan struct{}),
 	}
 	client.lastSeen.Store(time.Now().UnixNano())
@@ -343,7 +385,7 @@ func (p *PlainUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, buf *[]byte, 
 	go p.forwardResponses(clientKey, client)
 	go p.forwardUpstreamWrites(clientKey, client)
 
-	if err := client.enqueueUpstreamPacket(&plainUDPPendingWrite{buf: buf, n: n}); err != nil {
+	if err := client.enqueueUpstreamPacket(plainUDPPendingWrite{buf: buf, n: n}); err != nil {
 		p.bufferPool.Put(buf)
 	}
 
@@ -362,7 +404,7 @@ func (p *PlainUDPProxy) createPendingClientAndDialAsync(clientKey string, client
 	placeholder := &plainUDPClient{clientAddr: clientAddr}
 	placeholder.pending.Store(true)
 	placeholder.lastSeen.Store(time.Now().UnixNano())
-	placeholder.pendingPackets = append(placeholder.pendingPackets, &plainUDPPendingWrite{buf: buf, n: n})
+	placeholder.pendingPackets = append(placeholder.pendingPackets, plainUDPPendingWrite{buf: buf, n: n})
 	p.clients.Store(clientKey, placeholder)
 
 	p.wg.Add(1)
@@ -396,7 +438,8 @@ func (p *PlainUDPProxy) finishPendingClientDial(clientKey string, clientAddr *ne
 		clientAddr:      clientAddr,
 		targetConn:      targetConn,
 		targetAddr:      targetAddr,
-		upstreamWriteCh: make(chan *plainUDPPendingWrite, plainUDPUpstreamWriteQueueSize),
+		startTime:       time.Now(),
+		upstreamWriteCh: make(chan plainUDPPendingWrite, plainUDPUpstreamWriteQueueSize),
 		upstreamDone:    make(chan struct{}),
 	}
 	client.lastSeen.Store(time.Now().UnixNano())
@@ -443,17 +486,30 @@ func (p *PlainUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *plai
 		return
 	}
 	defer clientInfo.drainUpstreamWriteQueue(p.bufferPool)
+	mtuClamp := p.config.GetRakNetMTUClamp()
+	var writeDeadlineAt time.Time // refreshed only when under half the timeout is left
 
 	for {
 		select {
 		case <-clientInfo.upstreamDone:
 			return
 		case item := <-clientInfo.upstreamWriteCh:
-			if item == nil {
+			if item.buf == nil {
 				continue
 			}
-			clientInfo.targetConn.SetWriteDeadline(time.Now().Add(plainUDPUpstreamWriteTimeout))
-			_, err := writePacketConn(clientInfo.targetConn, (*item.buf)[:item.n], clientInfo.targetAddr)
+			// Minecraft's first handshake pads to 1492 bytes, which no longer
+			// fits a 1500-byte path once the proxy node adds its tunnel header
+			// (see raknet_mtu.go); non-RakNet datagrams pass through unchanged.
+			pkt := clampRakNetHandshakeMTU((*item.buf)[:item.n], mtuClamp)
+			if now := time.Now(); writeDeadlineAt.Sub(now) < plainUDPUpstreamWriteTimeout/2 {
+				writeDeadlineAt = now.Add(plainUDPUpstreamWriteTimeout)
+				clientInfo.targetConn.SetWriteDeadline(writeDeadlineAt)
+			}
+			_, err := writePacketConn(clientInfo.targetConn, pkt, clientInfo.targetAddr)
+			if err == nil {
+				clientInfo.packetsUp.Add(1)
+				clientInfo.bytesUp.Add(int64(len(pkt)))
+			}
 			p.bufferPool.Put(item.buf)
 			// A transient ICMP-induced error on a connected/direct UDP socket
 			// (e.g. connection refused) must not drop the session; skip the datagram.
@@ -547,6 +603,11 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 	buffer := *bufPtr
 	defer p.bufferPool.Put(bufPtr)
 
+	// Reconnecting only helps when a proxy association can be replaced; a
+	// direct socket to a dead target must survive (see isRecoverableConnError).
+	probeBlackhole := !p.config.IsDirectConnection()
+	mtuClamp := p.config.GetRakNetMTUClamp()
+	var readDeadlineSetAt time.Time
 	for {
 		select {
 		case <-p.context().Done():
@@ -554,8 +615,15 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 		default:
 		}
 
-		clientInfo.targetConn.SetReadDeadline(time.Now().Add(UDPReadTimeout))
-		n, _, err := clientInfo.targetConn.ReadFrom(buffer)
+		if now := time.Now(); now.Sub(readDeadlineSetAt) >= time.Second {
+			readTimeout := UDPReadTimeout
+			if probeBlackhole && clientInfo.packetsDown.Load() == 0 {
+				readTimeout = plainUDPBlackholeProbeInterval
+			}
+			clientInfo.targetConn.SetReadDeadline(now.Add(readTimeout))
+			readDeadlineSetAt = now
+		}
+		n, err := readPacketConn(clientInfo.targetConn, buffer)
 		if err != nil {
 			if p.closed.Load() {
 				return
@@ -577,15 +645,23 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 				}
 				return
 			}
+			if probeBlackhole && p.isClientBlackholed(clientInfo, time.Now()) {
+				logger.Warn("PlainUDP: blackhole detected (up_packets=%d down=0 after %v), closing for fresh ASSOCIATE: server=%s client=%s route=%s target=%s",
+					clientInfo.packetsUp.Load(), time.Since(clientInfo.startTime).Round(time.Second),
+					p.serverID, clientKey, p.config.GetProxyOutbound(), p.effectiveTargetAddrString())
+				return
+			}
 			if p.isClientIdleExpired(clientInfo, time.Now()) {
 				return
 			}
+			readDeadlineSetAt = time.Time{}
 			continue
 		}
 
+		clientInfo.packetsDown.Add(1)
+		clientInfo.bytesDown.Add(int64(n))
 		clientInfo.lastSeen.Store(time.Now().UnixNano())
-		p.listener.SetWriteDeadline(time.Now().Add(plainUDPWriteTimeout))
-		_, err = p.listener.WriteToUDP(buffer[:n], clientInfo.clientAddr)
+		_, err = p.listener.WriteToUDP(clampRakNetHandshakeMTU(buffer[:n], mtuClamp), clientInfo.clientAddr)
 		if err != nil && !isTimeoutError(err) {
 			// Transient ICMP-induced error on the shared listener socket:
 			// drop this datagram only, keep the session.
@@ -677,8 +753,26 @@ func (p *PlainUDPProxy) finalizePlainClientRemoval(clientKey string, client *pla
 	if client.targetConn != nil {
 		_ = client.targetConn.Close()
 	}
-	logger.Info("PlainUDP: client disconnected server=%s client=%s active_proxy_clients=%d",
-		p.serverID, clientKey, p.GetActiveClientCount())
+	logger.Info("PlainUDP: client disconnected server=%s client=%s duration=%v up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d active_proxy_clients=%d",
+		p.serverID, clientKey, plainUDPClientDuration(client), client.packetsUp.Load(), client.packetsDown.Load(),
+		client.bytesUp.Load(), client.bytesDown.Load(), p.GetActiveClientCount())
+}
+
+func plainUDPClientDuration(client *plainUDPClient) time.Duration {
+	if client.startTime.IsZero() {
+		return 0
+	}
+	return time.Since(client.startTime).Round(time.Second)
+}
+
+// isClientBlackholed reports whether the upstream path has been swallowing
+// packets: the client kept sending but not a single datagram came back. The
+// usual cause is a dead SOCKS5 UDP association; tearing the client down lets
+// its next packet dial a fresh one.
+func (p *PlainUDPProxy) isClientBlackholed(clientInfo *plainUDPClient, now time.Time) bool {
+	return clientInfo.packetsDown.Load() == 0 &&
+		clientInfo.packetsUp.Load() >= int64(RawUDPBlackholeMinUpPackets) &&
+		now.Sub(clientInfo.startTime) >= plainUDPBlackholeRecoverAfter
 }
 
 func (p *PlainUDPProxy) effectiveBufferSize() int {

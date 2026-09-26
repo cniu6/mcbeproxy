@@ -65,6 +65,13 @@ go test ./internal/config/...
 - `mitm` - Man-in-the-middle with gophertunnel (full protocol access)
 - `raw_udp` - Raw UDP forwarding
 - `transparent` - Transparent proxy mode
+- `nethernet` - Terminates NetherNet (WebRTC) on both sides via gophertunnel; sees player data, highest cost
+
+### NetherNet relay (`nethernet_relay: true`)
+Minecraft 26.x clients first probe NetherNet HTTP signaling on the TCP twin of the server port, then fall back to RakNet. With `nethernet_relay` on a `raw_udp` or plain `udp` server, `internal/proxy/nethernet_relay.go` answers that signaling, forwards the SDP offer upstream (through the outbound), rewrites only the answer's ICE candidates to the proxy's address, and relays the still-encrypted WebRTC media over the same UDP port as RakNet (demuxed by STUN ufrag). No decryption, no extra port; player names are not visible on that path. If the upstream has no NetherNet signaling, `GET /v1/join` returns 503 and clients use RakNet. Needs the TCP port opened alongside UDP.
+
+### Hot path
+Never block a shared receive loop: kick sends run via `sendKickAsync`, session DB writes via `sessionPersister`, and the transparent listener shards workers per client to keep packet order. `raw_udp`/`plain_udp` receive loops are allocation-free in steady state (`udpAddrCache`, `readPacketConn`/`writePacketConn` fast paths for dialed sockets). Guard with `go test ./internal/proxy -run '^$' -bench RoundTrip -benchmem` (0 allocs/op expected).
 
 ### Key Data Flow
 1. Minecraft clients connect via RakNet UDP

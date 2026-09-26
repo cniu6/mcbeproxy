@@ -126,6 +126,7 @@ const toggleAutoRefresh = (enabled) => {
 const startAutoRefresh = () => {
   stopAutoRefresh()
   refreshTimer = setInterval(() => {
+    if (document.hidden) return // 标签页在后台时不轮询
     if (logFile.value) {
       loadLog()
     }

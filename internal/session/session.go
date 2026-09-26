@@ -6,6 +6,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,9 +27,10 @@ type Session struct {
 	forwardMu   sync.Mutex   `json:"-"`
 
 	// Login packet reassembly buffer for fragmented RakNet packets
-	LoginBuffer     []byte     `json:"-"`
-	LoginBufferLock sync.Mutex `json:"-"`
-	LoginExtracted  bool       `json:"-"` // Whether we've already extracted login info
+	LoginBuffer     []byte       `json:"-"`
+	LoginBufferLock sync.Mutex   `json:"-"`
+	LoginExtracted  bool         `json:"-"` // Whether we've already extracted login info
+	loginScanCount  atomic.Int32 // packets inspected for login data (see ShouldScanForLogin)
 
 	// Connection status tracking
 	DisconnectStatus string `json:"-"` // e.g. "connected", "blacklist", "whitelist", "auth_failed", "kicked"
@@ -272,6 +274,27 @@ func (s *Session) IsLoginExtracted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.LoginExtracted
+}
+
+// loginScanBudget is how many client packets transparent mode inspects for a
+// Login. The Login is sent within the first few dozen datagrams of a
+// connection; past that the scan only burns CPU on every game packet.
+const loginScanBudget = 128
+
+// ShouldScanForLogin counts one client packet against the login-scan budget
+// and reports whether it should still be inspected.
+func (s *Session) ShouldScanForLogin() bool {
+	n := s.loginScanCount.Add(1)
+	if n == loginScanBudget+1 {
+		s.ClearLoginBuffer() // budget spent: free the reassembly buffer once
+	}
+	return n <= loginScanBudget && !s.IsLoginExtracted()
+}
+
+// LoginScanActive reports, without consuming budget, whether login
+// extraction is still running for this session (used for server responses).
+func (s *Session) LoginScanActive() bool {
+	return s.loginScanCount.Load() <= loginScanBudget && !s.IsLoginExtracted()
 }
 
 // SetLastSeenAt sets LastSeen to the timestamp of the last real packet.

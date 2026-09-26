@@ -1966,6 +1966,7 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 		return &hysteria2PacketConn{
 			conn:        conn,
 			destination: dest,
+			destStr:     dest.String(),
 			outbound:    s,
 		}, nil
 	}
@@ -2163,55 +2164,59 @@ func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err er
 
 	// Copy remaining payload
 	n = copy(p, buffer.Bytes())
-	logger.Debug("Shadowsocks: received %d bytes from %s", n, dest.String())
 	return n, dest.UDPAddr(), nil
 }
 
-// WriteTo writes a Shadowsocks UDP packet to the connection.
+// ssUDPZeroNonce is the nonce of every Shadowsocks AEAD UDP packet: each
+// packet has its own random salt and therefore its own subkey.
+var ssUDPZeroNonce [32]byte
+
+// WriteTo writes a Shadowsocks UDP packet: [salt][AEAD(subkey, 0, [dest][payload])].
+// The packet is built and sealed in one buffer (in-place AEAD), instead of
+// separate plaintext/nonce/ciphertext/packet allocations per datagram.
 func (c *ssNativeUDPPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	// Calculate destination address length
-	destLen := M.SocksaddrSerializer.AddrPortLen(c.destination)
-
-	// Build plaintext: [destination][payload]
-	plaintext := make([]byte, destLen+len(p))
-	destBuf := buf.With(plaintext[:destLen])
-	err = M.SocksaddrSerializer.WriteAddrPort(destBuf, c.destination)
-	if err != nil {
-		return 0, fmt.Errorf("failed to write destination: %w", err)
-	}
-	copy(plaintext[destLen:], p)
-
-	// Generate random salt
-	salt := make([]byte, c.keySaltLen)
+	var saltBuf [32]byte
+	salt := saltBuf[:c.keySaltLen]
 	if _, err = crand.Read(salt); err != nil {
 		return 0, fmt.Errorf("failed to generate salt: %w", err)
 	}
-
-	// Derive subkey
-	subkey := ssKdf(c.key, salt, c.keySaltLen)
-
-	// Create cipher
-	aead, err := c.constructor(subkey)
+	aead, err := c.constructor(ssKdf(c.key, salt, c.keySaltLen))
 	if err != nil {
 		return 0, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
-	// Encrypt
-	nonce := make([]byte, aead.NonceSize())
-	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	saltLen := len(salt)
+	destLen := M.SocksaddrSerializer.AddrPortLen(c.destination)
+	ptLen := destLen + len(p)
+	packet := make([]byte, saltLen+ptLen, saltLen+ptLen+aead.Overhead())
+	copy(packet, salt)
+	if err = M.SocksaddrSerializer.WriteAddrPort(buf.With(packet[saltLen:saltLen+destLen]), c.destination); err != nil {
+		return 0, fmt.Errorf("failed to write destination: %w", err)
+	}
+	copy(packet[saltLen+destLen:], p)
+	plaintext := packet[saltLen:]
+	ciphertext := aead.Seal(plaintext[:0], ssUDPZeroNonce[:aead.NonceSize()], plaintext, nil)
 
-	// Build packet: [salt][ciphertext]
-	packet := make([]byte, c.keySaltLen+len(ciphertext))
-	copy(packet[:c.keySaltLen], salt)
-	copy(packet[c.keySaltLen:], ciphertext)
-
-	// Send to server
-	_, err = c.UDPConn.WriteToUDP(packet, c.serverAddr)
-	if err != nil {
+	if _, err = c.UDPConn.WriteToUDP(packet[:saltLen+len(ciphertext)], c.serverAddr); err != nil {
 		return 0, err
 	}
-	logger.Debug("Shadowsocks: sent %d bytes (encrypted %d) to %s", len(p), len(packet), c.serverAddr)
 	return len(p), nil
+}
+
+// sourceAddr parses the peer address of a received datagram, reusing the
+// previous result: a session talks to a single peer, so re-parsing (and
+// allocating) it per packet is waste.
+func (c *hysteria2PacketConn) sourceAddr(s string) net.Addr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s == c.lastSrc && c.lastSrcAddr != nil {
+		return c.lastSrcAddr
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		c.lastSrc, c.lastSrcAddr = s, net.UDPAddrFromAddrPort(ap)
+		return c.lastSrcAddr
+	}
+	return c.destination.UDPAddr()
 }
 
 // LocalAddr returns the local network address.
@@ -3010,6 +3015,9 @@ func (d *SingboxDialer) dialAnyTLSTCP(ctx context.Context, _, dest M.Socksaddr) 
 type hysteria2PacketConn struct {
 	conn         hy2.HyUDPConn
 	destination  M.Socksaddr
+	destStr      string // destination.String(), computed once instead of per packet
+	lastSrc      string // source address cache for ReadFrom (one peer per session)
+	lastSrcAddr  *net.UDPAddr
 	outbound     *SingboxOutbound
 	closed       bool
 	readDeadline time.Time
@@ -3128,16 +3136,7 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			return 0, nil, r.err
 		}
 		n = copy(p, r.data)
-		logger.Debug("Hysteria2: received %d bytes from %s for dest %s", n, r.addr, c.destination.String())
-		// Parse source address
-		if host, portStr, parseErr := net.SplitHostPort(r.addr); parseErr == nil {
-			if port, portErr := net.LookupPort("udp", portStr); portErr == nil {
-				if ip := net.ParseIP(host); ip != nil {
-					return n, &net.UDPAddr{IP: ip, Port: port}, nil
-				}
-			}
-		}
-		return n, c.destination.UDPAddr(), nil
+		return n, c.sourceAddr(r.addr), nil
 
 	case <-timer.C:
 		logger.Debug("Hysteria2: read timeout for %s", c.destination.String())
@@ -3154,8 +3153,7 @@ func (c *hysteria2PacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	}
 	c.mu.Unlock()
 
-	destStr := c.destination.String()
-	logger.Debug("Hysteria2: sending %d bytes to %s", len(p), destStr)
+	destStr := c.destStr
 	err = c.conn.Send(p, destStr)
 	if err != nil {
 		logger.Debug("Hysteria2: send error to %s: %v", destStr, err)

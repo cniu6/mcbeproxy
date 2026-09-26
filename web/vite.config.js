@@ -1,10 +1,14 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { compression } from 'vite-plugin-compression2'
+import Components from 'unplugin-vue-components/vite'
+import { NaiveUiResolver } from 'unplugin-vue-components/resolvers'
 
 export default defineConfig({
   plugins: [
     vue(),
+    // 按需导入 naive-ui：模板里用到哪个组件才打包哪个，替代 app.use(naive) 的全量注册
+    Components({ resolvers: [NaiveUiResolver()], dts: false }),
     // 同时生成 .gz 与 .br，Go 端按 Accept-Encoding 直接吐出预压缩文件，
     // 把 ~1.9MB 的 JS 在线传输体积降到 ~500KB / ~400KB
     compression({
