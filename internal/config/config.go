@@ -18,6 +18,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // LoadBalance strategy constants
@@ -1036,7 +1037,7 @@ func preferredResolveIP(ips []net.IP) net.IP {
 }
 
 func newResolveDNSResolver(server string, timeout time.Duration) *net.Resolver {
-	dialer := &net.Dialer{Timeout: timeout}
+	dialer := netroute.Dialer(timeout, "")
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {

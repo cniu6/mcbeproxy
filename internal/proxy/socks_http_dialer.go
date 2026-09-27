@@ -18,6 +18,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -336,7 +337,7 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 	}
 
 	if !relayIsLoopback && directWorks {
-		directConn, derr := net.DialUDP("udp", nil, relayAddr)
+		directConn, derr := netroute.DialUDP(relayAddr)
 		if derr == nil {
 			direct := &connectedPacketConn{UDPConn: directConn, peer: relayAddr}
 			_ = directConn.SetReadBuffer(2 * 1024 * 1024)
@@ -370,7 +371,7 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 		}
 	}
 	if udpConn == nil {
-		directConn, derr := net.DialUDP("udp", nil, relayAddr)
+		directConn, derr := netroute.DialUDP(relayAddr)
 		if derr != nil {
 			ctrl.Close()
 			return nil, nil, nil, M.Socksaddr{}, fmt.Errorf("socks5: failed to open UDP socket: %w", derr)

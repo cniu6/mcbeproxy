@@ -11,6 +11,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // defaultUDPSocketBufferSize is the "auto" SO_RCVBUF/SO_SNDBUF. 1 MiB is the
@@ -185,7 +186,7 @@ type directUpstreamDialer struct {
 }
 
 func (d *directUpstreamDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	conn, err := netroute.BindDialer(nil, address).DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}

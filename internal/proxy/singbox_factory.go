@@ -33,6 +33,7 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/singboxcore"
+	"mcpeserverproxy/internal/netroute"
 
 	hy2 "github.com/apernet/hysteria/core/v2/client"
 	hy2obfs "github.com/apernet/hysteria/extras/v2/obfs"
@@ -141,7 +142,7 @@ func (d *directDialer) DialContext(ctx context.Context, network string, destinat
 			dialAddr = net.JoinHostPort(ip.String(), fmt.Sprintf("%d", destination.Port))
 		}
 	}
-	conn, err := dialer.DialContext(ctx, network, dialAddr)
+	conn, err := netroute.BindDialer(dialer, destination.String()).DialContext(ctx, network, dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +155,7 @@ func (d *directDialer) DialContext(ctx context.Context, network string, destinat
 }
 
 func (d *directDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	conn, err := net.ListenUDP("udp", nil)
+	conn, err := netroute.ListenUDP(destination.String())
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +349,7 @@ type hy2ObfsConnFactory struct {
 }
 
 func (f *hy2ObfsConnFactory) New(addr net.Addr) (net.PacketConn, error) {
-	conn, err := net.ListenUDP("udp", nil)
+	conn, err := netroute.ListenUDP(addrString(addr))
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +398,7 @@ type hy2PortHoppingConnFactory struct {
 // New creates a new port-hopping UDP connection.
 func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	// Create base UDP connection
-	conn, err := net.ListenUDP("udp", nil)
+	conn, err := netroute.ListenUDP(addrString(addr))
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +513,7 @@ func DialOutboundServerTCP(ctx context.Context, host string, port int, timeout t
 		}
 		dialer.Deadline = deadline
 	}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := netroute.BindDialer(dialer, net.JoinHostPort(host, fmt.Sprint(port))).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, addr, err
 	}
@@ -803,7 +804,7 @@ func (s *SingboxOutbound) dialShadowsocksUDP(ctx context.Context, serverAddr, de
 	}
 
 	// Create UDP socket
-	udpConn, err := net.ListenUDP("udp", nil)
+	udpConn, err := netroute.ListenUDP(serverUDPAddr.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDP socket: %w", err)
 	}

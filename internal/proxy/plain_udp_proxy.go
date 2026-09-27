@@ -13,6 +13,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 const (
@@ -574,7 +575,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 		if !ok || udpAddr == nil {
 			return nil, nil, fmt.Errorf("target address %s is not resolved for direct dialing", p.effectiveTargetAddrString())
 		}
-		conn, err := net.DialUDP("udp", nil, udpAddr)
+		conn, err := netroute.DialUDP(udpAddr)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -605,7 +606,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 					exclude = append(exclude, DirectNodeName)
 					continue
 				}
-				conn, derr := net.DialUDP("udp", nil, udpAddr)
+				conn, derr := netroute.DialUDP(udpAddr)
 				if derr == nil {
 					tuneUDPSocketForServer(conn, p.conf(), "plain_udp_direct:"+udpAddr.String())
 					return conn, p.target(), nil

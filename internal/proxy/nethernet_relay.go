@@ -19,6 +19,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // NetherNet transparent relay.
@@ -687,13 +688,13 @@ func (r *netherNetRelay) dialSignaling(ctx context.Context, network, address str
 			return d.DialTCPContext(ctx, r.conf().GetProxyOutbound(), address)
 		}
 	}
-	return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, address)
+	return netroute.Dialer(10*time.Second, address).DialContext(ctx, network, address)
 }
 
 func (r *netherNetRelay) dialMedia(ctx context.Context, media netip.AddrPort) (net.PacketConn, net.Addr, error) {
 	dest := net.UDPAddrFromAddrPort(media)
 	if r.conf().IsDirectConnection() {
-		conn, err := net.DialUDP("udp", nil, dest)
+		conn, err := netroute.DialUDP(dest)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -707,7 +708,7 @@ func (r *netherNetRelay) dialMedia(ctx context.Context, media netip.AddrPort) (n
 			return nil, nil, err
 		}
 		if IsDirectSelection(selected) {
-			conn, err := net.DialUDP("udp", nil, dest)
+			conn, err := netroute.DialUDP(dest)
 			if err != nil {
 				return nil, nil, err
 			}

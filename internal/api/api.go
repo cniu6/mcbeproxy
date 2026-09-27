@@ -33,6 +33,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/session"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // APIServer provides REST API endpoints for proxy management.
@@ -2633,7 +2634,7 @@ func tcpConnectProbe(ctx context.Context, address string, timeout time.Duration)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	dialer := net.Dialer{Timeout: timeout}
+	dialer := netroute.Dialer(timeout, address)
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {

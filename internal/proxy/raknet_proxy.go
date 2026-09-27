@@ -453,7 +453,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		} else {
 			// Use direct connection
 			// Requirements: 2.2
-			remoteConn, err = raknet.DialTimeout(targetAddr, 15*time.Second)
+			remoteConn, err = raknet.Dialer{UpstreamDialer: &directUpstreamDialer{cfg: serverCfg}}.DialTimeout(targetAddr, 15*time.Second)
 		}
 
 		if err == nil {

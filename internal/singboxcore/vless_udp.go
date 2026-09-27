@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/netroute"
 
 	vmess "github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing-vmess/vless"
@@ -111,7 +112,7 @@ func (o *vlessUDPOutbound) Close() error {
 
 func normalizeVLESSUDPPoCOptions(options VLESSUDPPoCOptions) VLESSUDPPoCOptions {
 	if options.DialContext == nil {
-		dialer := &net.Dialer{Timeout: 30 * time.Second}
+		dialer := netroute.Dialer(30*time.Second, "")
 		options.DialContext = dialer.DialContext
 	}
 	return options

@@ -16,6 +16,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
+	"mcpeserverproxy/internal/netroute"
 
 	"github.com/sandertv/go-raknet"
 )
@@ -425,7 +426,7 @@ func (l *UDPListener) forwardPingDirect(data []byte, clientAddr *net.UDPAddr, se
 		return
 	}
 
-	tempConn, err := net.DialUDP("udp", nil, remoteAddr)
+	tempConn, err := netroute.DialUDP(remoteAddr)
 	if err != nil {
 		logger.Warn("Failed to dial %s for ping: %v", targetAddr, err)
 		l.markPingFailure()
@@ -557,7 +558,7 @@ func (l *UDPListener) setupRemoteConnection(sess *session.Session, cfg *config.S
 		return fmt.Errorf("failed to resolve remote address %s: %w", targetAddr, err)
 	}
 
-	remoteConn, err := net.DialUDP("udp", nil, remoteAddr)
+	remoteConn, err := netroute.DialUDP(remoteAddr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to remote %s: %w", targetAddr, err)
 	}

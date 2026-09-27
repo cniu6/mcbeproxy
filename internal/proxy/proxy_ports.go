@@ -21,6 +21,7 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/singboxcore"
+	"mcpeserverproxy/internal/netroute"
 )
 
 const (
@@ -1353,7 +1354,7 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		if err != nil {
 			return nil, err
 		}
-		uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		uc, err := netroute.DialUDP(&net.UDPAddr{IP: ip, Port: port})
 		if err != nil {
 			return nil, err
 		}
@@ -1383,7 +1384,7 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		if err != nil {
 			return nil, err
 		}
-		uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+		uc, err := netroute.DialUDP(&net.UDPAddr{IP: ip, Port: port})
 		if err != nil {
 			return nil, err
 		}

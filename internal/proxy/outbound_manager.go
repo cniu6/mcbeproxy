@@ -16,6 +16,7 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/singboxcore"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // Error definitions for OutboundManager operations.
@@ -1617,7 +1618,7 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 // It is intentionally an optional concrete capability so existing OutboundManager mocks remain unchanged.
 func (m *outboundManagerImpl) DialTCPContext(ctx context.Context, outboundName, destination string) (net.Conn, error) {
 	if strings.TrimSpace(outboundName) == "" || strings.EqualFold(strings.TrimSpace(outboundName), DirectNodeName) {
-		return (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", destination)
+		return netroute.BindDialer(&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}, destination).DialContext(ctx, "tcp", destination)
 	}
 	selected := strings.TrimSpace(outboundName)
 	if strings.HasPrefix(selected, "@") || strings.Contains(selected, ",") {

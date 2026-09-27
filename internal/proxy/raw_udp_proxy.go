@@ -27,6 +27,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	internalprotocol "mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
+	"mcpeserverproxy/internal/netroute"
 
 	"github.com/golang-jwt/jwt/v4"
 	mcprotocol "github.com/sandertv/gophertunnel/minecraft/protocol"
@@ -1690,7 +1691,7 @@ func (p *RawUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey 
 		}
 	} else {
 		// Direct connection
-		directConn, dialErr := net.DialUDP("udp", nil, p.targetUDPAddr())
+		directConn, dialErr := netroute.DialUDP(p.targetUDPAddr())
 		if dialErr != nil {
 			logger.Error("Failed to connect to target %s (client=%s server=%s active_proxy_clients=%d): %v",
 				p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), dialErr)
@@ -1968,7 +1969,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 					}
 					udpAddr = resolved
 				}
-				conn, err := net.DialUDP("udp", nil, udpAddr)
+				conn, err := netroute.DialUDP(udpAddr)
 				if err != nil {
 					lastErr = err
 					excludeNodes = append(excludeNodes, selectedOutbound.Name)
@@ -2093,7 +2094,7 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 				}
 				udpAddr = resolved
 			}
-			conn, err := net.DialUDP("udp", nil, udpAddr)
+			conn, err := netroute.DialUDP(udpAddr)
 			return conn, DirectNodeName, err
 		}
 		// Use ping dialer for the selected node to avoid health marking
@@ -4709,7 +4710,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 		}
 		conn, selectedNode, err = p.dialThroughProxyForPing(pingTimeout)
 	} else {
-		conn, err = net.DialUDP("udp", nil, p.targetUDPAddr())
+		conn, err = netroute.DialUDP(p.targetUDPAddr())
 	}
 
 	if err != nil {

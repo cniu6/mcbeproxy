@@ -24,6 +24,7 @@ import (
 	"mcpeserverproxy/internal/monitor"
 	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // Listener is an interface for proxy listeners (both transparent and RakNet).
@@ -1953,7 +1954,7 @@ func (p *ProxyServer) pingServerDirect(serverID, targetAddr string) int64 {
 		logger.Debug("auto ping direct resolve failed: server=%s target=%s err=%v", serverID, targetAddr, err)
 		return -1
 	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := netroute.DialUDP(udpAddr)
 	if err != nil {
 		logger.Debug("auto ping direct dial failed: server=%s target=%s err=%v", serverID, targetAddr, err)
 		return -1
@@ -2023,7 +2024,7 @@ func (p *ProxyServer) probeTCPDirect(serverID, targetAddr string) int64 {
 	if p != nil && p.ctx != nil {
 		ctx = p.ctx
 	}
-	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	dialer := netroute.Dialer(8*time.Second, "")
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	startTime := time.Now()

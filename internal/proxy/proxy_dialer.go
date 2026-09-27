@@ -12,6 +12,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 type outboundPacketConnNoRetryDialer interface {
@@ -114,7 +115,7 @@ func (d *ProxyDialer) DialContext(ctx context.Context, network, address string) 
 	// Requirements: 2.2
 	if d.shouldUseDirect() {
 		logger.Debug("ProxyDialer: Using direct connection for %s", address)
-		dialer := &net.Dialer{Timeout: d.timeout}
+		dialer := netroute.Dialer(d.timeout, "")
 		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
 			return nil, err
@@ -243,7 +244,7 @@ func (d *ProxyDialer) dialWithLoadBalancing(ctx context.Context, network, addres
 		// net.Dialer connection. Failover still applies if the direct dial
 		// itself fails (e.g. target is unreachable from this host).
 		if IsDirectSelection(selectedOutbound) {
-			directDialer := &net.Dialer{Timeout: d.timeout}
+			directDialer := netroute.Dialer(d.timeout, "")
 			directConn, directErr := directDialer.DialContext(ctx, network, address)
 			if directErr == nil {
 				tuneDirectNetConn(directConn, d.serverConfig, "proxy_dialer_direct:"+address)

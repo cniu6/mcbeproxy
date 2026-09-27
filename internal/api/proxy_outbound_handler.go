@@ -26,6 +26,7 @@ import (
 	"mcpeserverproxy/internal/proxy"
 	"mcpeserverproxy/internal/singboxcore"
 	"mcpeserverproxy/internal/subscription"
+	"mcpeserverproxy/internal/netroute"
 )
 
 // ProxyOutboundHandler handles REST API requests for proxy outbound management.
@@ -3090,7 +3091,7 @@ func (h *ProxyOutboundHandler) testUDPPing(ctx context.Context, addr string) Pin
 	}
 
 	// Create UDP connection
-	conn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := netroute.DialUDP(udpAddr)
 	if err != nil {
 		result.Success = false
 		result.Error = fmt.Sprintf("Failed to create UDP connection: %v", err)

@@ -11,6 +11,7 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 )
 
 const (
@@ -137,7 +138,7 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 		return nil, "", fmt.Errorf("plain tcp proxy configuration is nil")
 	}
 	if p.config.IsDirectConnection() {
-		dialer := &net.Dialer{Timeout: plainTCPDialTimeout}
+		dialer := netroute.Dialer(plainTCPDialTimeout, "")
 		conn, err := dialer.DialContext(ctx, "tcp", address)
 		return conn, DirectNodeName, err
 	}
@@ -154,7 +155,7 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 			return nil, "", err
 		}
 		if IsDirectSelection(selected) {
-			dialer := &net.Dialer{Timeout: plainTCPDialTimeout}
+			dialer := netroute.Dialer(plainTCPDialTimeout, "")
 			conn, derr := dialer.DialContext(ctx, "tcp", address)
 			if derr != nil {
 				exclude = append(exclude, DirectNodeName)
