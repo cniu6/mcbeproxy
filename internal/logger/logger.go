@@ -415,7 +415,7 @@ func logAccessEntries(config *StartupConfig) {
 	if config.APIKeyConfigured {
 		Info("访问鉴权: 已配置 API Key (需在后台或 X-API-Key 请求头中提供)")
 	} else {
-		Info("访问鉴权: 未配置 API Key —— 后台当前为开放访问, 建议尽快设置")
+		Warn("访问鉴权: 未配置 API Key —— 任何能访问 %d 端口的人都拥有管理员权限（入口路径不是鉴权）。请在 config.json 设置 api_key", config.APIPort)
 	}
 }
 

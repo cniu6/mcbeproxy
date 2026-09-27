@@ -227,6 +227,7 @@ func NewAPIServer(
 		api.proxyOutboundHandler.SetOutboundReloadHook(api.reloadServersUsingOutbound)
 	}
 
+	api.registerSessionPersisterMetrics()
 	api.setupRoutes()
 	return api
 }
@@ -348,6 +349,7 @@ func (a *APIServer) setupRoutes() {
 			debugGroup.Use(a.requireAdminMiddleware())
 			debugGroup.GET("/goroutines", a.getGoroutines)
 			debugGroup.GET("/goroutines/stats", a.getGoroutineStats)
+			debugGroup.GET("/session-persister", a.getSessionPersisterStats)
 			debugGroup.GET("/goroutines/pprof", a.getGoroutinePprof)
 			debugGroup.Any("/pprof/*action", a.handlePprof)
 			debugGroup.POST("/goroutines/cancel/:id", a.cancelGoroutine)

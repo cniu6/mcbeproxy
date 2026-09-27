@@ -60,6 +60,11 @@ func TestUDPListenerPreservesPerClientOrder(t *testing.T) {
 		if _, err := client.Write(pkt); err != nil {
 			t.Fatal(err)
 		}
+		if i%200 == 199 {
+			// Short breather so a loaded machine (full suite in parallel)
+			// drops nothing to socket-buffer overflow; order is what we test.
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
 
 	buf := make([]byte, 2048)

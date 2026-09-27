@@ -256,8 +256,10 @@ func (m *mockOutboundManager) GetBestNodeForServer(serverID, groupOrName, sortBy
 
 func setupTestProxyOutboundHandler() (*ProxyOutboundHandler, *config.ProxyOutboundConfigManager, *mockOutboundManager) {
 	// Create config manager
-	configMgr := config.NewProxyOutboundConfigManager("testdata/test_proxy_outbounds.json")
-	subConfigMgr := config.NewProxySubscriptionConfigManager("testdata/test_proxy_subscriptions.json")
+	// Work on private copies: saving outbounds used to rewrite the committed
+	// testdata fixtures in place.
+	configMgr := config.NewProxyOutboundConfigManager(testDataCopy("test_proxy_outbounds.json"))
+	subConfigMgr := config.NewProxySubscriptionConfigManager(testDataCopy("test_proxy_subscriptions.json"))
 
 	// Create mock outbound manager
 	outboundMgr := newMockOutboundManager()

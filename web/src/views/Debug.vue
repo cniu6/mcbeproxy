@@ -101,6 +101,32 @@
             </n-space>
           </n-card>
         </n-gi>
+
+        <!-- 会话写库（后台持久化队列） -->
+        <n-gi>
+          <n-card size="small" title="会话写库">
+            <n-space vertical>
+              <n-space justify="space-between">
+                <span>已写入 / 已入队</span>
+                <n-text>{{ persister.written || 0 }} / {{ persister.enqueued || 0 }}</n-text>
+              </n-space>
+              <n-space justify="space-between">
+                <span>队列</span>
+                <n-text :type="(persister.queue_depth || 0) > (persister.queue_capacity || 1) / 2 ? 'warning' : 'default'">
+                  {{ persister.queue_depth || 0 }} / {{ persister.queue_capacity || 0 }}
+                </n-text>
+              </n-space>
+              <n-space justify="space-between">
+                <span>队满同步写入</span>
+                <n-text :type="(persister.inline_writes || 0) > 0 ? 'warning' : 'default'">{{ persister.inline_writes || 0 }}</n-text>
+              </n-space>
+              <n-space justify="space-between">
+                <span>写入异常</span>
+                <n-text :type="(persister.panics || 0) > 0 ? 'error' : 'default'">{{ persister.panics || 0 }}</n-text>
+              </n-space>
+            </n-space>
+          </n-card>
+        </n-gi>
       </n-grid>
     </n-card>
 
@@ -429,6 +455,7 @@ const message = useMessage()
 const loading = ref(false)
 const loadingStacks = ref(false)
 const stats = ref({})
+const persister = ref({})
 const goroutines = ref([])
 const runtimeStacks = ref([])
 const autoRefresh = ref(true)
@@ -634,6 +661,10 @@ const loadStats = async () => {
     const res2 = await api('/api/debug/goroutines')
     if (res2.success) {
       goroutines.value = res2.data.goroutines || []
+    }
+    const res3 = await api('/api/debug/session-persister')
+    if (res3.success) {
+      persister.value = res3.data || {}
     }
   } catch (e) {
     message.error('加载失败: ' + e.message)
