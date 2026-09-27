@@ -238,6 +238,8 @@ type rawUDPClientInfo struct {
 	slowWriteClientCount   atomic.Int64
 	maxClientPacketGapMs   atomic.Int64
 	maxTargetPacketGapMs   atomic.Int64
+	upLeg                  rakLegStats // RakNet seq/NACK accounting for packets from the client
+	downLeg                rakLegStats // ... and for packets from the target
 	writeMetricWindowAt    atomic.Int64
 	recentMaxWriteTargetMs atomic.Int64
 	recentMaxWriteClientMs atomic.Int64
@@ -733,7 +735,7 @@ func (p *RawUDPProxy) logRawUDPClientStats(clientKey string, clientInfo *rawUDPC
 		queueCap = cap(clientInfo.upstreamWriteCh)
 	}
 	upBPS, downBPS := rawUDPCurrentRates(clientInfo, upBytes, downBytes, now)
-	logger.Info("RawUDP stats: server=%s client=%s route=%s target=%s up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d up_bps=%d down_bps=%d since_client=%v since_target=%v write_target_errors=%d write_target_timeouts=%d write_client_errors=%d write_client_timeouts=%d read_target_timeouts=%d queue=%d/%d queue_drops=%d login_parse_attempts=%d login_parse_done=%t encrypted=%t write_target_ms=%d/%d slow_target=%d write_client_ms=%d/%d slow_client=%d targetConn=%T targetAddr=%s",
+	logger.Info("RawUDP stats: server=%s client=%s route=%s target=%s up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d up_bps=%d down_bps=%d since_client=%v since_target=%v write_target_errors=%d write_target_timeouts=%d write_client_errors=%d write_client_timeouts=%d read_target_timeouts=%d queue=%d/%d queue_drops=%d login_parse_attempts=%d login_parse_done=%t encrypted=%t write_target_ms=%d/%d slow_target=%d write_client_ms=%d/%d slow_client=%d targetConn=%T targetAddr=%s %s",
 		p.serverID,
 		clientKey,
 		rawUDPRouteName(clientInfo.proxyNode),
@@ -764,7 +766,8 @@ func (p *RawUDPProxy) logRawUDPClientStats(clientKey string, clientInfo *rawUDPC
 		clientInfo.maxWriteClientMs.Load(),
 		clientInfo.slowWriteClientCount.Load(),
 		clientInfo.targetConn,
-		rawUDPAddrString(clientInfo.targetAddr))
+		rawUDPAddrString(clientInfo.targetAddr),
+		clientInfo.rakLoss())
 }
 
 func (c *rawUDPClientInfo) shouldLogPacket(direction string, now time.Time, packetCount int64) bool {
@@ -1490,6 +1493,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			clientInfo.bytesUp.Add(int64(n))
 			clientInfo.packetsUp.Add(1)
 			clientInfo.packetCount.Add(1)
+			clientInfo.upLeg.observe(buffer[:n])
 
 			// A reliable RakNet frame means the UDP connection has reached the
 			// established data phase. Create the session before Login parsing so
@@ -2228,6 +2232,12 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 	buffer := getRawUDPBuffer()
 	defer putRawUDPBuffer(buffer)
 
+	if logger.IsLevelEnabled(logger.LevelDebug) {
+		traceDone := make(chan struct{})
+		defer close(traceDone)
+		go p.traceRakFlow(clientAddr.String(), clientInfo, traceDone)
+	}
+
 	// Deadlines are absolute: keep pushing the read deadline forward, but only
 	// about once a second rather than once per packet.
 	var readDeadlineSetAt time.Time
@@ -2293,9 +2303,9 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 						lastTarget := time.Unix(0, clientInfo.lastTargetPacket.Load())
 						if time.Since(lastClient) >= RawUDPDirectionalStallThreshold &&
 							time.Since(lastTarget) >= RawUDPDirectionalStallThreshold {
-							logger.Warn("RawUDP: bidirectional stall detected, closing for fresh association: server=%s client=%s route=%s target=%s up_packets=%d down_packets=%d silent_client=%v silent_target=%v",
+							logger.Warn("RawUDP: bidirectional stall detected, closing for fresh association: server=%s client=%s route=%s target=%s up_packets=%d down_packets=%d silent_client=%v silent_target=%v %s",
 								p.serverID, clientAddr.String(), rawUDPRouteName(clientInfo.proxyNode), p.effectiveTargetAddrString(),
-								clientInfo.packetsUp.Load(), clientInfo.packetsDown.Load(), time.Since(lastClient).Round(time.Second), time.Since(lastTarget).Round(time.Second))
+								clientInfo.packetsUp.Load(), clientInfo.packetsDown.Load(), time.Since(lastClient).Round(time.Second), time.Since(lastTarget).Round(time.Second), clientInfo.rakLoss())
 							return
 						}
 					}
@@ -2411,6 +2421,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 
 			clientInfo.bytesDown.Add(int64(n))
 			clientInfo.packetsDown.Add(1)
+			clientInfo.downLeg.observe(buffer[:n])
 			downAt := time.Now()
 			clientInfo.lastSeen.Store(downAt.UnixNano())
 			rawUDPRecordPacketGap(&clientInfo.lastTargetPacket, &clientInfo.maxTargetPacketGapMs, downAt)
@@ -2578,13 +2589,13 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 				playerName, playerUUID, clientKey, durationStr,
 				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
 		} else {
-			logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s",
+			logger.Info("Player disconnected: name=%s, uuid=%s, client=%s, duration=%s, up=%s, down=%s, total=%s %s",
 				playerName, playerUUID, clientKey, durationStr,
-				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes))
+				formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes), clientInfo.rakLoss())
 		}
 	} else {
-		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s, active_proxy_clients=%d",
-			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes), p.GetActiveClientCount())
+		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s, active_proxy_clients=%d %s",
+			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes), p.GetActiveClientCount(), clientInfo.rakLoss())
 	}
 
 	// Credit any bytes not yet delta-synced before the session is persisted,
@@ -2708,8 +2719,8 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 		} else if isUDPPeerGone(lastClientPktNano, clientInfo.lastTargetPacket.Load(), now) {
 			p.removeClient(key.(string))
 			removed++
-			logger.Info("RawUDP session closed (client stopped answering for %v while target kept sending): server=%s client=%s active_proxy_clients=%d",
-				now.Sub(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
+			logger.Info("RawUDP session closed (client stopped answering for %v while target kept sending): server=%s client=%s active_proxy_clients=%d %s",
+				now.Sub(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount(), clientInfo.rakLoss())
 		} else if effectiveClientTimeout > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > effectiveClientTimeout {
 			p.removeClient(key.(string))
 			removed++
