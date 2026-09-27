@@ -101,7 +101,7 @@ const (
 	RawUDPDirectionalStallThreshold = 5 * time.Second
 	// RawUDPBlackholeRecoverAfter：上行有包、下行始终为 0 超过该时长，判定为
 	// SOCKS5/上游黑洞，主动拆掉会话让客户端用新 ASSOCIATE 重连。
-	RawUDPBlackholeRecoverAfter = 8 * time.Second
+	RawUDPBlackholeRecoverAfter = 3 * time.Second
 	// RawUDPBlackholeMinUpPackets：至少发出这么多包才判定黑洞，避免刚握手误杀。
 	RawUDPBlackholeMinUpPackets = 3
 )
@@ -2242,7 +2242,13 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			}
 
 			if now := time.Now(); now.Sub(readDeadlineSetAt) >= time.Second {
-				clientInfo.targetConn.SetReadDeadline(now.Add(UDPReadTimeout))
+				readTimeout := UDPReadTimeout
+				if clientInfo.packetsDown.Load() == 0 {
+					// Probe for a dead association while the client is still
+					// retrying its handshake (it gives up after ~6s), not after 30s.
+					readTimeout = plainUDPBlackholeProbeInterval
+				}
+				clientInfo.targetConn.SetReadDeadline(now.Add(readTimeout))
 				readDeadlineSetAt = now
 			}
 			n, err := readPacketConn(clientInfo.targetConn, buffer)
