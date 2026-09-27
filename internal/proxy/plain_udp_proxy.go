@@ -141,16 +141,16 @@ func (c *plainUDPClient) drainUpstreamWriteQueue(bp *BufferPool) {
 
 type PlainUDPProxy struct {
 	serverID    string
-	config      *config.ServerConfig
+	cfgPtr      atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
 	outboundMgr OutboundManager
 	listener    *net.UDPConn
-	nnRelay     *netherNetRelay // NetherNet media shares listener; nil unless nethernet_relay
-	targetAddr  net.Addr
+	nnRelay     atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
+	targetPtr   atomic.Pointer[plainUDPTarget]  // resolved target, swapped by UpdateConfig
 	clients     sync.Map
 	closed      atomic.Bool
 	wg          sync.WaitGroup
-	bufferPool  *BufferPool
-	idleTimeout time.Duration
+	bufferPool  atomic.Pointer[BufferPool] // read via pool(); swapped when buffer_size changes
+	idleTimeout atomic.Int64 // time.Duration; -1 = never
 
 	// ctx/cancel are owned internally (created in Start(), cancelled in
 	// Stop()) and used for background dials and per-client goroutines —
@@ -172,10 +172,30 @@ func (p *PlainUDPProxy) context() context.Context {
 }
 
 func NewPlainUDPProxy(serverID string, cfg *config.ServerConfig) *PlainUDPProxy {
-	return &PlainUDPProxy{
-		serverID: serverID,
-		config:   cfg,
+	p := &PlainUDPProxy{serverID: serverID}
+	p.cfgPtr.Store(cfg)
+	return p
+}
+
+// plainUDPTarget is one immutable resolution of the target address.
+type plainUDPTarget struct{ addr net.Addr }
+
+// conf returns the current server config (hot-reloaded by UpdateConfig).
+func (p *PlainUDPProxy) conf() *config.ServerConfig {
+	return p.cfgPtr.Load()
+}
+
+// pool returns the current packet buffer pool.
+func (p *PlainUDPProxy) pool() *BufferPool {
+	return p.bufferPool.Load()
+}
+
+// target returns the resolved target address, or nil.
+func (p *PlainUDPProxy) target() net.Addr {
+	if t := p.targetPtr.Load(); t != nil {
+		return t.addr
 	}
+	return nil
 }
 
 func (p *PlainUDPProxy) SetOutboundManager(outboundMgr OutboundManager) {
@@ -183,34 +203,40 @@ func (p *PlainUDPProxy) SetOutboundManager(outboundMgr OutboundManager) {
 }
 
 func (p *PlainUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
-	p.config = cfg
+	p.cfgPtr.Store(cfg)
 	p.refreshTargetAddr()
 	p.updateIdleTimeout()
-	p.bufferPool = NewBufferPool(p.effectiveBufferSize())
+	// buffer_size applies live: new datagrams use the new pool, and buffers
+	// still out from the old one are dropped on Put (size mismatch) instead of
+	// being recycled.
+	if size := p.effectiveBufferSize(); p.pool() == nil || p.pool().Size() != size {
+		p.bufferPool.Store(NewBufferPool(size))
+	}
+	syncNetherNetRelay(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load)
 }
 
 func (p *PlainUDPProxy) Start() error {
-	addr, err := net.ResolveUDPAddr("udp", p.config.ListenAddr)
+	addr, err := net.ResolveUDPAddr("udp", p.conf().ListenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to resolve listen address %s: %w", p.config.ListenAddr, err)
+		return fmt.Errorf("failed to resolve listen address %s: %w", p.conf().ListenAddr, err)
 	}
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", p.config.ListenAddr, err)
+		return fmt.Errorf("failed to listen on %s: %w", p.conf().ListenAddr, err)
 	}
-	tuneUDPSocketForServer(conn, p.config, "plain_udp:"+p.serverID)
+	tuneUDPSocketForServer(conn, p.conf(), "plain_udp:"+p.serverID)
 	p.listener = conn
 	p.closed.Store(false)
 	p.refreshTargetAddr()
 	p.updateIdleTimeout()
 
-	p.bufferPool = NewBufferPool(p.effectiveBufferSize())
+	p.bufferPool.Store(NewBufferPool(p.effectiveBufferSize()))
 
 	// Own lifecycle context, created before any background work can observe
 	// it — see the PlainUDPProxy.ctx doc comment.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.nnRelay = startNetherNetRelayIfEnabled(p.serverID, p.config, p.outboundMgr, conn)
+	p.nnRelay.Store(startNetherNetRelayIfEnabled(p.serverID, p.conf, p.outboundMgr, conn))
 
 	return nil
 }
@@ -232,14 +258,14 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		default:
 		}
 
-		buf := p.bufferPool.Get()
+		buf := p.pool().Get()
 		if now := time.Now(); now.Sub(readDeadlineSetAt) >= plainUDPReadTimeout/2 {
 			p.listener.SetReadDeadline(now.Add(plainUDPReadTimeout))
 			readDeadlineSetAt = now
 		}
 		n, clientAddrPort, err := p.listener.ReadFromUDPAddrPort(*buf)
 		if err != nil {
-			p.bufferPool.Put(buf)
+			p.pool().Put(buf)
 			if p.closed.Load() {
 				return nil
 			}
@@ -254,8 +280,8 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 		}
 
 		// NetherNet media shares this port; the relay copies what it claims.
-		if p.nnRelay != nil && p.nnRelay.handleDatagram((*buf)[:n], clientAddrPort) {
-			p.bufferPool.Put(buf)
+		if r := p.nnRelay.Load(); r != nil && r.handleDatagram((*buf)[:n], clientAddrPort) {
+			p.pool().Put(buf)
 			continue
 		}
 
@@ -281,7 +307,7 @@ func (p *PlainUDPProxy) Stop() error {
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
-	_ = p.nnRelay.Close()
+	_ = p.nnRelay.Swap(nil).Close()
 	p.clients.Range(func(key, value interface{}) bool {
 		if client, ok := value.(*plainUDPClient); ok {
 			// Must stop the async writer goroutine (if any) before closing
@@ -289,7 +315,7 @@ func (p *PlainUDPProxy) Stop() error {
 			// an empty channel with nothing to wake it, leaking the goroutine
 			// and hanging p.wg.Wait() below.
 			client.stopUpstreamWriter()
-			client.drainUpstreamWriteQueue(p.bufferPool)
+			client.drainUpstreamWriteQueue(p.pool())
 			if client.targetConn != nil {
 				_ = client.targetConn.Close()
 			}
@@ -302,17 +328,17 @@ func (p *PlainUDPProxy) Stop() error {
 }
 
 func (p *PlainUDPProxy) effectiveTargetAddrString() string {
-	if p.targetAddr != nil {
-		return p.targetAddr.String()
+	if t := p.target(); t != nil {
+		return t.String()
 	}
-	if p.config != nil {
-		return p.config.GetTargetAddr()
+	if p.conf() != nil {
+		return p.conf().GetTargetAddr()
 	}
 	return ""
 }
 
 func (p *PlainUDPProxy) resolvedTargetAddr() (*net.UDPAddr, bool) {
-	udpAddr, ok := p.targetAddr.(*net.UDPAddr)
+	udpAddr, ok := p.target().(*net.UDPAddr)
 	return udpAddr, ok
 }
 
@@ -336,13 +362,13 @@ func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKe
 			if len(existing.pendingPackets) < plainUDPPendingDialQueueCap {
 				existing.pendingPackets = append(existing.pendingPackets, plainUDPPendingWrite{buf: buf, n: n})
 			} else {
-				p.bufferPool.Put(buf)
+				p.pool().Put(buf)
 			}
 			existing.pendingMu.Unlock()
 			return nil, false
 		}
 		if err := existing.enqueueUpstreamPacket(plainUDPPendingWrite{buf: buf, n: n}); err != nil {
-			p.bufferPool.Put(buf)
+			p.pool().Put(buf)
 		}
 		return existing, false
 	}
@@ -356,16 +382,16 @@ func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKe
 	// dial to a background goroutine instead (buffering this packet and any
 	// retries so nothing is lost). The very first client on an otherwise-idle
 	// server still dials synchronously — nobody else could be blocked by it.
-	if !p.config.IsDirectConnection() && p.GetActiveClientCount() > 0 {
+	if !p.conf().IsDirectConnection() && p.GetActiveClientCount() > 0 {
 		p.createPendingClientAndDialAsync(clientKey, clientAddr, buf, n)
 		return nil, false
 	}
 
 	targetConn, targetAddr, err := p.dialTargetConn(p.context())
 	if err != nil {
-		p.bufferPool.Put(buf)
+		p.pool().Put(buf)
 		logger.Error("PlainUDPProxy: failed to dial target %s (client=%s server=%s active_proxy_clients=%d): %v",
-			p.config.GetTargetAddr(), clientKey, p.serverID, p.GetActiveClientCount(), err)
+			p.conf().GetTargetAddr(), clientKey, p.serverID, p.GetActiveClientCount(), err)
 		return nil, false
 	}
 
@@ -386,7 +412,7 @@ func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKe
 	go p.forwardUpstreamWrites(clientKey, client)
 
 	if err := client.enqueueUpstreamPacket(plainUDPPendingWrite{buf: buf, n: n}); err != nil {
-		p.bufferPool.Put(buf)
+		p.pool().Put(buf)
 	}
 
 	logger.Info("PlainUDP: new proxy client server=%s client=%s active_proxy_clients=%d",
@@ -429,7 +455,7 @@ func (p *PlainUDPProxy) finishPendingClientDial(clientKey string, clientAddr *ne
 	targetConn, targetAddr, err := p.dialTargetConn(p.context())
 	if err != nil {
 		logger.Error("PlainUDPProxy: failed to dial target %s asynchronously (client=%s server=%s active_proxy_clients=%d): %v",
-			p.config.GetTargetAddr(), clientKey, p.serverID, p.GetActiveClientCount(), err)
+			p.conf().GetTargetAddr(), clientKey, p.serverID, p.GetActiveClientCount(), err)
 		p.removeClientIfMatch(clientKey, placeholder)
 		return
 	}
@@ -454,13 +480,13 @@ func (p *PlainUDPProxy) finishPendingClientDial(clientKey string, clientAddr *ne
 	placeholder.pendingMu.Unlock()
 	for _, item := range buffered {
 		if err := client.enqueueUpstreamPacket(item); err != nil {
-			p.bufferPool.Put(item.buf)
+			p.pool().Put(item.buf)
 		}
 	}
 
 	if !p.clients.CompareAndSwap(clientKey, placeholder, client) {
 		_ = targetConn.Close()
-		client.drainUpstreamWriteQueue(p.bufferPool)
+		client.drainUpstreamWriteQueue(p.pool())
 		logger.Debug("PlainUDP: async dial finished but client %s was superseded, discarding connection", clientKey)
 		return
 	}
@@ -485,8 +511,8 @@ func (p *PlainUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *plai
 	if clientInfo == nil || clientInfo.targetConn == nil || clientInfo.upstreamWriteCh == nil {
 		return
 	}
-	defer clientInfo.drainUpstreamWriteQueue(p.bufferPool)
-	mtuClamp := p.config.GetRakNetMTUClamp()
+	defer clientInfo.drainUpstreamWriteQueue(p.pool())
+	mtuClamp := p.conf().GetRakNetMTUClamp()
 	var writeDeadlineAt time.Time // refreshed only when under half the timeout is left
 
 	for {
@@ -510,7 +536,7 @@ func (p *PlainUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *plai
 				clientInfo.packetsUp.Add(1)
 				clientInfo.bytesUp.Add(int64(len(pkt)))
 			}
-			p.bufferPool.Put(item.buf)
+			p.pool().Put(item.buf)
 			// A transient ICMP-induced error on a connected/direct UDP socket
 			// (e.g. connection refused) must not drop the session; skip the datagram.
 			if err != nil && !isTimeoutError(err) && !isRecoverableConnError(err) {
@@ -523,13 +549,13 @@ func (p *PlainUDPProxy) forwardUpstreamWrites(clientKey string, clientInfo *plai
 }
 
 func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net.Addr, error) {
-	if p.targetAddr == nil {
+	if p.target() == nil {
 		return nil, nil, fmt.Errorf("target address not resolved")
 	}
-	if p.config == nil {
+	if p.conf() == nil {
 		return nil, nil, fmt.Errorf("plain udp proxy configuration is nil")
 	}
-	if p.config.IsDirectConnection() {
+	if p.conf().IsDirectConnection() {
 		udpAddr, ok := p.resolvedTargetAddr()
 		if !ok || udpAddr == nil {
 			return nil, nil, fmt.Errorf("target address %s is not resolved for direct dialing", p.effectiveTargetAddrString())
@@ -538,19 +564,19 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 		if err != nil {
 			return nil, nil, err
 		}
-		tuneUDPSocketForServer(conn, p.config, "plain_udp_direct:"+udpAddr.String())
+		tuneUDPSocketForServer(conn, p.conf(), "plain_udp_direct:"+udpAddr.String())
 		return conn, udpAddr, nil
 	}
 	if p.outboundMgr == nil {
 		return nil, nil, fmt.Errorf("proxy outbound manager unavailable for plain udp server %s", p.serverID)
 	}
 
-	proxyOutbound := p.config.GetProxyOutbound()
-	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
-		strategy := p.config.GetLoadBalance()
-		sortBy := p.config.GetLoadBalanceSort()
+	proxyOutbound := p.conf().GetProxyOutbound()
+	if p.conf().IsGroupSelection() || p.conf().IsMultiNodeSelection() {
+		strategy := p.conf().GetLoadBalance()
+		sortBy := p.conf().GetLoadBalanceSort()
 		exclude := make([]string, 0, 4)
-		attempts := proxySelectionAttemptLimit(p.config, p.outboundMgr)
+		attempts := proxySelectionAttemptLimit(p.conf(), p.outboundMgr)
 		for i := 0; i < attempts; i++ {
 			selected, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, exclude)
 			if err != nil {
@@ -567,26 +593,26 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 				}
 				conn, derr := net.DialUDP("udp", nil, udpAddr)
 				if derr == nil {
-					tuneUDPSocketForServer(conn, p.config, "plain_udp_direct:"+udpAddr.String())
-					return conn, p.targetAddr, nil
+					tuneUDPSocketForServer(conn, p.conf(), "plain_udp_direct:"+udpAddr.String())
+					return conn, p.target(), nil
 				}
 				exclude = append(exclude, DirectNodeName)
 				continue
 			}
-			conn, err := dialPacketConnForFailover(ctx, p.outboundMgr, selected.Name, p.config.GetTargetAddr())
+			conn, err := dialPacketConnForFailover(ctx, p.outboundMgr, selected.Name, p.conf().GetTargetAddr())
 			if err == nil {
-				return conn, p.targetAddr, nil
+				return conn, p.target(), nil
 			}
 			exclude = append(exclude, selected.Name)
 		}
 		return nil, nil, fmt.Errorf("all proxy outbounds failed")
 	}
 
-	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, p.config.GetTargetAddr())
+	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, p.conf().GetTargetAddr())
 	if err != nil {
 		return nil, nil, err
 	}
-	return conn, p.targetAddr, nil
+	return conn, p.target(), nil
 }
 
 func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPClient) {
@@ -599,14 +625,14 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 	}()
 	defer p.removeClientIfMatch(clientKey, clientInfo)
 
-	bufPtr := p.bufferPool.Get()
+	bufPtr := p.pool().Get()
 	buffer := *bufPtr
-	defer p.bufferPool.Put(bufPtr)
+	defer p.pool().Put(bufPtr)
 
 	// Reconnecting only helps when a proxy association can be replaced; a
 	// direct socket to a dead target must survive (see isRecoverableConnError).
-	probeBlackhole := !p.config.IsDirectConnection()
-	mtuClamp := p.config.GetRakNetMTUClamp()
+	probeBlackhole := !p.conf().IsDirectConnection()
+	mtuClamp := p.conf().GetRakNetMTUClamp()
 	var readDeadlineSetAt time.Time
 	for {
 		select {
@@ -648,7 +674,7 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 			if probeBlackhole && p.isClientBlackholed(clientInfo, time.Now()) {
 				logger.Warn("PlainUDP: blackhole detected (up_packets=%d down=0 after %v), closing for fresh ASSOCIATE: server=%s client=%s route=%s target=%s",
 					clientInfo.packetsUp.Load(), time.Since(clientInfo.startTime).Round(time.Second),
-					p.serverID, clientKey, p.config.GetProxyOutbound(), p.effectiveTargetAddrString())
+					p.serverID, clientKey, p.conf().GetProxyOutbound(), p.effectiveTargetAddrString())
 				return
 			}
 			if p.isClientIdleExpired(clientInfo, time.Now()) {
@@ -749,7 +775,7 @@ func (p *PlainUDPProxy) finalizePlainClientRemoval(clientKey string, client *pla
 		return
 	}
 	client.stopUpstreamWriter()
-	client.drainUpstreamWriteQueue(p.bufferPool)
+	client.drainUpstreamWriteQueue(p.pool())
 	if client.targetConn != nil {
 		_ = client.targetConn.Close()
 	}
@@ -776,10 +802,10 @@ func (p *PlainUDPProxy) isClientBlackholed(clientInfo *plainUDPClient, now time.
 }
 
 func (p *PlainUDPProxy) effectiveBufferSize() int {
-	if p.config == nil {
+	if p.conf() == nil {
 		return MaxUDPPacketSize
 	}
-	bufferSize := p.config.GetBufferSize()
+	bufferSize := p.conf().GetBufferSize()
 	if bufferSize == AutoBufferSize || bufferSize <= 0 {
 		return MaxUDPPacketSize
 	}
@@ -790,20 +816,20 @@ func (p *PlainUDPProxy) effectiveBufferSize() int {
 }
 
 func (p *PlainUDPProxy) refreshTargetAddr() {
-	shouldPreserveHostname := p.config != nil && !p.config.IsDirectConnection()
-	addr, _, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
+	shouldPreserveHostname := p.conf() != nil && !p.conf().IsDirectConnection()
+	addr, _, err := buildUDPDestinationAddr(context.Background(), p.conf().GetTargetAddr(), shouldPreserveHostname)
 	if err != nil {
-		logger.Warn("PlainUDPProxy: failed to resolve target %s: %v", p.config.GetTargetAddr(), err)
+		logger.Warn("PlainUDPProxy: failed to resolve target %s: %v", p.conf().GetTargetAddr(), err)
 		return
 	}
-	p.targetAddr = addr
+	p.targetPtr.Store(&plainUDPTarget{addr: addr})
 }
 
 func (p *PlainUDPProxy) isClientIdleExpired(clientInfo *plainUDPClient, now time.Time) bool {
-	if clientInfo == nil || p.idleTimeout < 0 {
+	timeout := time.Duration(p.idleTimeout.Load())
+	if clientInfo == nil || timeout < 0 {
 		return false
 	}
-	timeout := p.idleTimeout
 	if timeout == 0 {
 		timeout = defaultPlainIdle
 	}
@@ -811,15 +837,15 @@ func (p *PlainUDPProxy) isClientIdleExpired(clientInfo *plainUDPClient, now time
 }
 
 func (p *PlainUDPProxy) updateIdleTimeout() {
-	if p.config != nil {
-		if p.config.IdleTimeout == -1 {
-			p.idleTimeout = -1
+	if p.conf() != nil {
+		if p.conf().IdleTimeout == -1 {
+			p.idleTimeout.Store(-1)
 			return
 		}
-		if p.config.IdleTimeout > 0 {
-			p.idleTimeout = time.Duration(p.config.IdleTimeout) * time.Second
+		if p.conf().IdleTimeout > 0 {
+			p.idleTimeout.Store(int64(time.Duration(p.conf().IdleTimeout) * time.Second))
 			return
 		}
 	}
-	p.idleTimeout = defaultPlainIdle
+	p.idleTimeout.Store(int64(defaultPlainIdle))
 }

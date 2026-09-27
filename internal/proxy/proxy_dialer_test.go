@@ -510,12 +510,12 @@ func TestRawUDPProxyRefreshTargetAddrs_PreserveHostnameWhenProxying(t *testing.T
 	if err := proxy.refreshTargetAddrs(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if proxy.targetAddr != nil {
-		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname, got %+v", proxy.targetAddr)
+	if proxy.targetUDPAddr() != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname, got %+v", proxy.targetUDPAddr())
 	}
-	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	hostnameAddr, ok := proxy.effectiveTargetPacketAddr().(*HostnamePortAddr)
 	if !ok {
-		t.Fatalf("expected HostnamePortAddr, got %T", proxy.targetPacketAddr)
+		t.Fatalf("expected HostnamePortAddr, got %T", proxy.effectiveTargetPacketAddr())
 	}
 	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
 		t.Fatalf("unexpected targetPacketAddr: %q", got)
@@ -541,12 +541,12 @@ func TestRawUDPProxyStart_PreserveHostnameWhenProxying(t *testing.T) {
 		_ = proxy.Stop()
 	}()
 
-	if proxy.targetAddr != nil {
-		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after Start, got %+v", proxy.targetAddr)
+	if proxy.targetUDPAddr() != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after Start, got %+v", proxy.targetUDPAddr())
 	}
-	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	hostnameAddr, ok := proxy.effectiveTargetPacketAddr().(*HostnamePortAddr)
 	if !ok {
-		t.Fatalf("expected HostnamePortAddr after Start, got %T", proxy.targetPacketAddr)
+		t.Fatalf("expected HostnamePortAddr after Start, got %T", proxy.effectiveTargetPacketAddr())
 	}
 	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
 		t.Fatalf("unexpected targetPacketAddr after Start: %q", got)
@@ -577,12 +577,12 @@ func TestRawUDPProxyUpdateConfig_PreserveHostnameWhenProxying(t *testing.T) {
 	nextCfg.Port = 19133
 	proxy.UpdateConfig(&nextCfg)
 
-	if proxy.targetAddr != nil {
-		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after UpdateConfig, got %+v", proxy.targetAddr)
+	if proxy.targetUDPAddr() != nil {
+		t.Fatalf("expected targetAddr to stay nil for unresolved proxied hostname after UpdateConfig, got %+v", proxy.targetUDPAddr())
 	}
-	hostnameAddr, ok := proxy.targetPacketAddr.(*HostnamePortAddr)
+	hostnameAddr, ok := proxy.effectiveTargetPacketAddr().(*HostnamePortAddr)
 	if !ok {
-		t.Fatalf("expected HostnamePortAddr after UpdateConfig, got %T", proxy.targetPacketAddr)
+		t.Fatalf("expected HostnamePortAddr after UpdateConfig, got %T", proxy.effectiveTargetPacketAddr())
 	}
 	if got := hostnameAddr.String(); got != "geo.example.com:19133" {
 		t.Fatalf("unexpected targetPacketAddr after UpdateConfig: %q", got)
@@ -651,9 +651,9 @@ func TestPlainUDPProxyRefreshTargetAddr_PreserveHostnameWhenProxying(t *testing.
 	proxy.SetOutboundManager(NewOutboundManager(nil))
 	proxy.refreshTargetAddr()
 
-	hostnameAddr, ok := proxy.targetAddr.(*HostnamePortAddr)
+	hostnameAddr, ok := proxy.target().(*HostnamePortAddr)
 	if !ok {
-		t.Fatalf("expected HostnamePortAddr, got %T", proxy.targetAddr)
+		t.Fatalf("expected HostnamePortAddr, got %T", proxy.target())
 	}
 	if got := hostnameAddr.String(); got != "play.venitymc.com:19132" {
 		t.Fatalf("unexpected targetAddr: %q", got)

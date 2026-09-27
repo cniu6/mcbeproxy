@@ -860,20 +860,6 @@ var socks5UDPWritePool = sync.Pool{
 }
 
 func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	if c.remoteClosed.Load() {
-		return 0, errors.New("socks5: UDP relay closed")
-	}
-	c.waitReconnect()
-	if c.closed.Load() {
-		return 0, errors.New("socks5: connection closed")
-	}
-	if c.remoteClosed.Load() {
-		return 0, errors.New("socks5: UDP relay closed")
-	}
-	st := c.state.Load()
-	if st == nil {
-		return 0, errors.New("socks5: no connection")
-	}
 	datagramPtr := socks5UDPWritePool.Get().(*[]byte)
 	datagram := (*datagramPtr)[:0]
 	defer func() {
@@ -883,20 +869,39 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	datagram = append(datagram, 0x00, 0x00, 0x00)
 	datagram = appendSocksaddr(datagram, c.destination)
 	datagram = append(datagram, p...)
-	c.writeMu.Lock()
-	_ = st.udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, err := st.udpConn.WriteTo(datagram, st.relayAddr)
-	c.writeMu.Unlock()
-	if err != nil {
-		if c.reconnecting.Load() {
-			// Write failed because old conn was closed during reconnect — retry once.
-			return c.WriteTo(p, nil)
+
+	// A write that fails because a reconnect swapped the socket underneath is
+	// retried once on the new association; more attempts would only stall the
+	// caller through a reconnect storm.
+	for attempt := 0; ; attempt++ {
+		if c.remoteClosed.Load() {
+			return 0, errors.New("socks5: UDP relay closed")
+		}
+		c.waitReconnect()
+		if c.closed.Load() {
+			return 0, errors.New("socks5: connection closed")
+		}
+		if c.remoteClosed.Load() {
+			return 0, errors.New("socks5: UDP relay closed")
+		}
+		st := c.state.Load()
+		if st == nil {
+			return 0, errors.New("socks5: no connection")
+		}
+		c.writeMu.Lock()
+		_ = st.udpConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, err := st.udpConn.WriteTo(datagram, st.relayAddr)
+		c.writeMu.Unlock()
+		if err == nil {
+			c.lastWriteAt.Store(time.Now().UnixNano())
+			return len(p), nil
+		}
+		if attempt == 0 && c.reconnecting.Load() {
+			continue
 		}
 		logger.Debug("SOCKS5 UDP write failed: relay=%s err=%v", st.relayAddr, err)
 		return 0, err
 	}
-	c.lastWriteAt.Store(time.Now().UnixNano())
-	return len(p), nil
 }
 
 func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {

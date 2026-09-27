@@ -40,17 +40,18 @@ import (
 // visible on this path.
 
 const (
-	netherNetRelayIdleTimeout    = 60 * time.Second
-	netherNetRelayUnboundTimeout = 30 * time.Second
-	netherNetRelaySweepInterval  = 5 * time.Second
-	netherNetRelayMaxSessions    = 1024
-	netherNetRelayUpstreamOKTTL  = 5 * time.Minute
-	netherNetRelayUpstreamBadTTL = 30 * time.Second
-	netherNetRelayProbeTimeout   = 4 * time.Second
-	netherNetRelayOfferTimeout   = 15 * time.Second
-	netherNetRelayWriteQueue     = 128
-	netherNetRelayPacketSize     = 2048
-	netherNetMaxSDPSize          = 1 << 20
+	netherNetRelayIdleTimeout        = 60 * time.Second
+	netherNetRelayUnboundTimeout     = 30 * time.Second
+	netherNetRelaySweepInterval      = 5 * time.Second
+	netherNetRelayMaxSessions        = 1024
+	netherNetRelayUpstreamOKTTL      = 5 * time.Minute
+	netherNetRelayUpstreamBadTTL     = 30 * time.Second
+	netherNetRelayProbeTimeout       = 4 * time.Second
+	netherNetRelayOfferTimeout       = 15 * time.Second
+	netherNetRelayWriteQueue         = 128
+	netherNetRelayPacketSize         = 2048
+	netherNetMaxSDPSize              = 1 << 20
+	netherNetRelayMaxAddrsPerSession = 16
 
 	stunMagicCookie        = 0x2112A442
 	stunBindingRequest     = 0x0001
@@ -66,7 +67,7 @@ var netherNetPacketPool = sync.Pool{New: func() any {
 
 type netherNetRelay struct {
 	serverID    string
-	cfg         *config.ServerConfig
+	conf        func() *config.ServerConfig // live server config of the owning proxy (hot-reloaded)
 	outboundMgr OutboundManager
 	udp         *net.UDPConn // the RakNet listener socket, shared for media
 	listenPort  uint16
@@ -115,6 +116,10 @@ type netherNetSession struct {
 	packetsDown atomic.Int64
 	bytesUp     atomic.Int64
 	bytesDown   atomic.Int64
+	// Upstream write failures: timeouts mean the outbound blocked past the
+	// write deadline (the datagram is dropped, as UDP would be).
+	writeTimeouts atomic.Int64
+	writeErrors   atomic.Int64
 }
 
 type netherNetPacket struct {
@@ -124,8 +129,8 @@ type netherNetPacket struct {
 
 // newNetherNetRelay starts the signaling listener on the TCP twin of udp's
 // port. The caller routes datagrams through handleDatagram.
-func newNetherNetRelay(serverID string, cfg *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) (*netherNetRelay, error) {
-	if !cfg.IsDirectConnection() && outboundMgr == nil {
+func newNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) (*netherNetRelay, error) {
+	if !conf().IsDirectConnection() && outboundMgr == nil {
 		return nil, fmt.Errorf("nethernet relay: outbound manager unavailable for %s", serverID)
 	}
 	udpAddr, ok := udp.LocalAddr().(*net.UDPAddr)
@@ -139,7 +144,7 @@ func newNetherNetRelay(serverID string, cfg *config.ServerConfig, outboundMgr Ou
 	}
 	r := &netherNetRelay{
 		serverID:    serverID,
-		cfg:         cfg,
+		conf:        conf,
 		outboundMgr: outboundMgr,
 		udp:         udp,
 		listenPort:  uint16(udpAddr.Port),
@@ -219,7 +224,13 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 		return false
 	}
 	s := v.(*netherNetSession)
+	// A client binds a handful of addresses (one per ICE candidate, plus NAT
+	// rebinding); cap it so nobody can grow a session's address list.
 	s.addrsMu.Lock()
+	if len(s.addrs) >= netherNetRelayMaxAddrsPerSession {
+		s.addrsMu.Unlock()
+		return true // ours, but not bound: drop
+	}
 	s.addrs = append(s.addrs, from)
 	s.addrsMu.Unlock()
 	r.byAddr.Store(from, s)
@@ -264,6 +275,10 @@ func (r *netherNetRelay) forwardUpstream(s *netherNetSession) {
 			if _, err := writePacketConn(s.upstream, (*p.buf)[:p.n], s.mediaAddr); err == nil {
 				s.packetsUp.Add(1)
 				s.bytesUp.Add(int64(p.n))
+			} else if isTimeoutError(err) {
+				s.writeTimeouts.Add(1)
+			} else {
+				s.writeErrors.Add(1)
 			}
 			netherNetPacketPool.Put(p.buf)
 		}
@@ -281,6 +296,8 @@ func (r *netherNetRelay) forwardDownstream(s *netherNetSession) {
 			select {
 			case <-s.done:
 				return
+			case <-r.done:
+				return // relay closing: never outlive it, even for a session it missed
 			default:
 			}
 			if isTimeoutError(err) || isRecoverableConnError(err) {
@@ -337,9 +354,10 @@ func (r *netherNetRelay) closeSession(s *netherNetSession, reason string) {
 		if c := s.client.Load(); c != nil {
 			client = c.String()
 		}
-		logger.Info("NetherNet relay: session closed server=%s client=%s reason=%s duration=%v up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d",
+		logger.Info("NetherNet relay: session closed server=%s client=%s reason=%s duration=%v up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d up_write_timeouts=%d up_write_errors=%d",
 			r.serverID, client, reason, time.Since(s.created).Round(time.Second),
-			s.packetsUp.Load(), s.packetsDown.Load(), s.bytesUp.Load(), s.bytesDown.Load())
+			s.packetsUp.Load(), s.packetsDown.Load(), s.bytesUp.Load(), s.bytesDown.Load(),
+			s.writeTimeouts.Load(), s.writeErrors.Load())
 	})
 }
 
@@ -454,15 +472,22 @@ func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer s
 		done:      make(chan struct{}),
 	}
 	s.lastActive.Store(time.Now().UnixNano())
-	if !r.track(2) {
+	// Register the goroutines and publish the session under one lock: Close
+	// sets stopped and then sweeps r.sessions, so a session is either refused
+	// here or seen (and closed) by that sweep. Publishing it after the check
+	// let Close miss it and hang in wg.Wait on its forwarders.
+	r.lifeMu.Lock()
+	if r.stopped {
+		r.lifeMu.Unlock()
 		_ = upstream.Close()
 		return "", errors.New("relay stopped")
 	}
-	if old, loaded := r.sessions.Swap(ufrag, s); loaded {
-		r.count.Add(1) // closeSession of the replaced one decrements
-		r.closeSession(old.(*netherNetSession), "replaced by new offer")
-	} else {
-		r.count.Add(1)
+	r.wg.Add(2)
+	old, replaced := r.sessions.Swap(ufrag, s)
+	r.count.Add(1)
+	r.lifeMu.Unlock()
+	if replaced {
+		r.closeSession(old.(*netherNetSession), "replaced by new offer") // decrements count
 	}
 	go r.forwardUpstream(s)
 	go r.forwardDownstream(s)
@@ -472,16 +497,16 @@ func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer s
 }
 
 func (r *netherNetRelay) routeName() string {
-	if r.cfg.IsDirectConnection() {
+	if r.conf().IsDirectConnection() {
 		return DirectNodeName
 	}
-	return r.cfg.GetProxyOutbound()
+	return r.conf().GetProxyOutbound()
 }
 
 // advertisedAddr is where the client should send media: the configured public
 // address, or else the host it used for signaling on our (shared) port.
 func (r *netherNetRelay) advertisedAddr(ctx context.Context, req *http.Request) (netip.AddrPort, error) {
-	hostport := strings.TrimSpace(r.cfg.NetherNetPublicAddr)
+	hostport := strings.TrimSpace(r.conf().NetherNetPublicAddr)
 	if hostport == "" {
 		hostport = req.Host
 	}
@@ -519,11 +544,11 @@ func resolveNetherNetHost(ctx context.Context, host string) (netip.Addr, error) 
 }
 
 func (r *netherNetRelay) upstreamHostPort() (host string, port int) {
-	return r.cfg.Target, r.cfg.Port
+	return r.conf().Target, r.conf().Port
 }
 
 func (r *netherNetRelay) upstreamIP(ctx context.Context) netip.Addr {
-	host := strings.TrimSpace(r.cfg.TargetIP)
+	host := strings.TrimSpace(r.conf().TargetIP)
 	if host == "" {
 		host, _ = r.upstreamHostPort()
 	}
@@ -567,7 +592,7 @@ func (r *netherNetRelay) probeUpstream() {
 	defer r.wg.Done()
 	defer r.probing.Store(false)
 	var bases []string
-	if u := strings.TrimRight(strings.TrimSpace(r.cfg.NetherNetUpstream), "/"); u != "" {
+	if u := strings.TrimRight(strings.TrimSpace(r.conf().NetherNetUpstream), "/"); u != "" {
 		bases = []string{u}
 	} else {
 		host, port := r.upstreamHostPort()
@@ -606,6 +631,18 @@ func (r *netherNetRelay) probeUpstream() {
 	r.firstProbeOnce.Do(func() { close(r.firstProbe) })
 }
 
+// configChanged drops the cached upstream probe so a changed target or
+// nethernet_upstream is picked up on the next request instead of after the
+// cache TTL. Everything else reads the live config through r.conf.
+func (r *netherNetRelay) configChanged() {
+	if r == nil {
+		return
+	}
+	r.upstreamMu.Lock()
+	r.upstreamChecked = time.Time{}
+	r.upstreamMu.Unlock()
+}
+
 // track registers n goroutines with the relay unless it is closing.
 func (r *netherNetRelay) track(n int) bool {
 	r.lifeMu.Lock()
@@ -640,14 +677,14 @@ type netherNetTCPDialer interface {
 }
 
 func (r *netherNetRelay) dialSignaling(ctx context.Context, network, address string) (net.Conn, error) {
-	if pinned := strings.TrimSpace(r.cfg.TargetIP); pinned != "" {
+	if pinned := strings.TrimSpace(r.conf().TargetIP); pinned != "" {
 		if _, port, err := net.SplitHostPort(address); err == nil {
 			address = net.JoinHostPort(pinned, port)
 		}
 	}
-	if !r.cfg.IsDirectConnection() {
+	if !r.conf().IsDirectConnection() {
 		if d, ok := r.outboundMgr.(netherNetTCPDialer); ok {
-			return d.DialTCPContext(ctx, r.cfg.GetProxyOutbound(), address)
+			return d.DialTCPContext(ctx, r.conf().GetProxyOutbound(), address)
 		}
 	}
 	return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, address)
@@ -655,17 +692,17 @@ func (r *netherNetRelay) dialSignaling(ctx context.Context, network, address str
 
 func (r *netherNetRelay) dialMedia(ctx context.Context, media netip.AddrPort) (net.PacketConn, net.Addr, error) {
 	dest := net.UDPAddrFromAddrPort(media)
-	if r.cfg.IsDirectConnection() {
+	if r.conf().IsDirectConnection() {
 		conn, err := net.DialUDP("udp", nil, dest)
 		if err != nil {
 			return nil, nil, err
 		}
-		tuneUDPSocketForServer(conn, r.cfg, "nethernet_relay:"+media.String())
+		tuneUDPSocketForServer(conn, r.conf(), "nethernet_relay:"+media.String())
 		return conn, dest, nil
 	}
-	outbound := r.cfg.GetProxyOutbound()
-	if r.cfg.IsGroupSelection() || r.cfg.IsMultiNodeSelection() {
-		selected, err := r.outboundMgr.SelectOutboundWithFailoverForServer(r.serverID, outbound, r.cfg.GetLoadBalance(), r.cfg.GetLoadBalanceSort(), nil)
+	outbound := r.conf().GetProxyOutbound()
+	if r.conf().IsGroupSelection() || r.conf().IsMultiNodeSelection() {
+		selected, err := r.outboundMgr.SelectOutboundWithFailoverForServer(r.serverID, outbound, r.conf().GetLoadBalance(), r.conf().GetLoadBalanceSort(), nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -850,14 +887,43 @@ func (c *rejectTLSConn) Read(p []byte) (int, error) {
 // startNetherNetRelayIfEnabled starts the relay for a RakNet UDP listener when
 // the server opts in. A failure only disables NetherNet: RakNet keeps working
 // and clients fall back to it because the TCP port does not answer.
-func startNetherNetRelayIfEnabled(serverID string, cfg *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) *netherNetRelay {
-	if cfg == nil || !cfg.NetherNetRelay || udp == nil {
+func startNetherNetRelayIfEnabled(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) *netherNetRelay {
+	if cfg := conf(); cfg == nil || !cfg.NetherNetRelay || udp == nil {
 		return nil
 	}
-	r, err := newNetherNetRelay(serverID, cfg, outboundMgr, udp)
+	r, err := newNetherNetRelay(serverID, conf, outboundMgr, udp)
 	if err != nil {
 		logger.Error("NetherNet relay disabled for server %s: %v", serverID, err)
 		return nil
 	}
 	return r
+}
+
+// syncNetherNetRelay applies a hot config update to the relay slot of a
+// running proxy: it starts the relay when nethernet_relay was switched on,
+// stops it when switched off, and otherwise lets the live relay re-probe the
+// upstream. closed reports whether the owning proxy has been stopped.
+func syncNetherNetRelay(slot *atomic.Pointer[netherNetRelay], serverID string, conf func() *config.ServerConfig,
+	outboundMgr OutboundManager, udp *net.UDPConn, closed func() bool) {
+	cfg := conf()
+	want := cfg != nil && cfg.NetherNetRelay && udp != nil && !closed()
+	cur := slot.Load()
+	switch {
+	case want && cur == nil:
+		r := startNetherNetRelayIfEnabled(serverID, conf, outboundMgr, udp)
+		if r == nil {
+			return
+		}
+		if !slot.CompareAndSwap(nil, r) || closed() {
+			slot.CompareAndSwap(r, nil)
+			_ = r.Close()
+		}
+	case !want && cur != nil:
+		if slot.CompareAndSwap(cur, nil) {
+			_ = cur.Close()
+			logger.Info("NetherNet relay stopped: server=%s (disabled in config)", serverID)
+		}
+	case cur != nil:
+		cur.configChanged()
+	}
 }

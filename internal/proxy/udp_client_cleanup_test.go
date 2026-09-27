@@ -10,19 +10,20 @@ import (
 )
 
 func TestRawUDPProxy_EffectiveClientDisconnectTimeout_IdleNever(t *testing.T) {
-	p := &RawUDPProxy{clientInactiveTimeout: 0}
+	p := &RawUDPProxy{}
 	if got := p.effectiveClientDisconnectTimeout(); got != 0 {
 		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want disabled", got)
 	}
 }
 
 func TestRawUDPProxy_EffectiveClientDisconnectTimeout_Configured(t *testing.T) {
-	p := &RawUDPProxy{clientInactiveTimeout: 5 * time.Minute}
+	p := &RawUDPProxy{}
+	p.clientInactiveTimeoutNs.Store(int64(5 * time.Minute))
 	if got := p.effectiveClientDisconnectTimeout(); got != 5*time.Minute {
 		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want configured 5m", got)
 	}
 
-	p.clientInactiveTimeout = 30 * time.Second
+	p.clientInactiveTimeoutNs.Store(int64(30 * time.Second))
 	if got := p.effectiveClientDisconnectTimeout(); got != 30*time.Second {
 		t.Fatalf("effectiveClientDisconnectTimeout() = %v, want 30s", got)
 	}

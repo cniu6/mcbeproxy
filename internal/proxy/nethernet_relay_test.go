@@ -169,10 +169,10 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 	if mode == "raw_udp" {
 		cfg.ProxyMode = "raw_udp"
 		raw := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
-		p, relay, udp = raw, func() *netherNetRelay { return raw.nnRelay }, func() *net.UDPConn { return raw.listener }
+		p, relay, udp = raw, func() *netherNetRelay { return raw.nnRelay.Load() }, func() *net.UDPConn { return raw.listener }
 	} else {
 		plain := NewPlainUDPProxy(cfg.ID, cfg)
-		p, relay, udp = plain, func() *netherNetRelay { return plain.nnRelay }, func() *net.UDPConn { return plain.listener }
+		p, relay, udp = plain, func() *netherNetRelay { return plain.nnRelay.Load() }, func() *net.UDPConn { return plain.listener }
 	}
 	if err := p.Start(); err != nil {
 		t.Fatalf("start proxy: %v", err)

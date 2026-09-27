@@ -1015,15 +1015,14 @@ type bannedIPInfo struct {
 // It forwards UDP packets directly without any RakNet protocol processing.
 type RawUDPProxy struct {
 	serverID         string
-	config           *config.ServerConfig
+	cfgPtr           atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
 	configMgr        *config.ConfigManager
 	sessionMgr       *session.SessionManager
 	aclManager       ACLManager       // ACL manager for whitelist/blacklist
 	externalVerifier ExternalVerifier // External auth verifier (defined in passthrough_proxy.go)
 	listener         *net.UDPConn
-	nnRelay          *netherNetRelay // NetherNet media shares listener; nil unless nethernet_relay
-	targetAddr       *net.UDPAddr
-	targetPacketAddr net.Addr
+	nnRelay          atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
+	targets          atomic.Pointer[rawUDPTargets]  // resolved target, swapped by UpdateConfig
 	clients          sync.Map // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
 	bannedIPs        sync.Map // map[string]*bannedIPInfo (IP without port -> ban info)
 	closed           atomic.Bool
@@ -1040,7 +1039,7 @@ type RawUDPProxy struct {
 	lastPingTry   atomic.Int64
 	pingInFlight  atomic.Bool
 
-	clientInactiveTimeout          time.Duration
+	clientInactiveTimeoutNs        atomic.Int64 // time.Duration; rewritten by UpdateConfig
 	passthroughIdleTimeoutOverride time.Duration
 
 	// Basic unconnected ping rate limiting (per source IP, port-less).
@@ -1095,13 +1094,32 @@ func (p *RawUDPProxy) getResolvedACLSettings(serverID string) *db.ACLSettings {
 }
 
 func (p *RawUDPProxy) refreshTargetAddrs() error {
-	shouldPreserveHostname := p.config != nil && !p.config.IsDirectConnection()
-	addr, udpAddr, err := buildUDPDestinationAddr(context.Background(), p.config.GetTargetAddr(), shouldPreserveHostname)
+	shouldPreserveHostname := p.conf() != nil && !p.conf().IsDirectConnection()
+	addr, udpAddr, err := buildUDPDestinationAddr(context.Background(), p.conf().GetTargetAddr(), shouldPreserveHostname)
 	if err != nil {
 		return err
 	}
-	p.targetPacketAddr = addr
-	p.targetAddr = udpAddr
+	p.targets.Store(&rawUDPTargets{addr: udpAddr, packetAddr: addr})
+	return nil
+}
+
+// rawUDPTargets is one immutable resolution of the target, replaced as a
+// whole so readers never see a new hostname with an old IP.
+type rawUDPTargets struct {
+	addr       *net.UDPAddr // nil while a proxied hostname is left unresolved
+	packetAddr net.Addr
+}
+
+// conf returns the current server config (hot-reloaded by UpdateConfig).
+func (p *RawUDPProxy) conf() *config.ServerConfig {
+	return p.cfgPtr.Load()
+}
+
+// targetUDPAddr returns the resolved target address, or nil.
+func (p *RawUDPProxy) targetUDPAddr() *net.UDPAddr {
+	if t := p.targets.Load(); t != nil {
+		return t.addr
+	}
 	return nil
 }
 
@@ -1109,18 +1127,25 @@ func (p *RawUDPProxy) effectiveTargetPacketAddr() net.Addr {
 	if p == nil {
 		return nil
 	}
-	if p.targetPacketAddr != nil {
-		return p.targetPacketAddr
+	t := p.targets.Load()
+	if t == nil {
+		return nil
 	}
-	return p.targetAddr
+	if t.packetAddr != nil {
+		return t.packetAddr
+	}
+	if t.addr != nil {
+		return t.addr
+	}
+	return nil
 }
 
 func (p *RawUDPProxy) effectiveTargetAddrString() string {
 	if addr := p.effectiveTargetPacketAddr(); addr != nil {
 		return addr.String()
 	}
-	if p != nil && p.config != nil {
-		return p.config.GetTargetAddr()
+	if p != nil && p.conf() != nil {
+		return p.conf().GetTargetAddr()
 	}
 	return ""
 }
@@ -1136,14 +1161,15 @@ func NewRawUDPProxy(
 		sessionMgr = session.NewSessionManager(DefaultClientInactiveTimeout)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &RawUDPProxy{
+	p := &RawUDPProxy{
 		serverID:   serverID,
-		config:     cfg,
 		configMgr:  configMgr,
 		sessionMgr: sessionMgr,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+	p.cfgPtr.Store(cfg)
+	return p
 }
 
 func (p *RawUDPProxy) context() context.Context {
@@ -1195,8 +1221,8 @@ func (p *RawUDPProxy) GetOutboundManager() OutboundManager {
 
 // UpdateConfig updates the server configuration.
 func (p *RawUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
-	oldTarget := p.config.GetTargetAddr()
-	p.config = cfg
+	oldTarget := p.conf().GetTargetAddr()
+	p.cfgPtr.Store(cfg)
 	p.updateTimeouts()
 	newTarget := cfg.GetTargetAddr()
 
@@ -1205,9 +1231,10 @@ func (p *RawUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
 	} else if oldTarget != newTarget {
 		logger.Info("RawUDPProxy: Target address updated from %s to %s for server %s (existing clients preserved)", oldTarget, newTarget, p.serverID)
 	}
-	if p.config != nil && p.config.IsShowRealLatency() {
+	if p.conf() != nil && p.conf().IsShowRealLatency() {
 		p.maybeRefreshPingCacheAsync(true)
 	}
+	syncNetherNetRelay(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load)
 
 	logger.Debug("RawUDPProxy config updated for server %s", p.serverID)
 }
@@ -1217,7 +1244,7 @@ func (p *RawUDPProxy) Start() error {
 	p.updateTimeouts()
 
 	// Parse listen address
-	listenAddr, err := net.ResolveUDPAddr("udp", p.config.ListenAddr)
+	listenAddr, err := net.ResolveUDPAddr("udp", p.conf().ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve listen address: %w", err)
 	}
@@ -1241,7 +1268,7 @@ func (p *RawUDPProxy) Start() error {
 
 	// Create cancellable context before any background work can observe it.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.nnRelay = startNetherNetRelayIfEnabled(p.serverID, p.config, p.outboundMgr, listener)
+	p.nnRelay.Store(startNetherNetRelayIfEnabled(p.serverID, p.conf, p.outboundMgr, listener))
 
 	// Initialize cached latency state
 	p.latencyMu.Lock()
@@ -1254,17 +1281,17 @@ func (p *RawUDPProxy) Start() error {
 
 	// If show_real_latency is enabled, proactively populate cache in the background
 	// and keep it fresh without doing per-ping outbound dials.
-	if p.config.IsShowRealLatency() {
+	if p.conf().IsShowRealLatency() {
 		p.maybeRefreshPingCacheAsync(true)
 	}
 
 	// Log proxy mode
 	if p.shouldUseProxy() {
 		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (via proxy: %s, kick_strategy: %s)",
-			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr(), p.config.GetProxyOutbound(), p.config.GetRawUDPKickStrategy())
+			p.serverID, p.conf().ListenAddr, p.conf().GetTargetAddr(), p.conf().GetProxyOutbound(), p.conf().GetRawUDPKickStrategy())
 	} else {
 		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (direct, kick_strategy: %s)",
-			p.serverID, p.config.ListenAddr, p.config.GetTargetAddr(), p.config.GetRawUDPKickStrategy())
+			p.serverID, p.conf().ListenAddr, p.conf().GetTargetAddr(), p.conf().GetRawUDPKickStrategy())
 	}
 
 	return nil
@@ -1320,7 +1347,7 @@ func (p *RawUDPProxy) cleanupExpiredBans() {
 
 // shouldUseProxy returns true if proxy outbound should be used
 func (p *RawUDPProxy) shouldUseProxy() bool {
-	return p != nil && p.config != nil && !p.config.IsDirectConnection()
+	return p != nil && p.conf() != nil && !p.conf().IsDirectConnection()
 }
 
 // setUDPSocketOptions applies UDP socket tuning to the given connection. In
@@ -1333,7 +1360,7 @@ func (p *RawUDPProxy) setUDPSocketOptions(conn *net.UDPConn) error {
 	label := "raw_udp"
 	var cfg *config.ServerConfig
 	if p != nil {
-		cfg = p.config
+		cfg = p.conf()
 		if p.serverID != "" {
 			label = "raw_udp:" + p.serverID
 		}
@@ -1411,7 +1438,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 
 			// NetherNet media shares this port and must be claimed before RakNet
 			// dispatch (a STUN response starts with 0x01, like an unconnected ping).
-			if p.nnRelay != nil && p.nnRelay.handleDatagram(buffer[:n], clientAddrPort) {
+			if r := p.nnRelay.Load(); r != nil && r.handleDatagram(buffer[:n], clientAddrPort) {
 				continue
 			}
 
@@ -1425,7 +1452,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// Clamp the MTU the client offers so full-size datagrams still fit
 			// after the proxy node's tunnel header (see raknet_mtu.go).
 			if n > 0 && (buffer[0] == raknetOpenConnectionReq1 || buffer[0] == raknetOpenConnectionReq2) {
-				n = len(clampRakNetHandshakeMTU(buffer[:n], p.config.GetRakNetMTUClamp()))
+				n = len(clampRakNetHandshakeMTU(buffer[:n], p.conf().GetRakNetMTUClamp()))
 			}
 
 			// Check if this is a RakNet disconnect notification from client
@@ -1648,18 +1675,18 @@ func (p *RawUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey 
 			return nil, false
 		}
 		targetAddr = p.effectiveTargetPacketAddr()
-		if targetAddr == nil && p.config != nil {
-			resolvedAddr, _, resolveErr := buildUDPDestinationAddr(p.context(), p.config.GetTargetAddr(), true)
+		if targetAddr == nil && p.conf() != nil {
+			resolvedAddr, _, resolveErr := buildUDPDestinationAddr(p.context(), p.conf().GetTargetAddr(), true)
 			if resolveErr != nil {
 				_ = targetConn.Close()
-				logger.Error("Failed to resolve target %s for raw UDP proxy client %s: %v", p.config.GetTargetAddr(), clientKey, resolveErr)
+				logger.Error("Failed to resolve target %s for raw UDP proxy client %s: %v", p.conf().GetTargetAddr(), clientKey, resolveErr)
 				return nil, false
 			}
 			targetAddr = resolvedAddr
 		}
 	} else {
 		// Direct connection
-		directConn, dialErr := net.DialUDP("udp", nil, p.targetAddr)
+		directConn, dialErr := net.DialUDP("udp", nil, p.targetUDPAddr())
 		if dialErr != nil {
 			logger.Error("Failed to connect to target %s (client=%s server=%s active_proxy_clients=%d): %v",
 				p.effectiveTargetAddrString(), clientKey, p.serverID, p.GetActiveClientCount(), dialErr)
@@ -1670,7 +1697,7 @@ func (p *RawUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey 
 			logger.Warn("Failed to set target socket options: %v", err)
 		}
 		targetConn = directConn
-		targetAddr = p.targetAddr
+		targetAddr = p.targetUDPAddr()
 	}
 
 	if targetConn == nil {
@@ -1788,11 +1815,11 @@ func (p *RawUDPProxy) finishPendingClientDial(clientKey string, clientAddr *net.
 	}
 
 	targetAddr := p.effectiveTargetPacketAddr()
-	if targetAddr == nil && p.config != nil {
-		resolvedAddr, _, resolveErr := buildUDPDestinationAddr(p.context(), p.config.GetTargetAddr(), true)
+	if targetAddr == nil && p.conf() != nil {
+		resolvedAddr, _, resolveErr := buildUDPDestinationAddr(p.context(), p.conf().GetTargetAddr(), true)
 		if resolveErr != nil {
 			_ = targetConn.Close()
-			logger.Error("Failed to resolve target %s for raw UDP proxy client %s: %v", p.config.GetTargetAddr(), clientKey, resolveErr)
+			logger.Error("Failed to resolve target %s for raw UDP proxy client %s: %v", p.conf().GetTargetAddr(), clientKey, resolveErr)
 			p.removeClientIfMatch(clientKey, placeholder)
 			return
 		}
@@ -1894,7 +1921,7 @@ func (p *RawUDPProxy) dialThroughProxy() (net.PacketConn, string, error) {
 }
 
 func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.PacketConn, string, error) {
-	if p == nil || p.config == nil {
+	if p == nil || p.conf() == nil {
 		return nil, "", fmt.Errorf("raw udp proxy configuration is nil")
 	}
 	if p.outboundMgr == nil {
@@ -1905,13 +1932,13 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
-	proxyOutbound := p.config.GetProxyOutbound()
-	targetAddr := p.config.GetTargetAddr()
+	proxyOutbound := p.conf().GetProxyOutbound()
+	targetAddr := p.conf().GetTargetAddr()
 
 	// Check if this is a group or multi-node selection
-	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
-		strategy := p.config.GetLoadBalance()
-		sortBy := p.config.GetLoadBalanceSort()
+	if p.conf().IsGroupSelection() || p.conf().IsMultiNodeSelection() {
+		strategy := p.conf().GetLoadBalance()
+		sortBy := p.conf().GetLoadBalanceSort()
 		excludeNodes := make([]string, 0, 4)
 		var lastErr error
 
@@ -1927,7 +1954,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 
 			logger.Info("RawUDPProxy: Selected node '%s' for %s", selectedOutbound.Name, targetAddr)
 			if IsDirectSelection(selectedOutbound) {
-				udpAddr := p.targetAddr
+				udpAddr := p.targetUDPAddr()
 				if udpAddr == nil {
 					resolved, rerr := resolveUDPAddrWithContext(ctx, targetAddr)
 					if rerr != nil {
@@ -1957,7 +1984,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 				logger.Warn("RawUDPProxy: node dial failed for %s via %s: %v", targetAddr, selectedOutbound.Name, err)
 				continue
 			}
-			tunePacketConnBuffersForServer(conn, p.config, "raw_udp_proxy:"+p.serverID+":"+selectedOutbound.Name)
+			tunePacketConnBuffersForServer(conn, p.conf(), "raw_udp_proxy:"+p.serverID+":"+selectedOutbound.Name)
 			return conn, selectedOutbound.Name, nil
 		}
 
@@ -1968,7 +1995,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 	logger.Info("RawUDPProxy: Using single node '%s' for %s", proxyOutbound, targetAddr)
 	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, targetAddr)
 	if err == nil {
-		tunePacketConnBuffersForServer(conn, p.config, "raw_udp_proxy:"+p.serverID+":"+proxyOutbound)
+		tunePacketConnBuffersForServer(conn, p.conf(), "raw_udp_proxy:"+p.serverID+":"+proxyOutbound)
 	}
 	return conn, proxyOutbound, err
 }
@@ -2024,7 +2051,7 @@ func (p *RawUDPProxy) skipProxyPingIfNodeBusy(nodeName string) error {
 // This prevents transient SOCKS5 UDP relay failures (firewalled random ports)
 // from cascading into unhealthy outbound status and breaking active game connections.
 func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.PacketConn, string, error) {
-	if p == nil || p.config == nil {
+	if p == nil || p.conf() == nil {
 		return nil, "", fmt.Errorf("raw udp proxy configuration is nil")
 	}
 	if p.outboundMgr == nil {
@@ -2035,13 +2062,13 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 	ctx, cancel := context.WithTimeout(baseCtx, timeout)
 	defer cancel()
 
-	proxyOutbound := p.config.GetProxyOutbound()
-	targetAddr := p.config.GetTargetAddr()
+	proxyOutbound := p.conf().GetProxyOutbound()
+	targetAddr := p.conf().GetTargetAddr()
 
 	// Check if this is a group or multi-node selection
-	if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
-		strategy := p.config.GetLoadBalance()
-		sortBy := p.config.GetLoadBalanceSort()
+	if p.conf().IsGroupSelection() || p.conf().IsMultiNodeSelection() {
+		strategy := p.conf().GetLoadBalance()
+		sortBy := p.conf().GetLoadBalanceSort()
 
 		selectedOutbound, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil)
 		if err != nil {
@@ -2054,7 +2081,7 @@ func (p *RawUDPProxy) dialThroughProxyForPing(timeout time.Duration) (net.Packet
 
 		logger.Info("RawUDPProxy: Selected node '%s' for %s (ping)", selectedOutbound.Name, targetAddr)
 		if IsDirectSelection(selectedOutbound) {
-			udpAddr := p.targetAddr
+			udpAddr := p.targetUDPAddr()
 			if udpAddr == nil {
 				resolved, rerr := resolveUDPAddrWithContext(ctx, targetAddr)
 				if rerr != nil {
@@ -2310,7 +2337,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			}
 
 			if n > 0 && (buffer[0] == raknetOpenConnectionReply1 || buffer[0] == raknetOpenConnectionReply2) {
-				n = len(clampRakNetHandshakeMTU(buffer[:n], p.config.GetRakNetMTUClamp()))
+				n = len(clampRakNetHandshakeMTU(buffer[:n], p.conf().GetRakNetMTUClamp()))
 			}
 
 			// Forward to client FIRST — minimizes time between reading from
@@ -2625,7 +2652,7 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 		case <-ticker.C:
 			p.cleanupExpiredBans()
 			p.cleanupUnconnectedPingLimiter()
-			if p.config != nil && p.config.IsShowRealLatency() {
+			if p.conf() != nil && p.conf().IsShowRealLatency() {
 				p.maybeRefreshPingCacheAsync(false)
 			}
 			now := time.Now()
@@ -2639,8 +2666,8 @@ func (p *RawUDPProxy) cleanupInactiveClients() {
 				active := p.GetActiveClientCount()
 				if active > 0 {
 					idleTimeout := 0
-					if p.config != nil {
-						idleTimeout = p.config.IdleTimeout
+					if p.conf() != nil {
+						idleTimeout = p.conf().IdleTimeout
 					}
 					logger.Info("RawUDP: proxy client stats server=%s active_proxy_clients=%d idle_timeout=%ds effective_silent_timeout=%v",
 						p.serverID, active, idleTimeout, p.effectiveClientDisconnectTimeout())
@@ -2711,7 +2738,7 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 }
 
 func (p *RawUDPProxy) effectiveClientDisconnectTimeout() time.Duration {
-	return p.clientInactiveTimeout
+	return time.Duration(p.clientInactiveTimeoutNs.Load())
 }
 
 func (p *RawUDPProxy) makeSessionKey(clientAddr *net.UDPAddr) string {
@@ -2723,8 +2750,8 @@ func (p *RawUDPProxy) makeSessionKey(clientAddr *net.UDPAddr) string {
 	if p != nil && p.listener != nil && p.listener.LocalAddr() != nil {
 		listener = p.listener.LocalAddr().String()
 	}
-	if listener == "" && p != nil && p.config != nil {
-		listener = p.config.ListenAddr
+	if listener == "" && p != nil && p.conf() != nil {
+		listener = p.conf().ListenAddr
 	}
 	if p == nil || (p.serverID == "" && listener == "") {
 		return client
@@ -2841,24 +2868,24 @@ func (p *RawUDPProxy) updateTimeouts() {
 	// RakNet has its own keepalive (connected ping/pong) and disconnect
 	// mechanism (DisconnectNotification). MaxRawUDPStaleTimeout still prevents
 	// permanent resource leaks when clients vanish without a clean disconnect.
-	if p.config != nil && p.config.IdleTimeout == -1 {
-		p.clientInactiveTimeout = 0
+	if p.conf() != nil && p.conf().IdleTimeout == -1 {
+		p.clientInactiveTimeoutNs.Store(0)
 		return
 	}
 	timeout := DefaultClientInactiveTimeout
-	if p.config != nil && strings.EqualFold(p.config.GetProxyMode(), "passthrough") && p.passthroughIdleTimeoutOverride > 0 {
+	if p.conf() != nil && strings.EqualFold(p.conf().GetProxyMode(), "passthrough") && p.passthroughIdleTimeoutOverride > 0 {
 		// passthrough 全局覆盖优先
 		timeout = p.passthroughIdleTimeoutOverride
-	} else if p.config != nil && p.config.IdleTimeout > 0 {
-		timeout = time.Duration(p.config.IdleTimeout) * time.Second
-	} else if p.config != nil && strings.EqualFold(p.config.GetProxyMode(), "passthrough") {
+	} else if p.conf() != nil && p.conf().IdleTimeout > 0 {
+		timeout = time.Duration(p.conf().IdleTimeout) * time.Second
+	} else if p.conf() != nil && strings.EqualFold(p.conf().GetProxyMode(), "passthrough") {
 		// passthrough + raw compat: 默认用更短的空闲超时，避免玩家退出后长时间仍显示在线
 		timeout = PassthroughClientInactiveTimeout
 	}
 	if timeout < 30*time.Second {
 		timeout = 30 * time.Second
 	}
-	p.clientInactiveTimeout = timeout
+	p.clientInactiveTimeoutNs.Store(int64(timeout))
 }
 
 // Stop stops the proxy and closes all connections.
@@ -2876,7 +2903,7 @@ func (p *RawUDPProxy) Stop() error {
 	if p.listener != nil {
 		p.listener.Close()
 	}
-	_ = p.nnRelay.Close()
+	_ = p.nnRelay.Swap(nil).Close()
 
 	// Finalize every client through the same path as normal disconnect so bytes
 	// and LastSeen are flushed to the session before persistence.
@@ -2903,7 +2930,7 @@ func (p *RawUDPProxy) GetServerID() string {
 
 // GetConfig returns the server configuration.
 func (p *RawUDPProxy) GetConfig() *config.ServerConfig {
-	return p.config
+	return p.conf()
 }
 
 // isTimeoutError checks if an error is a timeout error
@@ -3006,7 +3033,7 @@ func (p *RawUDPProxy) handleUnconnectedPing(data []byte, clientAddr *net.UDPAddr
 	// Choose advertisement to return.
 	advertisement := p.getCachedAdvertisementForClient()
 	latency := p.getCachedLatencyNoRefresh()
-	if p.config != nil && p.config.IsShowRealLatency() {
+	if p.conf() != nil && p.conf().IsShowRealLatency() {
 		advertisement = embedLatencyInMOTDBytes(advertisement, latency)
 	}
 
@@ -3029,8 +3056,8 @@ func (p *RawUDPProxy) getCachedAdvertisementForAPI() []byte {
 	if len(cached) > 0 {
 		return cached
 	}
-	if p.config != nil {
-		if custom := p.config.GetCustomMOTD(); custom != "" {
+	if p.conf() != nil {
+		if custom := p.conf().GetCustomMOTD(); custom != "" {
 			return []byte(custom)
 		}
 	}
@@ -3043,8 +3070,8 @@ func (p *RawUDPProxy) getCachedAdvertisementForClient() []byte {
 	p.latencyMu.RUnlock()
 
 	if len(cached) > 0 {
-		if p.config != nil {
-			if custom := p.config.GetCustomMOTD(); custom != "" {
+		if p.conf() != nil {
+			if custom := p.conf().GetCustomMOTD(); custom != "" {
 				// 自定义 MOTD 只负责展示文案；协议号和版本必须跟随上游，避免旧广告阻止新客户端。
 				return mergeMOTDCompatibility([]byte(custom), cached)
 			}
@@ -3052,8 +3079,8 @@ func (p *RawUDPProxy) getCachedAdvertisementForClient() []byte {
 		return cached
 	}
 
-	if p.config != nil {
-		if custom := p.config.GetCustomMOTD(); custom != "" {
+	if p.conf() != nil {
+		if custom := p.conf().GetCustomMOTD(); custom != "" {
 			return []byte(custom)
 		}
 	}
@@ -3199,7 +3226,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 
 	// Check ACL (whitelist/blacklist) BEFORE forwarding Login packet
 	if p.aclManager != nil {
-		aclServerID := p.config.GetACLServerID()
+		aclServerID := p.conf().GetACLServerID()
 		settings := p.getResolvedACLSettings(aclServerID)
 		logger.Info("RawUDP ACL check: player=%s, serverID=%s", playerName, aclServerID)
 
@@ -3281,7 +3308,7 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 
 	// Check external auth verification (URL authorization)
 	if p.externalVerifier != nil && p.externalVerifier.IsEnabled() {
-		allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, p.config.GetACLServerID(), clientInfo.clientAddr.String())
+		allowed, reason := p.externalVerifier.Verify(playerXUID, playerUUID, playerName, p.conf().GetACLServerID(), clientInfo.clientAddr.String())
 
 		if !allowed {
 			logger.Info("Player %s blocked by external auth: %s", playerName, reason)
@@ -4155,7 +4182,7 @@ func (p *RawUDPProxy) sendKickAsync(mustSend bool, send func()) {
 }
 
 func (p *RawUDPProxy) currentKickProfile() rawUDPKickProfile {
-	strategy := p.config.GetRawUDPKickStrategy()
+	strategy := p.conf().GetRawUDPKickStrategy()
 	allVariants := rawUDPPacketVariantOptions{SendCompressed: true, SendRawBatch: true, SendLegacy: true}
 	switch strategy {
 	case config.RawUDPKickStrategyDisconnectOnly:
@@ -4549,17 +4576,17 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	if p == nil {
 		return -1
 	}
-	if p.shouldUseProxy() && p.config != nil && p.outboundMgr != nil {
-		proxyOutbound := p.config.GetProxyOutbound()
+	if p.shouldUseProxy() && p.conf() != nil && p.outboundMgr != nil {
+		proxyOutbound := p.conf().GetProxyOutbound()
 		// 任何活跃玩家会话都证明节点可达；不要在其他服务器的定时探测中
 		// 再创建独立 SOCKS5 UDP ASSOCIATE，避免节点/落地映射相互抢占。
 		if p.outboundMgr.GetActiveConnectionCount() > 0 {
 			logger.Debug("RawUDP pingTargetServer skipped: active outbound connections exist, server=%s target=%s", p.serverID, p.effectiveTargetAddrString())
 			return p.getCachedLatencyNoRefresh()
 		}
-		if p.config.IsGroupSelection() || p.config.IsMultiNodeSelection() {
-			strategy := p.config.GetLoadBalance()
-			sortBy := p.config.GetLoadBalanceSort()
+		if p.conf().IsGroupSelection() || p.conf().IsMultiNodeSelection() {
+			strategy := p.conf().GetLoadBalance()
+			sortBy := p.conf().GetLoadBalanceSort()
 			if selectedOutbound, err := p.outboundMgr.SelectOutboundWithFailoverForServer(p.serverID, proxyOutbound, strategy, sortBy, nil); err == nil && selectedOutbound != nil {
 				if p.rawUDPProxyNodeHasActiveConns(selectedOutbound.Name) {
 					logger.Debug("RawUDP pingTargetServer skipped: server=%s target=%s node=%s active_outbound_clients=true",
@@ -4600,7 +4627,7 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 	// during short idle periods (loading screens, etc.) that are well within
 	// the connection's actual lifetime. When clientInactiveTimeout=0
 	// (idle_timeout=-1), clients never time out, so always skip.
-	activeThreshold := p.clientInactiveTimeout
+	activeThreshold := time.Duration(p.clientInactiveTimeoutNs.Load())
 	if activeThreshold == 0 {
 		// idle_timeout=-1: clients never expire
 		hasAny := false
@@ -4654,13 +4681,13 @@ func (p *RawUDPProxy) pingTargetServer() int64 {
 		// 6-10s just for the SOCKS5 auth response through the tunnel.
 		pingTimeout := 8 * time.Second
 		if p.outboundMgr != nil {
-			if cfg, ok := p.outboundMgr.GetOutbound(p.config.GetProxyOutbound()); ok && cfg.IsChainProxy() {
+			if cfg, ok := p.outboundMgr.GetOutbound(p.conf().GetProxyOutbound()); ok && cfg.IsChainProxy() {
 				pingTimeout = 15 * time.Second
 			}
 		}
 		conn, selectedNode, err = p.dialThroughProxyForPing(pingTimeout)
 	} else {
-		conn, err = net.DialUDP("udp", nil, p.targetAddr)
+		conn, err = net.DialUDP("udp", nil, p.targetUDPAddr())
 	}
 
 	if err != nil {

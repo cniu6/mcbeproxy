@@ -402,8 +402,8 @@ func TestRawUDPProxy_PingSkippedWhileClientAssociationActive(t *testing.T) {
 	mgr := &countingRawUDPOutboundManager{}
 	p := NewRawUDPProxy("ping-skip-active", cfg, nil, sm)
 	p.SetOutboundManager(mgr)
-	p.targetAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
-	p.targetPacketAddr = p.targetAddr
+	target := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
+	p.targets.Store(&rawUDPTargets{addr: target, packetAddr: target})
 	p.updateTimeouts()
 
 	clientAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50001}
@@ -447,10 +447,10 @@ func TestRawUDPProxy_PingSkippedWhileSameOutboundActiveOnAnotherServer(t *testin
 	pB := NewRawUDPProxy("server-b", cfgB, nil, session.NewSessionManager(time.Hour))
 	pA.SetOutboundManager(mgr)
 	pB.SetOutboundManager(mgr)
-	pA.targetAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
-	pA.targetPacketAddr = pA.targetAddr
-	pB.targetAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19133}
-	pB.targetPacketAddr = pB.targetAddr
+	targetA := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}
+	pA.targets.Store(&rawUDPTargets{addr: targetA, packetAddr: targetA})
+	targetB := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19133}
+	pB.targets.Store(&rawUDPTargets{addr: targetB, packetAddr: targetB})
 	pA.updateTimeouts()
 	pB.updateTimeouts()
 
