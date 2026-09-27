@@ -1,7 +1,9 @@
 module mcpeserverproxy
 
-// 使用本机已安装的 Go 1.24.5 版本；如需升级 Go，请同步更新此处
+// toolchain 固定为 go1.26.8：go1.26.0 在 Windows 上开 -race 时 internal/poll 会崩溃（已在补丁版修复）
 go 1.26.0
+
+toolchain go1.26.8
 
 require (
 	github.com/anytls/sing-anytls v0.0.13
