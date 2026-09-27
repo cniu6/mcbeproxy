@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"syscall"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -74,6 +75,11 @@ func configureUDPConnBuffers(conn udpSocketBufferConfigurer, requested int) erro
 	if err := conn.SetWriteBuffer(bufferSize); err != nil {
 		return fmt.Errorf("set write buffer: %w", err)
 	}
+	// SetReadBuffer/SetWriteBuffer are silently capped by the OS (Linux
+	// rmem_max/wmem_max); lift the cap where the platform allows it.
+	if sc, ok := conn.(syscall.Conn); ok {
+		forceUDPSocketBuffers(sc, bufferSize)
+	}
 	return nil
 }
 
@@ -127,6 +133,13 @@ func tuneUDPSocketForServer(conn *net.UDPConn, cfg *config.ServerConfig, label s
 }
 
 func tunePacketConnBuffersForServer(conn net.PacketConn, cfg *config.ServerConfig, label string) {
+	tunePacketConnBuffersForNode(conn, cfg, nil, "", label)
+}
+
+// tunePacketConnBuffersForNode tunes a leg dialed through proxy node `node`.
+// The node's own udp_socket_buffer_size wins when set (non-zero); otherwise
+// the game server's applies, and 0 on both means auto (1MB).
+func tunePacketConnBuffersForNode(conn net.PacketConn, cfg *config.ServerConfig, mgr OutboundManager, node, label string) {
 	if conn == nil {
 		return
 	}
@@ -136,13 +149,23 @@ func tunePacketConnBuffersForServer(conn net.PacketConn, cfg *config.ServerConfi
 		return
 	}
 	aggressive := cfg.IsAggressiveLatency()
-	requested := 0
-	if cfg != nil {
-		requested = cfg.GetUDPSocketBufferSize()
-	}
-	if err := configureUDPConnBuffers(setter, effectiveUDPSocketBufferRequest(requested, aggressive)); err != nil {
+	if err := configureUDPConnBuffers(setter, effectiveUDPSocketBufferRequest(udpBufferRequestFor(cfg, mgr, node), aggressive)); err != nil {
 		logger.Warn("Failed to tune PacketConn buffers for %s: %v", label, err)
 	}
+}
+
+// udpBufferRequestFor resolves the requested socket buffer for a leg: the
+// node's udp_socket_buffer_size when non-zero, else the server's.
+func udpBufferRequestFor(cfg *config.ServerConfig, mgr OutboundManager, node string) int {
+	if mgr != nil && node != "" {
+		if ob, ok := mgr.GetOutbound(node); ok && ob != nil && ob.UDPSocketBufferSize != 0 {
+			return ob.UDPSocketBufferSize
+		}
+	}
+	if cfg != nil {
+		return cfg.GetUDPSocketBufferSize()
+	}
+	return 0
 }
 
 // tuneDirectNetConn applies the same UDP socket tuning to a direct net.Conn

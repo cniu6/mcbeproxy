@@ -83,15 +83,16 @@ type ProxyOutbound struct {
 
 	// Hysteria2 specific fields
 	// Password is reused from Shadowsocks
-	Obfs                     string `json:"obfs,omitempty"`             // Obfuscation type: salamander
-	ObfsPassword             string `json:"obfs_password,omitempty"`    // Obfuscation password
-	PortHopping              string `json:"port_hopping,omitempty"`     // Port hopping range (e.g., "20000-55000")
-	HopInterval              int    `json:"hop_interval,omitempty"`     // Port hopping interval in seconds (default: 10)
-	UpMbps                   int    `json:"up_mbps,omitempty"`          // Upload bandwidth limit in Mbps
-	DownMbps                 int    `json:"down_mbps,omitempty"`        // Download bandwidth limit in Mbps
-	ALPN                     string `json:"alpn,omitempty"`             // TLS ALPN (comma-separated, e.g., "h3,h2")
-	CertFingerprint          string `json:"cert_fingerprint,omitempty"` // Server certificate SHA256 fingerprint for pinning
-	DisableMTU               bool   `json:"disable_mtu,omitempty"`      // Disable Path MTU Discovery
+	Obfs                     string `json:"obfs,omitempty"`                   // Obfuscation type: salamander
+	ObfsPassword             string `json:"obfs_password,omitempty"`          // Obfuscation password
+	PortHopping              string `json:"port_hopping,omitempty"`           // Port hopping range (e.g., "20000-55000")
+	HopInterval              int    `json:"hop_interval,omitempty"`           // Port hopping interval in seconds (default: 10)
+	UpMbps                   int    `json:"up_mbps,omitempty"`                // Upload bandwidth limit in Mbps
+	DownMbps                 int    `json:"down_mbps,omitempty"`              // Download bandwidth limit in Mbps
+	ALPN                     string `json:"alpn,omitempty"`                   // TLS ALPN (comma-separated, e.g., "h3,h2")
+	CertFingerprint          string `json:"cert_fingerprint,omitempty"`       // Server certificate SHA256 fingerprint for pinning
+	DisableMTU               bool   `json:"disable_mtu,omitempty"`            // Disable Path MTU Discovery
+	UDPSocketBufferSize      int    `json:"udp_socket_buffer_size,omitempty"` // UDP socket buffers of legs via this node: 0 = follow the server (auto 1MB), -1 = OS default, >0 = bytes
 	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
 	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
 	MinIdleSession           int    `json:"min_idle_session,omitempty"`
@@ -161,6 +162,9 @@ func cloneProviderOptions(options map[string]interface{}) map[string]interface{}
 // Validate checks if all required fields are present and valid based on protocol type.
 // Returns an error if any required field is missing or invalid.
 func (p *ProxyOutbound) Validate() error {
+	if p.UDPSocketBufferSize < -1 {
+		return fmt.Errorf("invalid udp_socket_buffer_size %d: use 0 (follow server), -1 (OS default) or a byte count", p.UDPSocketBufferSize)
+	}
 	if p.Name == "" {
 		return errors.New("missing required field: name")
 	}
@@ -383,6 +387,7 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		ALPN:                     p.ALPN,
 		CertFingerprint:          p.CertFingerprint,
 		DisableMTU:               p.DisableMTU,
+		UDPSocketBufferSize:      p.UDPSocketBufferSize,
 		IdleSessionCheckInterval: p.IdleSessionCheckInterval,
 		IdleSessionTimeout:       p.IdleSessionTimeout,
 		MinIdleSession:           p.MinIdleSession,
@@ -713,6 +718,7 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.ALPN == other.ALPN &&
 		p.CertFingerprint == other.CertFingerprint &&
 		p.DisableMTU == other.DisableMTU &&
+		p.UDPSocketBufferSize == other.UDPSocketBufferSize &&
 		p.IdleSessionCheckInterval == other.IdleSessionCheckInterval &&
 		p.IdleSessionTimeout == other.IdleSessionTimeout &&
 		p.MinIdleSession == other.MinIdleSession &&

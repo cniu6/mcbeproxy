@@ -478,6 +478,12 @@
             <n-gi><n-form-item label="端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
             <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
             <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
+            <n-gi :span="2">
+              <n-form-item label="UDP缓冲">
+                <n-input-number v-model:value="form.udp_socket_buffer_size" :min="-1" :step="262144" style="width: 100%" placeholder="0=跟随服务器" />
+                <template #feedback>经此节点的 UDP 收发缓冲（字节）。0=跟随服务器设置（默认自动 1MB，推荐），-1=系统默认，正数=指定字节数，如 2097152=2MB。</template>
+              </n-form-item>
+            </n-gi>
             <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
           
           <!-- Shadowsocks 字段 -->
@@ -1803,6 +1809,7 @@ const defaultForm = {
   username: '', method: 'aes-256-gcm', password: '', uuid: '', alter_id: 0, security: 'auto',
   flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '',
   idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
+  udp_socket_buffer_size: 0,
   reality: false, reality_public_key: '', reality_short_id: '',
   network: '', ws_path: '', ws_host: '', xhttp_mode: '', grpc_service_name: '', grpc_authority: '',
   auto_select_blocked: false, auto_select_block_reason: '', auto_select_block_expires_at: null,

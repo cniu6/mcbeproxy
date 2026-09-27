@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -853,6 +854,23 @@ func (c *socks5UDPPacketConn) applyConfiguredBuffers(st *connState) {
 			_ = setter.SetWriteBuffer(writeSize)
 		}
 	}
+	// A reconnect swaps in a fresh socket: lift its OS cap too.
+	if readSize := int(c.readBufferSize.Load()); readSize > 0 {
+		if sc, ok := st.udpConn.(syscall.Conn); ok {
+			forceUDPSocketBuffers(sc, readSize)
+		}
+	}
+}
+
+// SyscallConn exposes the current relay socket so buffer tuning
+// (forceUDPSocketBuffers) can reach it through this wrapper.
+func (c *socks5UDPPacketConn) SyscallConn() (syscall.RawConn, error) {
+	if st := c.state.Load(); st != nil {
+		if sc, ok := st.udpConn.(syscall.Conn); ok {
+			return sc.SyscallConn()
+		}
+	}
+	return nil, errors.New("socks5: relay socket does not expose SyscallConn")
 }
 
 var socks5UDPWritePool = sync.Pool{

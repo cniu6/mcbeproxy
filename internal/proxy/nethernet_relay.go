@@ -719,6 +719,7 @@ func (r *netherNetRelay) dialMedia(ctx context.Context, media netip.AddrPort) (n
 	if err != nil {
 		return nil, nil, err
 	}
+	tunePacketConnBuffersForNode(conn, r.conf(), r.outboundMgr, outbound, "nethernet_relay:"+r.serverID+":"+outbound)
 	return conn, dest, nil
 }
 

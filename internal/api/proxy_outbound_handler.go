@@ -208,6 +208,7 @@ type ProxyOutboundDTO struct {
 	ALPN                     string `json:"alpn,omitempty"`
 	CertFingerprint          string `json:"cert_fingerprint,omitempty"`
 	DisableMTU               bool   `json:"disable_mtu,omitempty"`
+	UDPSocketBufferSize      int    `json:"udp_socket_buffer_size,omitempty"`
 	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
 	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
 	MinIdleSession           int    `json:"min_idle_session,omitempty"`
@@ -263,6 +264,7 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 		ALPN:                     cfg.ALPN,
 		CertFingerprint:          cfg.CertFingerprint,
 		DisableMTU:               cfg.DisableMTU,
+		UDPSocketBufferSize:      cfg.UDPSocketBufferSize,
 		IdleSessionCheckInterval: cfg.IdleSessionCheckInterval,
 		IdleSessionTimeout:       cfg.IdleSessionTimeout,
 		MinIdleSession:           cfg.MinIdleSession,
@@ -339,6 +341,7 @@ type CreateProxyOutboundRequest struct {
 	ALPN                     string `json:"alpn,omitempty"`
 	CertFingerprint          string `json:"cert_fingerprint,omitempty"`
 	DisableMTU               bool   `json:"disable_mtu,omitempty"`
+	UDPSocketBufferSize      int    `json:"udp_socket_buffer_size,omitempty"`
 	IdleSessionCheckInterval int    `json:"idle_session_check_interval,omitempty"`
 	IdleSessionTimeout       int    `json:"idle_session_timeout,omitempty"`
 	MinIdleSession           int    `json:"min_idle_session,omitempty"`
@@ -395,6 +398,7 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		ALPN:                     r.ALPN,
 		CertFingerprint:          r.CertFingerprint,
 		DisableMTU:               r.DisableMTU,
+		UDPSocketBufferSize:      r.UDPSocketBufferSize,
 		IdleSessionCheckInterval: r.IdleSessionCheckInterval,
 		IdleSessionTimeout:       r.IdleSessionTimeout,
 		MinIdleSession:           r.MinIdleSession,

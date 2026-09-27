@@ -24,8 +24,10 @@ const (
 	// congestion instead of stalling; kept short like RawUDP's equivalent.
 	plainUDPUpstreamWriteTimeout = 250 * time.Millisecond
 	// plainUDPUpstreamWriteQueueSize buffers short per-client bursts without
-	// letting a blocked outbound consume unbounded memory.
-	plainUDPUpstreamWriteQueueSize = 64
+	// letting a blocked outbound consume unbounded memory. Same as raw_udp:
+	// while chunks stream in after joining, the client ACKs every datagram,
+	// and a 64-slot queue dropped ACKs, which made the server retransmit.
+	plainUDPUpstreamWriteQueueSize = RawUDPUpstreamWriteQueueSize
 	// plainUDPPendingDialQueueCap bounds how many datagrams get buffered on a
 	// still-connecting (pending) client while its proxy dial runs in the
 	// background (see createPendingClientAndDialAsync).
@@ -145,12 +147,12 @@ type PlainUDPProxy struct {
 	outboundMgr OutboundManager
 	listener    *net.UDPConn
 	nnRelay     atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
-	targetPtr   atomic.Pointer[plainUDPTarget]  // resolved target, swapped by UpdateConfig
+	targetPtr   atomic.Pointer[plainUDPTarget] // resolved target, swapped by UpdateConfig
 	clients     sync.Map
 	closed      atomic.Bool
 	wg          sync.WaitGroup
 	bufferPool  atomic.Pointer[BufferPool] // read via pool(); swapped when buffer_size changes
-	idleTimeout atomic.Int64 // time.Duration; -1 = never
+	idleTimeout atomic.Int64               // time.Duration; -1 = never
 
 	// ctx/cancel are owned internally (created in Start(), cancelled in
 	// Stop()) and used for background dials and per-client goroutines —
@@ -601,6 +603,7 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 			}
 			conn, err := dialPacketConnForFailover(ctx, p.outboundMgr, selected.Name, p.conf().GetTargetAddr())
 			if err == nil {
+				tunePacketConnBuffersForNode(conn, p.conf(), p.outboundMgr, selected.Name, "plain_udp_proxy:"+p.serverID+":"+selected.Name)
 				return conn, p.target(), nil
 			}
 			exclude = append(exclude, selected.Name)
@@ -612,6 +615,11 @@ func (p *PlainUDPProxy) dialTargetConn(ctx context.Context) (net.PacketConn, net
 	if err != nil {
 		return nil, nil, err
 	}
+	// Like raw_udp: the node leg must absorb the spawn burst (several MB of
+	// chunks in seconds). With the OS default buffer (about 208KB on Linux,
+	// 64KB on Windows) it overflowed, RakNet stalled on retransmits for the
+	// first seconds after joining, then recovered.
+	tunePacketConnBuffersForNode(conn, p.conf(), p.outboundMgr, proxyOutbound, "plain_udp_proxy:"+p.serverID+":"+proxyOutbound)
 	return conn, p.target(), nil
 }
 

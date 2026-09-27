@@ -1023,8 +1023,8 @@ type RawUDPProxy struct {
 	listener         *net.UDPConn
 	nnRelay          atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
 	targets          atomic.Pointer[rawUDPTargets]  // resolved target, swapped by UpdateConfig
-	clients          sync.Map // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
-	bannedIPs        sync.Map // map[string]*bannedIPInfo (IP without port -> ban info)
+	clients          sync.Map                       // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
+	bannedIPs        sync.Map                       // map[string]*bannedIPInfo (IP without port -> ban info)
 	closed           atomic.Bool
 	wg               sync.WaitGroup
 	ctx              context.Context
@@ -1984,7 +1984,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 				logger.Warn("RawUDPProxy: node dial failed for %s via %s: %v", targetAddr, selectedOutbound.Name, err)
 				continue
 			}
-			tunePacketConnBuffersForServer(conn, p.conf(), "raw_udp_proxy:"+p.serverID+":"+selectedOutbound.Name)
+			tunePacketConnBuffersForNode(conn, p.conf(), p.outboundMgr, selectedOutbound.Name, "raw_udp_proxy:"+p.serverID+":"+selectedOutbound.Name)
 			return conn, selectedOutbound.Name, nil
 		}
 
@@ -1995,7 +1995,7 @@ func (p *RawUDPProxy) dialThroughProxyWithTimeout(timeout time.Duration) (net.Pa
 	logger.Info("RawUDPProxy: Using single node '%s' for %s", proxyOutbound, targetAddr)
 	conn, err := p.outboundMgr.DialPacketConn(ctx, proxyOutbound, targetAddr)
 	if err == nil {
-		tunePacketConnBuffersForServer(conn, p.conf(), "raw_udp_proxy:"+p.serverID+":"+proxyOutbound)
+		tunePacketConnBuffersForNode(conn, p.conf(), p.outboundMgr, proxyOutbound, "raw_udp_proxy:"+p.serverID+":"+proxyOutbound)
 	}
 	return conn, proxyOutbound, err
 }
