@@ -41,6 +41,12 @@ const (
 	// Open Connection Request every ~0.5-1s for ~10s, so tearing a dead
 	// association down after 3s lets the same attempt retry on a fresh one.
 	plainUDPBlackholeRecoverAfter = 3 * time.Second
+	// udpPeerGoneAfter: a live RakNet client ACKs every datagram it receives
+	// and times the server out itself after ~10s of silence. If the target
+	// keeps sending while the client has sent nothing for this long, the
+	// client is gone (closed the game, switched server, NAT dropped) and the
+	// upstream leg is only wasting bandwidth until idle_timeout.
+	udpPeerGoneAfter = 15 * time.Second
 )
 
 var (
@@ -60,7 +66,8 @@ type plainUDPClient struct {
 	clientAddr *net.UDPAddr
 	targetConn net.PacketConn
 	targetAddr net.Addr
-	lastSeen   atomic.Int64
+	lastSeen   atomic.Int64 // any direction
+	lastUp     atomic.Int64 // client->proxy only (dead-client detection)
 	startTime  time.Time
 
 	// Traffic counters: logged when the client is removed and used for
@@ -358,7 +365,9 @@ func (p *PlainUDPProxy) getOrCreateClient(clientAddr *net.UDPAddr, buf *[]byte, 
 func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey string, buf *[]byte, n int) (*plainUDPClient, bool) {
 	if val, ok := p.clients.Load(clientKey); ok {
 		existing := val.(*plainUDPClient)
-		existing.lastSeen.Store(time.Now().UnixNano())
+		nowNs := time.Now().UnixNano()
+		existing.lastSeen.Store(nowNs)
+		existing.lastUp.Store(nowNs)
 		if existing.pending.Load() {
 			existing.pendingMu.Lock()
 			if len(existing.pendingPackets) < plainUDPPendingDialQueueCap {
@@ -406,6 +415,7 @@ func (p *PlainUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKe
 		upstreamDone:    make(chan struct{}),
 	}
 	client.lastSeen.Store(time.Now().UnixNano())
+	client.lastUp.Store(client.lastSeen.Load())
 
 	p.clients.Store(clientKey, client)
 
@@ -432,6 +442,7 @@ func (p *PlainUDPProxy) createPendingClientAndDialAsync(clientKey string, client
 	placeholder := &plainUDPClient{clientAddr: clientAddr}
 	placeholder.pending.Store(true)
 	placeholder.lastSeen.Store(time.Now().UnixNano())
+	placeholder.lastUp.Store(placeholder.lastSeen.Load())
 	placeholder.pendingPackets = append(placeholder.pendingPackets, plainUDPPendingWrite{buf: buf, n: n})
 	p.clients.Store(clientKey, placeholder)
 
@@ -471,6 +482,7 @@ func (p *PlainUDPProxy) finishPendingClientDial(clientKey string, clientAddr *ne
 		upstreamDone:    make(chan struct{}),
 	}
 	client.lastSeen.Store(time.Now().UnixNano())
+	client.lastUp.Store(placeholder.lastUp.Load())
 
 	// Flush everything buffered while pending into the new client's upstream
 	// queue BEFORE publishing it, so ordering is preserved: any packet the
@@ -656,6 +668,11 @@ func (p *PlainUDPProxy) forwardResponses(clientKey string, clientInfo *plainUDPC
 			}
 			clientInfo.targetConn.SetReadDeadline(now.Add(readTimeout))
 			readDeadlineSetAt = now
+			if isUDPPeerGone(clientInfo.lastUp.Load(), clientInfo.lastSeen.Load(), now) {
+				logger.Info("PlainUDP: client stopped answering while target keeps sending (silent %v), closing: server=%s client=%s",
+					now.Sub(time.Unix(0, clientInfo.lastUp.Load())).Round(time.Second), p.serverID, clientKey)
+				return
+			}
 		}
 		n, err := readPacketConn(clientInfo.targetConn, buffer)
 		if err != nil {
@@ -856,4 +873,15 @@ func (p *PlainUDPProxy) updateIdleTimeout() {
 		}
 	}
 	p.idleTimeout.Store(int64(defaultPlainIdle))
+}
+
+// isUDPPeerGone reports whether the client has been silent for
+// udpPeerGoneAfter while the target was still sending to it (lastDown more
+// than 5s newer than lastUp). A quiet session with no traffic either way is
+// left to the normal idle timeout.
+func isUDPPeerGone(lastUpNs, lastDownNs int64, now time.Time) bool {
+	if lastUpNs == 0 {
+		return false
+	}
+	return now.UnixNano()-lastUpNs > int64(udpPeerGoneAfter) && lastDownNs-lastUpNs > int64(5*time.Second)
 }

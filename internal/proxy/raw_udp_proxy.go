@@ -2699,6 +2699,11 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 			removed++
 			logger.Info("RawUDP session closed (pre-login timeout %v): server=%s client=%s active_proxy_clients=%d",
 				now.Sub(clientInfo.startTime).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
+		} else if isUDPPeerGone(lastClientPktNano, clientInfo.lastTargetPacket.Load(), now) {
+			p.removeClient(key.(string))
+			removed++
+			logger.Info("RawUDP session closed (client stopped answering for %v while target kept sending): server=%s client=%s active_proxy_clients=%d",
+				now.Sub(time.Unix(0, lastClientPktNano)).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
 		} else if effectiveClientTimeout > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > effectiveClientTimeout {
 			p.removeClient(key.(string))
 			removed++
