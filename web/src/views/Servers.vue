@@ -110,6 +110,12 @@
               <template #feedback>0=自动(走节点时限制为1400，直连不改)，-1=不改写，576~1492=指定值。走代理卡加载界面时保持自动。</template>
             </n-form-item>
           </n-gi>
+          <n-gi v-if="isRaknetMode">
+            <n-form-item label="下行限速(kbps)">
+              <n-input-number v-model:value="form.downstream_limit_kbps" :min="0" :step="100" style="width: 100%" placeholder="0=不限速" />
+              <template #feedback>仅 RakNet 模式。填略低于服务器出口带宽的值(如 3Mbps 填 2400)：进服大包先由代理收下再匀速发给玩家，不再被云厂商限速丢包卡死。0=不限速。</template>
+            </n-form-item>
+          </n-gi>
           <template v-if="canUseNetherNetRelay">
             <n-gi>
               <n-form-item label="NetherNet 中继">
@@ -1291,6 +1297,7 @@ const baseDefaultForm = {
   udp_socket_buffer_size: 0,
   target_ip: '',
   raknet_mtu: 0,
+  downstream_limit_kbps: 0,
   latency_mode: 'normal',
   load_balance: 'least-latency', load_balance_sort: 'udp',
   auto_ping_enabled: true,
@@ -1407,6 +1414,7 @@ const buildServerPayload = (server) => {
   payload.udp_speeder = buildUDPSpeederPayload(payload.udp_speeder)
   payload.target_ip = String(payload.target_ip ?? '').trim()
   payload.raknet_mtu = Number.isFinite(payload.raknet_mtu) ? payload.raknet_mtu : 0
+  payload.downstream_limit_kbps = Number.isFinite(payload.downstream_limit_kbps) && payload.downstream_limit_kbps > 0 ? Math.round(payload.downstream_limit_kbps) : 0
   delete payload.resolved_ip
   if (payload.nethernet_ice_servers_json) {
     try {
@@ -1513,6 +1521,7 @@ const generateDefaultMOTD = (name, port) => {
 }
 const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
+const isRaknetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'raknet')
 const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
 // The NetherNet relay rides on a RakNet UDP listener: raw_udp, or protocol=udp (plain UDP).
 const canUseNetherNetRelay = computed(() => {

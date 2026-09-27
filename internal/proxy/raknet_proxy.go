@@ -29,8 +29,9 @@ type RakNetProxy struct {
 	configMgr   *config.ConfigManager
 	sessionMgr  *session.SessionManager
 	listener    *raknet.Listener
-	aclManager  *acl.ACLManager // ACL manager for access control
-	outboundMgr OutboundManager // Outbound manager for proxy routing
+	pacer       *pacedPacketConn // client-facing socket; paces downstream_limit_kbps
+	aclManager  *acl.ACLManager  // ACL manager for access control
+	outboundMgr OutboundManager  // Outbound manager for proxy routing
 	closed      atomic.Bool
 	wg          sync.WaitGroup
 	// Cached pong data with real latency
@@ -95,18 +96,24 @@ func (p *RakNetProxy) GetOutboundManager() OutboundManager {
 // This is called when the config file changes to update proxy_outbound and other settings.
 func (p *RakNetProxy) UpdateConfig(cfg *config.ServerConfig) {
 	p.config = cfg
+	if p.pacer != nil {
+		p.pacer.SetRateKbps(cfg.DownstreamLimitKbps)
+	}
 	logger.Debug("RakNetProxy config updated for server %s, proxy_outbound=%s", p.serverID, cfg.GetProxyOutbound())
 }
 
 // Start begins listening for RakNet connections.
 func (p *RakNetProxy) Start() error {
-	// Create RakNet listener
-	listener, err := raknet.Listen(p.config.ListenAddr)
+	// Create RakNet listener on a pacing socket so downstream_limit_kbps can
+	// keep each client under the server's egress cap (0 = plain passthrough).
+	pl := &pacedListener{kbps: p.config.DownstreamLimitKbps, cfg: p.config, label: "raknet_listener:" + p.serverID}
+	listener, err := raknet.ListenConfig{UpstreamPacketListener: pl}.Listen(p.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start RakNet listener: %w", err)
 	}
 
 	p.listener = listener
+	p.pacer = pl.conn
 	p.closed.Store(false)
 
 	// Create cancellable context for background goroutines
@@ -494,6 +501,14 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 	// Create context for this connection
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// go-raknet reads ignore deadlines, so a forwarder blocked in ReadPacket
+	// only returns when its connection closes. When either side ends, close
+	// both so the other forwarder (and the session) do not linger.
+	go func() {
+		<-connCtx.Done()
+		_ = clientConn.Close()
+		_ = remoteConn.Close()
+	}()
 
 	gm := monitor.GetGoroutineManager()
 
@@ -516,6 +531,10 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		defer cancel()
 		gid := gm.Track("forward-remote-to-client", "raknet-proxy", "Client: "+clientAddr, cancel)
 		defer gm.Untrack(gid)
+		if p.pacer != nil && p.pacer.bytesPerSec.Load() > 0 {
+			p.relayPacedDownstream(connCtx, remoteConn, clientConn, sess, gid)
+			return
+		}
 		p.forwardPacketsTracked(connCtx, remoteConn, clientConn, sess, false, gid)
 	}()
 
@@ -543,11 +562,6 @@ func (p *RakNetProxy) forwardPackets(ctx context.Context, src, dst *raknet.Conn,
 
 // forwardPacketsTracked forwards packets between two RakNet connections with goroutine tracking.
 func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *raknet.Conn, sess *session.Session, isClientToRemote bool, gid int64) {
-	// Use buffer pool to reduce GC pressure
-	bufPtr := GetRakNetBuffer()
-	buf := *bufPtr
-	defer PutRakNetBuffer(bufPtr)
-
 	gm := monitor.GetGoroutineManager()
 	// Use longer timeout to reduce CPU usage from frequent deadline checks
 	const readTimeout = 500 * time.Millisecond
@@ -559,7 +573,10 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 			return
 		default:
 			src.SetReadDeadline(time.Now().Add(readTimeout))
-			n, err := src.Read(buf)
+			// ReadPacket, not Read into a fixed buffer: go-raknet fails Read
+			// with ErrBufferTooSmall for any game packet larger than the
+			// buffer (chunk batches exceed 32KB), which ended the relay.
+			data, err := src.ReadPacket()
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					// Update activity less frequently (every 5 timeouts = 2.5 seconds)
@@ -573,11 +590,10 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 				return
 			}
 
+			n := len(data)
 			if n == 0 {
 				continue
 			}
-
-			data := buf[:n]
 			activityUpdateCounter = 0
 
 			// Update session stats and keep session alive
@@ -924,4 +940,83 @@ func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) error {
 		return fmt.Errorf("write disconnect packet: %w", err)
 	}
 	return nil
+}
+
+// relayPacedDownstream relays server -> client when downstream_limit_kbps is
+// set. The server connection is drained as fast as it delivers, so go-raknet
+// ACKs it immediately and the server never resends (inbound bandwidth is not
+// the bottleneck). The client connection is fed only while the pacer's queue
+// for this client is short, because go-raknet has no congestion control and
+// would otherwise dump the whole join burst at once.
+func (p *RakNetProxy) relayPacedDownstream(ctx context.Context, remote, client *raknet.Conn, sess *session.Session, gid int64) {
+	queue := make(chan []byte, 1<<15)
+	var buffered atomic.Int64
+	go func() {
+		defer close(queue)
+		for {
+			pk, err := remote.ReadPacket()
+			if err != nil {
+				return
+			}
+			buffered.Add(int64(len(pk)))
+			select {
+			case queue <- pk:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	gm := monitor.GetGoroutineManager()
+	clientAddr := client.RemoteAddr()
+	start := time.Now()
+	var relayed, peak int64
+	defer func() {
+		logger.Info("RakNet paced downstream done: server=%s client=%s rate=%dkbps relayed=%s in %v peak_buffered=%s pacer_dropped=%d",
+			p.serverID, clientAddr, p.pacer.bytesPerSec.Load()*8/1000, formatBytes(relayed), time.Since(start).Round(time.Second),
+			formatBytes(peak), p.pacer.Dropped(clientAddr))
+	}()
+
+	for {
+		var pk []byte
+		var ok bool
+		select {
+		case <-ctx.Done():
+			return
+		case pk, ok = <-queue:
+			if !ok {
+				return
+			}
+		}
+		if b := buffered.Load(); b > peak {
+			peak = b
+		}
+		// Keep at most ~250ms of data queued in the pacer; the rest waits
+		// here, already ACKed to the server.
+		high := max(int(p.pacer.bytesPerSec.Load()/4), 32<<10)
+		for p.pacer.Backlog(clientAddr) > high {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		buffered.Add(-int64(len(pk)))
+		relayed += int64(len(pk))
+		if gid != 0 {
+			gm.UpdateActivity(gid)
+		}
+		sess.AddBytesDownAndUpdateLastSeen(int64(len(pk)))
+		p.tryExtractPlayerInfoFromServer(sess, pk)
+		if msg := p.tryParseDisconnectPacket(pk); msg != "" {
+			logger.Info("Remote server disconnect for %s: %s", sess.ClientAddr, msg)
+			if err := p.sendDisconnect(client, msg); err != nil {
+				logger.Debug("Failed to send translated disconnect packet to client %s: %v", sess.ClientAddr, err)
+			}
+			return
+		}
+		if _, err := client.Write(pk); err != nil {
+			return
+		}
+	}
 }

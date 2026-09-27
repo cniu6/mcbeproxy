@@ -177,6 +177,10 @@ type ServerConfig struct {
 	// clamping on tunnels). 0 = auto (1400 when routed via a proxy node, off
 	// for direct), -1 = never rewrite, 576..1492 = explicit clamp.
 	RakNetMTU int `json:"raknet_mtu,omitempty"`
+	// DownstreamLimitKbps paces what proxy_mode "raknet" sends to each client
+	// (kbit/s). Set it just under the server's egress bandwidth cap so a join
+	// burst queues instead of being dropped by the cloud's policer. 0 = off.
+	DownstreamLimitKbps int `json:"downstream_limit_kbps,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"`         // Per-server ping interval in minutes
@@ -458,6 +462,9 @@ func (sc *ServerConfig) Validate() error {
 	if sc.RakNetMTU != 0 && sc.RakNetMTU != -1 && (sc.RakNetMTU < MinRakNetMTU || sc.RakNetMTU > MaxRakNetMTU) {
 		return fmt.Errorf("invalid raknet_mtu %d: use 0 (auto), -1 (off) or %d..%d", sc.RakNetMTU, MinRakNetMTU, MaxRakNetMTU)
 	}
+	if sc.DownstreamLimitKbps < 0 {
+		return fmt.Errorf("invalid downstream_limit_kbps %d: must be >= 0", sc.DownstreamLimitKbps)
+	}
 	if !isValidLatencyMode(sc.LatencyMode) {
 		return fmt.Errorf("invalid latency_mode: %s", sc.LatencyMode)
 	}
@@ -644,6 +651,7 @@ type ServerConfigDTO struct {
 	TargetIP                   string                 `json:"target_ip,omitempty"`
 	ResolvedIP                 string                 `json:"resolved_ip,omitempty"`
 	RakNetMTU                  int                    `json:"raknet_mtu,omitempty"`
+	DownstreamLimitKbps        int                    `json:"downstream_limit_kbps,omitempty"`
 	Status                     string                 `json:"status"`                 // running, stopped
 	ActiveSessions             int                    `json:"active_sessions"`
 	ActiveProxyClients         int                    `json:"active_proxy_clients"`
@@ -702,6 +710,7 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		TargetIP:                      strings.TrimSpace(sc.TargetIP),
 		ResolvedIP:                    sc.resolvedIP,
 		RakNetMTU:                     sc.RakNetMTU,
+		DownstreamLimitKbps:           sc.DownstreamLimitKbps,
 		Status:                        status,
 		ActiveSessions:                activeSessions,
 		AutoPingEnabled:               sc.IsAutoPingEnabled(),
