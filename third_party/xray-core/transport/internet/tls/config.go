@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -47,7 +48,47 @@ func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
 
 // BuildCertificates builds a list of TLS certificates from proto definition.
 func (c *Config) BuildCertificates() []*tls.Certificate {
+	return c.buildCertificateStore().snapshot()
+}
+
+// certificateStore holds the server certificates. PATCHED (mcpeserverproxy):
+// upstream let the hot-reload/OCSP goroutine write slice elements (and mutate
+// OCSPStaple in place) while TLS handshakes read them — a data race. Now
+// updates build a new slice (and a copied certificate) and publish it
+// atomically; readers never lock.
+type certificateStore struct {
+	mu    sync.Mutex // serialises writers
+	certs atomic.Pointer[[]*tls.Certificate]
+}
+
+func (s *certificateStore) snapshot() []*tls.Certificate {
+	if p := s.certs.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func (s *certificateStore) get(index int) *tls.Certificate {
+	return s.snapshot()[index]
+}
+
+func (s *certificateStore) set(index int, cert *tls.Certificate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := append([]*tls.Certificate(nil), s.snapshot()...)
+	next[index] = cert
+	s.certs.Store(&next)
+}
+
+func (c *Config) buildCertificateStore() *certificateStore {
+	store := &certificateStore{}
 	certs := make([]*tls.Certificate, 0, len(c.Certificate))
+	type reloader struct {
+		entry *Certificate
+		index int
+		load  func() *tls.Certificate
+	}
+	var reloaders []reloader
 	for _, entry := range c.Certificate {
 		if entry.Usage != Certificate_ENCIPHERMENT {
 			continue
@@ -70,11 +111,16 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 		} else {
 			continue
 		}
-		index := len(certs) - 1
-		setupOcspTicker(entry, func(isReloaded, isOcspstapling bool) {
-			cert := certs[index]
+		reloaders = append(reloaders, reloader{entry: entry, index: len(certs) - 1, load: getX509KeyPair})
+	}
+	store.certs.Store(&certs)
+	// Start the reloaders only once the store is published.
+	for _, r := range reloaders {
+		r := r
+		setupOcspTicker(r.entry, func(isReloaded, isOcspstapling bool) {
+			cert := store.get(r.index)
 			if isReloaded {
-				if newKeyPair := getX509KeyPair(); newKeyPair != nil {
+				if newKeyPair := r.load(); newKeyPair != nil {
 					cert = newKeyPair
 				} else {
 					return
@@ -84,13 +130,15 @@ func (c *Config) BuildCertificates() []*tls.Certificate {
 				if newOCSPData, err := ocsp.GetOCSPForCert(cert.Certificate); err != nil {
 					errors.LogWarningInner(context.Background(), err, "ignoring invalid OCSP")
 				} else if string(newOCSPData) != string(cert.OCSPStaple) {
-					cert.OCSPStaple = newOCSPData
+					updated := *cert // copy: the old value may be in use by a handshake
+					updated.OCSPStaple = newOCSPData
+					cert = &updated
 				}
 			}
-			certs[index] = cert
+			store.set(r.index, cert)
 		})
 	}
-	return certs
+	return store
 }
 
 func setupOcspTicker(entry *Certificate, callback func(isReloaded, isOcspstapling bool)) {
@@ -243,8 +291,9 @@ func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.Cli
 	}
 }
 
-func getNewGetCertificateFunc(certs []*tls.Certificate, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func getNewGetCertificateFunc(store *certificateStore, rejectUnknownSNI bool) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		certs := store.snapshot()
 		if len(certs) == 0 {
 			return nil, errNoCertificates
 		}
@@ -409,7 +458,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	if len(caCerts) > 0 {
 		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	} else {
-		config.GetCertificate = getNewGetCertificateFunc(c.BuildCertificates(), c.RejectUnknownSni)
+		config.GetCertificate = getNewGetCertificateFunc(c.buildCertificateStore(), c.RejectUnknownSni)
 	}
 
 	if sn := c.parseServerName(); len(sn) > 0 {

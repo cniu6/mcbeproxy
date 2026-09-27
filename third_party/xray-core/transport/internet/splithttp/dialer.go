@@ -607,11 +607,15 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 
 	var writed int
 	for _, buff := range buffer.MultiBuffer {
+		// PATCHED (mcpeserverproxy): WriteMultiBuffer hands buff to the upload
+		// goroutine, which drains and recycles it; upstream read buff.Len()
+		// afterwards (a data race on a possibly reused buffer).
+		n := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += n
 	}
 	return writed, nil
 }

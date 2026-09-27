@@ -19,14 +19,38 @@ type Packet struct {
 }
 
 type uploadQueue struct {
-	reader          io.ReadCloser
 	nomore          bool
 	pushedPackets   chan Packet
 	writeCloseMutex sync.Mutex
 	heap            uploadHeap
 	nextSeq         uint64
-	closed          bool
 	maxPackets      int
+
+	// PATCHED (mcpeserverproxy): reader and closed were written by Close
+	// (under writeCloseMutex) and read by Read without any lock. They get
+	// their own mutex: Read cannot take writeCloseMutex, which Push holds
+	// while blocked on the channel that Read drains.
+	stateMu sync.Mutex
+	reader  io.ReadCloser
+	closed  bool
+}
+
+func (h *uploadQueue) getReader() io.ReadCloser {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	return h.reader
+}
+
+func (h *uploadQueue) setReader(r io.ReadCloser) {
+	h.stateMu.Lock()
+	h.reader = r
+	h.stateMu.Unlock()
+}
+
+func (h *uploadQueue) isClosed() bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	return h.closed
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
@@ -34,7 +58,6 @@ func NewUploadQueue(maxPackets int) *uploadQueue {
 		pushedPackets: make(chan Packet, maxPackets),
 		heap:          uploadHeap{},
 		nextSeq:       0,
-		closed:        false,
 		maxPackets:    maxPackets,
 	}
 }
@@ -43,7 +66,7 @@ func (h *uploadQueue) Push(p Packet) error {
 	h.writeCloseMutex.Lock()
 	defer h.writeCloseMutex.Unlock()
 
-	if h.closed {
+	if h.isClosed() {
 		return errors.New("packet queue closed")
 	}
 	if h.nomore {
@@ -60,15 +83,17 @@ func (h *uploadQueue) Close() error {
 	h.writeCloseMutex.Lock()
 	defer h.writeCloseMutex.Unlock()
 
-	if !h.closed {
+	if !h.isClosed() {
+		h.stateMu.Lock()
 		h.closed = true
+		h.stateMu.Unlock()
 		runtime.Gosched() // hope Read() gets the packet
 	f:
 		for {
 			select {
 			case p := <-h.pushedPackets:
 				if p.Reader != nil {
-					h.reader = p.Reader
+					h.setReader(p.Reader)
 				}
 			default:
 				break f
@@ -76,18 +101,18 @@ func (h *uploadQueue) Close() error {
 		}
 		close(h.pushedPackets)
 	}
-	if h.reader != nil {
-		return h.reader.Close()
+	if r := h.getReader(); r != nil {
+		return r.Close()
 	}
 	return nil
 }
 
 func (h *uploadQueue) Read(b []byte) (int, error) {
-	if h.reader != nil {
-		return h.reader.Read(b)
+	if r := h.getReader(); r != nil {
+		return r.Read(b)
 	}
 
-	if h.closed {
+	if h.isClosed() {
 		return 0, io.EOF
 	}
 
@@ -97,8 +122,8 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 		if packet.Reader != nil {
-			h.reader = packet.Reader
-			return h.reader.Read(b)
+			h.setReader(packet.Reader)
+			return packet.Reader.Read(b)
 		}
 		heap.Push(&h.heap, packet)
 	}
