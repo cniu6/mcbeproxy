@@ -28,7 +28,7 @@
       </n-gi>
       <n-gi>
         <n-form-item label="监听地址">
-          <n-input v-model:value="port.listen_addr" placeholder="0.0.0.0:1080" />
+          <ListenAddrInput v-model:value="port.listen_addr" :default-port="1080" size="small" />
         </n-form-item>
       </n-gi>
       <n-gi>
@@ -164,10 +164,32 @@
         </template>
       </n-dynamic-input>
     </n-form-item>
+
+    <n-form-item label="全局路由规则">
+      <n-switch :value="!port.ignore_route_rules" @update:value="v => port.ignore_route_rules = !v" />
+      <n-text depth="3" style="margin-left: 10px; font-size: 12px">
+        {{ port.ignore_route_rules ? '忽略「路由网络」里的规则 (用户可单独覆盖)' : '套用「路由网络」里的直连/代理/阻止规则' }}
+      </n-text>
+    </n-form-item>
+
+    <n-divider title-placement="left" style="margin: 8px 0">多用户 (同一端口按账号分流)</n-divider>
+    <PortUsersEditor
+      :users="port.users"
+      :stats="port.user_stats || []"
+      :is-mobile="isMobile"
+      :load-balance-options="loadBalanceOptions"
+      :load-balance-sort-options="loadBalanceSortOptions"
+      :needs-load-balance="needsLoadBalance"
+      :get-proxy-outbound-display="getProxyOutboundDisplay"
+      @pick-outbound="u => $emit('pick-user-outbound', u)"
+    />
   </n-form>
 </template>
 
 <script setup>
+import ListenAddrInput from '../../components/ListenAddrInput.vue'
+import PortUsersEditor from './PortUsersEditor.vue'
+
 const hasRuntimeNode = (port) => {
   if (!port) return false
   return !!port.has_node || port.current_node === 'direct'
@@ -202,7 +224,7 @@ defineProps({
   runtimeRefreshing: { type: Boolean, default: false }
 })
 
-defineEmits(['open-proxy-selector', 'clear-proxy', 'refresh-runtime'])
+defineEmits(['open-proxy-selector', 'clear-proxy', 'refresh-runtime', 'pick-user-outbound'])
 </script>
 
 <style scoped>

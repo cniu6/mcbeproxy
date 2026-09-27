@@ -73,6 +73,12 @@ Minecraft 26.x clients first probe NetherNet HTTP signaling on the TCP twin of t
 ### Hot path
 Never block a shared receive loop: kick sends run via `sendKickAsync`, session DB writes via `sessionPersister`, and the transparent listener shards workers per client to keep packet order. `raw_udp`/`plain_udp` receive loops are allocation-free in steady state (`udpAddrCache`, `readPacketConn`/`writePacketConn` fast paths for dialed sockets). Guard with `go test ./internal/proxy -run '^$' -bench RoundTrip -benchmem` (0 allocs/op expected).
 
+### Network routing (`internal/netroute`, `network.json`)
+Global outgoing interface + Proxifier-style destination rules (IP / CIDR / `a.b.c.*` / ranges / domains / `*.domain` / globs, per-target ports, port lists; actions default/direct/proxy/block, optional per-rule interface). Compiled once, published via an atomic pointer; with nothing configured every helper is the plain `net` call. Every outgoing socket must go through it: use `netroute.Dialer/BindDialer/DialContext/DialUDP/ListenUDP` instead of `net.Dialer{}` / `net.DialUDP` / `net.ListenUDP("udp", nil)`. sing-box nodes are covered by `directDialer`; xray and mihomo are hooked in `proxy/netroute_hooks.go`. Pinning uses `IP_UNICAST_IF` (Windows) / `SO_BINDTODEVICE` (Linux, source-address fallback); loopback is never pinned. Local interceptors that redirect to 127.0.0.1 (Proxifier, TUN) break pinned TCP. Rule actions apply to proxy-port traffic; the interface part applies to all outgoing sockets. API: `/api/network`, `/api/network/interfaces` (adaptive-TTL cache, `?refresh=1`), `/api/network/test`.
+
+### Multi-user proxy ports (`users` in `proxy_ports.json`)
+One listening port, many credentials, each with its own route (node / `@group` / `a,b` / `direct`, empty = port route), IP whitelist, max connections, expiry, UDP toggle and rule opt-out (`proxy/proxy_port_users.go`). The credential table is swapped atomically on edits (no listener restart, live connections keep their identity); per-user counters live in the manager's registry and survive restarts. SOCKS4 carries `user:pass` in USERID.
+
 ### Key Data Flow
 1. Minecraft clients connect via RakNet UDP
 2. Proxy extracts player info from login packets

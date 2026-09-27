@@ -103,11 +103,46 @@
           :show-runtime-info="false"
           @open-proxy-selector="openFormProxySelector(newPortDraft)"
           @clear-proxy="clearProxySelection(newPortDraft)"
+          @pick-user-outbound="u => openFormProxySelector(u)"
         />
         <template #footer>
           <n-space justify="end">
             <n-button size="small" @click="newPortDraft = null">取消</n-button>
             <n-button size="small" type="primary" :loading="newPortDraft && newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
+          </n-space>
+        </template>
+      </n-modal>
+
+      <n-modal
+        :show="!!usersModal"
+        preset="card"
+        :title="usersModal ? `用户管理 · ${usersModal.port.name || usersModal.port.id} (${usersModal.port.listen_addr})` : ''"
+        style="width: 820px; max-width: 95vw"
+        @update:show="(v) => { if (!v) usersModal = null }"
+      >
+        <template v-if="usersModal">
+          <n-alert type="info" :show-icon="false" style="margin-bottom: 10px; font-size: 12px">
+            同一个端口, 客户端用不同的用户名/密码登录, 就走不同的线路; 线路留空则继承端口线路
+            ({{ getProxyOutboundDisplay(usersModal.port.proxy_outbound) || '直连' }})。保存后立即生效, 已连接的客户端不会被断开。
+          </n-alert>
+          <PortUsersEditor
+            :users="usersModal.users"
+            :stats="usersModal.port.user_stats || []"
+            :is-mobile="isMobile"
+            :load-balance-options="loadBalanceOptions"
+            :load-balance-sort-options="loadBalanceSortOptions"
+            :needs-load-balance="needsLoadBalance"
+            :get-proxy-outbound-display="getProxyOutboundDisplay"
+            @pick-outbound="u => openFormProxySelector(u)"
+          />
+        </template>
+        <template #footer>
+          <n-space justify="space-between">
+            <n-button size="small" quaternary @click="refreshUsersModalStats">刷新统计</n-button>
+            <n-space>
+              <n-button size="small" @click="usersModal = null">取消</n-button>
+              <n-button size="small" type="primary" :loading="usersModal && usersModal.saving" @click="saveUsersModal">保存</n-button>
+            </n-space>
           </n-space>
         </template>
       </n-modal>
@@ -306,7 +341,16 @@
             </n-gi>
             <n-gi>
               <n-form-item label="监听主机">
-                <n-input v-model:value="bulkForm.listen_host" placeholder="0.0.0.0" />
+                <n-select
+                  v-model:value="bulkForm.listen_host"
+                  :options="listenHostOptions"
+                  filterable
+                  tag
+                  :loading="ifaceLoading"
+                  placeholder="0.0.0.0"
+                  :consistent-menu-width="false"
+                  @focus="loadInterfaces(false)"
+                />
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -417,8 +461,12 @@ import { useMessage, NTag, NButton, NSpace, NInput, NSelect, NSwitch, NInputNumb
 import { api } from '../api'
 import { useDragSelect } from '../composables/useDragSelect'
 import PortEditForm from './components/PortEditForm.vue'
+import PortUsersEditor from './components/PortUsersEditor.vue'
+import ListenAddrInput from '../components/ListenAddrInput.vue'
+import { useNetworkInterfaces } from '../composables/useNetworkInterfaces'
 
 const message = useMessage()
+const { listenHostOptions, loadInterfaces, loading: ifaceLoading } = useNetworkInterfaces()
 const loading = ref(false)
 const savingGlobal = ref(false)
 const ports = ref([])
@@ -515,13 +563,14 @@ const editableFields = [
   'proxy_outbound', 'load_balance', 'load_balance_sort',
   'auto_ping_enabled', 'auto_ping_interval_minutes', 'auto_ping_top_candidates',
   'auto_ping_full_scan_mode', 'auto_ping_full_scan_time', 'auto_ping_full_scan_interval_hours',
-  'allow_list'
+  'allow_list', 'ignore_route_rules', 'users'
 ]
+const cloneField = (v) => (Array.isArray(v) ? JSON.parse(JSON.stringify(v)) : v)
 const isEditingPort = (row) => editingRowIds.value.includes(row.id)
 const startEditPort = (port) => {
   if (!port || isEditingPort(port)) return
   const snap = {}
-  editableFields.forEach(f => { snap[f] = Array.isArray(port[f]) ? [...port[f]] : port[f] })
+  editableFields.forEach(f => { snap[f] = cloneField(port[f]) })
   editSnapshots.set(port.id, snap)
   editingRowIds.value = [...editingRowIds.value, port.id]
   refreshPortRuntime(port)
@@ -532,7 +581,7 @@ const finishEditPort = (port) => {
 }
 const cancelEditPort = (port) => {
   const snap = editSnapshots.get(port.id)
-  if (snap) editableFields.forEach(f => { port[f] = Array.isArray(snap[f]) ? [...snap[f]] : snap[f] })
+  if (snap) editableFields.forEach(f => { port[f] = cloneField(snap[f]) })
   finishEditPort(port)
 }
 const saveEditPort = async (port) => {
@@ -712,7 +761,8 @@ const portRuntimeFieldDefaults = {
   http_ms: 0,
   has_tcp: false,
   has_udp: false,
-  has_http: false
+  has_http: false,
+  user_stats: []
 }
 
 const applyPortRuntimeSnapshot = (port, snapshot = {}) => {
@@ -726,7 +776,33 @@ const applyPortRuntimeSnapshot = (port, snapshot = {}) => {
   port.has_tcp = !!snapshot.has_tcp
   port.has_udp = !!snapshot.has_udp
   port.has_http = !!snapshot.has_http
+  port.user_stats = Array.isArray(snapshot.user_stats) ? snapshot.user_stats : []
 }
+
+const normalizePortUser = (u = {}) => ({
+  username: u.username || '',
+  password: u.password || '',
+  disabled: !!u.disabled,
+  remark: u.remark || '',
+  proxy_outbound: u.proxy_outbound || '',
+  load_balance: u.load_balance || '',
+  load_balance_sort: u.load_balance_sort || '',
+  allow_list: Array.isArray(u.allow_list) ? [...u.allow_list] : [],
+  max_connections: Number(u.max_connections) || 0,
+  expire_at: u.expire_at || null,
+  disable_udp: !!u.disable_udp,
+  ignore_route_rules: typeof u.ignore_route_rules === 'boolean' ? u.ignore_route_rules : null
+})
+
+const buildUsersPayload = (users) => (users || [])
+  .map(normalizePortUser)
+  .map(u => {
+    const out = { ...u, username: u.username.trim(), allow_list: u.allow_list.map(v => String(v).trim()).filter(Boolean) }
+    if (!out.expire_at) delete out.expire_at
+    if (out.ignore_route_rules === null) delete out.ignore_route_rules
+    if (!out.max_connections) delete out.max_connections
+    return out
+  })
 
 const normalizePort = (port) => {
   const normalized = {
@@ -747,6 +823,8 @@ const normalizePort = (port) => {
     auto_ping_full_scan_time: port.auto_ping_full_scan_time,
     auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours,
     allow_list: Array.isArray(port.allow_list) && port.allow_list.length > 0 ? [...port.allow_list] : ['0.0.0.0/0'],
+    ignore_route_rules: !!port.ignore_route_rules,
+    users: (port.users || []).map(normalizePortUser),
     ...portRuntimeFieldDefaults
   }
   applyLoadBalanceDefaults(normalized)
@@ -1233,8 +1311,19 @@ const portTableColumns = computed(() => [
     width: 160,
     ellipsis: { tooltip: true },
     render: row => isEditingPort(row)
-      ? h(NInput, { value: row.listen_addr, size: 'small', placeholder: '0.0.0.0:1080', onUpdateValue: v => { row.listen_addr = v } })
+      ? h(ListenAddrInput, { value: row.listen_addr, size: 'small', defaultPort: 1080, 'onUpdate:value': v => { row.listen_addr = v } })
       : (row.listen_addr || '-')
+  },
+  {
+    title: '用户',
+    key: 'users',
+    width: 120,
+    render: row => {
+      const count = (row.users || []).length
+      const active = (row.user_stats || []).reduce((n, s) => n + (s.active || 0), 0)
+      return h(NButton, { size: 'tiny', secondary: true, type: count ? 'primary' : 'default', onClick: (e) => { e.stopPropagation(); openUsersModal(row) } },
+        () => count ? `${count} 用户${active ? ` · 活动 ${active}` : ''}` : '添加用户')
+    }
   },
   {
     title: '类型',
@@ -1397,7 +1486,9 @@ const buildPortPayload = (port) => {
     auto_ping_full_scan_mode: port.auto_ping_full_scan_mode || '',
     auto_ping_full_scan_time: port.auto_ping_full_scan_time || autoPingDefaults.full_scan_time,
     auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours || autoPingDefaults.full_scan_interval_hours,
-    allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean)
+    allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean),
+    ignore_route_rules: !!port.ignore_route_rules,
+    users: buildUsersPayload(port.users)
   }
 }
 
@@ -1679,6 +1770,39 @@ const getProxyOutboundDisplay = (value) => {
   return `节点: ${value}`
 }
 
+// ----- 多用户 -----
+const usersModal = ref(null)
+
+const openUsersModal = (port) => {
+  usersModal.value = { port, users: JSON.parse(JSON.stringify(port.users || [])), saving: false }
+  refreshPortRuntime(port)
+}
+
+const refreshUsersModalStats = () => {
+  if (usersModal.value) refreshPortRuntime(usersModal.value.port)
+}
+
+const saveUsersModal = async () => {
+  const modal = usersModal.value
+  if (!modal) return
+  const names = modal.users.map(u => (u.username || '').trim())
+  if (names.some(n => !n)) { message.error('用户名不能为空'); return }
+  if (new Set(names).size !== names.length) { message.error('用户名重复'); return }
+  modal.saving = true
+  try {
+    const res = await api(`/api/proxy-ports/${encodeURIComponent(modal.port.id)}`, 'PUT', buildPortPayload({ ...modal.port, users: modal.users }))
+    if (res.success) {
+      message.success(`已保存 ${modal.users.length} 个用户, 立即生效`)
+      usersModal.value = null
+      await loadPorts()
+    } else {
+      message.error(res.msg ? `${res.msg}: ${res.error || ''}` : '保存失败')
+    }
+  } finally {
+    modal.saving = false
+  }
+}
+
 const clearProxySelection = (port) => {
   port.proxy_outbound = ''
   port.load_balance = ''
@@ -1691,6 +1815,10 @@ const clearBulkProxySelection = () => {
   bulkForm.assignment_mode = 'shared'
 }
 
+// A user of a multi-user port (has username, no listen_addr): "direct" there
+// means an explicit direct route; an empty value means "inherit the port".
+const isPortUserTarget = (t) => !!t && !('listen_addr' in t) && 'username' in t
+
 const openFormProxySelector = async (port) => {
   activePort.value = port
   showFormProxySelector.value = true
@@ -1699,7 +1827,7 @@ const openFormProxySelector = async (port) => {
   formProxySelectorPagination.value.page = 1
 
   const currentValue = (port.proxy_outbound || '').trim()
-  if (!currentValue) {
+  if (!currentValue || currentValue === 'direct') {
     formProxyMode.value = 'direct'
     formSelectedGroup.value = ''
     formSelectedNodes.value = []
@@ -1740,7 +1868,7 @@ const confirmFormProxySelection = () => {
   if (!port) return
 
   if (formProxyMode.value === 'direct') {
-    port.proxy_outbound = ''
+    port.proxy_outbound = isPortUserTarget(port) ? 'direct' : ''
     port.load_balance = ''
     port.load_balance_sort = ''
   } else if (formProxyMode.value === 'group') {
@@ -1759,6 +1887,10 @@ const confirmFormProxySelection = () => {
       port.load_balance = formLoadBalance.value || 'least-latency'
       port.load_balance_sort = formLoadBalanceSort.value || 'tcp'
     }
+  }
+  if (isPortUserTarget(port)) {
+    showFormProxySelector.value = false
+    return
   }
   applyLoadBalanceDefaults(port)
   applyAutoPingDefaults(port)

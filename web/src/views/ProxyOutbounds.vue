@@ -960,6 +960,7 @@ import { ref, reactive, computed, onMounted, onBeforeUnmount, h, watch, nextTick
 import { NTag, NButton, NSpace, NPopconfirm, NIcon, useMessage } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
+import { createAdaptivePoll } from '../composables/useAdaptivePoll'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
 import { useDragSelect } from '../composables/useDragSelect'
@@ -1089,7 +1090,7 @@ const proxyHistoryDetailMetrics = ref({ tcp: [], http: [], udp: [] })
 const proxyHistoryViewportPercent = ref([0, 100])
 let proxyHistoryOverviewFetchToken = 0
 let proxyHistoryDetailFetchToken = 0
-let managedDataRefreshTimer = null
+const managedDataPoller = createAdaptivePoll(() => refreshManagedData(), { interval: 30000 })
 let refreshManagedDataPromise = null
 const proxyHistoryMetricOrder = ['tcp', 'http', 'udp']
 const proxyHistoryMetricLabels = { tcp: 'TCP', http: 'HTTP', udp: 'UDP' }
@@ -4228,10 +4229,7 @@ watch([proxyHistoryRangeKey, proxyHistoryCustomRange], () => {
 onMounted(async () => {
 	await loadHistoryConfig()
   await refreshManagedData()
-  managedDataRefreshTimer = setInterval(() => {
-    if (document.hidden) return // 标签页在后台时不轮询
-    refreshManagedData()
-  }, 30000)
+  managedDataPoller.start()
   // 优先使用 initialHighlight，否则使用 initialSearch
   const highlightTarget = props.initialHighlight || props.initialSearch
   if (highlightTarget) {
@@ -4246,10 +4244,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (managedDataRefreshTimer) {
-    clearInterval(managedDataRefreshTimer)
-    managedDataRefreshTimer = null
-  }
+  managedDataPoller.stop()
 })
 
 // 监听 initialSearch 和 initialHighlight 变化

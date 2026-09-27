@@ -17,6 +17,7 @@ import (
 	"mcpeserverproxy/internal/db"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
+	"mcpeserverproxy/internal/netroute"
 	"mcpeserverproxy/internal/proxy"
 	"mcpeserverproxy/internal/subscription"
 )
@@ -77,6 +78,15 @@ func main() {
 	// Enable debug mode from config if not already set by flag
 	if globalConfig.DebugMode && !*debugMode {
 		logger.SetDefaultLevel(logger.LevelDebug)
+	}
+
+	// Network settings (outgoing interface + destination rules) must be in
+	// place before any outgoing socket is opened.
+	networkStore := netroute.NewStore("network.json")
+	if err := networkStore.Load(); err != nil {
+		logger.Error("Failed to load network settings: %v (using system routing)", err)
+	} else if nc := netroute.Current(); nc.Interface != "" || len(nc.Rules) > 0 {
+		logger.Info("Network: outgoing interface=%q, %d route rule(s)", nc.Interface, len(nc.Rules))
 	}
 
 	// Configure file logging
@@ -199,6 +209,7 @@ func main() {
 		proxyServer.GetProxyPortConfigManager(),
 	)
 	proxyServer.SetServerLatencyRecorder(apiServer)
+	apiServer.SetNetworkStore(networkStore)
 
 	if err := proxyServer.Start(); err != nil {
 		logger.Error("Failed to start proxy server: %v", err)

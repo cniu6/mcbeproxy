@@ -210,6 +210,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api, formatBytes, formatDuration, formatTime, formatStartTime } from '../api'
+import { createAdaptivePoll } from '../composables/useAdaptivePoll'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ServerLatencyHistoryModal from '../components/ServerLatencyHistoryModal.vue'
 
@@ -231,7 +232,8 @@ const selectedHistoryServer = ref(null)
 const latencyRefreshNonce = ref(0)
 const countdownNow = ref(Date.now())
 const nextLatencyRefreshAt = ref(0)
-let timer = null
+// Adaptive: no overlapping loads, paused in background tabs, backs off when slow.
+const poller = createAdaptivePoll(() => loadData(), { interval: 30000, onSchedule: at => { nextLatencyRefreshAt.value = at } })
 let countdownTimer = null
 let loadSeq = 0
 
@@ -429,18 +431,12 @@ const openServerLatencyHistoryModal = (server) => {
 }
 
 const setupAutoRefresh = (val) => {
-  if (timer) clearInterval(timer)
+  poller.stop()
   const seconds = Number(val) || 0
   if (seconds > 0) {
-    nextLatencyRefreshAt.value = Date.now() + seconds * 1000
-    timer = setInterval(() => {
-      if (document.hidden) return // 标签页在后台时不轮询
-      nextLatencyRefreshAt.value = Date.now() + seconds * 1000
-      loadData()
-    }, seconds * 1000)
-    return
+    poller.setInterval(seconds * 1000)
+    poller.start()
   }
-  nextLatencyRefreshAt.value = 0
 }
 
 const handleManualRefresh = () => {
@@ -489,7 +485,7 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
 })
 onUnmounted(() => {
-  if (timer) clearInterval(timer)
+  poller.stop()
   if (countdownTimer) clearInterval(countdownTimer)
   window.removeEventListener('resize', handleResize)
 })

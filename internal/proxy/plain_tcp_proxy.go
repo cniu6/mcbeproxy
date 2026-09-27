@@ -178,20 +178,24 @@ func (p *PlainTCPProxy) dialOutbound(ctx context.Context, address string) (net.C
 	return nil, "", fmt.Errorf("all proxy outbounds failed")
 }
 
-func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
+// relayStream copies both ways until both sides finish and returns the bytes
+// sent upstream (local -> remote) and downstream.
+func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) (up, down int64) {
 	type relayResult struct {
 		err        error
 		halfClosed bool
+		n          int64
+		upstream   bool
 	}
 
 	done := make(chan relayResult, 2)
 	go func() {
-		_, err := relayCopy(remote, localReader)
-		done <- relayResult{err: err, halfClosed: closeWriteSide(remote)}
+		n, err := relayCopy(remote, localReader)
+		done <- relayResult{err: err, halfClosed: closeWriteSide(remote), n: n, upstream: true}
 	}()
 	go func() {
-		_, err := relayCopy(local, remote)
-		done <- relayResult{err: err, halfClosed: closeWriteSide(local)}
+		n, err := relayCopy(local, remote)
+		done <- relayResult{err: err, halfClosed: closeWriteSide(local), n: n}
 	}()
 
 	first := <-done
@@ -199,9 +203,17 @@ func relayStream(local net.Conn, localReader io.Reader, remote net.Conn) {
 		_ = local.Close()
 		_ = remote.Close()
 	}
-	<-done
+	second := <-done
 	_ = local.Close()
 	_ = remote.Close()
+	for _, r := range [2]relayResult{first, second} {
+		if r.upstream {
+			up = r.n
+		} else {
+			down = r.n
+		}
+	}
+	return up, down
 }
 
 // relayBufPool holds the copy buffers for TCP relays: io.Copy allocated a

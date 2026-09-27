@@ -31,7 +31,7 @@
         <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="服务器 ID" required><n-input v-model:value="form.id" :disabled="!!editingId" placeholder="唯一标识" /></n-form-item></n-gi>
           <n-gi><n-form-item label="名称" required><n-input v-model:value="form.name" placeholder="显示名称" @blur="onNameChange" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="监听地址" required><n-input v-model:value="form.listen_addr" placeholder="0.0.0.0:19132" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="监听地址" required><ListenAddrInput v-model:value="form.listen_addr" :default-port="19132" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标地址" required><n-input v-model:value="form.target" placeholder="目标服务器" /></n-form-item></n-gi>
           <n-gi><n-form-item label="目标端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
           <n-gi v-if="!isNetherNetMode">
@@ -50,7 +50,7 @@
             </n-gi>
             <n-gi>
               <n-form-item label="信令监听">
-                <n-input v-model:value="form.nethernet_listen_addr" placeholder="0.0.0.0:19132" />
+                <ListenAddrInput v-model:value="form.nethernet_listen_addr" :default-port="19132" />
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -1208,7 +1208,9 @@
  import { api, apiStream } from '../api'
  import LatencySparkline from '../components/LatencySparkline.vue'
  import ServerLatencyHistoryModal from '../components/ServerLatencyHistoryModal.vue'
+ import ListenAddrInput from '../components/ListenAddrInput.vue'
  import { useDragSelect } from '../composables/useDragSelect'
+ import { createAdaptivePoll } from '../composables/useAdaptivePoll'
 
  const message = useMessage()
 const servers = ref([])
@@ -1909,7 +1911,7 @@ const countdownNow = ref(Date.now())
 let serverOverviewFetchToken = 0
 let editServerLiveSessionsFetchToken = 0
 let finalServerNodeLatencyFetchToken = 0
-let serverOverviewTimer = null
+const serverOverviewPoller = createAdaptivePoll(() => refreshServerLatencyOverview(), { interval: 30000 })
 let serverStatsTimer = null
 let serverStatsPollCancelled = false
 let countdownTimer = null
@@ -5041,7 +5043,7 @@ onMounted(async () => {
   await Promise.all([loadProxyOutbounds(), loadGlobalDefaults()])
   await load()
   scheduleServerStatsPoll()
-  serverOverviewTimer = setInterval(refreshServerLatencyOverview, 30000)
+  serverOverviewPoller.start()
   countdownTimer = setInterval(() => {
     countdownNow.value = Date.now()
   }, 1000)
@@ -5049,7 +5051,7 @@ onMounted(async () => {
 onUnmounted(() => {
   serverStatsPollCancelled = true
   if (serverStatsTimer) clearTimeout(serverStatsTimer)
-  if (serverOverviewTimer) clearInterval(serverOverviewTimer)
+  serverOverviewPoller.stop()
   if (countdownTimer) clearInterval(countdownTimer)
 })
 </script>

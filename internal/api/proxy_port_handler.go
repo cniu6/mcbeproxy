@@ -54,6 +54,12 @@ type proxyPortRuntimeDTO struct {
 	HasTCP            bool   `json:"has_tcp,omitempty"`
 	HasUDP            bool   `json:"has_udp,omitempty"`
 	HasHTTP           bool   `json:"has_http,omitempty"`
+	// UserStats are the per-user counters of a multi-user port.
+	UserStats []proxy.ProxyPortUserStat `json:"user_stats,omitempty"`
+}
+
+type proxyPortUserStatsProvider interface {
+	GetProxyPortUserStats(portID string) []proxy.ProxyPortUserStat
 }
 
 type proxyPortListDTO struct {
@@ -128,6 +134,12 @@ func (a *APIServer) buildProxyPortRuntimeSnapshot(port *config.ProxyPortConfig) 
 		dto.HasTCP = ref.HasTCP
 		dto.HasUDP = ref.HasUDP
 		dto.HasHTTP = ref.HasHTTP
+	}
+
+	if len(port.Users) > 0 {
+		if p, ok := a.proxyController.(proxyPortUserStatsProvider); ok {
+			dto.UserStats = p.GetProxyPortUserStats(port.ID)
+		}
 	}
 
 	if port.IsDirectConnection() {

@@ -224,7 +224,7 @@ func TestSharedUDPRelayCloseStopsTimeoutOnlyResponseLoop(t *testing.T) {
 	}}
 
 	relay.wg.Add(1)
-	go relay.forwardUDPResponses(pc, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}, nil)
+	go relay.forwardUDPResponses(pc, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 50000}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 19132}, nil, nil)
 
 	done := make(chan struct{})
 	go func() {

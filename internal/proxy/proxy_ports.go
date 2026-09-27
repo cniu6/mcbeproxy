@@ -44,6 +44,7 @@ type ProxyPortManager struct {
 	mu             sync.Mutex
 	listeners      map[string]*proxyPortListener
 	dialerPool     *proxyPortDialerPool
+	stats          *proxyPortStatsRegistry
 }
 
 func NewProxyPortManager(configMgr *config.ProxyPortConfigManager, outboundMgr OutboundManager) *ProxyPortManager {
@@ -62,7 +63,16 @@ func NewProxyPortManagerWithSingboxFactory(configMgr *config.ProxyPortConfigMana
 		singboxFactory: chainFactory,
 		listeners:      make(map[string]*proxyPortListener),
 		dialerPool:     newProxyPortDialerPool(chainFactory),
+		stats:          newProxyPortStatsRegistry(),
 	}
+}
+
+// UserStats returns the per-user counters of a proxy port.
+func (m *ProxyPortManager) UserStats(portID string) []ProxyPortUserStat {
+	if m == nil || m.stats == nil {
+		return nil
+	}
+	return m.stats.snapshot(portID)
 }
 
 // Start starts all enabled proxy port listeners when feature is enabled.
@@ -84,6 +94,7 @@ func (m *ProxyPortManager) Start(enabled bool) error {
 			continue
 		}
 		listener := newProxyPortListener(cfg, m.outboundMgr, m.dialerPool)
+		listener.stats = m.stats
 		if err := listener.Start(); err != nil {
 			logger.Error("ProxyPort: failed to start %s (%s): %v", cfg.ID, cfg.ListenAddr, err)
 			if firstErr == nil {
@@ -127,6 +138,12 @@ func (m *ProxyPortManager) Reload(enabled bool) error {
 		if !ok || !proxyPortRuntimeConfigEqual(listener.cfg, cfg) {
 			listener.StopWithWait(false)
 			delete(m.listeners, id)
+			continue
+		}
+		// Users / rule opt-outs change without a restart: new connections
+		// use the new table, live ones keep the identity they logged in with.
+		if err := listener.updateAuth(cfg); err != nil {
+			logger.Warn("ProxyPort: keeping previous users for %s: %v", id, err)
 		}
 	}
 	m.mu.Unlock()
@@ -295,6 +312,8 @@ type proxyPortListener struct {
 	activeNetConns map[net.Conn]struct{}
 	sharedRelay    *sharedUDPRelay
 	relayMu        sync.Mutex
+	auth           atomic.Pointer[proxyPortAuth]
+	stats          *proxyPortStatsRegistry // shared by the manager; nil in unit tests
 }
 
 func newProxyPortListener(cfg *config.ProxyPortConfig, outboundMgr OutboundManager, dialerPool *proxyPortDialerPool) *proxyPortListener {
@@ -321,6 +340,9 @@ func (l *proxyPortListener) Start() error {
 		return err
 	}
 	l.allowList = allowList
+	if err := l.updateAuth(l.cfg); err != nil {
+		return err
+	}
 
 	ln, err := net.Listen("tcp", l.cfg.ListenAddr)
 	if err != nil {
@@ -501,6 +523,8 @@ func (l *proxyPortListener) handleMixed(conn net.Conn, reader *bufio.Reader) {
 }
 
 func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
+	var ident *proxyPortIdentity
+	defer func() { ident.release() }()
 	for {
 		setProxyHandshakeDeadline(conn)
 		req, err := http.ReadRequest(reader)
@@ -508,13 +532,24 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 			return
 		}
 		clearProxyConnDeadline(conn)
-		if l.requiresAuth() && !l.checkHTTPAuth(req) {
+		id, ok := l.httpIdentity(req, conn.RemoteAddr())
+		if !ok {
 			writeHTTPAuthRequired(conn)
 			return
 		}
+		if id != ident {
+			// Keep-alive requests normally reuse one login; switch the
+			// connection's accounting only if the credentials change.
+			if err := id.acquire(); err != nil {
+				writeHTTPError(conn, http.StatusTooManyRequests, "Too Many Connections")
+				return
+			}
+			ident.release()
+			ident = id
+		}
 
 		if strings.EqualFold(req.Method, http.MethodConnect) {
-			l.handleHTTPConnect(conn, reader, req)
+			l.handleHTTPConnect(conn, reader, req, ident)
 			return
 		}
 
@@ -529,9 +564,14 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 		if !strings.Contains(target, ":") {
 			target = net.JoinHostPort(target, "80")
 		}
+		route, blocked := routeFor(ident, target)
+		if blocked {
+			writeHTTPError(conn, http.StatusForbidden, "Forbidden")
+			return
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
-		remote, _, err := l.dialOutbound(ctx, target)
+		remote, _, err := l.dialRoute(ctx, route, target)
 		cancel()
 		if err != nil {
 			writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway")
@@ -575,7 +615,7 @@ func (l *proxyPortListener) handleHTTP(conn net.Conn, reader *bufio.Reader) {
 	}
 }
 
-func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reader, req *http.Request) {
+func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reader, req *http.Request, ident *proxyPortIdentity) {
 	target := req.Host
 	if target == "" {
 		writeHTTPError(conn, http.StatusBadRequest, "Bad Request")
@@ -584,9 +624,14 @@ func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reade
 	if !strings.Contains(target, ":") {
 		target = net.JoinHostPort(target, "443")
 	}
+	route, blocked := routeFor(ident, target)
+	if blocked {
+		writeHTTPError(conn, http.StatusForbidden, "Forbidden")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
-	remote, _, err := l.dialOutbound(ctx, target)
+	remote, _, err := l.dialRoute(ctx, route, target)
 	cancel()
 	if err != nil {
 		writeHTTPError(conn, http.StatusBadGateway, "Bad Gateway")
@@ -600,11 +645,12 @@ func (l *proxyPortListener) handleHTTPConnect(conn net.Conn, reader *bufio.Reade
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	defer l.closeTrackedConn(remote)
-	relayStream(conn, reader, remote)
+	ident.addBytes(relayStream(conn, reader, remote))
 }
 
 func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
-	if err := l.handleSocks5Handshake(conn, reader); err != nil {
+	ident, err := l.handleSocks5Handshake(conn, reader)
+	if err != nil {
 		return
 	}
 	cmd, target, err := readSocks5RequestEx(reader)
@@ -612,11 +658,21 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 		writeSocks5Reply(conn, 0x01)
 		return
 	}
+	if err := ident.acquire(); err != nil {
+		writeSocks5Reply(conn, 0x02) // not allowed by ruleset
+		return
+	}
+	defer ident.release()
 
 	switch cmd {
 	case 0x01: // CONNECT
+		route, blocked := routeFor(ident, target)
+		if blocked {
+			writeSocks5Reply(conn, 0x02)
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
-		remote, _, err := l.dialOutbound(ctx, target)
+		remote, _, err := l.dialRoute(ctx, route, target)
 		cancel()
 		if err != nil {
 			writeSocks5Reply(conn, 0x05)
@@ -629,26 +685,31 @@ func (l *proxyPortListener) handleSocks5(conn net.Conn, reader *bufio.Reader) {
 		clearProxyConnDeadline(conn)
 		writeSocks5Reply(conn, 0x00)
 		defer l.closeTrackedConn(remote)
-		relayStream(conn, reader, remote)
+		ident.addBytes(relayStream(conn, reader, remote))
 	case 0x03: // UDP ASSOCIATE
-		l.handleSocks5UDPAssociate(conn)
+		if ident.disableUDP {
+			ident.reject("UDP disabled")
+			writeSocks5Reply(conn, 0x02)
+			return
+		}
+		l.handleSocks5UDPAssociate(conn, ident, target)
 	default:
 		writeSocks5Reply(conn, 0x07) // Command not supported
 	}
 }
 
-func (l *proxyPortListener) handleSocks5Handshake(conn net.Conn, reader *bufio.Reader) error {
+func (l *proxyPortListener) handleSocks5Handshake(conn net.Conn, reader *bufio.Reader) (*proxyPortIdentity, error) {
 	ver, err := reader.ReadByte()
 	if err != nil || ver != 0x05 {
-		return fmt.Errorf("invalid socks5 version")
+		return nil, fmt.Errorf("invalid socks5 version")
 	}
 	nMethods, err := reader.ReadByte()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	methods := make([]byte, int(nMethods))
 	if _, err := io.ReadFull(reader, methods); err != nil {
-		return err
+		return nil, err
 	}
 
 	authRequired := l.requiresAuth()
@@ -659,53 +720,53 @@ func (l *proxyPortListener) handleSocks5Handshake(conn net.Conn, reader *bufio.R
 
 	if authRequired && !containsByte(methods, 0x02) {
 		_, _ = conn.Write([]byte{0x05, 0xFF})
-		return fmt.Errorf("no acceptable auth method")
+		return nil, fmt.Errorf("no acceptable auth method")
 	}
 	if !authRequired && !containsByte(methods, 0x00) {
 		_, _ = conn.Write([]byte{0x05, 0xFF})
-		return fmt.Errorf("no acceptable auth method")
+		return nil, fmt.Errorf("no acceptable auth method")
 	}
 
 	if _, err := conn.Write([]byte{0x05, chosen}); err != nil {
-		return err
+		return nil, err
 	}
 	if chosen == 0x02 {
-		if err := l.handleSocks5Auth(conn, reader); err != nil {
-			return err
-		}
+		return l.handleSocks5Auth(conn, reader)
 	}
-	return nil
+	return l.authTable().anonymous(), nil
 }
 
-func (l *proxyPortListener) handleSocks5Auth(conn net.Conn, reader *bufio.Reader) error {
+func (l *proxyPortListener) handleSocks5Auth(conn net.Conn, reader *bufio.Reader) (*proxyPortIdentity, error) {
 	ver, err := reader.ReadByte()
 	if err != nil || ver != 0x01 {
 		_, _ = conn.Write([]byte{0x01, 0x01})
-		return fmt.Errorf("invalid auth version")
+		return nil, fmt.Errorf("invalid auth version")
 	}
 	ulen, err := reader.ReadByte()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	uname := make([]byte, int(ulen))
 	if _, err := io.ReadFull(reader, uname); err != nil {
-		return err
+		return nil, err
 	}
 	plen, err := reader.ReadByte()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pass := make([]byte, int(plen))
 	if _, err := io.ReadFull(reader, pass); err != nil {
-		return err
+		return nil, err
 	}
 
-	if !secureStringEqual(string(uname), l.cfg.Username) || !secureStringEqual(string(pass), l.cfg.Password) {
+	ident, err := l.authTable().authenticate(string(uname), string(pass), conn.RemoteAddr())
+	if err != nil {
 		_, _ = conn.Write([]byte{0x01, 0x01})
-		return fmt.Errorf("auth failed")
+		logger.Debug("ProxyPort %s: SOCKS5 login %q from %s refused: %v", l.cfg.ID, string(uname), conn.RemoteAddr(), err)
+		return nil, err
 	}
 	_, _ = conn.Write([]byte{0x01, 0x00})
-	return nil
+	return ident, nil
 }
 
 // readSocks5RequestEx reads a SOCKS5 request and returns the command byte
@@ -793,10 +854,24 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 	if _, err := io.ReadFull(reader, ipBuf); err != nil {
 		return
 	}
-	if _, err := readUntilNull(reader, maxSocks4FieldLength); err != nil {
+	userID, err := readUntilNull(reader, maxSocks4FieldLength)
+	if err != nil {
 		writeSocks4Reply(conn, 0x5B, nil, 0)
 		return
 	}
+	// SOCKS4 has no password exchange: with auth on, the USERID field must
+	// carry "user:password" (or just "user" for a password-less user).
+	user, pass, _ := strings.Cut(userID, ":")
+	ident, err := l.authTable().authenticate(user, pass, conn.RemoteAddr())
+	if err != nil {
+		writeSocks4Reply(conn, 0x5D, nil, 0)
+		return
+	}
+	if err := ident.acquire(); err != nil {
+		writeSocks4Reply(conn, 0x5B, nil, 0)
+		return
+	}
+	defer ident.release()
 
 	destIP := net.IP(ipBuf)
 	host := destIP.String()
@@ -813,9 +888,14 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 
 	port := int(portBuf[0])<<8 | int(portBuf[1])
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	route, blocked := routeFor(ident, target)
+	if blocked {
+		writeSocks4Reply(conn, 0x5B, destIP, port)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultProxyDialTimeout)
-	remote, _, err := l.dialOutbound(ctx, target)
+	remote, _, err := l.dialRoute(ctx, route, target)
 	cancel()
 	if err != nil {
 		writeSocks4Reply(conn, 0x5B, destIP, port)
@@ -829,7 +909,7 @@ func (l *proxyPortListener) handleSocks4(conn net.Conn, reader *bufio.Reader) {
 
 	writeSocks4Reply(conn, 0x5A, destIP, port)
 	defer l.closeTrackedConn(remote)
-	relayStream(conn, reader, remote)
+	ident.addBytes(relayStream(conn, reader, remote))
 }
 
 func writeSocks4Reply(conn net.Conn, status byte, ip net.IP, port int) {
@@ -878,13 +958,23 @@ func clearProxyConnDeadline(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 }
 
+// dialOutbound dials address with the port's own route (plus global rules).
 func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (net.Conn, string, error) {
 	if l.cfg == nil {
 		return nil, "", fmt.Errorf("proxy port configuration is nil")
 	}
-	if l.cfg.IsDirectConnection() {
-		dialer := &net.Dialer{Timeout: defaultProxyDialTimeout}
-		conn, err := dialer.DialContext(ctx, "tcp", address)
+	route, blocked := routeFor(l.authTable().anonymous(), address)
+	if blocked {
+		return nil, "", fmt.Errorf("destination %s blocked by route rules", address)
+	}
+	return l.dialRoute(ctx, route, address)
+}
+
+// dialRoute dials address through route: direct, or a node selected (with
+// failover) from the route's node / group / list.
+func (l *proxyPortListener) dialRoute(ctx context.Context, route proxyPortRoute, address string) (net.Conn, string, error) {
+	if route.isDirect() {
+		conn, err := netroute.Dialer(defaultProxyDialTimeout, address).DialContext(ctx, "tcp", address)
 		return conn, DirectNodeName, err
 	}
 	if l.outboundMgr == nil {
@@ -892,10 +982,10 @@ func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (n
 	}
 
 	exclude := make([]string, 0, 4)
-	attempts := proxySelectionAttemptLimit(l.cfg, l.outboundMgr)
+	attempts := proxySelectionAttemptLimit(route, l.outboundMgr)
 
 	for i := 0; i < attempts; i++ {
-		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), exclude)
+		selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(route.selectorID, route.outbound, route.getLoadBalance(), route.getLoadBalanceSort(), exclude)
 		if err != nil {
 			return nil, "", err
 		}
@@ -903,8 +993,7 @@ func (l *proxyPortListener) dialOutbound(ctx context.Context, address string) (n
 		// instead of going through the outbound manager's dialer pool.
 		// Failover still applies if the direct dial itself fails.
 		if IsDirectSelection(selected) {
-			dialer := &net.Dialer{Timeout: defaultProxyDialTimeout}
-			conn, derr := dialer.DialContext(ctx, "tcp", address)
+			conn, derr := netroute.Dialer(defaultProxyDialTimeout, address).DialContext(ctx, "tcp", address)
 			if derr == nil {
 				return conn, DirectNodeName, nil
 			}
@@ -978,31 +1067,55 @@ func parseAllowList(entries []string) ([]*net.IPNet, error) {
 	return result, nil
 }
 
-func (l *proxyPortListener) requiresAuth() bool {
-	return l.cfg.Username != "" || l.cfg.Password != ""
+// authTable returns the current credential table.
+func (l *proxyPortListener) authTable() *proxyPortAuth {
+	if a := l.auth.Load(); a != nil {
+		return a
+	}
+	a, _ := buildProxyPortAuth(l.cfg, nil)
+	return a
 }
 
-func (l *proxyPortListener) checkHTTPAuth(req *http.Request) bool {
-	header := req.Header.Get("Proxy-Authorization")
-	if header == "" {
-		return false
+// updateAuth rebuilds the credential table from cfg (users, rule opt-outs)
+// and publishes it for new connections.
+func (l *proxyPortListener) updateAuth(cfg *config.ProxyPortConfig) error {
+	a, err := buildProxyPortAuth(cfg, l.stats)
+	if err != nil {
+		return err
 	}
+	l.auth.Store(a)
+	return nil
+}
+
+func (l *proxyPortListener) requiresAuth() bool {
+	return l.authTable().requires
+}
+
+// httpIdentity authenticates an HTTP proxy request (Basic Proxy-Authorization).
+func (l *proxyPortListener) httpIdentity(req *http.Request, remote net.Addr) (*proxyPortIdentity, bool) {
+	a := l.authTable()
+	if !a.requires {
+		return a.anonymous(), true
+	}
+	header := req.Header.Get("Proxy-Authorization")
 	parts := strings.SplitN(header, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Basic") {
-		return false
+		return nil, false
 	}
 	raw, err := base64.StdEncoding.DecodeString(parts[1])
 	if err != nil {
-		return false
+		return nil, false
 	}
-	pair := string(raw)
-	idx := strings.Index(pair, ":")
-	if idx < 0 {
-		return false
+	user, pass, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		return nil, false
 	}
-	user := pair[:idx]
-	pass := pair[idx+1:]
-	return secureStringEqual(user, l.cfg.Username) && secureStringEqual(pass, l.cfg.Password)
+	ident, err := a.authenticate(user, pass, remote)
+	if err != nil {
+		logger.Debug("ProxyPort %s: HTTP login %q from %s refused: %v", l.cfg.ID, user, remote, err)
+		return nil, false
+	}
+	return ident, true
 }
 
 func writeHTTPAuthRequired(conn net.Conn) {
@@ -1036,6 +1149,9 @@ type sharedUDPRelay struct {
 	clients     map[string]*udpClientEntry // clientAddr.String() -> entry
 	activeIPsMu sync.Mutex
 	activeIPs   map[string]int // net.IP.String() -> reference count of active TCP control conns
+	// idents maps "ip:port" (when the ASSOCIATE request named the client's
+	// UDP port) or "ip" to the identity whose route the datagrams follow.
+	idents map[string]*proxyPortIdentity
 	wg          sync.WaitGroup
 	stopCh      chan struct{}
 	closeOnce   sync.Once
@@ -1046,6 +1162,7 @@ type sharedUDPRelay struct {
 type udpClientEntry struct {
 	upstreams map[string]*upstreamConn // destAddr -> upstream
 	mu        sync.Mutex
+	ident     *proxyPortIdentity // whose route/stats this client's datagrams use
 }
 
 type udpRelayPacket struct {
@@ -1185,6 +1302,7 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 		conn:      conn,
 		clients:   make(map[string]*udpClientEntry),
 		activeIPs: make(map[string]int),
+		idents:    make(map[string]*proxyPortIdentity),
 		stopCh:    make(chan struct{}),
 		cfgID:     l.cfg.ID,
 	}
@@ -1199,9 +1317,31 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 // registerClientIP marks a TCP control connection's remote IP as active,
 // allowing UDP datagrams from that IP to be accepted by the shared relay.
 func (r *sharedUDPRelay) registerClientIP(ip net.IP) {
+	r.registerClient(ip, 0, nil)
+}
+
+// registerClient is registerClientIP carrying the logged-in identity. port
+// is the client's UDP source port when the ASSOCIATE request named it.
+func (r *sharedUDPRelay) registerClient(ip net.IP, port int, ident *proxyPortIdentity) {
 	r.activeIPsMu.Lock()
 	r.activeIPs[ip.String()]++
+	if ident != nil {
+		r.idents[ip.String()] = ident
+		if port > 0 {
+			r.idents[net.JoinHostPort(ip.String(), strconv.Itoa(port))] = ident
+		}
+	}
 	r.activeIPsMu.Unlock()
+}
+
+// identityFor returns the identity registered for a client source address.
+func (r *sharedUDPRelay) identityFor(clientKey, ipKey string) *proxyPortIdentity {
+	r.activeIPsMu.Lock()
+	defer r.activeIPsMu.Unlock()
+	if id := r.idents[clientKey]; id != nil {
+		return id
+	}
+	return r.idents[ipKey]
 }
 
 // unregisterClientIP decrements the reference count for a TCP control
@@ -1214,10 +1354,18 @@ func (r *sharedUDPRelay) registerClientIP(ip net.IP) {
 // cleanup would close the new connection's upstreams. Stale upstreams are now
 // cleaned up by the idle sweeper (30s ticker, 2min timeout) instead.
 func (r *sharedUDPRelay) unregisterClientIP(ip net.IP) {
+	r.unregisterClient(ip, 0)
+}
+
+func (r *sharedUDPRelay) unregisterClient(ip net.IP, port int) {
 	r.activeIPsMu.Lock()
 	r.activeIPs[ip.String()]--
+	if port > 0 {
+		delete(r.idents, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	}
 	if r.activeIPs[ip.String()] <= 0 {
 		delete(r.activeIPs, ip.String())
+		delete(r.idents, ip.String())
 	}
 	r.activeIPsMu.Unlock()
 }
@@ -1339,9 +1487,19 @@ func appendSocks5UDPResponseHeader(dst []byte, addr net.Addr) ([]byte, bool) {
 	return dst, true
 }
 
-// dialUDPUpstream creates an upstream UDP connection for the given destination.
+// dialUDPUpstream creates an upstream UDP connection for the given destination
+// using the port's own route.
 func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, error) {
-	if l.cfg.IsDirectConnection() {
+	return l.dialUDPFor(l.authTable().anonymous(), destAddr)
+}
+
+// dialUDPFor dials destAddr with the identity's route and the global rules.
+func (l *proxyPortListener) dialUDPFor(ident *proxyPortIdentity, destAddr string) (net.PacketConn, error) {
+	route, blocked := routeFor(ident, destAddr)
+	if blocked {
+		return nil, fmt.Errorf("destination %s blocked by route rules", destAddr)
+	}
+	if route.isDirect() {
 		host, portStr, err := net.SplitHostPort(destAddr)
 		if err != nil {
 			return nil, err
@@ -1367,7 +1525,7 @@ func (l *proxyPortListener) dialUDPUpstream(destAddr string) (net.PacketConn, er
 		return nil, fmt.Errorf("no outbound manager")
 	}
 	selected, err := l.outboundMgr.SelectOutboundWithFailoverForServer(
-		proxyPortSelectorID(l.cfg.ID), l.cfg.ProxyOutbound, l.cfg.GetLoadBalance(), l.cfg.GetLoadBalanceSort(), nil)
+		route.selectorID, route.outbound, route.getLoadBalance(), route.getLoadBalanceSort(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1521,8 +1679,9 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 		// Get or create client entry and enqueue work. The shared relay read loop
 		// must never dial or write upstream synchronously; one slow upstream would
 		// otherwise head-of-line block all clients sharing this UDP socket.
-		entry := r.getOrCreateClientEntry(clientKey)
+		entry := r.getOrCreateClientEntry(clientKey, dc.ipKey)
 		uc := r.getOrCreateUpstream(l, entry, clientKey, destAddr, clientAddr)
+		entry.ident.addBytes(int64(len(payload)), 0)
 
 		payloadCopy := append([]byte(nil), payload...)
 		enqueueResult := uc.enqueue(udpRelayPacket{payload: payloadCopy, dest: dc.destNet})
@@ -1536,12 +1695,12 @@ func (r *sharedUDPRelay) readLoop(l *proxyPortListener) {
 	}
 }
 
-func (r *sharedUDPRelay) getOrCreateClientEntry(clientKey string) *udpClientEntry {
+func (r *sharedUDPRelay) getOrCreateClientEntry(clientKey, ipKey string) *udpClientEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, exists := r.clients[clientKey]
 	if !exists {
-		entry = &udpClientEntry{upstreams: make(map[string]*upstreamConn)}
+		entry = &udpClientEntry{upstreams: make(map[string]*upstreamConn), ident: r.identityFor(clientKey, ipKey)}
 		r.clients[clientKey] = entry
 	}
 	return entry
@@ -1561,7 +1720,7 @@ func (r *sharedUDPRelay) getOrCreateUpstream(l *proxyPortListener, entry *udpCli
 	entry.upstreams[destAddr] = uc
 	clientCopy := *clientAddr
 	r.wg.Add(1)
-	go r.upstreamWorker(l, clientKey, destAddr, uc, &clientCopy)
+	go r.upstreamWorker(l, entry.ident, clientKey, destAddr, uc, &clientCopy)
 	return uc
 }
 
@@ -1582,9 +1741,12 @@ func (r *sharedUDPRelay) removeUpstream(clientKey string, destAddr string, targe
 	}
 }
 
-func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, destAddr string, uc *upstreamConn, clientAddr *net.UDPAddr) {
+func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, ident *proxyPortIdentity, clientKey string, destAddr string, uc *upstreamConn, clientAddr *net.UDPAddr) {
 	defer r.wg.Done()
-	pc, err := l.dialUDPUpstream(destAddr)
+	if ident == nil {
+		ident = l.authTable().anonymous()
+	}
+	pc, err := l.dialUDPFor(ident, destAddr)
 	if err != nil {
 		logger.Warn("SOCKS5 UDP relay: failed to dial upstream for %s: %v (proxy_port=%s)", destAddr, err, r.cfgID)
 		uc.close()
@@ -1604,7 +1766,7 @@ func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, 
 	uc.mu.Unlock()
 
 	r.wg.Add(1)
-	go r.forwardUDPResponses(pc, clientAddr, socks5UDPResponseAddr(destAddr), uc.done)
+	go r.forwardUDPResponses(pc, clientAddr, socks5UDPResponseAddr(destAddr), uc.done, ident)
 
 	consecutiveWriteFailures := 0
 	var writeDeadlineAt time.Time // refreshed only when under half the timeout is left
@@ -1640,7 +1802,7 @@ func (r *sharedUDPRelay) upstreamWorker(l *proxyPortListener, clientKey string, 
 	}
 }
 
-func (r *sharedUDPRelay) forwardUDPResponses(pc net.PacketConn, clientAddr *net.UDPAddr, fallbackAddr net.Addr, done <-chan struct{}) {
+func (r *sharedUDPRelay) forwardUDPResponses(pc net.PacketConn, clientAddr *net.UDPAddr, fallbackAddr net.Addr, done <-chan struct{}, ident *proxyPortIdentity) {
 	defer r.wg.Done()
 	respBuf := make([]byte, sharedUDPRelayMaxResponseHeader+sharedUDPRelayMaxDatagramSize)
 	// Set read deadline once; reset only after timeout. This eliminates 1
@@ -1690,6 +1852,7 @@ func (r *sharedUDPRelay) forwardUDPResponses(pc net.PacketConn, clientAddr *net.
 		// response goroutine (they would overwrite each other's deadline), and a
 		// UDP send does not block on a slow client anyway.
 		_, _ = r.conn.WriteToUDP(respBuf[packetStart:sharedUDPRelayMaxResponseHeader+n], clientAddr)
+		ident.addBytes(0, int64(n))
 	}
 }
 
@@ -1716,7 +1879,7 @@ func (r *sharedUDPRelay) close() {
 // All clients on the same proxy port share a single UDP relay socket,
 // bound to the same port as the TCP listener when possible, so cloud VPS
 // firewalls only need to open one port for both TCP+UDP.
-func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
+func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn, ident *proxyPortIdentity, requested string) {
 	relay, err := l.getOrCreateSharedUDPRelay()
 	if err != nil {
 		logger.Error("SOCKS5 UDP ASSOCIATE: failed to create relay socket: %v (proxy_port=%s)", err, l.cfg.ID)
@@ -1743,9 +1906,15 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 	}
 	clearProxyConnDeadline(conn)
 
-	// Register this client IP so the shared relay accepts its UDP datagrams
+	// Register this client IP so the shared relay accepts its UDP datagrams,
+	// with the identity whose route they follow. Clients that name their UDP
+	// source port get an exact mapping (two users behind one IP still work).
+	clientPort := 0
+	if _, p, err := net.SplitHostPort(requested); err == nil {
+		clientPort, _ = strconv.Atoi(p)
+	}
 	if clientIP != nil {
-		relay.registerClientIP(clientIP)
+		relay.registerClient(clientIP, clientPort, ident)
 	}
 
 	logger.Info("SOCKS5 UDP ASSOCIATE: relay=0.0.0.0:%d for client=%s (proxy_port=%s)",
@@ -1790,7 +1959,7 @@ func (l *proxyPortListener) handleSocks5UDPAssociate(conn net.Conn) {
 
 	// Client disconnected — unregister and clean up per-client upstreams
 	if clientIP != nil {
-		relay.unregisterClientIP(clientIP)
+		relay.unregisterClient(clientIP, clientPort)
 	}
 
 	logger.Debug("SOCKS5 UDP ASSOCIATE: control connection closed for client=%s (proxy_port=%s)",

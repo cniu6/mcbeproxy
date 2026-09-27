@@ -26,13 +26,13 @@ func (c Config) Clone() Config {
 
 // Decision is the outcome of matching a destination.
 type Decision struct {
-	RuleID          string
-	RuleName        string
-	Action          string // ActionDefault when no rule matched
-	Outbound        string
-	LoadBalance     string
-	LoadBalanceSort string
-	Interface       string // effective interface, "" = OS routing
+	RuleID          string `json:"rule_id,omitempty"`
+	RuleName        string `json:"rule_name,omitempty"`
+	Action          string `json:"action"` // ActionDefault when no rule matched
+	Outbound        string `json:"outbound,omitempty"`
+	LoadBalance     string `json:"load_balance,omitempty"`
+	LoadBalanceSort string `json:"load_balance_sort,omitempty"`
+	Interface       string `json:"interface,omitempty"` // effective interface, "" = OS routing
 }
 
 // Matched reports whether a rule matched.

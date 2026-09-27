@@ -2880,6 +2880,14 @@ func (p *ProxyServer) GetActiveSessionCount() int {
 	return p.sessionMgr.Count()
 }
 
+// GetProxyPortUserStats returns per-user counters of a multi-user proxy port.
+func (p *ProxyServer) GetProxyPortUserStats(portID string) []ProxyPortUserStat {
+	if p == nil || p.proxyPortManager == nil {
+		return nil
+	}
+	return p.proxyPortManager.UserStats(portID)
+}
+
 func (p *ProxyServer) GetActiveProxyPortConnectionCount() int {
 	if p == nil || p.proxyPortManager == nil {
 		return 0

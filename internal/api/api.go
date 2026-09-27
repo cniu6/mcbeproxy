@@ -62,6 +62,8 @@ type APIServer struct {
 	// Proxy port config manager
 	proxyPortConfigMgr   *config.ProxyPortConfigManager
 	serverLatencyHistory *serverLatencyHistoryStore
+	// Global network settings (interface pinning + destination rules)
+	networkStore *netroute.Store
 }
 
 func (a *APIServer) globalConfigPath() string {
@@ -451,6 +453,17 @@ func (a *APIServer) setupRoutes() {
 				proxyPortAdminGroup.DELETE("/:id", a.deleteProxyPort)
 				proxyPortGroup.POST("/:id/test", a.testProxyPort)
 			}
+		}
+
+		// Network settings: outgoing interface + destination rules
+		networkGroup := api.Group("/network")
+		networkAdminGroup := networkGroup.Group("")
+		networkAdminGroup.Use(a.requireAdminMiddleware())
+		{
+			networkGroup.GET("", a.getNetworkConfig)
+			networkGroup.GET("/interfaces", a.getNetworkInterfaces)
+			networkGroup.POST("/test", a.testNetworkRoute)
+			networkAdminGroup.PUT("", a.updateNetworkConfig)
 		}
 	}
 }

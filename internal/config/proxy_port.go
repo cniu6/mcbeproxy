@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 // ProxyPortType constants.
@@ -44,6 +45,52 @@ type ProxyPortConfig struct {
 	AutoPingFullScanTime          string   `json:"auto_ping_full_scan_time,omitempty"`
 	AutoPingFullScanIntervalHours int      `json:"auto_ping_full_scan_interval_hours"`
 	AllowList                     []string `json:"allow_list"` // CIDR list
+	// IgnoreRouteRules skips the global destination rules (network page)
+	// for this port; users can override it individually.
+	IgnoreRouteRules bool `json:"ignore_route_rules,omitempty"`
+	// Users lets one listening port serve several credentials, each with its
+	// own route. Empty = the single Username/Password above (old behavior).
+	// When set, Username/Password (if non-empty) still work as a default
+	// user that follows the port's own route.
+	Users []ProxyPortUser `json:"users,omitempty"`
+}
+
+// ProxyPortUser is one credential on a multi-user proxy port. Every routing
+// field is optional and falls back to the port's value.
+type ProxyPortUser struct {
+	Username        string   `json:"username"`
+	Password        string   `json:"password"`
+	Disabled        bool     `json:"disabled,omitempty"`
+	Remark          string   `json:"remark,omitempty"`
+	ProxyOutbound   string   `json:"proxy_outbound,omitempty"` // "" = the port's route; "direct", node, "@group", "a,b"
+	LoadBalance     string   `json:"load_balance,omitempty"`
+	LoadBalanceSort string   `json:"load_balance_sort,omitempty"`
+	AllowList       []string `json:"allow_list,omitempty"`      // client IP/CIDR whitelist on top of the port's
+	MaxConnections  int      `json:"max_connections,omitempty"` // concurrent connections, 0 = unlimited
+	ExpireAt        string   `json:"expire_at,omitempty"`       // RFC3339 or YYYY-MM-DD[ HH:MM]; empty = never
+	DisableUDP      bool     `json:"disable_udp,omitempty"`     // refuse SOCKS5 UDP ASSOCIATE
+	// IgnoreRouteRules: nil = inherit the port's setting.
+	IgnoreRouteRules *bool `json:"ignore_route_rules,omitempty"`
+}
+
+// ParseExpireAt parses the accepted expiry formats (local time for dates).
+func ParseExpireAt(v string) (time.Time, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02T15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, v, time.Local); err == nil {
+			if layout == "2006-01-02" {
+				t = t.Add(24*time.Hour - time.Nanosecond) // the whole day counts
+			}
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid expire_at %q (use 2006-01-02, 2006-01-02 15:04 or RFC3339)", v)
 }
 
 // Clone returns a deep copy of the config.
@@ -54,6 +101,19 @@ func (pc *ProxyPortConfig) Clone() *ProxyPortConfig {
 	clone := *pc
 	if pc.AllowList != nil {
 		clone.AllowList = append([]string{}, pc.AllowList...)
+	}
+	if pc.Users != nil {
+		clone.Users = make([]ProxyPortUser, len(pc.Users))
+		for i, u := range pc.Users {
+			if u.AllowList != nil {
+				u.AllowList = append([]string{}, u.AllowList...)
+			}
+			if u.IgnoreRouteRules != nil {
+				v := *u.IgnoreRouteRules
+				u.IgnoreRouteRules = &v
+			}
+			clone.Users[i] = u
+		}
 	}
 	return &clone
 }
@@ -141,7 +201,36 @@ func (pc *ProxyPortConfig) Validate() error {
 	if err := validateCIDRList(pc.AllowList); err != nil {
 		return err
 	}
+	seen := make(map[string]bool, len(pc.Users))
+	for i := range pc.Users {
+		u := &pc.Users[i]
+		u.Username = strings.TrimSpace(u.Username)
+		if u.Username == "" {
+			return fmt.Errorf("users[%d]: username is required", i)
+		}
+		if seen[u.Username] {
+			return fmt.Errorf("duplicate user %q", u.Username)
+		}
+		seen[u.Username] = true
+		if u.Username == pc.Username && pc.Username != "" {
+			return fmt.Errorf("user %q duplicates the port's own username", u.Username)
+		}
+		if u.MaxConnections < 0 {
+			return fmt.Errorf("user %q: max_connections must be >= 0", u.Username)
+		}
+		if _, err := ParseExpireAt(u.ExpireAt); err != nil {
+			return fmt.Errorf("user %q: %w", u.Username, err)
+		}
+		if err := validateCIDRList(u.AllowList); err != nil {
+			return fmt.Errorf("user %q: %w", u.Username, err)
+		}
+	}
 	return nil
+}
+
+// RequiresAuth reports whether clients must present credentials.
+func (pc *ProxyPortConfig) RequiresAuth() bool {
+	return pc.Username != "" || pc.Password != "" || len(pc.Users) > 0
 }
 
 // IsDirectConnection returns true if no proxy outbound is configured.

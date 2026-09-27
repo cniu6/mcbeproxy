@@ -76,7 +76,7 @@
 import { ref, h, onMounted, onUnmounted, computed, defineAsyncComponent } from 'vue'
 import { darkTheme } from 'naive-ui'
 import { api } from './api'
-import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline } from '@vicons/ionicons5'
+import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline, GlobeOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 
 // 视图按需加载（每个页面一个 chunk），减小入口体积
@@ -92,6 +92,7 @@ const Settings = defineAsyncComponent(() => import('./views/Settings.vue'))
 const ProxyOutbounds = defineAsyncComponent(() => import('./views/ProxyOutbounds.vue'))
 const ProxyPorts = defineAsyncComponent(() => import('./views/ProxyPorts.vue'))
 const Debug = defineAsyncComponent(() => import('./views/Debug.vue'))
+const NetworkRoute = defineAsyncComponent(() => import('./views/NetworkRoute.vue'))
 
 const versionInfo = ref({ version: 'dev', build_time: 'unknown', git_commit: 'unknown' })
 const versionLabel = computed(() => {
@@ -117,6 +118,7 @@ const menuOptions = [
   { label: '代理服务器', key: 'servers', icon: renderIcon(ServerOutline) },
   { label: '代理节点', key: 'proxy-outbounds', icon: renderIcon(GitNetworkOutline) },
   { label: '代理端口', key: 'proxy-ports', icon: renderIcon(SwapHorizontalOutline) },
+  { label: '路由网络', key: 'network', icon: renderIcon(GlobeOutline) },
   { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
   { label: '黑名单', key: 'blacklist', icon: renderIcon(BanOutline) },
   { label: '白名单', key: 'whitelist', icon: renderIcon(CheckmarkCircleOutline) },
@@ -135,6 +137,7 @@ const pageComponentMap = {
   'servers': Servers,
   'proxy-outbounds': ProxyOutbounds,
   'proxy-ports': ProxyPorts,
+  'network': NetworkRoute,
   'players': Players,
   'blacklist': Blacklist,
   'whitelist': Whitelist,
