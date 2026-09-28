@@ -432,15 +432,6 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		logger.Debug("Attempting RakNet connection to %s (attempt %d/3)", targetAddr, i+1)
 
 		if useProxy {
-			// Use proxy dialer for outbound connection
-			proxyDialer := NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
-			lastProxyDialer = proxyDialer
-			// Cap the MTU through the node: a 1492-byte probe plus the node's
-			// header exceeds 1500 and is dropped, which stalled MTU discovery.
-			dialer := raknet.Dialer{
-				UpstreamDialer: proxyDialer,
-				MaxMTU:         uint16(serverCfg.GetRakNetMTUClamp()),
-			}
 			if i == 0 {
 				proxyConfig := serverCfg.GetProxyOutbound()
 				if strings.Contains(proxyConfig, ",") {
@@ -452,9 +443,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 					logger.Info("Connecting to remote %s via node '%s'", targetAddr, proxyConfig)
 				}
 			}
-			// Short attempts: a dead node association never answers, and a
-			// fresh one (next attempt) usually connects at once.
-			remoteConn, err = dialer.DialTimeout(targetAddr, 5*time.Second)
+			remoteConn, lastProxyDialer, err = p.dialViaNode(serverCfg, targetAddr)
 		} else {
 			// Use direct connection
 			// Requirements: 2.2
@@ -644,8 +633,21 @@ func (p *RakNetProxy) tryExtractPlayerInfo(sess *session.Session, data []byte) {
 	if len(data) < 10 || !sess.ShouldScanForLogin() {
 		return
 	}
+	// Same Login parser as raw_udp: decompresses the batch and reads the
+	// identity chain. The text search below misses compressed Logins.
+	if data[0] == raknetGamePacketHeader {
+		if name, uuid, xuid := rakNetLoginParser.parseLoginPacket(data); name != "" {
+			logger.Info("Player identified: name=%s, xuid=%s, client=%s", name, xuid, sess.ClientAddr)
+			sess.SetPlayerInfoWithXUID(uuid, name, xuid)
+			p.enforceACL(sess, name)
+			return
+		}
+	}
 	p.searchForPlayerInfo(sess, data)
 }
+
+// rakNetLoginParser reuses raw_udp's stateless Login parsing helpers.
+var rakNetLoginParser = &RawUDPProxy{}
 
 // tryExtractPlayerInfoFromServer attempts to extract player info from server packets.
 func (p *RakNetProxy) tryExtractPlayerInfoFromServer(sess *session.Session, data []byte) {
@@ -659,62 +661,27 @@ func (p *RakNetProxy) tryExtractPlayerInfoFromServer(sess *session.Session, data
 // to look for a Disconnect reason.
 const rakNetDisconnectScanMaxBytes = 1024
 
-// searchForPlayerInfo searches for player information patterns in packet data.
+// searchForPlayerInfo is the fallback for Logins the structured parser could
+// not read: it looks for identity fields as plain text.
 func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 	dataStr := string(data)
-
-	// Pattern 1: Look for "displayName" in JSON
 	if idx := findPattern(dataStr, `"displayName"`); idx >= 0 {
-		name := extractJSONString(dataStr, idx, "displayName")
-		if name != "" && len(name) > 0 && len(name) < 50 {
+		if name := extractJSONString(dataStr, idx, "displayName"); name != "" && len(name) < 50 {
 			logger.Info("Player identified: name=%s, client=%s", name, sess.ClientAddr)
 			sess.SetPlayerInfo("", name)
-
-			// 在 RakNet 模式下，同样在这里做 ACL 检查。
-			// 如果拒绝，则额外构造一个 MCBE Disconnect 包，把 ACL 返回的原因当作踢出文案发给客户端，
-			// 避免玩家只看到“断开与主机的连接”，无法知道是被封禁/未在白名单等原因。
-			if p.aclManager != nil {
-				allowed, reason := p.checkACLAccess(name, p.config.GetACLServerID(), sess.ClientAddr)
-				if !allowed {
-					if reason == "" {
-						reason = "你已被封禁"
-					}
-					logger.Warn("RakNet proxy: ACL denied, will disconnect player=%s, reason=%s", name, reason)
-
-					// 尝试获取当前玩家对应的 RakNet 连接并发送 Disconnect
-					p.activeConnsMu.RLock()
-					conn := p.activeConns[sess.ClientAddr]
-					p.activeConnsMu.RUnlock()
-
-					if conn != nil {
-						if err := p.sendDisconnect(conn, reason); err != nil {
-							logger.Debug("Failed to send ACL disconnect packet to client %s: %v", sess.ClientAddr, err)
-						}
-						// 主动关闭连接，结束转发循环
-						_ = conn.Close()
-					} else {
-						logger.Debug("RakNet proxy: no active conn found for ACL-denied client %s", sess.ClientAddr)
-					}
-				}
-			}
+			p.enforceACL(sess, name)
 			return
 		}
 	}
-
-	// Pattern 2: Look for "identity" (UUID) in JSON
 	if idx := findPattern(dataStr, `"identity"`); idx >= 0 {
-		uuid := extractJSONString(dataStr, idx, "identity")
-		if uuid != "" && len(uuid) == 36 {
+		if uuid := extractJSONString(dataStr, idx, "identity"); len(uuid) == 36 {
 			logger.Info("Player UUID found: uuid=%s, client=%s", uuid, sess.ClientAddr)
 			sess.SetPlayerInfo(uuid, sess.GetDisplayName())
 			return
 		}
 	}
-
-	// Pattern 3: Look for XUID
 	if idx := findPattern(dataStr, `"XUID"`); idx >= 0 {
-		xuid := extractJSONString(dataStr, idx, "XUID")
-		if xuid != "" && len(xuid) > 0 {
+		if xuid := extractJSONString(dataStr, idx, "XUID"); xuid != "" {
 			logger.Info("Player XUID found: xuid=%s, client=%s", xuid, sess.ClientAddr)
 			if sess.GetDisplayName() == "" {
 				sess.SetPlayerInfo(xuid, "")
@@ -723,7 +690,33 @@ func (p *RakNetProxy) searchForPlayerInfo(sess *session.Session, data []byte) {
 	}
 }
 
-// findPattern finds a pattern in a string and returns its index.
+// enforceACL disconnects a denied player, sending the ACL reason as the
+// MCBE Disconnect message so they see why instead of a bare disconnect.
+func (p *RakNetProxy) enforceACL(sess *session.Session, name string) {
+	if p.aclManager == nil {
+		return
+	}
+	allowed, reason := p.checkACLAccess(name, p.config.GetACLServerID(), sess.ClientAddr)
+	if allowed {
+		return
+	}
+	if reason == "" {
+		reason = "你已被封禁"
+	}
+	logger.Warn("RakNet proxy: ACL denied, will disconnect player=%s, reason=%s", name, reason)
+	p.activeConnsMu.RLock()
+	conn := p.activeConns[sess.ClientAddr]
+	p.activeConnsMu.RUnlock()
+	if conn == nil {
+		logger.Debug("RakNet proxy: no active conn found for ACL-denied client %s", sess.ClientAddr)
+		return
+	}
+	if err := p.sendDisconnect(conn, reason); err != nil {
+		logger.Debug("Failed to send ACL disconnect packet to client %s: %v", sess.ClientAddr, err)
+	}
+	_ = conn.Close()
+}
+
 func findPattern(s, pattern string) int {
 	for i := 0; i <= len(s)-len(pattern); i++ {
 		if s[i:i+len(pattern)] == pattern {
@@ -948,4 +941,61 @@ func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) error {
 		return fmt.Errorf("write disconnect packet: %w", err)
 	}
 	return nil
+}
+
+// dialViaNode dials targetAddr through the server's outbound. A node's first
+// UDP association often never answers (dead relay), so a second association
+// is started if the first has not connected within 1.5s; the first to finish
+// the RakNet handshake wins and the other is closed.
+func (p *RakNetProxy) dialViaNode(serverCfg *config.ServerConfig, targetAddr string) (*raknet.Conn, *ProxyDialer, error) {
+	type result struct {
+		conn   *raknet.Conn
+		dialer *ProxyDialer
+		err    error
+	}
+	results := make(chan result, 2)
+	dial := func() {
+		pd := NewProxyDialer(p.outboundMgr, serverCfg, 15*time.Second)
+		// Cap the MTU through the node: a 1492-byte probe plus the node's
+		// header exceeds 1500 and is dropped, which stalls MTU discovery.
+		c, err := raknet.Dialer{UpstreamDialer: pd, MaxMTU: uint16(serverCfg.GetRakNetMTUClamp())}.DialTimeout(targetAddr, 5*time.Second)
+		results <- result{c, pd, err}
+	}
+	go dial()
+	started, pending := 1, 1
+	stagger := time.NewTimer(1500 * time.Millisecond)
+	defer stagger.Stop()
+	var firstErr error
+	for pending > 0 {
+		select {
+		case <-stagger.C:
+			if started < 2 {
+				started++
+				pending++
+				go dial()
+			}
+		case r := <-results:
+			pending--
+			if r.err == nil {
+				// Close a slower association that may still connect.
+				go func(n int) {
+					for ; n > 0; n-- {
+						if o := <-results; o.conn != nil {
+							_ = o.conn.Close()
+						}
+					}
+				}(pending)
+				return r.conn, r.dialer, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if started < 2 {
+				started++
+				pending++
+				go dial()
+			}
+		}
+	}
+	return nil, nil, firstErr
 }
