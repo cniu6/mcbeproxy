@@ -224,3 +224,5 @@ require (
 )
 
 replace github.com/xtls/xray-core => ./third_party/xray-core
+
+replace github.com/sandertv/go-raknet => ./third_party/go-raknet
