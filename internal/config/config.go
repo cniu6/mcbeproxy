@@ -177,9 +177,11 @@ type ServerConfig struct {
 	// clamping on tunnels). 0 = auto (1400 when routed via a proxy node, off
 	// for direct), -1 = never rewrite, 576..1492 = explicit clamp.
 	RakNetMTU int `json:"raknet_mtu,omitempty"`
-	// DownstreamLimitKbps paces what proxy_mode "raknet" sends to each client
-	// (kbit/s). Set it just under the server's egress bandwidth cap so a join
-	// burst queues instead of being dropped by the cloud's policer. 0 = off.
+	// DownstreamLimitKbps paces what proxy_mode "raknet" and "raw_udp" send to
+	// each client (kbit/s). Set it just under the server's egress bandwidth cap
+	// so a join burst queues instead of being dropped by the cloud's policer.
+	// raw_udp then ACKs the server itself and resends lost frames to the client
+	// (see proxy/raw_udp_pacer.go). 0 = off.
 	DownstreamLimitKbps int `json:"downstream_limit_kbps,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
@@ -603,8 +605,8 @@ type RawUDPClientStatsDTO struct {
 	MaxWriteClientMs       int64     `json:"max_write_client_ms"`
 	SlowWriteClient        int64     `json:"slow_write_client_count"`
 	StallReason            string    `json:"stall_reason,omitempty"`
-	// raknet mode only: round-trip times of each leg and bytes waiting in
-	// the downstream_limit_kbps pacer.
+	// Round-trip times of each leg (raknet mode; raw_udp reports the client
+	// leg when paced) and bytes waiting in the downstream_limit_kbps pacer.
 	ClientRTTMs            int64     `json:"client_rtt_ms,omitempty"`
 	TargetRTTMs            int64     `json:"target_rtt_ms,omitempty"`
 	DownstreamPendingBytes int64     `json:"downstream_pending_bytes,omitempty"`

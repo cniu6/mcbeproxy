@@ -110,10 +110,10 @@
               <template #feedback>0=自动(走节点时限制为1400，直连不改)，-1=不改写，576~1492=指定值。走代理卡加载界面时保持自动。</template>
             </n-form-item>
           </n-gi>
-          <n-gi v-if="isRaknetMode">
+          <n-gi v-if="canLimitDownstream">
             <n-form-item label="下行限速(kbps)">
               <n-input-number v-model:value="form.downstream_limit_kbps" :min="0" :step="100" style="width: 100%" placeholder="0=不限速" />
-              <template #feedback>仅 RakNet 模式。填略低于服务器出口带宽的值(如 3Mbps 填 2400)：进服大包先由代理收下再匀速发给玩家，不再被云厂商限速丢包卡死。0=不限速。</template>
+              <template #feedback>RakNet / Raw UDP 模式。填略低于服务器出口带宽的值(如 3Mbps 填 2400)：进服大包先由代理收下再匀速发给玩家，不再被云厂商限速丢包卡死。Raw UDP 下代理替玩家向服务器确认收包、自己补发丢包，不解密。0=不限速。</template>
             </n-form-item>
           </n-gi>
           <template v-if="canUseNetherNetRelay">
@@ -1523,7 +1523,8 @@ const generateDefaultMOTD = (name, port) => {
 }
 const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
-const isRaknetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'raknet')
+// downstream_limit_kbps paces raknet and raw_udp (proxy/raw_udp_pacer.go).
+const canLimitDownstream = computed(() => isRaknetProtocol.value && ['raknet', 'raw_udp'].includes(String(form.value.proxy_mode || '').toLowerCase()))
 const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
 // The NetherNet relay rides on a RakNet UDP listener: raw_udp, or protocol=udp (plain UDP).
 const canUseNetherNetRelay = computed(() => {
@@ -2326,7 +2327,7 @@ const renderRawUDPStatsTooltip = (stats, clients = []) => {
     `写客户端超时/错误: ${stats.write_client_timeouts || 0}/${stats.write_client_errors || 0}`,
     `读目标超时: ${stats.read_target_timeouts || 0}`,
     `异常合计: ${errorCount}`,
-    ...(stats.client_rtt_ms || stats.target_rtt_ms ? [`延迟(RTT): 客户端 ${stats.client_rtt_ms || 0}ms / 目标 ${stats.target_rtt_ms || 0}ms`] : []),
+    ...(stats.client_rtt_ms || stats.target_rtt_ms ? [`延迟(RTT): 客户端 ${stats.client_rtt_ms || 0}ms${stats.target_rtt_ms ? ` / 目标 ${stats.target_rtt_ms}ms` : ''}`] : []),
     ...(stats.downstream_pending_bytes ? [`下行限速排队: ${formatLiveSessionBytes(stats.downstream_pending_bytes)}`] : [])
   ]
   const children = lines.map(line => h('div', null, line))

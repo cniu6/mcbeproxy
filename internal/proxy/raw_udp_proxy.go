@@ -241,6 +241,7 @@ type rawUDPClientInfo struct {
 	maxTargetPacketGapMs   atomic.Int64
 	upLeg                  rakLegStats // RakNet seq/NACK accounting for packets from the client
 	downLeg                rakLegStats // ... and for packets from the target
+	pacer                  *rawUDPPacer // downstream_limit_kbps (raw_udp_pacer.go); nil when off
 	writeMetricWindowAt    atomic.Int64
 	recentMaxWriteTargetMs atomic.Int64
 	recentMaxWriteClientMs atomic.Int64
@@ -675,6 +676,11 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 			queueCap = cap(clientInfo.upstreamWriteCh)
 		}
 		upBPS, downBPS := rawUDPCurrentRates(clientInfo, upBytes, downBytes, now)
+		var pacedBytes int
+		var clientRTT time.Duration
+		if clientInfo.pacer != nil {
+			pacedBytes, clientRTT = clientInfo.pacer.stats()
+		}
 		stats = append(stats, config.RawUDPClientStatsDTO{
 			Client:                 clientKey,
 			ClientAddr:             clientAddr,
@@ -717,6 +723,8 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 			RecentMaxWriteTargetMs: clientInfo.recentMaxWriteTargetMs.Load(),
 			RecentMaxWriteClientMs: clientInfo.recentMaxWriteClientMs.Load(),
 			StallReason:            rawUDPStallReason(clientInfo, sinceClientMs, sinceTargetMs),
+			ClientRTTMs:            clientRTT.Milliseconds(),
+			DownstreamPendingBytes: int64(pacedBytes),
 		})
 		return true
 	})
@@ -1486,6 +1494,9 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				p.replayKickResponse(clientInfo, buffer[:n])
 				continue
 			}
+			if clientInfo.pacer != nil && n > 0 && buffer[0] == raknetOpenConnectionReq1 {
+				clientInfo.pacer.reset() // a new RakNet connection from the same address
+			}
 
 			// Update stats (lock-free)
 			now := time.Now().UnixNano()
@@ -1520,6 +1531,13 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				} else {
 					logger.Info("Raw UDP client connected: %s -> %s (direct)", clientAddr.String(), p.effectiveTargetAddrString())
 				}
+			}
+
+			// With a pacer the client's ACK/NACKs name the pacer's datagram
+			// numbers, not the server's: they end there.
+			if clientInfo.pacer != nil && n > 0 && buffer[0]&0x80 != 0 && buffer[0]&(raknetACKMask|raknetNACKMask) != 0 {
+				clientInfo.pacer.fromClient(buffer[:n], time.Now())
+				continue
 			}
 
 			// Check if we still need to verify Login. Parsing is best-effort and bounded;
@@ -1731,6 +1749,7 @@ func (p *RawUDPProxy) getOrCreateClientKeyed(clientAddr *net.UDPAddr, clientKey 
 	}
 	clientInfo.lastSeen.Store(now.UnixNano())
 	clientInfo.lastClientPacket.Store(now.UnixNano())
+	p.startRawUDPPacer(clientInfo)
 
 	// Store client
 	p.clients.Store(clientKey, clientInfo)
@@ -1853,6 +1872,7 @@ func (p *RawUDPProxy) finishPendingClientDial(clientKey string, clientAddr *net.
 	}
 	clientInfo.lastSeen.Store(now.UnixNano())
 	clientInfo.lastClientPacket.Store(placeholder.lastClientPacket.Load())
+	p.startRawUDPPacer(clientInfo)
 
 	// Flush everything buffered while pending into the new client's upstream
 	// queue BEFORE publishing it, so ordering is preserved: any packet the
@@ -1874,6 +1894,7 @@ func (p *RawUDPProxy) finishPendingClientDial(clientKey string, clientAddr *net.
 	// sweep, or a brand new reconnect), discard this connection instead of
 	// clobbering whatever now owns the slot.
 	if !p.clients.CompareAndSwap(clientKey, placeholder, clientInfo) {
+		clientInfo.pacer.close()
 		_ = targetConn.Close()
 		logger.Debug("RawUDP: async dial finished but client %s was superseded, discarding connection", clientKey)
 		return
@@ -2360,11 +2381,15 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			// Forward to client FIRST — minimizes time between reading from
 			// target and delivering to client, reducing risk of kernel buffer
 			// overflow on the target connection under heavy traffic.
-			writeStart := time.Now()
-			_, err = p.writeToClient(clientAddr, buffer[:n], UDPWriteTimeout)
-			writeElapsed := time.Since(writeStart)
-			rawUDPRecordWriteLatency(&clientInfo.lastWriteClientMs, &clientInfo.maxWriteClientMs, &clientInfo.slowWriteClientCount, writeElapsed)
-			rawUDPRecordRecentWrite(clientInfo, false, writeElapsed, time.Now())
+			if clientInfo.pacer != nil {
+				clientInfo.pacer.fromTarget(buffer[:n], time.Now())
+			} else {
+				writeStart := time.Now()
+				_, err = p.writeToClient(clientAddr, buffer[:n], UDPWriteTimeout)
+				writeElapsed := time.Since(writeStart)
+				rawUDPRecordWriteLatency(&clientInfo.lastWriteClientMs, &clientInfo.maxWriteClientMs, &clientInfo.slowWriteClientCount, writeElapsed)
+				rawUDPRecordRecentWrite(clientInfo, false, writeElapsed, time.Now())
+			}
 
 			if err != nil {
 				// ICMP from the client side (NAT rebinding, brief unreachable)
@@ -2445,9 +2470,11 @@ func (p *RawUDPProxy) updateRakNetSendStateFromDatagram(datagram []byte, clientI
 		return
 	}
 
-	// Update datagram sequence (24-bit LE).
-	seq := uint32(datagram[1]) | uint32(datagram[2])<<8 | uint32(datagram[3])<<16
-	atomicMaxUint24(&clientInfo.sendDatagramSeq, seq)
+	// Update datagram sequence (24-bit LE). A pacer numbers the client's
+	// datagrams itself and keeps sendDatagramSeq current.
+	if clientInfo.pacer == nil {
+		atomicMaxUint24(&clientInfo.sendDatagramSeq, rawUDPUint24(datagram[1:]))
+	}
 
 	// Parse encapsulated packets to learn the current messageIndex/orderIndex used by the remote server.
 	offset := 4
@@ -2598,6 +2625,7 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 		logger.Info("Raw UDP client disconnected: %s, duration=%s, up=%s, down=%s, total=%s, active_proxy_clients=%d %s",
 			clientKey, durationStr, formatBytes(bytesUp), formatBytes(bytesDown), formatBytes(totalBytes), p.GetActiveClientCount(), clientInfo.rakLoss())
 	}
+	clientInfo.pacer.close()
 
 	// Credit any bytes not yet delta-synced before the session is persisted,
 	// otherwise the tail of the connection's traffic is lost from statistics.
@@ -4432,7 +4460,12 @@ func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo
 }
 
 func buildInjectedReliableOrderedFrame(clientInfo *rawUDPClientInfo, payload []byte) []byte {
-	seq := clientInfo.sendDatagramSeq.Add(1) & 0xFFFFFF
+	var seq uint32
+	if clientInfo.pacer != nil {
+		seq = clientInfo.pacer.takeSeq()
+	} else {
+		seq = clientInfo.sendDatagramSeq.Add(1) & 0xFFFFFF
+	}
 	msgIndex := clientInfo.sendMessageIndex.Add(1) & 0xFFFFFF
 	orderIndex := clientInfo.sendOrderIndex.Add(1) & 0xFFFFFF
 

@@ -86,14 +86,15 @@ func rakNACKMissing(b []byte) int {
 }
 
 type rakLossSnapshot struct {
-	c2pLost, c2pDatagrams int64 // client -> proxy leg
-	t2pLost, t2pDatagrams int64 // target -> node -> proxy leg
-	clientNacked          int64 // downstream datagrams the client never got (whole path)
-	targetNacked          int64 // upstream datagrams the target never got (whole path)
+	c2pLost, c2pDatagrams int64  // client -> proxy leg
+	t2pLost, t2pDatagrams int64  // target -> node -> proxy leg
+	clientNacked          int64  // downstream datagrams the client never got (whole path)
+	targetNacked          int64  // upstream datagrams the target never got (whole path)
+	paced                 string // pacer counters (downstream_limit_kbps), else empty
 }
 
 func (c *rawUDPClientInfo) rakLoss() rakLossSnapshot {
-	return rakLossSnapshot{
+	s := rakLossSnapshot{
 		c2pLost:      c.upLeg.lost.Load(),
 		c2pDatagrams: c.upLeg.datagrams.Load(),
 		t2pLost:      c.downLeg.lost.Load(),
@@ -101,16 +102,30 @@ func (c *rawUDPClientInfo) rakLoss() rakLossSnapshot {
 		clientNacked: c.upLeg.nackMissing.Load(),
 		targetNacked: c.downLeg.nackMissing.Load(),
 	}
+	if c.pacer != nil {
+		s.paced = c.pacer.String()
+	}
+	return s
 }
 
 // String reports per-leg loss. p2c (proxy -> client) and p2t (proxy -> target)
 // are the NACKed totals minus what was already missing when it reached the
-// proxy; they are estimates (a total blackout produces no NACKs at all).
+// proxy; they are estimates (a total blackout produces no NACKs at all). A
+// pacer recovers t2p loss itself and numbers the client's datagrams, so there
+// every client NACK is p2c loss.
 func (s rakLossSnapshot) String() string {
-	return fmt.Sprintf("loss[c2p=%d/%d t2p=%d/%d client_nacked=%d(p2c~%d) target_nacked=%d(p2t~%d)]",
+	p2c := max(s.clientNacked-s.t2pLost, 0)
+	if s.paced != "" {
+		p2c = s.clientNacked
+	}
+	out := fmt.Sprintf("loss[c2p=%d/%d t2p=%d/%d client_nacked=%d(p2c~%d) target_nacked=%d(p2t~%d)]",
 		s.c2pLost, s.c2pDatagrams, s.t2pLost, s.t2pDatagrams,
-		s.clientNacked, max(s.clientNacked-s.t2pLost, 0),
+		s.clientNacked, p2c,
 		s.targetNacked, max(s.targetNacked-s.c2pLost, 0))
+	if s.paced != "" {
+		out += " " + s.paced
+	}
+	return out
 }
 
 // rawUDPFlowTraceWindow bounds the per-second debug trace to the join phase,

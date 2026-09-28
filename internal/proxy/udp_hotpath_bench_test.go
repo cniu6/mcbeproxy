@@ -28,6 +28,9 @@ func startBenchUDPEcho(b *testing.B) *net.UDPAddr {
 			if err != nil {
 				return
 			}
+			if n > 0 && buf[0]&0x80 != 0 && buf[0]&0x60 != 0 {
+				continue // a paced proxy's RakNet ACK/NACK: not part of the ping-pong
+			}
 			_, _ = conn.WriteToUDPAddrPort(buf[:n], addr)
 		}
 	}()
@@ -82,8 +85,20 @@ func benchServerConfig(id string, echo *net.UDPAddr) *config.ServerConfig {
 }
 
 func BenchmarkRawUDPRoundTrip(b *testing.B) {
+	benchRawUDPRoundTrip(b, 0)
+}
+
+// BenchmarkRawUDPPacedRoundTrip is the same with downstream_limit_kbps set
+// far above the traffic: the cost of the pacer when nothing has to wait.
+func BenchmarkRawUDPPacedRoundTrip(b *testing.B) {
+	benchRawUDPRoundTrip(b, 1000000)
+}
+
+func benchRawUDPRoundTrip(b *testing.B, downstreamKbps int) {
 	echo := startBenchUDPEcho(b)
-	p := NewRawUDPProxy("bench-raw", benchServerConfig("bench-raw", echo), nil, session.NewSessionManager(time.Hour))
+	cfg := benchServerConfig("bench-raw", echo)
+	cfg.DownstreamLimitKbps = downstreamKbps
+	p := NewRawUDPProxy("bench-raw", cfg, nil, session.NewSessionManager(time.Hour))
 	if err := p.Start(); err != nil {
 		b.Fatalf("start: %v", err)
 	}
