@@ -101,6 +101,13 @@ func TestRakNetProxyPacedDownstreamDeliversBurst(t *testing.T) {
 		t.Fatalf("3MB took %v at 2MB/s: relay stalled", el)
 	}
 	t.Logf("3MB relayed in %v at 16000kbps", el)
+	stats := p.GetRawUDPClientStats()
+	if len(stats) != 1 || stats[0].DownBytes < total || stats[0].UpBytes == 0 || stats[0].Route != "direct" {
+		t.Fatalf("dashboard stats wrong: %+v", stats)
+	}
+	if n := p.GetActiveClientCount(); n != 1 {
+		t.Fatalf("active clients = %d, want 1", n)
+	}
 }
 
 // policedUDPRelay forwards client<->proxy datagrams and drops downstream

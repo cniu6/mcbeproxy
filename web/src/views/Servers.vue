@@ -2325,7 +2325,9 @@ const renderRawUDPStatsTooltip = (stats, clients = []) => {
     `写目标超时/错误: ${stats.write_target_timeouts || 0}/${stats.write_target_errors || 0}`,
     `写客户端超时/错误: ${stats.write_client_timeouts || 0}/${stats.write_client_errors || 0}`,
     `读目标超时: ${stats.read_target_timeouts || 0}`,
-    `异常合计: ${errorCount}`
+    `异常合计: ${errorCount}`,
+    ...(stats.client_rtt_ms || stats.target_rtt_ms ? [`延迟(RTT): 客户端 ${stats.client_rtt_ms || 0}ms / 目标 ${stats.target_rtt_ms || 0}ms`] : []),
+    ...(stats.downstream_pending_bytes ? [`下行限速排队: ${formatLiveSessionBytes(stats.downstream_pending_bytes)}`] : [])
   ]
   const children = lines.map(line => h('div', null, line))
   if (otherClients.length > 0) {

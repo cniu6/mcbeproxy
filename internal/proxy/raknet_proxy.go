@@ -45,6 +45,7 @@ type RakNetProxy struct {
 	// 为了在 ACL 拒绝时能够精确踢出对应玩家，并向其发送带理由的 Disconnect 包，
 	// 我们在 RakNet 模式下增加一个 clientAddr -> *raknet.Conn 的映射。
 	activeConns   map[string]*raknet.Conn
+	connStats     map[string]*rakConnStats // dashboard stats, guarded by activeConnsMu
 	activeConnsMu sync.RWMutex
 }
 
@@ -499,6 +500,23 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		}()
 	}
 
+	route := "direct"
+	if useProxy && lastProxyDialer != nil && lastProxyDialer.GetSelectedNode() != "" {
+		route = lastProxyDialer.GetSelectedNode()
+	}
+	st := &rakConnStats{client: clientConn, remote: remoteConn, sess: sess, route: route, target: targetAddr, start: time.Now()}
+	p.activeConnsMu.Lock()
+	if p.connStats == nil {
+		p.connStats = make(map[string]*rakConnStats)
+	}
+	p.connStats[clientAddr] = st
+	p.activeConnsMu.Unlock()
+	defer func() {
+		p.activeConnsMu.Lock()
+		delete(p.connStats, clientAddr)
+		p.activeConnsMu.Unlock()
+	}()
+
 	// Create context for this connection
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -523,7 +541,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		defer cancel()
 		gid := gm.Track("forward-client-to-remote", "raknet-proxy", "Client: "+clientAddr, cancel)
 		defer gm.Untrack(gid)
-		p.forwardPacketsTracked(connCtx, clientConn, remoteConn, sess, true, gid)
+		p.forwardPacketsTracked(connCtx, clientConn, remoteConn, sess, true, gid, st)
 	}()
 
 	// Remote -> Client
@@ -532,7 +550,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		defer cancel()
 		gid := gm.Track("forward-remote-to-client", "raknet-proxy", "Client: "+clientAddr, cancel)
 		defer gm.Untrack(gid)
-		p.forwardPacketsTracked(connCtx, remoteConn, clientConn, sess, false, gid)
+		p.forwardPacketsTracked(connCtx, remoteConn, clientConn, sess, false, gid, st)
 	}()
 
 	wg.Wait()
@@ -554,11 +572,11 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 
 // forwardPackets forwards packets between two RakNet connections.
 func (p *RakNetProxy) forwardPackets(ctx context.Context, src, dst *raknet.Conn, sess *session.Session, isClientToRemote bool) {
-	p.forwardPacketsTracked(ctx, src, dst, sess, isClientToRemote, 0)
+	p.forwardPacketsTracked(ctx, src, dst, sess, isClientToRemote, 0, nil)
 }
 
 // forwardPacketsTracked forwards packets between two RakNet connections with goroutine tracking.
-func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *raknet.Conn, sess *session.Session, isClientToRemote bool, gid int64) {
+func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *raknet.Conn, sess *session.Session, isClientToRemote bool, gid int64, st *rakConnStats) {
 	gm := monitor.GetGoroutineManager()
 	// Use longer timeout to reduce CPU usage from frequent deadline checks
 	const readTimeout = 500 * time.Millisecond
@@ -592,6 +610,7 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 				continue
 			}
 			activityUpdateCounter = 0
+			st.record(isClientToRemote, n)
 
 			// Update session stats and keep session alive
 			if gid != 0 {
@@ -1006,4 +1025,104 @@ func (p *RakNetProxy) GetActiveClientCount() int {
 	p.activeConnsMu.RLock()
 	defer p.activeConnsMu.RUnlock()
 	return len(p.activeConns)
+}
+
+// rakConnStats backs the dashboard's per-client row for raknet mode, in the
+// same DTO raw_udp fills.
+type rakConnStats struct {
+	client, remote *raknet.Conn
+	sess           *session.Session
+	route, target  string
+	start          time.Time
+
+	upPackets, downPackets atomic.Int64
+	upBytes, downBytes     atomic.Int64
+	lastUp, lastDown       atomic.Int64 // unix nano
+
+	rateMu                         sync.Mutex
+	rateAt                         time.Time
+	rateUpBytes, rateDownBytes     int64
+	upBytesPerSec, downBytesPerSec int64
+}
+
+func (st *rakConnStats) record(fromClient bool, n int) {
+	if st == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	if fromClient {
+		st.upPackets.Add(1)
+		st.upBytes.Add(int64(n))
+		st.lastUp.Store(now)
+		return
+	}
+	st.downPackets.Add(1)
+	st.downBytes.Add(int64(n))
+	st.lastDown.Store(now)
+}
+
+func (st *rakConnStats) dto(now time.Time) config.RawUDPClientStatsDTO {
+	up, down := st.upBytes.Load(), st.downBytes.Load()
+	st.rateMu.Lock()
+	if dt := now.Sub(st.rateAt); st.rateAt.IsZero() || dt >= time.Second {
+		if !st.rateAt.IsZero() {
+			st.upBytesPerSec = int64(float64(up-st.rateUpBytes) / dt.Seconds())
+			st.downBytesPerSec = int64(float64(down-st.rateDownBytes) / dt.Seconds())
+		}
+		st.rateAt, st.rateUpBytes, st.rateDownBytes = now, up, down
+	}
+	upRate, downRate := st.upBytesPerSec, st.downBytesPerSec
+	st.rateMu.Unlock()
+
+	since := func(ns int64) int64 {
+		if ns == 0 {
+			return now.Sub(st.start).Milliseconds()
+		}
+		return now.Sub(time.Unix(0, ns)).Milliseconds()
+	}
+	addr := st.client.RemoteAddr().String()
+	d := config.RawUDPClientStatsDTO{
+		Client:                 addr,
+		ClientAddr:             addr,
+		SessionKey:             addr,
+		ConnectedAt:            st.start,
+		DurationSeconds:        int64(now.Sub(st.start).Seconds()),
+		Route:                  st.route,
+		Target:                 st.target,
+		UpPackets:              st.upPackets.Load(),
+		DownPackets:            st.downPackets.Load(),
+		UpBytes:                up,
+		DownBytes:              down,
+		UpBytesPerSecond:       upRate,
+		DownBytesPerSecond:     downRate,
+		SinceClientMs:          since(st.lastUp.Load()),
+		SinceTargetMs:          since(st.lastDown.Load()),
+		ClientRTTMs:            st.client.Latency().Milliseconds() * 2,
+		TargetRTTMs:            st.remote.Latency().Milliseconds() * 2,
+		DownstreamPendingBytes: int64(st.client.PendingBytes()),
+	}
+	if st.sess != nil {
+		d.PlayerName = st.sess.GetDisplayName()
+		d.PlayerXUID = st.sess.GetXUID()
+		d.LoginParsed = d.PlayerName != ""
+		d.LoginParseDone = d.LoginParsed
+	}
+	return d
+}
+
+// GetRawUDPClientStats feeds the dashboard's per-client rows (same method
+// raw_udp implements).
+func (p *RakNetProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
+	p.activeConnsMu.RLock()
+	list := make([]*rakConnStats, 0, len(p.connStats))
+	for _, st := range p.connStats {
+		list = append(list, st)
+	}
+	p.activeConnsMu.RUnlock()
+	now := time.Now()
+	out := make([]config.RawUDPClientStatsDTO, 0, len(list))
+	for _, st := range list {
+		out = append(out, st.dto(now))
+	}
+	return out
 }

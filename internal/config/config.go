@@ -603,6 +603,11 @@ type RawUDPClientStatsDTO struct {
 	MaxWriteClientMs       int64     `json:"max_write_client_ms"`
 	SlowWriteClient        int64     `json:"slow_write_client_count"`
 	StallReason            string    `json:"stall_reason,omitempty"`
+	// raknet mode only: round-trip times of each leg and bytes waiting in
+	// the downstream_limit_kbps pacer.
+	ClientRTTMs            int64     `json:"client_rtt_ms,omitempty"`
+	TargetRTTMs            int64     `json:"target_rtt_ms,omitempty"`
+	DownstreamPendingBytes int64     `json:"downstream_pending_bytes,omitempty"`
 	MaxClientPacketGapMs   int64     `json:"max_client_packet_gap_ms"`
 	MaxTargetPacketGapMs   int64     `json:"max_target_packet_gap_ms"`
 	RecentMaxWriteTargetMs int64     `json:"recent_max_write_target_ms"`
