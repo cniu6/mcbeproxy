@@ -999,3 +999,11 @@ func (p *RakNetProxy) dialViaNode(serverCfg *config.ServerConfig, targetAddr str
 	}
 	return nil, nil, firstErr
 }
+
+// GetActiveClientCount reports live client connections, for the dashboard's
+// connection count (raw_udp implements the same method).
+func (p *RakNetProxy) GetActiveClientCount() int {
+	p.activeConnsMu.RLock()
+	defer p.activeConnsMu.RUnlock()
+	return len(p.activeConns)
+}
