@@ -326,6 +326,7 @@ flowchart TD
 | `load_balance` | string | ⚪ | 负载均衡策略 |
 | `load_balance_sort` | string | ⚪ | 延迟排序类型（udp/tcp/http） |
 | `auto_ping_interval_minutes` | int | ⚪ | 自动 ping 间隔（分钟） |
+| `downstream_limit_kbps` | int | ⚪ | 下行限速（kbps，`raknet` / `raw_udp` 模式），0=不限。只给进服突发大、不会自己降速的服务器用（目前仅 Venity=3200，见 [docs/2026-09-28-venity-raw-udp-downstream-limit.md](docs/2026-09-28-venity-raw-udp-downstream-limit.md)） |
 
 ---
 
