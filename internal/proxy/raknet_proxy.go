@@ -128,37 +128,37 @@ func (p *RakNetProxy) Start() error {
 
 // updatePongData sets the pong data for server list queries.
 func (p *RakNetProxy) updatePongData() {
-	// If show_real_latency is enabled, start periodic refresh with latency
-	if p.config.IsShowRealLatency() {
-		// Set initial pong data
-		customMOTD := p.config.GetCustomMOTD()
-		if customMOTD != "" {
-			p.listener.PongData([]byte(customMOTD))
+	// Advertise something valid right away; the real upstream pong follows.
+	p.listener.PongData(p.advertisement(nil))
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		gm := monitor.GetGoroutineManager()
+		gid := gm.TrackBackground("pong-refresh", "raknet-proxy", "Server: "+p.serverID, p.cancel)
+		defer gm.Untrack(gid)
+		p.fetchRemotePong()
+		p.startPongRefresh(p.ctx)
+	}()
+}
+
+// advertisement builds the server-list pong sent to clients. Like raw_udp,
+// custom_motd only changes the display fields and must be a full
+// "MCPE;..." line; protocol/version always follow upstream, and an invalid
+// custom_motd (e.g. "1") is ignored - clients cannot join a server whose
+// pong they cannot parse.
+func (p *RakNetProxy) advertisement(upstream []byte) []byte {
+	custom := p.config.GetCustomMOTD()
+	if len(upstream) > 0 {
+		if custom != "" {
+			return mergeMOTDCompatibility([]byte(custom), upstream)
 		}
-		// Immediately fetch once to initialize cache, then start periodic refresh
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
-			// Track this goroutine as a background task (expected to run for server lifetime)
-			gm := monitor.GetGoroutineManager()
-			gid := gm.TrackBackground("pong-refresh", "raknet-proxy", "Server: "+p.serverID, p.cancel)
-			defer gm.Untrack(gid)
-
-			p.fetchRemotePongWithLatency()
-			// Then start periodic refresh with cancellable context
-			p.startPongRefresh(p.ctx)
-		}()
-		return
+		return upstream
 	}
-
-	// Normal mode: use custom MOTD or fetch from remote
-	customMOTD := p.config.GetCustomMOTD()
-	if customMOTD != "" {
-		p.listener.PongData([]byte(customMOTD))
-	} else {
-		// Fetch pong from remote server (one-time, no need to track)
-		go p.fetchRemotePong()
+	if strings.HasPrefix(custom, "MCPE;") {
+		return []byte(custom)
 	}
+	return defaultAdvertisementForServer(p.serverID)
 }
 
 // startPongRefresh periodically refreshes pong data with real latency.
@@ -181,7 +181,7 @@ func (p *RakNetProxy) startPongRefresh(ctx context.Context) {
 			if p.hasActiveConnections() {
 				continue
 			}
-			p.fetchRemotePongWithLatency()
+			p.fetchRemotePong()
 		}
 	}
 }
@@ -200,13 +200,22 @@ func (p *RakNetProxy) fetchRemotePong() {
 	}
 
 	targetAddr := serverCfg.GetTargetAddr()
-	pong, err := raknet.Ping(targetAddr)
+	var pong []byte
+	var err error
+	if !serverCfg.IsDirectConnection() {
+		pong, _, err = p.pingThroughProxy(targetAddr, serverCfg.GetProxyOutbound())
+	} else {
+		pong, err = raknet.Ping(targetAddr)
+	}
 	if err != nil {
 		logger.Debug("Failed to ping remote server %s: %v", targetAddr, err)
 		return
 	}
 
-	p.listener.PongData(pong)
+	p.cachedPongMu.Lock()
+	p.cachedPong = pong
+	p.cachedPongMu.Unlock()
+	p.listener.PongData(p.advertisement(pong))
 }
 
 // fetchRemotePongWithLatency fetches pong data through proxy and embeds real latency.
@@ -234,11 +243,7 @@ func (p *RakNetProxy) fetchRemotePongWithLatency() {
 	if err != nil {
 		logger.Debug("Failed to ping remote server %s: %v", targetAddr, err)
 		// If ping fails but we have custom MOTD, use it with error indicator
-		customMOTD := serverCfg.GetCustomMOTD()
-		if customMOTD != "" {
-			pongToSend := p.embedLatencyInMOTD([]byte(customMOTD), -1)
-			p.listener.PongData(pongToSend)
-		}
+		p.listener.PongData(p.embedLatencyInMOTD(p.advertisement(nil), -1))
 		// Cache the failed state
 		p.cachedPongMu.Lock()
 		p.lastPongLatency = -1
@@ -253,12 +258,7 @@ func (p *RakNetProxy) fetchRemotePongWithLatency() {
 	p.cachedPongMu.Unlock()
 
 	// Prepare pong to send to client
-	pongToSend := pong
-	// Use custom MOTD if set, otherwise use remote pong
-	customMOTD := serverCfg.GetCustomMOTD()
-	if customMOTD != "" {
-		pongToSend = []byte(customMOTD)
-	}
+	pongToSend := p.advertisement(pong)
 
 	// Embed latency into MOTD
 	if len(pongToSend) > 0 {
