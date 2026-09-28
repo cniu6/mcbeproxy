@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/proxy"
 )
 
 // SetNetworkStore wires the persisted network settings (interface + rules).
@@ -90,6 +93,9 @@ type networkTestRequest struct {
 	Target string `json:"target"` // "host:port", "host" or "[v6]:port"
 	Host   string `json:"host"`
 	Port   int    `json:"port"`
+	// Probe, when "udp" or "tcp", also connects along the decided route:
+	// udp sends a Minecraft (RakNet) ping, tcp opens a connection.
+	Probe string `json:"probe,omitempty"`
 }
 
 type networkTestResult struct {
@@ -97,7 +103,19 @@ type networkTestResult struct {
 	Port     int               `json:"port"`
 	Decision netroute.Decision `json:"decision"`
 	// ResolvedInterface is the OS name the socket would be pinned to.
-	ResolvedInterface string `json:"resolved_interface,omitempty"`
+	ResolvedInterface string              `json:"resolved_interface,omitempty"`
+	Probe             *networkProbeResult `json:"probe,omitempty"`
+}
+
+type networkProbeResult struct {
+	Protocol   string `json:"protocol"`
+	Via        string `json:"via"` // "direct" or the outbound node
+	Success    bool   `json:"success"`
+	LatencyMs  int64  `json:"latency_ms"`
+	ServerName string `json:"server_name,omitempty"`
+	Players    string `json:"players,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // testNetworkRoute shows which rule a destination hits, without dialing.
@@ -124,6 +142,9 @@ func (a *APIServer) testNetworkRoute(c *gin.Context) {
 	if d.Interface != "" {
 		res.ResolvedInterface = netroute.InterfaceName(d.Interface)
 	}
+	if probe := strings.ToLower(strings.TrimSpace(req.Probe)); probe == "udp" || probe == "tcp" {
+		res.Probe = a.probeNetworkRoute(c.Request.Context(), probe, host, port, d)
+	}
 	respondSuccess(c, res)
 }
 
@@ -140,4 +161,92 @@ func splitTarget(t string) (host, port string, ok bool) {
 		return h, p, true
 	}
 	return t, "", false
+}
+
+// probeNetworkRoute really connects to host:port the way the rules decide:
+// direct sockets are pinned to the decided interface by netroute; a proxy
+// action goes through its outbound node.
+func (a *APIServer) probeNetworkRoute(parent context.Context, proto, host string, port int, d netroute.Decision) *networkProbeResult {
+	r := &networkProbeResult{Protocol: proto, Via: "direct"}
+	if d.Action == netroute.ActionBlock {
+		r.Error = "blocked by rule"
+		return r
+	}
+	if port <= 0 {
+		if proto != "udp" {
+			r.Error = "port is required for tcp"
+			return r
+		}
+		port = 19132
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	node := ""
+	if d.Action == netroute.ActionProxy && d.Outbound != "" {
+		node, r.Via = d.Outbound, d.Outbound
+		if strings.HasPrefix(node, "@") || strings.Contains(node, ",") {
+			r.Error = "rule routes to a group/list; test a single node on the outbound page"
+			return r
+		}
+	}
+	var mgr proxy.OutboundManager
+	if a.proxyOutboundHandler != nil {
+		mgr = a.proxyOutboundHandler.outboundMgr
+	}
+	if node != "" && mgr == nil {
+		r.Error = "outbound manager not available"
+		return r
+	}
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+	defer cancel()
+	start := time.Now()
+
+	if proto == "tcp" {
+		var conn net.Conn
+		var err error
+		if node != "" {
+			td, ok := mgr.(interface {
+				DialTCPContext(ctx context.Context, outboundName, destination string) (net.Conn, error)
+			})
+			if !ok {
+				r.Error = "tcp through outbound not supported"
+				return r
+			}
+			conn, err = td.DialTCPContext(ctx, node, address)
+		} else {
+			conn, err = netroute.DialContext(ctx, &net.Dialer{}, "tcp", address)
+		}
+		r.LatencyMs = time.Since(start).Milliseconds()
+		if err != nil {
+			r.Error = err.Error()
+			return r
+		}
+		_ = conn.Close()
+		r.Success = true
+		return r
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		r.Error = err.Error()
+		return r
+	}
+	var pc net.PacketConn
+	if node != "" {
+		pc, err = mgr.DialPacketConn(ctx, node, address)
+	} else {
+		pc, err = netroute.ListenUDP(address)
+	}
+	if err != nil {
+		r.LatencyMs = time.Since(start).Milliseconds()
+		r.Error = err.Error()
+		return r
+	}
+	defer pc.Close()
+	ping := performMCBEPing(ctx, pc, udpAddr, 3*time.Second)
+	r.Success, r.LatencyMs, r.Error = ping.Success, ping.LatencyMs, ping.Error
+	r.ServerName, r.Players, r.Version = ping.ServerName, ping.Players, ping.Version
+	if !r.Success && r.Error != "" {
+		r.Error += " (UDP blocked on this route, or not a Minecraft server)"
+	}
+	return r
 }

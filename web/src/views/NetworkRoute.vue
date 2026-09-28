@@ -84,6 +84,7 @@
     <n-card size="small" bordered title="规则测试">
       <n-space align="center" wrap>
         <n-input v-model:value="testTarget" placeholder="例如 play.example.com:19132 或 10.2.3.4:443" style="width: 320px" @keyup.enter="runTest" />
+        <n-select v-model:value="testProbe" :options="probeOptions" size="small" style="width: 150px" />
         <n-button size="small" :loading="testing" @click="runTest">测试</n-button>
         <n-text depth="3" style="font-size: 12px">测试的是已保存生效的配置, 修改后请先保存。</n-text>
       </n-space>
@@ -95,6 +96,18 @@
         → 动作 <n-tag size="small" :type="actionTag(testResult.decision.action)">{{ actionLabel(testResult.decision.action) }}</n-tag>
         <template v-if="testResult.decision.outbound"> 线路 <n-tag size="small">{{ testResult.decision.outbound }}</n-tag></template>
         · 网卡 <n-tag size="small">{{ testResult.resolved_interface || testResult.decision.interface || '系统自动' }}</n-tag>
+      </div>
+      <div v-if="testResult?.probe" class="test-result">
+        {{ testResult.probe.protocol.toUpperCase() }} 实测 (经 {{ testResult.probe.via === 'direct' ? '直连' : testResult.probe.via }}):
+        <template v-if="testResult.probe.success">
+          <n-tag size="small" type="success">通 {{ testResult.probe.latency_ms }}ms</n-tag>
+          <template v-if="testResult.probe.server_name"> {{ testResult.probe.server_name }}</template>
+          <template v-if="testResult.probe.version"> · {{ testResult.probe.version }}</template>
+          <template v-if="testResult.probe.players"> · 在线 {{ testResult.probe.players }}</template>
+        </template>
+        <template v-else>
+          <n-tag size="small" type="error">不通</n-tag> <n-text depth="3">{{ testResult.probe.error }}</n-text>
+        </template>
       </div>
     </n-card>
 
@@ -179,6 +192,12 @@ const editingIndex = ref(-1)
 const testTarget = ref('')
 const testing = ref(false)
 const testResult = ref(null)
+const testProbe = ref('')
+const probeOptions = [
+  { label: '只看命中规则', value: '' },
+  { label: 'UDP 实测 (MC ping)', value: 'udp' },
+  { label: 'TCP 实测 (建连)', value: 'tcp' }
+]
 const outbounds = ref([])
 const groups = ref([])
 
@@ -370,7 +389,7 @@ const runTest = async () => {
   if (!t) return
   testing.value = true
   try {
-    const res = await api('/api/network/test', 'POST', { target: t })
+    const res = await api('/api/network/test', 'POST', { target: t, probe: testProbe.value })
     if (res?.success) testResult.value = res.data
     else message.error(res?.error || res?.msg || '测试失败')
   } finally {
