@@ -5,11 +5,13 @@
 ## 核心特性
 
 ### 🚀 高性能代理
-- **多协议支持**: Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / SOCKS5 / HTTP
+- **多协议支持**: Shadowsocks / ShadowsocksR / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / TUIC / WireGuard / Naive / SOCKS5 / HTTP
 - **链式代理**: 支持多级代理嵌套（A → B → C），自动展开嵌套链，内置循环引用检测
 - **智能负载均衡**: 支持按组/节点列表做负载均衡与自动故障切换
-- **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm
+- **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm / nethernet；另有 `nethernet_relay`（不解密转发 NetherNet/WebRTC）
 - **实时延迟检测**: 自动选择最优节点，确保最佳游戏体验
+- **节点订阅**: 支持 Clash/Mihomo 订阅链接（`proxy_subscriptions.json`），可定时自动更新节点
+- **网络路由**: `network.json` 提供 Proxifier 式目的地址规则 + 全局出口网卡绑定
 
 ### 📊 数据统计与监控
 - **会话统计**: 实时追踪玩家连接、流量使用、在线时长
@@ -35,7 +37,7 @@
 
 ```
 .
-├── cmd/mcpeserverproxy/    # 主程序入口（main.go, 194行）
+├── main.go                  # 主程序入口（模块根目录）
 ├── internal/                # 核心业务逻辑
 │   ├── acl/                # 访问控制列表管理
 │   ├── api/                # REST API 服务 + 安全中间件
@@ -45,11 +47,15 @@
 │   ├── errors/             # 统一错误处理
 │   ├── logger/             # 日志系统
 │   ├── monitor/            # 系统监控（Prometheus）+ Goroutine 管理
+│   ├── netroute/           # 全局出口网卡 + 目的地址路由规则
 │   ├── protocol/           # RakNet/MCBE 协议处理
-│   ├── proxy/              # 代理核心实现 + UDPspeeder 集成
-│   └── session/            # 会话管理
-├── web/                    # Vue 3 前端控制台（17 个源文件）
+│   ├── proxy/              # 代理核心实现 + UDPspeeder 集成 + NetherNet relay
+│   ├── session/            # 会话管理
+│   ├── singboxcore/        # sing-box 出站工厂
+│   └── subscription/       # 节点订阅更新调度
+├── web/                    # Vue 3 前端控制台
 ├── doc/                    # 文档和示例配置（含 UDPspeeder）
+├── docs/                   # 开发/变更记录文档
 └── build.bat              # Windows 构建脚本
 ```
 
@@ -62,6 +68,9 @@
 - [代理模式（proxy_mode）](#代理模式-proxy_mode)
 - [上游节点与负载均衡（proxy_outbounds）](#上游节点与负载均衡-proxy_outbounds)
 - [本地代理端口（proxy_ports）](#本地代理端口-proxy_ports)
+- [节点订阅配置（proxy_subscriptions）](#节点订阅配置-proxy_subscriptionsjson)
+- [网络路由配置（network.json）](#网络路由配置-networkjson)
+- [延迟优化（latency_mode 与 udp_speeder）](#延迟优化-latency_mode-与-udp_speeder)
 - [API 与 Dashboard](#api-与-dashboard)
 - [监控与日志](#监控与日志)
 - [开发与构建](#开发与构建)
@@ -77,6 +86,8 @@
 - [`server_list.json`](#服务器配置-server_listjson)（初始化为 `[]`）
 - [`proxy_outbounds.json`](#上游节点配置-proxy_outboundsjson)（初始化为 `[]`）
 - [`proxy_ports.json`](#代理端口配置-proxy_portsjson)（初始化为 `[]`）
+- [`proxy_subscriptions.json`](#节点订阅配置-proxy_subscriptionsjson)（初始化为 `[]`）
+- [`network.json`](#网络路由配置-networkjson)（不自动创建，未配置 = 系统默认路由）
 
 ### 2. 运行程序
 
@@ -130,21 +141,23 @@ mcpeserverproxy.exe -version
 
 ## 整体架构
 
-入口：`cmd/mcpeserverproxy/main.go`（194 行）
+入口：`main.go`（模块根目录）
 
-主要组件（53 个源文件 + 17 个测试文件，约 24,000+ 行后端代码）：
+主要组件：
 
-- `internal/proxy`: 代理核心（19 个源文件，~12,800 行）— 多种 proxy_mode、会话、转发、上游节点、负载均衡、代理端口、UDPspeeder 集成
-- `internal/api`: Gin API + 安全中间件 + 内嵌 Dashboard（6 个源文件，~3,700 行）— 含 `security.go` 鉴权、`proxy_port_handler.go` 端口管理、`proxy_outbound_tester.go` 节点测试
-- `internal/config`: 配置加载 + 热更新（5 个源文件，~1,760 行）— fsnotify 监听 JSON 文件变化
-- `internal/protocol`: RakNet/MCBE 协议处理（2 个源文件，~1,250 行）— 含 `raknet.go` 底层协议工具
-- `internal/db`: SQLite 持久化（9 个源文件，~1,430 行）— 会话历史、玩家、ACL 模型、API Keys
-- `internal/monitor`: 系统监控 + Prometheus + Goroutine 管理（3 个源文件，~950 行）
-- `internal/session`: 玩家会话与 GC（2 个源文件，~520 行）
-- `internal/auth`: Xbox Live 认证 + 外部认证 + Token 缓存（3 个源文件，~450 行）
-- `internal/logger`: 分级日志 + 文件轮转（1 个源文件，~420 行）
-- `internal/acl`: 黑/白名单与访问控制策略（1 个源文件，~420 行）
-- `internal/errors`: 统一错误处理（1 个源文件，~180 行）
+- `internal/proxy`: 代理核心 — 多种 proxy_mode、plain TCP/UDP、NetherNet relay、会话、转发、上游节点、负载均衡、代理端口、UDPspeeder 集成
+- `internal/api`: Gin API + 安全中间件 + 内嵌 Dashboard + 网络设置接口
+- `internal/config`: 配置加载 + 热更新（fsnotify），含服务器/上游节点/订阅/代理端口管理器
+- `internal/netroute`: 全局出口网卡绑定 + Proxifier 式目的地址规则（`network.json`）
+- `internal/protocol`: RakNet/MCBE 协议处理
+- `internal/db`: SQLite 持久化 — 会话历史、玩家、ACL 模型、API Keys
+- `internal/subscription`: 节点订阅定时更新
+- `internal/monitor`: 系统监控 + Prometheus + Goroutine 管理
+- `internal/session`: 玩家会话与 GC
+- `internal/auth`: Xbox Live 认证 + 外部认证 + Token 缓存
+- `internal/logger`: 分级日志 + 文件轮转
+- `internal/acl`: 黑/白名单与访问控制策略
+- `internal/errors`: 统一错误处理
 
 ## 核心流程图
 
@@ -200,18 +213,20 @@ flowchart TD
 
 ## 配置文件
 
-程序运行时会用到 4 个 JSON 配置文件，所有配置都支持热更新，修改后自动生效。
+程序运行时会用到以下 JSON 配置文件，核心配置都支持热更新，修改后自动生效。
 
 ### 配置文件概览
 
 | 配置文件 | 用途 | 是否必需 |
 |---------|------|---------|
 | [`config.json`](#配置文件-configjson) | 全局配置（API 端口、数据库、日志、鉴权等） | ✅ 必需 |
-| [`server_list.json`](#服务器配置-server_listjson) | 要监听的 MCBE 服务列表 | ✅ 必需 |
+| [`server_list.json`](#服务器配置-server_listjson) | 要监听的 MCBE / TCP / UDP 服务列表 | ✅ 必需 |
 | [`proxy_outbounds.json`](#上游节点配置-proxy_outboundsjson) | 上游节点（用于代理转发） | ⚪ 可选 |
 | [`proxy_ports.json`](#代理端口配置-proxy_portsjson) | 本地 HTTP/SOCKS 代理端口 | ⚪ 可选 |
+| [`proxy_subscriptions.json`](#节点订阅配置-proxy_subscriptionsjson) | 上游节点订阅（自动更新节点） | ⚪ 可选 |
+| [`network.json`](#网络路由配置-networkjson) | 全局出口网卡 + 目的地址路由规则 | ⚪ 可选 |
 
-> **注意**: 本仓库默认不跟踪这些运行时配置（已加入 [`.gitignore`](.gitignore)）。首次运行会自动创建缺失的配置文件，然后你再按需修改即可。
+> **注意**: 本仓库默认不跟踪这些运行时配置（已加入 [`.gitignore`](.gitignore)）。除 `network.json` 外，首次运行会自动创建缺失的配置文件，然后你再按需修改即可。
 
 ---
 
@@ -238,7 +253,21 @@ flowchart TD
   "auth_cache_minutes": 15,
   "proxy_ports_enabled": true,
   "passthrough_idle_timeout": 30,
-  "public_ping_timeout_seconds": 5
+  "public_ping_timeout_seconds": 5,
+  "server_auto_ping_interval_minutes_default": 10,
+  "server_auto_ping_top_candidates_default": 10,
+  "server_auto_ping_full_scan_mode_default": "",
+  "server_auto_ping_full_scan_time_default": "04:00",
+  "server_auto_ping_full_scan_interval_hours_default": 24,
+  "proxy_port_auto_ping_interval_minutes_default": 10,
+  "proxy_port_auto_ping_top_candidates_default": 10,
+  "proxy_port_auto_ping_full_scan_mode_default": "",
+  "proxy_port_auto_ping_full_scan_time_default": "04:00",
+  "proxy_port_auto_ping_full_scan_interval_hours_default": 24,
+  "latency_history_min_interval_minutes": 10,
+  "latency_history_render_limit": 100,
+  "latency_history_storage_limit": 1000,
+  "latency_history_retention_days": 5
 }
 ```
 
@@ -260,8 +289,18 @@ flowchart TD
 | `auth_verify_url` | string | "" | 外部认证验证 URL |
 | `auth_cache_minutes` | int | 15 | 认证结果缓存时长（分钟） |
 | `proxy_ports_enabled` | bool | true | 是否启用本地代理端口功能 |
-| `passthrough_idle_timeout` | int | 30 | passthrough 模式空闲超时（秒） |
-| `public_ping_timeout_seconds` | int | 5 | 公开状态接口的 ping 超时（秒） |
+| `passthrough_idle_timeout` | int | 30 | passthrough 模式空闲超时（秒，0=用各服务器 `idle_timeout`） |
+| `public_ping_timeout_seconds` | int | 5 | 公开状态接口的 ping 超时（秒，0=不限制） |
+| `server_auto_ping_interval_minutes_default` | int | 10 | 新建服务器自动 ping 的默认间隔 |
+| `server_auto_ping_top_candidates_default` | int | 10 | 自动 ping 候选节点数默认值 |
+| `server_auto_ping_full_scan_mode_default` | string | "" | 服务器全量扫描模式（`daily`/`interval`/空=关闭） |
+| `server_auto_ping_full_scan_time_default` | string | "04:00" | daily 模式的全量扫描时间 |
+| `server_auto_ping_full_scan_interval_hours_default` | int | 24 | interval 模式的全量扫描间隔（小时） |
+| `proxy_port_auto_ping_*` | — | 同上 | 代理端口自动 ping 的一组同义默认值 |
+| `latency_history_min_interval_minutes` | int | 10 | 延迟历史最小采样间隔（分钟） |
+| `latency_history_render_limit` | int | 100 | 延迟历史前端渲染条数上限 |
+| `latency_history_storage_limit` | int | 1000 | 延迟历史落盘条数上限（须 ≥ render_limit） |
+| `latency_history_retention_days` | int | 5 | 延迟历史保留天数 |
 
 ---
 
@@ -281,7 +320,7 @@ flowchart TD
     "listen_addr": "0.0.0.0:19132",
     "protocol": "raknet",
     "enabled": true,
-    "disabled": false,
+    "hidden": false,
     "send_real_ip": false,
     "resolve_interval": 300,
     "idle_timeout": 300,
@@ -289,13 +328,22 @@ flowchart TD
     "disabled_message": "§c服务器维护中§r\n§7请稍后再试",
     "custom_motd": "MCPE;§aCubeCraft Proxy;712;1.21.50;0;100;12345678901234567;CubeCraft;Survival;1;19132;19132;0;",
     "proxy_mode": "passthrough",
+    "nethernet_relay": false,
     "xbox_auth_enabled": false,
     "xbox_token_path": "xbox_token.json",
     "proxy_outbound": "全三网入口IPLC专线节点",
     "show_real_latency": true,
     "load_balance": "least-latency",
     "load_balance_sort": "udp",
-    "auto_ping_interval_minutes": 5
+    "downstream_limit_kbps": 0,
+    "raknet_mtu": 0,
+    "latency_mode": "normal",
+    "auto_ping_enabled": true,
+    "auto_ping_interval_minutes": 5,
+    "auto_ping_top_candidates": 10,
+    "auto_ping_full_scan_mode": "",
+    "auto_ping_full_scan_time": "04:00",
+    "auto_ping_full_scan_interval_hours": 24
   }
 ]
 ```
@@ -306,26 +354,40 @@ flowchart TD
 |------|------|------|------|
 | `id` | string | ✅ | 服务器唯一标识符 |
 | `name` | string | ✅ | 服务器显示名称 |
-| `target` | string | ✅ | 目标服务器地址（域名或 IP） |
+| `target` | string | ✅* | 目标服务器地址（域名或 IP；nethernet 模式可留空） |
+| `target_ip` | string | ⚪ | 固定上游 IP（多 IP/GeoDNS 场景跳过 DNS，直连/代理都拨此 IP） |
 | `port` | int | ✅ | 目标服务器端口（通常为 19132） |
 | `listen_addr` | string | ✅ | 监听地址（如 `0.0.0.0:19132`） |
-| `protocol` | string | ✅ | 协议类型（通常为 `raknet`） |
+| `protocol` | string | ✅ | 协议类型：`raknet`（MCBE）/ `udp` / `tcp` / `tcp_udp` |
 | `enabled` | bool | ✅ | 是否启用此服务器 |
-| `disabled` | bool | ✅ | 是否拒绝新连接（当 enabled=true 时） |
+| `hidden` | bool | ⚪ | 是否在公开状态页隐藏（不影响连接；旧字段 `disabled` 已迁移为 hidden） |
 | `send_real_ip` | bool | ⚪ | 是否发送真实 IP 到目标服务器 |
 | `resolve_interval` | int | ⚪ | DNS 解析间隔（秒） |
 | `idle_timeout` | int | ⚪ | 空闲超时（秒） |
 | `buffer_size` | int | ⚪ | UDP 缓冲区大小（-1 为自动） |
+| `udp_socket_buffer_size` | int | ⚪ | UDP socket 缓冲字节数（0=自动，-1=系统默认） |
 | `disabled_message` | string | ⚪ | 服务器禁用时的自定义消息 |
 | `custom_motd` | string | ⚪ | 自定义 MOTD（服务器描述） |
-| `proxy_mode` | string | ⚪ | 代理模式（见[代理模式说明](#代理模式-proxy_mode)） |
+| `proxy_mode` | string | ⚪ | 代理模式（见[代理模式说明](#代理模式-proxy_mode)，仅 `protocol=raknet` 时有效） |
+| `nethernet_relay` | bool | ⚪ | 为 `raw_udp`/`udp` 服务器增加 NetherNet 信令+媒体转发（见[NetherNet relay](#nethernet-转发-nethernet_relay)） |
+| `nethernet_*` | — | ⚪ | `nethernet` 模式的信令/证书/ICE 配置（见[NetherNet 模式](#6-nethernetnethernet-中间人)） |
+| `raw_udp_kick_strategy` | string | ⚪ | raw_udp 踢人策略（如 `disconnect_only`，默认即此） |
 | `xbox_auth_enabled` | bool | ⚪ | 是否启用 Xbox Live 认证 |
 | `xbox_token_path` | string | ⚪ | Xbox Token 文件路径 |
 | `proxy_outbound` | string | ⚪ | 上游节点名称、组名或节点列表 |
 | `show_real_latency` | bool | ⚪ | 是否显示真实延迟 |
 | `load_balance` | string | ⚪ | 负载均衡策略 |
 | `load_balance_sort` | string | ⚪ | 延迟排序类型（udp/tcp/http） |
+| `protocol_version` | int | ⚪ | 覆盖登录包的协议版本（0=不修改） |
+| `latency_mode` | string | ⚪ | `normal`/`aggressive`/`fec_tunnel`（见[延迟优化](#延迟优化-latency_mode-与-udp_speeder)） |
+| `raknet_mtu` | int | ⚪ | RakNet MTU 钳制（0=auto：经节点时 1400、直连不钳；-1=关闭；576..1492 显式值） |
+| `auto_ping_enabled` | bool | ⚪ | 是否启用自动 ping |
 | `auto_ping_interval_minutes` | int | ⚪ | 自动 ping 间隔（分钟） |
+| `auto_ping_top_candidates` | int | ⚪ | 除当前节点外参与比较的候选数 |
+| `auto_ping_full_scan_*` | — | ⚪ | 定时全量扫描：`mode`(`daily`/`interval`)、`time`(HH:MM)、`interval_hours` |
+| `acl_server_id` | string | ⚪ | 该服务器使用的 ACL 分组 ID（默认同 `id`） |
+| `auto_select_blocked_nodes` | object | ⚪ | 服务器级节点拉黑（由 API 维护） |
+| `udp_speeder` | object | ⚪ | UDPspeeder sidecar 配置（见[延迟优化](#延迟优化-latency_mode-与-udp_speeder)） |
 | `downstream_limit_kbps` | int | ⚪ | 下行限速（kbps，`raknet` / `raw_udp` 模式），0=不限。只给进服突发大、不会自己降速的服务器用（目前仅 Venity=3200，见 [docs/2026-09-28-venity-raw-udp-downstream-limit.md](docs/2026-09-28-venity-raw-udp-downstream-limit.md)） |
 
 ---
@@ -375,13 +437,20 @@ flowchart TD
 | 类型 | 说明 | 必需字段 |
 |------|------|---------|
 | `shadowsocks` | Shadowsocks 协议 | server, port, password, method |
-| `vmess` | VMess 协议 | server, port, uuid, security |
-| `vless` | VLESS 协议 | server, port, uuid |
+| `shadowsocksr` | ShadowsocksR 协议 | server, port, password* |
+| `vmess` | VMess 协议 | server, port, uuid |
+| `vless` | VLESS 协议（支持 Reality / WS / gRPC / XHTTP） | server, port, uuid |
 | `trojan` | Trojan 协议 | server, port, password |
 | `hysteria2` | Hysteria2 协议 | server, port, password |
-| `anytls` | AnyTLS 协议 | server, port, password |
+| `anytls` | AnyTLS 协议 | server, port, password, tls |
+| `tuic` | TUIC 协议 | server, port, password 或 uuid* |
+| `wireguard` | WireGuard 协议 | server, port + provider_options* |
+| `naive` | NaiveProxy (HTTPS) | server, port, username, password |
 | `socks5` | SOCKS5 协议（支持 TCP CONNECT + UDP ASSOCIATE） | server, port |
 | `http` | HTTP CONNECT 协议（仅 TCP） | server, port |
+| `chain` | 纯链式代理容器 | chain |
+
+\* `shadowsocksr` / `tuic` / `wireguard` 的完整参数由 `provider_options`（订阅导入时保留的原始 Clash/Mihomo 字段）提供；手工配置可只填 `provider_options` 原始字段。
 
 #### 配置字段说明
 
@@ -402,10 +471,21 @@ flowchart TD
 | `sni` | string | ⚪ | TLS SNI |
 | `insecure` | bool | ⚪ | 是否跳过证书验证 |
 | `chain` | array | ⚪ | 链式代理跳板列表（如 `["node-A", "node-B"]`，流量依次经过） |
-| `udp_available` | bool | ⚪ | 是否支持 UDP |
+| `provider_options` | object | ⚪ | 订阅导入保留的原始 Clash/Mihomo 字段（不手写） |
+| `subscription_id` / `subscription_name` / `subscription_node_id` | string | ⚪ | 订阅来源标记（由订阅管理维护） |
+| `network` | string | ⚪ | 传输方式：tcp / ws / grpc / httpupgrade / xhttp |
+| `ws_path` / `ws_host` / `xhttp_mode` | string | ⚪ | WebSocket/XHTTP 路径、Host、模式 |
+| `grpc_service_name` / `grpc_authority` | string | ⚪ | gRPC 服务名与 :authority |
+| `reality` / `reality_public_key` / `reality_short_id` / `reality_spider_x` | — | ⚪ | VLESS/AnyTLS Reality 参数 |
+| `flow` | string | ⚪ | VLESS flow（如 `xtls-rprx-vision`） |
+| `obfs` / `obfs_password` | string | ⚪ | Hysteria2 salamander 混淆 |
+| `port_hopping` / `hop_interval` | string/int | ⚪ | Hysteria2 端口跳跃范围与间隔 |
+| `up_mbps` / `down_mbps` / `alpn` / `cert_fingerprint` / `disable_mtu` | — | ⚪ | Hysteria2 带宽、ALPN、证书指纹、MTU 开关 |
+| `udp_available` | bool | ⚪ | 是否支持 UDP（节点实测结果） |
 | `udp_latency_ms` | int | ⚪ | UDP 延迟（毫秒） |
 | `tcp_latency_ms` | int | ⚪ | TCP 延迟（毫秒） |
 | `http_latency_ms` | int | ⚪ | HTTP 延迟（毫秒） |
+| `auto_select_blocked` 等 | — | ⚪ | 全局节点拉黑（由 API 维护） |
 
 ---
 
@@ -423,11 +503,29 @@ flowchart TD
     "listen_addr": "0.0.0.0:1080",
     "type": "mixed",
     "enabled": true,
-    "proxy_outbound": "HK-1,剩余流量：199.82 GB,HK-2",
+    "username": "",
+    "password": "",
+    "proxy_outbound": "HK-1,HK-2",
     "load_balance": "least-latency",
     "load_balance_sort": "tcp",
-    "allow_list": [
-      "0.0.0.0/0"
+    "auto_ping_enabled": true,
+    "auto_ping_interval_minutes": 10,
+    "allow_list": ["0.0.0.0/0"],
+    "ignore_route_rules": false,
+    "users": [
+      {
+        "username": "alice",
+        "password": "secret-1",
+        "proxy_outbound": "@香港节点",
+        "max_connections": 20,
+        "expire_at": "2026-12-31"
+      },
+      {
+        "username": "bob",
+        "password": "secret-2",
+        "proxy_outbound": "direct",
+        "disable_udp": true
+      }
     ]
   }
 ]
@@ -445,9 +543,11 @@ flowchart TD
 | `proxy_outbound` | string | ⚪ | 上游节点名称、组名或节点列表 |
 | `load_balance` | string | ⚪ | 负载均衡策略 |
 | `load_balance_sort` | string | ⚪ | 延迟排序类型（udp/tcp/http） |
-| `allow_list` | array | ⚪ | 允许的 IP 段（CIDR 格式） |
-| `username` | string | ⚪ | 代理用户名（可选） |
-| `password` | string | ⚪ | 代理密码（可选） |
+| `allow_list` | array | ⚪ | 允许的 IP/CIDR 白名单（默认 `0.0.0.0/0`） |
+| `username` / `password` | string | ⚪ | 默认账号（同时是 users 之外兜底） |
+| `ignore_route_rules` | bool | ⚪ | 跳过全局 network 目的地址规则 |
+| `auto_ping_*` | — | ⚪ | 该端口的自动 ping / 全量扫描设置（同服务器侧字段） |
+| `users` | array | ⚪ | 多用户凭证表（见[多用户代理端口](#多用户代理端口)） |
 
 ## 代理模式 (proxy_mode)
 
@@ -462,6 +562,7 @@ flowchart TD
 | `passthrough` | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ✅ | 提取信息 + 保持原始流量 |
 | `raw_udp` | ⭐⭐⭐⭐ | ⭐⭐⭐ | ✅ | 兼容性优先 + 上游转发 |
 | `mitm` | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ✅ | 完整协议可见性 + Xbox 代登录 |
+| `nethernet` | ⭐⭐ | ⭐⭐⭐⭐ | ✅ | NetherNet(WebRTC) 中间人，两端终止信令与媒体 |
 
 ### 详细说明
 
@@ -642,7 +743,57 @@ flowchart TD
 
 ---
 
-### 模式选择建议
+#### 6. nethernet（NetherNet 中间人）
+
+**特点**：
+- 使用 gophertunnel 在客户端与上游两端分别终止 NetherNet（HTTPS 信令 + WebRTC ICE/DTLS/SCTP）
+- 能看到完整玩家数据，但成本最高
+- 26.x 客户端优先探测 NetherNet；本模式把它作为一等传输处理
+
+**必需配置**：`nethernet_listen_addr`（HTTPS 信令绑定地址）、`nethernet_cert_file` + `nethernet_key_file`（TLS 证书）、`nethernet_upstream`（`https://host:port` 上游信令 URL）。
+
+**可选配置**：`nethernet_identity_file`（Xbox 身份）、`nethernet_ice_gather_policy`（`all`/`relay`）、`nethernet_ice_servers`（STUN/TURN，policy=relay 时必填）、`nethernet_allow_anonymous`、`nethernet_disable_trickle_ice`（Normalize 自动置 true）。
+
+`target`/`port`/`listen_addr` 在 nethernet 模式下不是必填。
+
+**配置示例**：
+```json
+{
+  "id": "nn-proxy",
+  "name": "NetherNet 代理",
+  "protocol": "raknet",
+  "proxy_mode": "nethernet",
+  "nethernet_listen_addr": "0.0.0.0:19132",
+  "nethernet_cert_file": "certs/dev.crt",
+  "nethernet_key_file": "certs/dev.key",
+  "nethernet_upstream": "https://upstream.example:19132",
+  "nethernet_allow_anonymous": true
+}
+```
+
+---
+
+### NetherNet 转发 (nethernet_relay)
+
+`nethernet_relay: true` 是给 `raw_udp` / `udp` 服务器加的开源替代：
+
+- 26.x 客户端会先探测服务器端口 TCP 孪生的 NetherNet HTTPS 信令，再回落 RakNet。
+- 开启 relay 后，代理在同一 UDP 端口应答信令、把 SDP offer 经上游转发给真实服务器，只改写 answer 中的 ICE 候选为代理地址，加密 WebRTC 媒体仍走同一 UDP 端口（按 STUN ufrag 分流）。
+- 不解密、不需要额外端口；该路径看不到玩家名。
+- 上游无 NetherNet 信令时 `GET /v1/join` 返回 503，客户端自动回落 RakNet。
+- 需要同时开放 TCP + UDP 端口。
+
+```json
+{
+  "id": "relay-example",
+  "protocol": "raknet",
+  "proxy_mode": "raw_udp",
+  "nethernet_relay": true,
+  "nethernet_public_addr": "203.0.113.5:19132"
+}
+```
+
+`nethernet_public_addr` 为对客户端宣告的 `ip:port`（空=客户端拨入的地址）。
 
 #### 根据需求选择
 
@@ -687,7 +838,7 @@ flowchart TD
 上游节点定义在 `proxy_outbounds.json`（也可通过 API 创建/更新/测试）。
 
 关键点：
-- `type`: `shadowsocks` / `vmess` / `trojan` / `vless` / `hysteria2` / `anytls`
+- `type`: `shadowsocks` / `shadowsocksr` / `vmess` / `vless` / `trojan` / `hysteria2` / `anytls` / `tuic` / `wireguard` / `naive` / `socks5` / `http` / `chain`（详见上方[节点类型表](#支持的节点类型)）
 - `group`: 用于组选择（`@groupName`）
 - 负载均衡策略：`least-latency` / `round-robin` / `random` / `least-connections`
 - 延迟排序类型：`udp` / `tcp` / `http`（用于 least-latency）
@@ -754,6 +905,114 @@ flowchart TD
 - `allow_list`: CIDR 白名单（例如仅允许本机：`127.0.0.1/32`）
 - `proxy_outbound`: 与 server 的规则一致（direct / node / @group / node list）
 
+### 多用户代理端口
+
+`users` 可在一个监听端口上挂多组凭证，每个用户可覆盖端口的路由与限制：
+
+| users 字段 | 说明 |
+|-----------|------|
+| `username` / `password` | 凭证（username 不能与端口默认 username 重复） |
+| `disabled` | 单独停用该用户 |
+| `remark` | 备注 |
+| `proxy_outbound` / `load_balance` / `load_balance_sort` | 覆盖端口路由（空=跟随端口） |
+| `allow_list` | 在端口白名单之上再叠加的客户端 IP/CIDR 白名单 |
+| `max_connections` | 并发连接上限（0=不限） |
+| `expire_at` | 过期时间（`YYYY-MM-DD[ HH:MM]` 或 RFC3339，空=永不过期） |
+| `disable_udp` | 拒绝该用户的 SOCKS5 UDP ASSOCIATE |
+| `ignore_route_rules` | 覆盖端口的规则旁路开关（null=继承端口） |
+
+凭证表原子热替换，改用户不需要重启监听；SOCKS4 会把 `user:pass` 放在 USERID 中携带。
+
+## 节点订阅配置 (proxy_subscriptions.json)
+
+通过 Clash/Mihomo 订阅链接批量导入节点，支持定时自动更新。
+
+```json
+[
+  {
+    "id": "sub-1",
+    "name": "机场订阅",
+    "url": "https://example.com/api/clash?token=***",
+    "enabled": true,
+    "group": "香港节点",
+    "proxy_name": "",
+    "user_agent": "Mozilla/5.0",
+    "auto_update_enabled": true,
+    "auto_update_mode": "daily",
+    "auto_update_time": "04:00",
+    "auto_update_interval_days": 1
+  }
+]
+```
+
+| 字段 | 说明 |
+|------|------|
+| `url` | 订阅地址（http/https，Clash/Mihomo/URI 分享格式均可） |
+| `group` | 导入节点统一归入的组名 |
+| `proxy_name` | 拉取订阅时使用的本地上游节点名（空=直连） |
+| `auto_update_mode` | `daily`（每天 `auto_update_time`）或 `interval`（每 `auto_update_interval_days` 天） |
+| `last_*` | 最近更新的节点数/订阅流量/到期时间等（由程序维护） |
+
+导入节点保留 `provider_options` 原始字段，Reality、SSR、TUIC、WireGuard、Naive 等协议参数不会在刷新中丢失。
+
+## 网络路由配置 (network.json)
+
+全局出口网卡 + Proxifier 式目的地址规则，对**所有出站 socket**生效（服务器转发、代理端口、订阅拉取、ping 探测等）。文件不存在时使用系统默认路由。
+
+```json
+{
+  "interface": "以太网",
+  "rules": [
+    {
+      "id": "rule-1",
+      "name": "游戏走节点",
+      "enabled": true,
+      "targets": "*.game.com; 203.0.113.0/24",
+      "ports": "19132; 25565",
+      "action": "proxy",
+      "outbound": "@香港节点"
+    },
+    {
+      "id": "rule-2",
+      "name": "拦截广告",
+      "enabled": true,
+      "targets": "ads.example.com",
+      "action": "block"
+    }
+  ]
+}
+```
+
+- `interface`：全局出口网卡名（Windows 用 `IP_UNICAST_IF`，Linux 用 `SO_BINDTODEVICE`）。
+- `rules[].action`：`default`（只应用接口）/ `direct` / `proxy`（走 `outbound`）/ `block`。
+- `targets`：`;` `,` 空格分隔，支持 IP、CIDR、`192.168.1.*`、`10.0.0.1-10.0.0.9`、域名、`*.domain`、`*glob*`、`host:port`、`[::1]:53`。
+- 规则的 action 只对代理端口流量生效；接口绑定对全部出站 socket 生效。
+- API：`GET/PUT /api/network`、`GET /api/network/interfaces`、`POST /api/network/test`。
+
+## 延迟优化 (latency_mode 与 udp_speeder)
+
+每个服务器可声明 `latency_mode`：
+
+| 值 | 效果 |
+|----|------|
+| `normal` | 默认行为 |
+| `aggressive` | UDP socket 低风险内联优化（DSCP/EF 标记、更大默认 socket 缓冲；protocol=tcp 时拒绝） |
+| `fec_tunnel` | 强制要求 `udp_speeder` 已启用，FEC 隧道成为真实传输层（tcp/tcp_udp 时拒绝） |
+
+`udp_speeder` 把 `doc/UDPspeeder` 的 `speederv2` 作为 sidecar 集成：启用后该服务器的出站目标临时改为 `127.0.0.1:<speeder 本地端口>`，流量进入本机 speeder 再到远端 `speederv2 -s`。此模式会旁路 `proxy_outbound`，不支持 `protocol=tcp`/`tcp_udp`。
+
+```json
+"udp_speeder": {
+  "enabled": true,
+  "binary_path": "doc/UDPspeeder/speederv2.exe",
+  "local_listen_addr": "127.0.0.1:4096",
+  "remote_addr": "1.2.3.4:4096",
+  "fec": "20:10",
+  "key": "passwd",
+  "mode": 0
+}
+```
+
 ### SOCKS5 UDP ASSOCIATE 支持
 
 SOCKS5 和 mixed 类型的代理端口支持完整的 UDP ASSOCIATE 命令，可用于 UDP 代理转发（如 DNS、游戏 UDP 流量等）。
@@ -789,15 +1048,25 @@ API 使用请求头 `X-API-Key`。
 ### 常用接口
 
 - `GET /api/servers`：查看服务与运行状态
+- `POST /api/servers` / `PUT|DELETE /api/servers/:id`：增改删服务器（管理）
 - `POST /api/servers/:id/start|stop|reload`：控制单个服务
-- `GET /api/sessions`：在线会话
-- `GET /api/sessions/history`：历史会话（SQLite）
+- `POST /api/servers/:id/hide|show`：公开状态页显示/隐藏
+- `GET /api/servers/:id/latency|latency-history|node-latency|current-node|blocked-nodes`：延迟与节点状态
+- `POST /api/servers/:id/switch-node|block-node|unblock-node`：切换/拉黑节点（管理）
+- `GET /api/sessions`：在线会话；`GET /api/sessions/history`：历史会话
+- `DELETE /api/sessions/:id`、`POST /api/players/:name/kick`：踢连接/踢玩家（管理）
 - `GET /api/acl/*`：黑/白名单与策略
 - `GET /api/proxy-outbounds`：上游节点列表
-- `POST /api/proxy-outbounds/test`：测试节点
-- `GET /api/proxy-ports`：本地代理端口
+- `POST /api/proxy-outbounds/test|batch-test|detailed-test|test-mcbe|health`：节点测试
+- `POST /api/proxy-outbounds/parse-import|fetch-subscription`：导入/抓取订阅
+- `GET /api/proxy-outbounds/latency-overview|groups|groups/:name`：延迟总览与组统计
+- `GET /api/proxy-subscriptions`、管理组 `POST|PUT|DELETE|POST /:id/update|update-all`：订阅管理
+- `GET /api/proxy-ports` / `GET /api/proxy-ports/:id/runtime` / `POST /api/proxy-ports/:id/test`：本地代理端口
+- `GET|PUT /api/network`、`GET /api/network/interfaces`、`POST /api/network/test`：网络路由
+- `GET /api/config`、`PUT /api/config`（管理）：全局配置
 - `GET /api/metrics`：Prometheus 指标
-- `GET /api/public/status`：公开状态快照（无鉴权，用于展示）
+- `GET /api/debug/*`：goroutine/pprof/GC（管理）
+- `GET /api/public/status`、`/api/web/index*`：公开状态页（无鉴权）
 
 ## 监控与日志
 
@@ -836,14 +1105,14 @@ cd web
 npm install
 npm run build
 
-go build -tags=with_utls -ldflags="-s -w" -o mcpeserverproxy.exe cmd/mcpeserverproxy/main.go
+go build -tags=with_utls -ldflags="-s -w" -o mcpeserverproxy.exe .
 ```
 
 如果你需要手动执行与 `build.bat` 一致的交叉编译，可以参考：
 
 ```bash
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_windows_amd64.exe cmd/mcpeserverproxy/main.go
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_linux_amd64 cmd/mcpeserverproxy/main.go
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_windows_amd64.exe .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" -o build/mcpeserverproxy_linux_amd64 .
 ```
 
 ### 运行测试
@@ -1280,7 +1549,7 @@ go tool pprof cpu.prof
 
 ### Q6: 支持哪些代理协议？
 
-**A**: 支持 Shadowsocks / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / SOCKS5 / HTTP。其中 SOCKS5 支持 TCP CONNECT 和 UDP ASSOCIATE，HTTP 仅支持 TCP CONNECT。
+**A**: 支持 Shadowsocks / ShadowsocksR / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / TUIC / WireGuard / Naive / SOCKS5 / HTTP，另有 `chain`（多级链式代理）。SOCKS5 支持 TCP CONNECT 和 UDP ASSOCIATE，HTTP 仅支持 TCP CONNECT。
 
 ### Q7: 如何备份配置和数据？
 
@@ -1348,7 +1617,7 @@ npm run dev
 
 # 在另一个终端启动后端
 cd ..
-go run cmd/mcpeserverproxy/main.go -debug
+go run . -debug
 ```
 
 ### 代码规范
@@ -1369,6 +1638,16 @@ go run cmd/mcpeserverproxy/main.go -debug
 ---
 
 ## 版本历史
+
+### v2.5.0
+- ✨ **NetherNet 支持**: 新增 `nethernet` 中间人模式与 `nethernet_relay` 不解密转发（26.x 客户端探测路径）
+- ✨ **新节点协议**: 新增 ShadowsocksR / TUIC / WireGuard / Naive / TUIC-UDP，Clash/Mihomo 订阅完整保留 `provider_options`
+- ✨ **节点订阅**: `proxy_subscriptions.json` 支持 Clash/URI 订阅链接，可定时自动更新
+- ✨ **网络路由**: `network.json` 提供全局出口网卡绑定 + Proxifier 式目的地址规则（direct/proxy/block）
+- ✨ **多用户代理端口**: `proxy_ports.users` 支持一端口多凭证、独立路由/限额/过期/UDP 开关
+- ✨ **延迟优化**: `latency_mode`（normal/aggressive/fec_tunnel）+ UDPspeeder sidecar 集成
+- ✨ **raw_udp pacer**: `downstream_limit_kbps` 对入服突发做主动 ACK/NACK 与限速重传
+- 🐛 修复多处 hot-path 分配、UDP socket 缓冲与 netroute 绑定细节
 
 ### v2.4.0 (2026-06-26)
 - ✨ **链式代理（Chain Proxy）**: 支持多级代理嵌套，自动展开嵌套链，内置循环引用检测

@@ -85,7 +85,7 @@ mindmap
 | internal/logger | 1 | 0 | ~420行 | ★★★☆☆ |
 | internal/acl | 1 | 1 | ~420行 | ★★☆☆☆ |
 | internal/errors | 1 | 0 | ~180行 | ★★☆☆☆ |
-| cmd/mcpeserverproxy | 1 | 0 | ~194行 | ★★☆☆☆ |
+| main | 1 | 0 | ~281行 | ★★☆☆☆ |
 | web/frontend | 17 | 0 | ~8,710行 | ★★★☆☆ |
 | **总计** | **70** | **17** | **~32,880行** | - |
 
@@ -93,8 +93,7 @@ mindmap
 
 ```
 mcpeserverproxy/
-├── 📁 cmd/mcpeserverproxy/                    # 应用程序入口点
-│   └── 📄 main.go                             # 194行 - 初始化所有组件
+├── 📁 main.go                               # 应用程序入口点（模块根目录，281行）
 ├── 📁 internal/                               # 内部实现（禁止外部导入）
 │   ├── 📁 proxy/                              # 代理核心 - 12,860行（19源+4测试）
 │   │   ├── 📄 singbox_factory.go              # 2,201行 - sing-box协议工厂
@@ -255,7 +254,7 @@ graph TB
 ```mermaid
 graph TB
     subgraph "Entry Point"
-        MAIN[cmd/mcpeserverproxy/main.go]
+        MAIN[main.go]
     end
     
     subgraph "Core Proxy Layer"
@@ -789,7 +788,7 @@ flowchart LR
 
 ## 第4章 核心组件深度剖析
 
-### 4.1 入口点：main.go (194行)
+### 4.1 入口点：main.go (281行)
 
 #### 4.1.1 完整启动流程
 
@@ -857,7 +856,7 @@ sequenceDiagram
 #### 4.1.2 代码结构解析
 
 ```go
-// cmd/mcpeserverproxy/main.go
+// main.go
 
 // 1. 命令行参数定义
 var (
@@ -2521,7 +2520,7 @@ classDiagram
 
 | 文件路径 | 行数 | 主要功能 | 关键结构/函数 |
 |---------|-----|---------|--------------|
-| cmd/mcpeserverproxy/main.go | 194 | 程序入口 | main(), ensureJSONFile() |
+| main.go | 281 | 程序入口 | main(), ensureJSONFile() |
 | internal/proxy/singbox_factory.go | 2,201 | sing-box协议工厂 | CreateSingboxOutbound(), protocol handlers |
 | internal/proxy/passthrough_proxy.go | 2,126 | 直通代理模式 | PassthroughProxy, handleConnection(), parseLoginPacket() |
 | internal/proxy/raw_udp_proxy.go | 2,001 | 原始UDP代理 | RawUDPProxy, handleUDPConn() |

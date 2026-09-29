@@ -14,7 +14,7 @@ description: End-to-end test mcbeproxy 负载均衡 features — per-server/全�
 - 前端: `web/src/views/Servers.vue` — 候选表 tag、作用域开关、行内 `switchToSpecificNode`、头部 `manualSwitchNode`。
 
 ## 环境搭建
-1. 编译并运行二进制（在 repo 根）: `go build -tags=with_utls -o mcpeserverproxy.exe ./cmd/mcpeserverproxy`，复制到独立工作目录（如 `C:/Users/Administrator/mcbe-test-run`）后运行（默认 :8080，无 API Key 时仪表盘 `http://localhost:8080/`，admin 路由 `/mcpe-admin/#/servers`）。
+1. 编译并运行二进制（在 repo 根）: `go build -tags=with_utls -o mcpeserverproxy.exe .`，复制到独立工作目录（如 `C:/Users/Administrator/mcbe-test-run`）后运行（默认 :8080，无 API Key 时仪表盘 `http://localhost:8080/`，admin 路由 `/mcpe-admin/#/servers`）。
 2. 建**两台共享候选**的服务器 srvA / srvB，`proxy_outbound="node-001,node-002,node-003,node-004"`，`load_balance=least-latency`，`load_balance_sort=tcp`。
 3. 让其中一个节点可达以演示「自动选优」: 例如 node-001 指向 `1.1.1.1:443`（真实 TCP RTT≈几 ms）；其余指向不可达地址（无样本，用于演示「切到无样本节点」+ 封禁）。
 4. 配置持久化在工作目录的 `server_list.json`（`auto_select_blocked_nodes` 字段）。手动 pin 为内存态，不写入该文件。

@@ -55,7 +55,7 @@ jobs:
             name="mcpeserverproxy-${VERSION}-${goos}-${goarch}"
             echo "Building ${name}${ext}"
             CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-              go build -tags=with_utls -trimpath -ldflags "${LDFLAGS}" -o "${name}${ext}" ./cmd/mcpeserverproxy
+              go build -tags=with_utls -trimpath -ldflags "${LDFLAGS}" -o "${name}${ext}" .
             if [ "${goos}" = "windows" ]; then
               zip -qj "dist-release/${name}.zip" "${name}${ext}"
             else

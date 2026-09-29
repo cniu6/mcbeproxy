@@ -13,7 +13,7 @@ MCPE Server Proxy - A high-performance UDP proxy for Minecraft Bedrock Edition g
 build.bat
 
 # Manual Go build (requires frontend built first)
-go build -tags=with_utls -ldflags="-s -w" -o mcpeserverproxy.exe cmd/mcpeserverproxy/main.go
+go build -tags=with_utls -ldflags="-s -w" -o mcpeserverproxy.exe .
 
 # Build frontend only
 cd web && npm install && npm run build
@@ -42,7 +42,7 @@ go test ./internal/config/...
 ## Architecture
 
 ### Entry Point
-`cmd/mcpeserverproxy/main.go` - Initializes all components: config loading, database, proxy server, ACL manager, API server.
+`main.go` - Initializes all components: config loading, database, proxy server, ACL manager, API server.
 
 ### Core Packages (`internal/`)
 
