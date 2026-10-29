@@ -9,20 +9,12 @@ type OpenConnectionRequest1 struct {
 	MTU            uint16
 }
 
-var cachedOCR1 = map[uint16][]byte{}
-
 func (pk *OpenConnectionRequest1) MarshalBinary() (data []byte, err error) {
-	if b, ok := cachedOCR1[pk.MTU]; ok {
-		// Cache OpenConnectionRequest1 data. These are independent of any other
-		// inputs and are pretty big.
-		return b, nil
-	}
 	b := make([]byte, pk.MTU-20-8) // IP Header: 20 bytes, UDP Header: 8 bytes.
 	b[0] = IDOpenConnectionRequest1
 	copy(b[1:], unconnectedMessageSequence[:])
 	b[17] = pk.ClientProtocol
 
-	cachedOCR1[pk.MTU] = b
 	return b, nil
 }
 

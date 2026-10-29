@@ -459,7 +459,7 @@ func (p *RawUDPProxy) processLoginPhasePacket(clientInfo *rawUDPClientInfo, upst
 	clientInfo.clearPendingACKSeqs()
 
 	if err := clientInfo.enqueueUpstreamPacket(upstreamPacket); err != nil {
-		putRawUDPBuffer(upstreamPacket)
+		defer putRawUDPBuffer(upstreamPacket)
 		clientInfo.writeTargetErrors.Add(1)
 		if errors.Is(err, errRawUDPUpstreamQueueFull) {
 			drops := clientInfo.upstreamQueueDrops.Add(1)
