@@ -14,12 +14,15 @@ type ElasticChan[T any] struct {
 	len atomic.Int64
 	ch  chan T
 	lim int64
+	// swapped 在每次换成更大的通道时被关闭并重建，用来唤醒还在旧通道上等待的读者。
+	swapped chan struct{}
 }
 
 // Chan creates an ElasticChan of a size.
 func Chan[T any](size, max int) *ElasticChan[T] {
 	c := new(ElasticChan[T])
 	c.lim = int64(max)
+	c.swapped = make(chan struct{})
 	c.grow(size)
 	return c
 }
@@ -27,17 +30,25 @@ func Chan[T any](size, max int) *ElasticChan[T] {
 // Recv attempts to read a value from the channel. If ctx is canceled, Recv
 // will return ok = false.
 func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	for {
+		// 只在取当前通道引用与改计数时持读锁，阻塞等待期间绝不持锁：否则
+		// 空通道上等待的读者会一直占着读锁，发送者在 growSend 里拿不到写锁，
+		// 两边互等，整条连接再也收不到数据。
+		c.mu.RLock()
+		ch, swapped := c.ch, c.swapped
+		c.mu.RUnlock()
 
-	select {
-	case <-ctx.Done():
-		return val, false
-	case val = <-c.ch:
-		if c.len.Add(-1) < 0 {
-			panic("unreachable")
+		select {
+		case <-ctx.Done():
+			return val, false
+		case val = <-ch:
+			if c.len.Add(-1) < 0 {
+				panic("unreachable")
+			}
+			return val, true
+		case <-swapped:
+			// 通道已被扩容替换，旧通道上的等待作废，换新通道重试。
 		}
-		return val, true
 	}
 }
 
@@ -69,8 +80,19 @@ func (c *ElasticChan[T]) growSend(val T) {
 // in the channel into a new channel with a bigger buffer.
 func (c *ElasticChan[T]) grow(size int) {
 	ch := make(chan T, size)
-	for len(c.ch) > 0 {
-		ch <- <-c.ch
+	// Recv 不再在等待期间持锁，读者可能与这里并发地从旧通道取走最后一个值；
+	// 阻塞式搬运会因此永远等不到数据，所以必须用非阻塞方式排空旧通道。
+drain:
+	for {
+		select {
+		case v := <-c.ch:
+			ch <- v
+		default:
+			break drain
+		}
 	}
 	c.ch = ch
+	// 通知旧通道上的等待者换到新通道；首次构造时没有等待者，重建即可。
+	close(c.swapped)
+	c.swapped = make(chan struct{})
 }
