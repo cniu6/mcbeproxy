@@ -8,12 +8,15 @@ import (
 )
 
 func TestListen(t *testing.T) {
-	l, err := raknet.Listen(":19132")
+	// Port 0 lets the OS pick a free port: a fixed 19132 collides with a real
+	// server (or a previous run) and fails for reasons unrelated to the code.
+	l, err := raknet.Listen("127.0.0.1:0")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
+	defer l.Close()
 	go func() {
-		_, _ = raknet.Dial("127.0.0.1:19132")
+		_, _ = raknet.Dial(l.Addr().String())
 	}()
 	c := make(chan error)
 	go accept(l, c)
