@@ -574,6 +574,18 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 		outbound.UpMbps = parseMbps(firstNonEmpty(getString(item, "up"), getString(item, "up-mbps"), getString(item, "up_mbps")))
 		outbound.DownMbps = parseMbps(firstNonEmpty(getString(item, "down"), getString(item, "down-mbps"), getString(item, "down_mbps")))
 		outbound.TLS = true
+	case config.ProtocolHysteria:
+		outbound.Password = firstNonEmpty(getString(item, "auth-str"), getString(item, "auth"), getString(item, "auth_str"))
+		outbound.Obfs = getString(item, "obfs")
+		outbound.PortHopping = firstNonEmpty(getString(item, "ports"), getString(item, "mport"))
+		outbound.HopInterval = getIntAlt(item, "hop-interval", "hop_interval")
+		outbound.UpMbps = parseMbps(firstNonEmpty(getString(item, "up"), getString(item, "up-mbps"), getString(item, "up_mbps")))
+		outbound.DownMbps = parseMbps(firstNonEmpty(getString(item, "down"), getString(item, "down-mbps"), getString(item, "down_mbps")))
+		outbound.TLS = true
+	case config.ProtocolSnell:
+		outbound.Password = firstNonEmpty(getString(item, "psk"), getString(item, "password"))
+	case config.ProtocolMieru, config.ProtocolShadowQUIC, config.ProtocolSudoku, config.ProtocolMasque, config.ProtocolTrustTunnel:
+		// Their option structs are large; provider_options carries them to mihomo.
 	case config.ProtocolShadowsocksR:
 		outbound.Method = firstNonEmpty(getString(item, "cipher"), getString(item, "method"))
 		outbound.Password = getString(item, "password")
@@ -725,7 +737,7 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 			)
 		}
 	}
-	if outbound.Type == config.ProtocolHysteria2 && outbound.SNI == "" {
+	if (outbound.Type == config.ProtocolHysteria2 || outbound.Type == config.ProtocolHysteria) && outbound.SNI == "" {
 		outbound.SNI = server
 	}
 	if err := outbound.Validate(); err != nil {
@@ -770,10 +782,17 @@ func parseLink(link string) (ParsedOutbound, bool) {
 		return parseAnyTLS(trimmed)
 	case hasSchemePrefix(trimmed, "vless"):
 		return parseVLESS(trimmed)
-	case hasSchemePrefix(trimmed, "hysteria2", "hy2", "hysteria"):
+	case hasSchemePrefix(trimmed, "hysteria2", "hy2"):
 		normalized := strings.Replace(trimmed, "hy2://", "hysteria2://", 1)
-		normalized = strings.Replace(normalized, "hysteria://", "hysteria2://", 1)
 		return parseHysteria2(normalized)
+	case hasSchemePrefix(trimmed, "hysteria"):
+		// hysteria:// is used by both true Hysteria v1 links and providers
+		// that kept the old scheme for Hysteria2. The v1 query markers tell
+		// them apart without breaking the existing compatibility path.
+		if isHysteria1Link(trimmed) {
+			return parseHysteria1(trimmed)
+		}
+		return parseHysteria2(strings.Replace(trimmed, "hysteria://", "hysteria2://", 1))
 	case hasSchemePrefix(trimmed, "socks", "socks5", "socks5h"):
 		return parseSOCKS5(trimmed)
 	case hasSchemePrefix(trimmed, "http", "https"):
@@ -1342,6 +1361,116 @@ func parseVLESS(link string) (ParsedOutbound, bool) {
 	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
 }
 
+// isHysteria1Link distinguishes a true Hysteria v1 share link from providers
+// that still use hysteria:// for Hysteria2.
+func isHysteria1Link(link string) bool {
+	parsed, err := url.Parse(link)
+	if err != nil {
+		return false
+	}
+	query := parsed.Query()
+	for _, key := range []string{"auth", "auth_str", "auth-str", "upmbps", "downmbps", "peer", "protocol"} {
+		if strings.TrimSpace(query.Get(key)) != "" {
+			return true
+		}
+	}
+	return strings.EqualFold(strings.TrimSpace(query.Get("obfs")), "xplus")
+}
+
+func parseHysteria1(link string) (ParsedOutbound, bool) {
+	parsed, err := url.Parse(link)
+	if err != nil {
+		return ParsedOutbound{}, false
+	}
+	server := parsed.Hostname()
+	port, _ := strconv.Atoi(parsed.Port())
+	if server == "" || port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	query := parsed.Query()
+	auth := queryFirst(query, "auth", "auth_str", "auth-str")
+	if auth == "" && parsed.User != nil {
+		auth = decodePercent(parsed.User.Username())
+		if auth == "" {
+			if password, ok := parsed.User.Password(); ok {
+				auth = decodePercent(password)
+			}
+		}
+	}
+	if auth == "" {
+		return ParsedOutbound{}, false
+	}
+
+	up := parseMbps(firstNonEmpty(queryFirst(query, "upmbps", "up-mbps", "up_mbps", "up"), "100"))
+	down := parseMbps(firstNonEmpty(queryFirst(query, "downmbps", "down-mbps", "down_mbps", "down"), "100"))
+	if up <= 0 {
+		up = 100
+	}
+	if down <= 0 {
+		down = 100
+	}
+	sni := firstNonEmpty(queryFirst(query, "peer", "sni", "serverName"), server)
+	insecure := queryAllowInsecure(query)
+	alpn := queryFirst(query, "alpn")
+	obfs := queryFirst(query, "obfs")
+	obfsPassword := queryFirst(query, "obfs-password", "obfs_password", "obfsParam", "obfs_param")
+	ports := queryFirst(query, "ports", "mport")
+	hop := parsePositiveInt(firstNonEmpty(queryFirst(query, "hop-interval", "hop_interval")))
+
+	options := map[string]interface{}{
+		"type":     "hysteria",
+		"auth-str": auth,
+		"up":       fmt.Sprintf("%d Mbps", up),
+		"down":     fmt.Sprintf("%d Mbps", down),
+		"protocol": firstNonEmpty(queryFirst(query, "protocol"), "udp"),
+	}
+	if sni != "" {
+		options["sni"] = sni
+	}
+	if insecure {
+		options["skip-cert-verify"] = true
+	}
+	if obfs != "" {
+		options["obfs"] = obfs
+	}
+	if obfsPassword != "" {
+		options["obfs-password"] = obfsPassword
+	}
+	if alpn != "" {
+		options["alpn"] = strings.Split(alpn, ",")
+	}
+	if ports != "" {
+		options["ports"] = ports
+	}
+	if hop > 0 {
+		options["hop-interval"] = hop
+	}
+
+	outbound := &config.ProxyOutbound{
+		Name:            fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Type:            config.ProtocolHysteria,
+		Server:          server,
+		Port:            port,
+		Password:        auth,
+		TLS:             true,
+		SNI:             sni,
+		Insecure:        insecure,
+		UpMbps:          up,
+		DownMbps:        down,
+		Obfs:            obfs,
+		ObfsPassword:    obfsPassword,
+		ALPN:            alpn,
+		PortHopping:     ports,
+		HopInterval:     hop,
+		ProviderOptions: options,
+		Enabled:         true,
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
 func parseHysteria2(link string) (ParsedOutbound, bool) {
 	parsed, err := url.Parse(link)
 	if err != nil {
@@ -1352,12 +1481,16 @@ func parseHysteria2(link string) (ParsedOutbound, bool) {
 	if server == "" || port <= 0 {
 		return ParsedOutbound{}, false
 	}
+	password := ""
+	if parsed.User != nil {
+		password = decodePercent(parsed.User.Username())
+	}
 	outbound := &config.ProxyOutbound{
 		Name:            fallbackName(decodeURLFragment(parsed.Fragment), server, port),
 		Type:            config.ProtocolHysteria2,
 		Server:          server,
 		Port:            port,
-		Password:        decodePercent(parsed.User.Username()),
+		Password:        password,
 		Obfs:            parsed.Query().Get("obfs"),
 		ObfsPassword:    parsed.Query().Get("obfs-password"),
 		PortHopping:     firstNonEmpty(parsed.Query().Get("mport"), parsed.Query().Get("ports")),
@@ -1608,8 +1741,10 @@ func normalizeProtocol(value string) string {
 		return config.ProtocolSOCKS5
 	case "http", "https":
 		return config.ProtocolHTTP
-	case "hy2", "hysteria", "hysteria2":
+	case "hy2", "hysteria2":
 		return config.ProtocolHysteria2
+	case "hysteria":
+		return config.ProtocolHysteria
 	case "naiveproxy":
 		return config.ProtocolNaive
 	default:

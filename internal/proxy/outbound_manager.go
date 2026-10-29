@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"regexp"
 	"sort"
@@ -1574,6 +1575,18 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 
 		lastErr = err
 
+		// A cancelled dial (player left while the handshake ran) is not a node
+		// failure and must not trigger further attempts.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+
+		// Authentication / configuration errors do not heal inside a retry
+		// window; retrying only delays the failure by the backoff budget.
+		if !isRetryableDialError(err) {
+			break
+		}
+
 		// Check if we should skip retries (unhealthy node marked during attempt)
 		// Requirements: 6.4
 		m.mu.RLock()
@@ -1599,7 +1612,7 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(retryDelay):
+		case <-time.After(dialRetryJitter(retryDelay)):
 		}
 
 		// Increase delay for next retry (exponential backoff)
@@ -1611,7 +1624,50 @@ func (m *outboundManagerImpl) dialWithRetry(ctx context.Context, outboundName st
 
 	// All retries failed
 	// Requirements: 6.2
-	return nil, fmt.Errorf("%w: %s after %d attempts: %v", ErrAllRetriesFailed, outboundName, MaxRetryAttempts, lastErr)
+	if isRetryableDialError(lastErr) {
+		return nil, fmt.Errorf("%w: %s after %d attempts: %v", ErrAllRetriesFailed, outboundName, MaxRetryAttempts, lastErr)
+	}
+	return nil, fmt.Errorf("%w: %s: %v", ErrAllRetriesFailed, outboundName, lastErr)
+}
+
+// dialRetryJitter spreads retry attempts of concurrent players so a node that
+// just went bad is not hammered by every session at the same instant.
+func dialRetryJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	half := base / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
+}
+
+// isRetryableDialError reports whether another attempt can plausibly succeed.
+// Misconfiguration and authentication failures are terminal for this dial.
+func isRetryableDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"authentication failed",
+		"auth failed",
+		"invalid password",
+		"invalid uuid",
+		"unsupported",
+		"missing required",
+		"not initialized",
+		"no such host",
+		"certificate",
+		"x509:",
+		"permission denied",
+	} {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 // DialTCPContext creates a TCP connection through one configured outbound.
@@ -1682,7 +1738,7 @@ func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, ou
 	// Get or create sing-box outbound instance and hold a runtime reference while dialing.
 	active, err := m.getOrCreateSingboxOutbound(cfg)
 	if err != nil {
-		if markHealth {
+		if markHealth && ctx.Err() == nil {
 			cfg.SetHealthy(false)
 			cfg.SetLastError(err.Error())
 			cfg.SetLastCheck(time.Now())
@@ -1710,7 +1766,10 @@ func (m *outboundManagerImpl) dialPacketConnOnceInternal(ctx context.Context, ou
 			return nil, fmt.Errorf("failed to dial packet connection: %w", err)
 		}
 
-		if markHealth {
+		// Context cancellation (player left mid-handshake) says nothing about
+		// node health; marking the node unhealthy here removed it from
+		// selection for every other player for 30 seconds.
+		if markHealth && ctx.Err() == nil {
 			cfg.SetHealthy(false)
 			cfg.SetLastError(err.Error())
 			cfg.SetLastCheck(time.Now())

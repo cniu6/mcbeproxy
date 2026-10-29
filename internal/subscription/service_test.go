@@ -12,6 +12,119 @@ import (
 	"mcpeserverproxy/internal/config"
 )
 
+func TestParseHysteria1Link(t *testing.T) {
+	content := []byte("hysteria://v1.example.com:443?auth=secret&peer=v1.example.com&upmbps=30&downmbps=100&obfs=xplus&protocol=udp#hy1\n")
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolHysteria {
+		t.Fatalf("type = %s, want hysteria", got.Type)
+	}
+	if got.Password != "secret" || got.UpMbps != 30 || got.DownMbps != 100 {
+		t.Fatalf("unexpected hysteria v1 fields: %+v", got)
+	}
+	if got.SNI != "v1.example.com" || got.Obfs != "xplus" {
+		t.Fatalf("unexpected hysteria v1 sni/obfs: %+v", got)
+	}
+	if got.ProviderOptions["auth-str"] != "secret" {
+		t.Fatalf("auth-str missing from provider options: %+v", got.ProviderOptions)
+	}
+}
+
+func TestHysteriaSchemeKeepsHysteria2Compatibility(t *testing.T) {
+	// Some providers still use hysteria:// for Hysteria2 links. The absence of
+	// v1-only query markers must keep the old compatibility path.
+	content := []byte("hysteria://secret@example.com:443?up=30%20Mbps&down=200%20Mbps&obfs=salamander&obfs-password=obfs&sni=edge.example.com#hy2\n")
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 outbound, got %d", len(parsed))
+	}
+	got := parsed[0].Outbound
+	if got.Type != config.ProtocolHysteria2 {
+		t.Fatalf("type = %s, want hysteria2", got.Type)
+	}
+	if got.Password != "secret" || got.UpMbps != 30 || got.DownMbps != 200 {
+		t.Fatalf("unexpected hysteria2 compatibility fields: %+v", got)
+	}
+}
+
+func TestParseClashNewUpstreamProtocols(t *testing.T) {
+	content := []byte(`proxies:
+  - name: hy1
+    type: hysteria
+    server: 127.0.0.1
+    port: 443
+    auth-str: secret
+    up: 30 Mbps
+    down: 100 Mbps
+    sni: example.com
+  - name: snell
+    type: snell
+    server: 127.0.0.1
+    port: 443
+    psk: psk-value
+    version: 4
+    udp: true
+  - name: mieru
+    type: mieru
+    server: 127.0.0.1
+    port: 443
+    transport: TCP
+    username: u
+    password: p
+  - name: shadowquic
+    type: shadowquic
+    server: 127.0.0.1
+    port: 443
+    password: p
+  - name: sudoku
+    type: sudoku
+    server: 127.0.0.1
+    port: 443
+    key: k
+  - name: masque
+    type: masque
+    server: 127.0.0.1
+    port: 443
+    username: u
+    password: p
+  - name: trusttunnel
+    type: trusttunnel
+    server: 127.0.0.1
+    port: 443
+    username: u
+    password: p
+`)
+	parsed, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatalf("ParseSubscriptionContent: %v", err)
+	}
+	want := map[string]bool{
+		config.ProtocolHysteria: false, config.ProtocolSnell: false,
+		config.ProtocolMieru: false, config.ProtocolShadowQUIC: false,
+		config.ProtocolSudoku: false, config.ProtocolMasque: false,
+		config.ProtocolTrustTunnel: false,
+	}
+	for _, item := range parsed {
+		if _, ok := want[item.Outbound.Type]; ok {
+			want[item.Outbound.Type] = true
+		}
+	}
+	for protocol, found := range want {
+		if !found {
+			t.Errorf("protocol %s was not imported", protocol)
+		}
+	}
+}
+
 func TestParseSubscriptionContent_LinkVariants(t *testing.T) {
 	content := []byte("SOCKS5://user:pass@127.0.0.1:1080#sockA\n" +
 		"socks5h://127.0.0.1:1081?username=alice&password=secret&tls=true&sni=edge.example.com#sockB\n" +

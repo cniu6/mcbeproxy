@@ -9,9 +9,32 @@
         <n-button size="small" @click="handleManualRefresh">刷新</n-button>
       </n-space>
     </n-space>
-    
+
+    <!-- 概览横幅：把“系统是否健康”压缩成一眼可读的三个指标 -->
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="hero-eyebrow"><span class="pulse" aria-hidden="true"></span> LIVE · Bedrock 加速中</div>
+        <h1 class="hero-title">网络状态一览</h1>
+        <p class="hero-sub">节点、玩家与吞吐实时汇总，异常会在这里第一时间体现。</p>
+      </div>
+      <div class="hero-metrics">
+        <div class="hero-metric">
+          <span class="hero-metric-label">在线玩家</span>
+          <span class="hero-metric-value">{{ totalOnline }}</span>
+        </div>
+        <div class="hero-metric">
+          <span class="hero-metric-label">运行服务器</span>
+          <span class="hero-metric-value">{{ runningServers }}<small>/ {{ servers.length }}</small></span>
+        </div>
+        <div class="hero-metric">
+          <span class="hero-metric-label">下行速率</span>
+          <span class="hero-metric-value">{{ formatBytes(stats.network_total?.speed_in_bps) }}<small>/s</small></span>
+        </div>
+      </div>
+    </section>
+
     <!-- 系统状态 -->
-    <n-grid :cols="isMobile ? 2 : 8" :x-gap="10" :y-gap="10" style="margin-bottom: 12px" responsive="screen">
+    <n-grid :cols="isMobile ? 2 : (windowWidth < 1200 ? 3 : 5)" :x-gap="10" :y-gap="10" style="margin-bottom: 12px" responsive="screen">
       <n-gi>
         <n-card size="small">
           <n-statistic label="CPU">
@@ -290,6 +313,7 @@ const supportsServerAutoPing = (server) => {
 const serverAutoPingActive = (server) => supportsServerAutoPing(server) && !!server?.auto_ping_enabled
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
+const runningServers = computed(() => servers.value.filter(s => s.status === 'running').length)
 
 const formatCountdown = (targetAt) => {
   if (!refreshInterval.value || refreshInterval.value <= 0 || !targetAt) return '自动刷新关闭'
@@ -493,4 +517,89 @@ onUnmounted(() => {
 
 <style scoped>
 .table-wrapper { width: 100%; overflow-x: auto; }
+
+.hero {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding: 22px 24px;
+  margin-bottom: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(99, 226, 183, 0.18);
+  background:
+    radial-gradient(600px 200px at 0% 0%, rgba(99, 226, 183, 0.14), transparent 70%),
+    linear-gradient(135deg, rgba(20, 26, 38, 0.9), rgba(14, 19, 28, 0.72));
+  overflow: hidden;
+}
+.hero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.045), transparent);
+  transform: translateX(-100%);
+  animation: hero-sheen 6s ease-in-out infinite;
+}
+@keyframes hero-sheen {
+  0%, 60% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.hero-copy { position: relative; z-index: 1; min-width: 240px; }
+.hero-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #63e2b7;
+}
+.pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #63e2b7;
+  box-shadow: 0 0 0 0 rgba(99, 226, 183, 0.6);
+  animation: hero-pulse 2s infinite;
+}
+@keyframes hero-pulse {
+  70% { box-shadow: 0 0 0 8px rgba(99, 226, 183, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 226, 183, 0); }
+}
+.hero-title {
+  margin: 8px 0 4px;
+  font-size: 24px;
+  line-height: 1.2;
+  background: linear-gradient(90deg, #f2fffa, #a7f3d0 55%, #7dd3fc);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.hero-sub { margin: 0; color: #8b98ad; font-size: 13px; }
+.hero-metrics { position: relative; z-index: 1; display: flex; gap: 12px; flex-wrap: wrap; }
+.hero-metric {
+  min-width: 112px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hero-metric-label { font-size: 11px; color: #8b98ad; }
+.hero-metric-value { font-size: 20px; font-weight: 700; color: #eafaf4; font-variant-numeric: tabular-nums; }
+.hero-metric-value small { font-size: 11px; font-weight: 500; color: #8b98ad; margin-left: 2px; }
+
+@media (max-width: 767px) {
+  .hero { padding: 18px; }
+  .hero-title { font-size: 20px; }
+  .hero-metric { min-width: 96px; flex: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero::after, .pulse { animation: none; }
+}
 </style>

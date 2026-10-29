@@ -18,12 +18,54 @@ type mihomoOutbound struct {
 	proxy mihomoC.Proxy
 }
 
+// providerOptionCore lets one node opt into a specific outbound engine without
+// changing the global behaviour:
+//
+//	"core": "mihomo"  -> always use the mihomo adapter for this node
+//	"core": "native"  -> always use the hand-written sing-* implementation
+//
+// The key is consumed locally and removed before the mapping reaches mihomo.
+const providerOptionCore = "core"
+
+func outboundCorePreference(cfg *config.ProxyOutbound) string {
+	if cfg == nil || len(cfg.ProviderOptions) == 0 {
+		return ""
+	}
+	value, _ := cfg.ProviderOptions[providerOptionCore].(string)
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// mihomoSupportsProtocol lists the protocols the mihomo bridge can carry.
+// NaiveProxy is excluded because it needs the official Cronet runtime.
+func mihomoSupportsProtocol(protocol string) bool {
+	switch protocol {
+	case config.ProtocolShadowsocks, config.ProtocolShadowsocksR, config.ProtocolVMess,
+		config.ProtocolTrojan, config.ProtocolVLESS, config.ProtocolSOCKS5,
+		config.ProtocolHTTP, config.ProtocolHysteria, config.ProtocolHysteria2,
+		config.ProtocolTUIC, config.ProtocolWireGuard, config.ProtocolSnell,
+		config.ProtocolMieru, config.ProtocolShadowQUIC, config.ProtocolSudoku,
+		config.ProtocolMasque, config.ProtocolTrustTunnel:
+		return true
+	default:
+		return false
+	}
+}
+
 func supportsMihomo(cfg *config.ProxyOutbound) bool {
 	if cfg == nil {
 		return false
 	}
+	switch outboundCorePreference(cfg) {
+	case "mihomo", "clash":
+		return mihomoSupportsProtocol(cfg.Type)
+	case "native", "legacy", "singbox":
+		return false
+	}
 	switch cfg.Type {
-	case config.ProtocolShadowsocksR, config.ProtocolTUIC, config.ProtocolWireGuard, config.ProtocolNaive:
+	case config.ProtocolShadowsocksR, config.ProtocolTUIC, config.ProtocolWireGuard, config.ProtocolNaive,
+		config.ProtocolHysteria, config.ProtocolSnell, config.ProtocolMieru,
+		config.ProtocolShadowQUIC, config.ProtocolSudoku, config.ProtocolMasque,
+		config.ProtocolTrustTunnel:
 		return true
 	case config.ProtocolVLESS:
 		return cfg.Reality
@@ -37,7 +79,10 @@ func newMihomoOutbound(cfg *config.ProxyOutbound) (*mihomoOutbound, error) {
 		return nil, fmt.Errorf("proxy outbound configuration cannot be nil")
 	}
 	if cfg.Type == config.ProtocolNaive {
-		return nil, fmt.Errorf("NaiveProxy requires the official Cronet runtime; this build does not include it")
+		// NaiveProxy is HTTP/2 CONNECT over TLS: it carries TCP streams only.
+		// MCPE is UDP, so there is no data path for this protocol regardless of
+		// whether the Chromium Cronet runtime is available.
+		return nil, fmt.Errorf("NaiveProxy only supports TCP CONNECT and cannot carry MCPE UDP traffic")
 	}
 	proxy, err := mihomo.ParseProxy(buildMihomoMapping(cfg))
 	if err != nil {
@@ -89,6 +134,8 @@ func buildMihomoMapping(cfg *config.ProxyOutbound) map[string]any {
 	if mapping == nil {
 		mapping = make(map[string]any)
 	}
+	// Local routing hint, not a mihomo proxy field.
+	delete(mapping, providerOptionCore)
 	if _, ok := mapping["type"]; !ok {
 		mapping["type"] = mihomoProtocolType(cfg.Type)
 	}
@@ -124,6 +171,120 @@ func buildMihomoMapping(cfg *config.ProxyOutbound) map[string]any {
 	if cfg.Flow != "" {
 		mapping["flow"] = cfg.Flow
 	}
+	// Transport path/host must survive a switch to the mihomo engine; otherwise
+	// a WS/gRPC node would connect to the TLS endpoint without its upgrade.
+	if cfg.WSPath != "" || cfg.WSHost != "" {
+		wsOpts := make(map[string]any)
+		if existing, ok := mapping["ws-opts"].(map[string]interface{}); ok {
+			for key, value := range existing {
+				wsOpts[key] = value
+			}
+		}
+		if cfg.WSPath != "" {
+			wsOpts["path"] = cfg.WSPath
+		}
+		if cfg.WSHost != "" {
+			wsOpts["headers"] = map[string]any{"Host": cfg.WSHost}
+		}
+		mapping["ws-opts"] = wsOpts
+	}
+	if cfg.GRPCServiceName != "" {
+		grpcOpts := make(map[string]any)
+		if existing, ok := mapping["grpc-opts"].(map[string]interface{}); ok {
+			for key, value := range existing {
+				grpcOpts[key] = value
+			}
+		}
+		grpcOpts["grpc-service-name"] = cfg.GRPCServiceName
+		mapping["grpc-opts"] = grpcOpts
+	}
+
+	// Protocol-specific fields the generic model already knows about. Keeping
+	// them here means `core: mihomo` nodes do not silently lose settings that
+	// were parsed out of a subscription.
+	switch cfg.Type {
+	case config.ProtocolShadowsocks:
+		if cfg.Method != "" {
+			mapping["cipher"] = cfg.Method
+		}
+	case config.ProtocolVLESS:
+		if cfg.TLS {
+			mapping["tls"] = true
+		}
+	case config.ProtocolVMess:
+		if cfg.TLS {
+			mapping["tls"] = true
+		}
+		mapping["alterId"] = cfg.AlterID
+		if cfg.Security != "" {
+			mapping["cipher"] = cfg.Security
+		}
+	case config.ProtocolTrojan:
+		mapping["tls"] = true
+	case config.ProtocolHTTP:
+		if cfg.TLS {
+			mapping["tls"] = true
+		}
+	case config.ProtocolHysteria:
+		// Hysteria v1: mihomo reads auth-str/auth, up/down ("N Mbps"),
+		// obfs, ports and hop-interval.
+		delete(mapping, "password")
+		if cfg.Password != "" {
+			mapping["auth-str"] = cfg.Password
+		}
+		if cfg.UpMbps > 0 {
+			mapping["up"] = fmt.Sprintf("%d Mbps", cfg.UpMbps)
+		}
+		if cfg.DownMbps > 0 {
+			mapping["down"] = fmt.Sprintf("%d Mbps", cfg.DownMbps)
+		}
+		if cfg.Obfs != "" {
+			mapping["obfs"] = cfg.Obfs
+		}
+		if cfg.PortHopping != "" {
+			mapping["ports"] = cfg.PortHopping
+		}
+		if cfg.HopInterval > 0 {
+			mapping["hop-interval"] = cfg.HopInterval
+		}
+		if _, ok := mapping["protocol"]; !ok {
+			mapping["protocol"] = "udp"
+		}
+	case config.ProtocolSnell:
+		// Snell v4/v5: PSK + UDP. Version/reuse can be overridden by the
+		// subscription's provider_options.
+		delete(mapping, "password")
+		if cfg.Password != "" {
+			mapping["psk"] = cfg.Password
+		}
+		mapping["udp"] = true
+		if _, ok := mapping["version"]; !ok {
+			mapping["version"] = 4
+		}
+		if _, ok := mapping["reuse"]; !ok {
+			mapping["reuse"] = true
+		}
+	case config.ProtocolHysteria2:
+		if cfg.UpMbps > 0 {
+			mapping["up"] = fmt.Sprintf("%d Mbps", cfg.UpMbps)
+		}
+		if cfg.DownMbps > 0 {
+			mapping["down"] = fmt.Sprintf("%d Mbps", cfg.DownMbps)
+		}
+		if cfg.Obfs != "" {
+			mapping["obfs"] = cfg.Obfs
+		}
+		if cfg.ObfsPassword != "" {
+			mapping["obfs-password"] = cfg.ObfsPassword
+		}
+		if cfg.PortHopping != "" {
+			mapping["ports"] = cfg.PortHopping
+		}
+		if cfg.HopInterval > 0 {
+			mapping["hop-interval"] = cfg.HopInterval
+		}
+	}
+
 	if cfg.Reality {
 		mapping["tls"] = true
 		// 保留上游的 MLKEM 等扩展，不修改原始订阅映射。

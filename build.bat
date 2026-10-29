@@ -14,6 +14,9 @@ set "BUILD_DIR=build"
 set "WEB_DIR=web"
 set "DIST_DIR=internal\api\dist"
 set "MAIN_FILE=main.go"
+:: 单一构建：全部协议 + 网页面板 + SQLite + 全部代理模式。
+:: no_easytier/no_zerotier 只排除两个 MCPE 用不到的虚拟组网适配器。
+set "BUILD_TAGS=with_utls no_easytier no_zerotier"
 set "RELEASE_VERSION="
 for /f "delims=" %%I in ('git describe --tags --always 2^>nul') do set "RELEASE_VERSION=%%I"
 if not defined RELEASE_VERSION set "RELEASE_VERSION=dev"
@@ -86,7 +89,7 @@ echo       Done.
 echo.
 
 :: 交叉编译
-echo [3/3] Cross compiling for all platforms...
+echo [3/3] Building Windows/Linux...
 echo.
 
 set "SUCCESS_COUNT=0"
@@ -94,26 +97,12 @@ set "FAIL_COUNT=0"
 
 :: Windows
 call :build_target windows amd64 .exe
-@REM call :build_target windows 386 .exe
-@REM call :build_target windows arm64 .exe
 
 :: Linux
 call :build_target linux amd64
-@REM call :build_target linux 386
-@REM call :build_target linux arm64
-@REM call :build_target linux arm
 
-@REM :: macOS
-@REM call :build_target darwin amd64
-@REM call :build_target darwin arm64
-
-@REM :: FreeBSD
-@REM call :build_target freebsd amd64
-@REM call :build_target freebsd arm64
-
-@REM echo.
 echo ========================================
-echo   Build Complete!
+echo   Build Complete
 echo   Success: %SUCCESS_COUNT%  Failed: %FAIL_COUNT%
 echo   Output: %BUILD_DIR%\
 echo ========================================
@@ -141,8 +130,8 @@ set "OUTPUT=%BUILD_DIR%\%PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%"
 echo       Building %GOOS%/%GOARCH%...
 
 set "CGO_ENABLED=0"
-set "LDFLAGS=-s -w -X=mcpeserverproxy/internal/logger.Version=!RELEASE_VERSION! -X=mcpeserverproxy/internal/logger.BuildTime=!BUILD_TIME! -X=mcpeserverproxy/internal/logger.GitCommit=!GIT_COMMIT!"
-go build -tags=with_utls -ldflags="!LDFLAGS!" -o "%OUTPUT%" "%MAIN_FILE%"
+set "LDFLAGS=-s -w -buildid= -X=mcpeserverproxy/internal/logger.Version=!RELEASE_VERSION! -X=mcpeserverproxy/internal/logger.BuildTime=!BUILD_TIME! -X=mcpeserverproxy/internal/logger.GitCommit=!GIT_COMMIT!"
+go build -trimpath -tags="%BUILD_TAGS%" -ldflags="!LDFLAGS!" -o "%OUTPUT%" "%MAIN_FILE%"
 
 if %errorlevel% equ 0 (
     echo       [OK] %PROJECT_NAME%_%GOOS%_%GOARCH%%EXT%

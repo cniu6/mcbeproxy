@@ -25,6 +25,16 @@ const (
 	ProtocolTUIC         = "tuic"
 	ProtocolWireGuard    = "wireguard"
 	ProtocolNaive        = "naive"
+	// Newer upstream (mihomo) outbounds that can carry UDP. Hysteria v1 and
+	// Snell have first-class fields below; the rest are carried by
+	// provider_options imported from a subscription.
+	ProtocolHysteria    = "hysteria"
+	ProtocolSnell       = "snell"
+	ProtocolMieru       = "mieru"
+	ProtocolShadowQUIC  = "shadowquic"
+	ProtocolSudoku      = "sudoku"
+	ProtocolMasque      = "masque"
+	ProtocolTrustTunnel = "trusttunnel"
 	ProtocolChain        = "chain"
 )
 
@@ -214,8 +224,14 @@ func (p *ProxyOutbound) Validate() error {
 		return p.validateWireGuard()
 	case ProtocolNaive:
 		return p.validateNaive()
+	case ProtocolHysteria:
+		return p.validateHysteria()
+	case ProtocolSnell:
+		return p.validateSnell()
+	case ProtocolMieru, ProtocolShadowQUIC, ProtocolSudoku, ProtocolMasque, ProtocolTrustTunnel:
+		return p.validateProviderOptionsOnly()
 	default:
-		return fmt.Errorf("invalid field: type must be one of shadowsocks, shadowsocksr, vmess, trojan, vless, socks5, http, hysteria2, anytls, tuic, wireguard, naive, chain, got %s", p.Type)
+		return fmt.Errorf("invalid field: type must be one of shadowsocks, shadowsocksr, vmess, trojan, vless, socks5, http, hysteria, hysteria2, anytls, tuic, wireguard, naive, snell, mieru, shadowquic, sudoku, masque, trusttunnel, chain, got %s", p.Type)
 	}
 }
 
@@ -316,6 +332,30 @@ func (p *ProxyOutbound) validateWireGuard() error {
 func (p *ProxyOutbound) validateNaive() error {
 	if p.Username == "" || p.Password == "" {
 		return errors.New("missing required field: username and password (required for naive)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateHysteria() error {
+	if p.Password == "" && p.ProviderOptions == nil {
+		return errors.New("missing required field: password (required for hysteria)")
+	}
+	return nil
+}
+
+func (p *ProxyOutbound) validateSnell() error {
+	if p.Password == "" && p.ProviderOptions == nil {
+		return errors.New("missing required field: password/psk (required for snell)")
+	}
+	return nil
+}
+
+// validateProviderOptionsOnly covers upstream outbounds whose option structs
+// are too large to mirror field by field. Their parameters come from a
+// subscription (Clash YAML or a share link) and are passed to mihomo as-is.
+func (p *ProxyOutbound) validateProviderOptionsOnly() error {
+	if p.ProviderOptions == nil {
+		return fmt.Errorf("missing required field: provider_options (required for %s; import it from a subscription)", p.Type)
 	}
 	return nil
 }

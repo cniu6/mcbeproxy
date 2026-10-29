@@ -1,2 +1,107 @@
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #18181c; min-height: 100vh; }
+/* Global design tokens + base layer for the MCPE Proxy dashboard. */
+:root {
+  color-scheme: dark;
+  --app-bg: #0b0f16;
+  --app-bg-soft: #0e131c;
+  --app-panel: rgba(20, 26, 38, 0.72);
+  --app-panel-solid: #141a26;
+  --app-border: rgba(255, 255, 255, 0.07);
+  --app-border-strong: rgba(255, 255, 255, 0.12);
+  --app-text: #e7eefb;
+  --app-text-dim: #8b98ad;
+  --app-brand: #63e2b7;
+  --app-brand-2: #38bdf8;
+  --app-brand-glow: rgba(99, 226, 183, 0.18);
+  --app-radius: 14px;
+  --app-shadow: 0 1px 2px rgba(0, 0, 0, 0.24), 0 14px 40px rgba(0, 0, 0, 0.22);
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html,
+body,
+#app { min-height: 100%; }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1100px 520px at 8% -12%, rgba(99, 226, 183, 0.10), transparent 62%),
+    radial-gradient(900px 480px at 98% -6%, rgba(56, 189, 248, 0.09), transparent 58%),
+    radial-gradient(900px 700px at 50% 120%, rgba(99, 102, 241, 0.07), transparent 62%),
+    var(--app-bg);
+  background-attachment: fixed;
+  color: var(--app-text);
+  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(99, 226, 183, 0.28);
+  color: #f4fffb;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.26);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Content shell: one centered column with a consistent page transition. */
+.app-shell { background: transparent !important; }
+.app-main { background: transparent !important; }
+.app-content { width: 100%; max-width: 1480px; margin: 0 auto; }
+.app-content > * { animation: page-in 0.3s cubic-bezier(0.2, 0.7, 0.2, 1); }
+
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-content > * { animation: none; }
+  .n-card,
+  .n-button { transition: none !important; }
+}
+
+/* Cards: glass panel that reacts only on hover, never reflows the page. */
+.n-card {
+  backdrop-filter: blur(10px);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.n-card:hover {
+  border-color: rgba(99, 226, 183, 0.26) !important;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.24);
+}
+
+.n-statistic .n-statistic-value { font-variant-numeric: tabular-nums; }
+
+h1, h2, h3,
+.n-h1, .n-h2, .n-h3 { letter-spacing: -0.01em; }
+
+code, pre, .mono {
+  font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+}
+
+:focus-visible { outline: 2px solid rgba(99, 226, 183, 0.55); outline-offset: 2px; }
+
+.table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+  border-radius: 12px;
+}
+.table-wrapper .n-table { --n-th-color: rgba(255, 255, 255, 0.035); }
+
+/* Dense tables keep their own surface instead of inheriting the glass card. */
+.n-data-table .n-data-table-td { font-variant-numeric: tabular-nums; }
+

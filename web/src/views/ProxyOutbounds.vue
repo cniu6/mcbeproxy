@@ -525,15 +525,37 @@
             <n-gi><n-form-item label="Flow"><n-select v-model:value="form.flow" :options="vlessFlowOptions" clearable /></n-form-item></n-gi>
           </template>
           
-          <!-- Hysteria2 字段 -->
-          <template v-if="form.type === 'hysteria2'">
+          <!-- Hysteria v1 / v2 字段 -->
+          <template v-if="['hysteria', 'hysteria2'].includes(form.type)">
             <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="端口跳跃"><n-input v-model:value="form.port_hopping" placeholder="如: 20000-55000 (可选)" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="混淆类型"><n-select v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable /></n-form-item></n-gi>
+            <n-gi>
+              <n-form-item label="混淆类型">
+                <n-input v-if="form.type === 'hysteria'" v-model:value="form.obfs" placeholder="如 xplus（可选）" />
+                <n-select v-else v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable />
+              </n-form-item>
+            </n-gi>
             <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input v-model:value="form.obfs_password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('obfs_password')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="SNI"><n-input v-model:value="form.sni" placeholder="节点域名（可选）" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="跳过验证"><n-switch v-model:value="form.insecure" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="上行 Mbps"><n-input-number v-model:value="form.up_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="下行 Mbps"><n-input-number v-model:value="form.down_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
+          </template>
+
+          <!-- Snell 字段 -->
+          <template v-if="form.type === 'snell'">
+            <n-gi :span="2"><n-form-item label="PSK"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-alert type="info">Snell 默认 v4 并开启 UDP，适合 MCPE；高级版本/混淆参数请通过订阅导入。</n-alert></n-gi>
           </template>
           
+          <!-- TUIC 字段 -->
+          <template v-if="form.type === 'tuic'">
+            <n-gi><n-form-item label="UUID / Token"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
+          </template>
+
           <!-- TLS 通用字段 -->
           <template v-if="form.tls || form.reality">
             <n-gi><n-form-item label="SNI"><n-input v-model:value="form.sni" placeholder="服务器名称指示" /></n-form-item></n-gi>
@@ -646,7 +668,7 @@
     <!-- 导入 Modal -->
     <n-modal v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
       <n-alert type="info" style="margin-bottom: 12px">
-        支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、hysteria2://、hy2://，也支持 Clash/Mihomo YAML 订阅<br/>
+        支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、tuic://、hysteria://、hysteria2://、hy2://，也支持 Clash/Mihomo YAML 订阅<br/>
         每行一个链接，支持批量导入，支持 Base64 编码的订阅内容
       </n-alert>
       <n-form-item label="导入分组" style="margin-bottom: 12px">
@@ -1382,12 +1404,14 @@ function chainInlineGetLatencyType(ms) {
 
 const chainInlineColors = {
   shadowsocks: '#6366f1', vmess: '#8b5cf6', trojan: '#f59e0b', vless: '#06b6d4',
-  socks5: '#10b981', http: '#3b82f6', hysteria2: '#ec4899', anytls: '#f97316',
+  socks5: '#10b981', http: '#3b82f6', hysteria2: '#ec4899', hysteria: '#e879f9', snell: '#22d3ee', anytls: '#f97316',
+  tuic: '#14b8a6', wireguard: '#a855f7', shadowsocksr: '#64748b', mieru: '#f43f5e', shadowquic: '#818cf8', sudoku: '#fbbf24', masque: '#38bdf8', trusttunnel: '#a3e635',
   chain: '#63e2b7', unknown: '#6b7280',
 }
 const chainInlineIcons = {
   shadowsocks: 'SS', vmess: 'VM', trojan: 'TJ', vless: 'VL',
-  socks5: 'S5', http: 'HP', hysteria2: 'H2', anytls: 'AT', chain: 'CH', unknown: '?',
+  socks5: 'S5', http: 'HP', hysteria2: 'H2', hysteria: 'H1', snell: 'SN', anytls: 'AT',
+  tuic: 'TU', wireguard: 'WG', shadowsocksr: 'SR', mieru: 'MI', shadowquic: 'SQ', sudoku: 'SK', masque: 'MQ', trusttunnel: 'TT', chain: 'CH', unknown: '?',
 }
 function chainInlineGetColor(type) { return chainInlineColors[type] || chainInlineColors.unknown }
 function chainInlineGetIcon(type) { return chainInlineIcons[type] || chainInlineIcons.unknown }
@@ -1540,7 +1564,15 @@ const protocolFilterOptions = [
   { label: 'SOCKS5', value: 'socks5' },
   { label: 'HTTP', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
-  { label: 'Hysteria2', value: 'hysteria2' }
+  { label: 'Hysteria2', value: 'hysteria2' },
+  { label: 'Hysteria (v1)', value: 'hysteria' },
+  { label: 'Snell', value: 'snell' },
+  { label: 'TUIC', value: 'tuic' },
+  { label: 'Mieru', value: 'mieru' },
+  { label: 'ShadowQUIC', value: 'shadowquic' },
+  { label: 'Sudoku', value: 'sudoku' },
+  { label: 'Masque', value: 'masque' },
+  { label: 'TrustTunnel', value: 'trusttunnel' }
 ]
 
 // 状态筛选选项
@@ -1757,6 +1789,9 @@ const protocolOptions = [
   { label: 'HTTP Proxy', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' },
+  { label: 'Hysteria (v1)', value: 'hysteria' },
+  { label: 'Snell', value: 'snell' },
+  { label: 'TUIC', value: 'tuic' },
   { label: '代理链条', value: 'chain' }
 ]
 
@@ -1809,6 +1844,7 @@ const defaultForm = {
   name: '', type: 'shadowsocks', server: '', port: 443, enabled: true, group: '',
   username: '', method: 'aes-256-gcm', password: '', uuid: '', alter_id: 0, security: 'auto',
   flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '',
+  up_mbps: 0, down_mbps: 0,
   idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
   udp_socket_buffer_size: 0,
   reality: false, reality_public_key: '', reality_short_id: '',
@@ -2884,7 +2920,7 @@ const openEditModal = (o) => {
 const onProtocolChange = () => {
   form.value.method = form.value.type === 'shadowsocks' ? 'aes-256-gcm' : ''
   form.value.security = form.value.type === 'vmess' ? 'auto' : ''
-  form.value.tls = ['trojan', 'vless', 'anytls'].includes(form.value.type)
+  form.value.tls = ['trojan', 'vless', 'anytls', 'tuic'].includes(form.value.type)
   if (!['vmess', 'trojan', 'vless'].includes(form.value.type)) {
     form.value.network = ''
     form.value.ws_path = ''
@@ -2906,7 +2942,7 @@ const onProtocolChange = () => {
     form.value.reality_public_key = ''
     form.value.reality_short_id = ''
   }
-  if (form.value.type === 'hysteria2' && !form.value.alpn) {
+  if (['hysteria2', 'hysteria'].includes(form.value.type) && !form.value.alpn) {
     form.value.alpn = 'h3'
   }
 }
