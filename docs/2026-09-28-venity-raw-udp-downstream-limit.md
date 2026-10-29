@@ -50,9 +50,12 @@ RakNet 模式 + `downstream_limit_kbps` 已验证可用（两次会话分别 18 
 玩家断开时日志有一行：
 
 ```
-Player disconnected: ... loss[...] paced[rate=3200kbps sent=... resent=...(nack=... timeout=...) dup_frames=... target_gaps_nacked=... overflow=... peak_queue=... unsent=... rtt=...]
+Player disconnected: ... loss[...] paced[rate=3200kbps sent=... resent=...(nack=... timeout=...) dup_frames=... target_gaps_nacked=... overflow=... peak_queue=... unsent=... rtt=... resets=...]
 ```
 
 - `resent` 很高：限速超过了实际出口，调低限速值。
 - `overflow` > 0：代理积压超过 16MB，服务器突发异常大。
 - `peak_queue`：进服突发积压量，除以限速即进服等待时间。
+- `resets`：pacer 因收到 OCR1 而重置的次数（丢弃已排队帧与 `inflight`，`srvNext`/下行序号归零，`raw_udp_pacer.go:214-225`）。该字段只在 `downstream_limit_kbps > 0` 时出现——pacer 为 nil 时整段 `paced[...]` 都不输出（`raknet_flow_trace.go:105-107`）。
+  - 首连通常记 1：新客户端的首个 OCR1 先在 `raw_udp_proxy.go:1487` 建客户端（内部启动 pacer，`raw_udp_pacer.go:131-156`），再到 `:1497` 的 reset。`reset()` 在生产代码里只有这一个调用点，且条件里只比对 `raknetOpenConnectionReq1`（`raw_udp_proxy.go:1496-1498`），所以只发 OCR2 的握手不计数；该客户端正处于异步拨号时 `getOrCreateClientKeyed` 返回 nil、`Listen` 直接 `continue`（`raw_udp_proxy.go:1487-1489`）也不会走到这里。所以 **0 也正常**。单连接内 OCR1 被丢包重发会让计数继续增加，那同样是无害的重置，只有当重置发生在首段下行数据之后才有代价。
+  - 真正要看的是「首段下行数据之后仍在增」：那时重置会丢掉已被代理代 ACK 的帧且不会重发（见 `raw_udp_proxy.go:1497-1499` 与 §5 R1）。这一行只有聚合值，分不清「握手期反复重发 OCR1」与「进服中途重置」，需配合 flow trace 每秒 `down=` 的回落时刻判断（`raknet_flow_trace.go:157-162`）。

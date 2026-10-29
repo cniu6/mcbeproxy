@@ -124,6 +124,9 @@ type rawUDPPacer struct {
 
 	sent, nackResent, rtoResent, dupFrames, gapNacked, overflow int64
 	peakQueued                                                  int
+	// resets 记录 reset() 次数：每次收到 OCR1 都会清空队列与序号，
+	// 若它出现在数据流中途，已代 ACK 的帧会被丢弃且不会重发。
+	resets int64
 }
 
 // startRawUDPPacer gives a client that is not published yet a pacer when
@@ -135,7 +138,7 @@ func (p *RawUDPProxy) startRawUDPPacer(c *rawUDPClientInfo) {
 	}
 	r := newRawUDPPacer(kbps,
 		func(b []byte) {
-			if _, err := p.writeToClient(c.clientAddr, b, UDPWriteTimeout); err != nil {
+			if _, err := p.writeToClient(c.clientAddr, b); err != nil {
 				c.writeClientErrors.Add(1)
 			}
 		},
@@ -218,6 +221,7 @@ func (r *rawUDPPacer) reset() {
 	r.srvNext, r.seq = 0, 0
 	r.acks, r.nacks = r.acks[:0], r.nacks[:0]
 	r.held = rawUDPReliableWindow{}
+	r.resets++
 }
 
 func (r *rawUDPPacer) dropAll() {
@@ -493,9 +497,10 @@ func (r *rawUDPPacer) stats() (queued int, rtt time.Duration) {
 func (r *rawUDPPacer) String() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return fmt.Sprintf("paced[rate=%dkbps sent=%d resent=%d(nack=%d timeout=%d) dup_frames=%d target_gaps_nacked=%d overflow=%d peak_queue=%s unsent=%s rtt=%v]",
+	// resets 追加在末尾：既有字段名与顺序不变，旧解析逻辑仍可读取。
+	return fmt.Sprintf("paced[rate=%dkbps sent=%d resent=%d(nack=%d timeout=%d) dup_frames=%d target_gaps_nacked=%d overflow=%d peak_queue=%s unsent=%s rtt=%v resets=%d]",
 		int(r.rate*8/1000), r.sent, r.nackResent+r.rtoResent, r.nackResent, r.rtoResent, r.dupFrames, r.gapNacked, r.overflow,
-		formatBytes(int64(r.peakQueued)), formatBytes(int64(r.queued)), r.srtt.Round(time.Millisecond))
+		formatBytes(int64(r.peakQueued)), formatBytes(int64(r.queued)), r.srtt.Round(time.Millisecond), r.resets)
 }
 
 func rawUDPUint24(b []byte) uint32 {
