@@ -1195,9 +1195,8 @@ func (p *RawUDPProxy) context() context.Context {
 // The listener is shared by every client's forwardResponses goroutine, so no
 // per-packet write deadline is set here: that was one timer update per packet
 // contended across all players, and a UDP send never blocks for long anyway
-// (the kernel drops on a full buffer instead of stalling). timeout is kept for
-// call-site documentation only.
-func (p *RawUDPProxy) writeToClient(clientAddr *net.UDPAddr, payload []byte, _ time.Duration) (int, error) {
+// (the kernel drops on a full buffer instead of stalling).
+func (p *RawUDPProxy) writeToClient(clientAddr *net.UDPAddr, payload []byte) (int, error) {
 	if p == nil || p.listener == nil {
 		return 0, net.ErrClosed
 	}
@@ -2366,7 +2365,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			if n > 0 && buffer[0] == raknetDisconnectNotification {
 				logger.Info("RawUDP session closed (server sent RakNet disconnect): client=%s", clientAddr.String())
 				// Forward to client and then close
-				_, _ = p.writeToClient(clientAddr, buffer[:n], UDPWriteTimeout)
+				_, _ = p.writeToClient(clientAddr, buffer[:n])
 				return
 			}
 
@@ -2385,7 +2384,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 				clientInfo.pacer.fromTarget(buffer[:n], time.Now())
 			} else {
 				writeStart := time.Now()
-				_, err = p.writeToClient(clientAddr, buffer[:n], UDPWriteTimeout)
+				_, err = p.writeToClient(clientAddr, buffer[:n])
 				writeElapsed := time.Since(writeStart)
 				rawUDPRecordWriteLatency(&clientInfo.lastWriteClientMs, &clientInfo.maxWriteClientMs, &clientInfo.slowWriteClientCount, writeElapsed)
 				rawUDPRecordRecentWrite(clientInfo, false, writeElapsed, time.Now())
@@ -3089,7 +3088,7 @@ func (p *RawUDPProxy) handleUnconnectedPing(data []byte, clientAddr *net.UDPAddr
 	}
 
 	pong := buildUnconnectedPongPacket(pingTimestamp, p.serverGUID.Load(), advertisement)
-	if _, err := p.writeToClient(clientAddr, pong, 2*time.Second); err != nil && !isTimeoutError(err) {
+	if _, err := p.writeToClient(clientAddr, pong); err != nil && !isTimeoutError(err) {
 		logger.Debug("Failed to send unconnected pong to %s: %v", clientAddr.String(), err)
 	}
 }
@@ -3385,73 +3384,6 @@ func (p *RawUDPProxy) handlePacketWithLoginCheck(data []byte, clientInfo *rawUDP
 		playerName, playerUUID, playerXUID, clientInfo.clientAddr.String())
 
 	return true // Forward Login packet
-}
-
-// tryParseClientPacket is deprecated - use handlePacketWithLoginCheck instead
-// Kept for backward compatibility but does nothing now
-func (p *RawUDPProxy) tryParseClientPacket(data []byte, clientInfo *rawUDPClientInfo) {
-	// All login parsing and verification is now done in handlePacketWithLoginCheck
-	// This function is kept for backward compatibility but does nothing
-}
-
-// tryParseServerPacket tries to parse server packets for disconnect messages
-// Only parses packets that are likely to contain important info (not every packet)
-func (p *RawUDPProxy) tryParseServerPacket(data []byte, clientInfo *rawUDPClientInfo) {
-	// Skip parsing for most packets to reduce memory allocation
-	// Only parse if it looks like a game packet that might contain disconnect info
-	if len(data) < 3 {
-		return
-	}
-
-	// Only parse RakNet reliable frames that might contain disconnect
-	frameType := data[0]
-	if frameType < 0x80 || frameType > 0x8f {
-		return // Not a reliable frame, skip
-	}
-
-	// Try to extract game packet from RakNet frame
-	gamePacket := p.extractGamePacket(data)
-	if gamePacket == nil {
-		return
-	}
-
-	// Only parse if it's a game packet with known compression
-	if len(gamePacket) < 3 || gamePacket[0] != raknetGamePacketHeader {
-		return
-	}
-
-	// Only parse unencrypted packets (compression ID 0x00, 0x01, or 0xff)
-	compressionID := gamePacket[1]
-	if compressionID != 0x00 && compressionID != 0x01 && compressionID != 0xff {
-		if clientInfo.loginParsed.Load() {
-			clientInfo.encrypted.Store(true)
-		}
-		return // Encrypted, skip
-	}
-
-	// Parse important packets (disconnect, play status, etc.)
-	p.parseAndLogGamePacket(gamePacket, clientInfo)
-}
-
-// extractGamePacket extracts the game packet (0xfe header) from RakNet frame
-func (p *RawUDPProxy) extractGamePacket(data []byte) []byte {
-	if len(data) < 4 {
-		return nil
-	}
-
-	// Check if this is a RakNet reliable frame (0x80-0x8f)
-	frameType := data[0]
-	if frameType >= 0x80 && frameType <= 0x8f {
-		// This is a reliable frame, need to parse RakNet encapsulation
-		return p.parseRakNetFrame(data, nil)
-	}
-
-	// Check if this is directly a game packet (0xfe)
-	if frameType == raknetGamePacketHeader {
-		return data
-	}
-
-	return nil
 }
 
 // extractGamePacketWithSplit extracts game packet with split packet reassembly support
@@ -4436,7 +4368,7 @@ func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo
 
 	if options.SendCompressed {
 		compressedFrame := buildInjectedReliableOrderedFrame(clientInfo, gamePacket)
-		if _, err := p.writeToClient(clientInfo.clientAddr, compressedFrame, UDPWriteTimeout); err != nil {
+		if _, err := p.writeToClient(clientInfo.clientAddr, compressedFrame); err != nil {
 			logger.Error("Failed to send %s packet to client: %v", packetName, err)
 		}
 	}
@@ -4445,7 +4377,7 @@ func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo
 	if options.SendRawBatch && len(rawBatchPacket) > 0 {
 		rawBatchFrame := buildInjectedReliableOrderedFrame(clientInfo, rawBatchPacket)
 		time.Sleep(35 * time.Millisecond)
-		if _, err := p.writeToClient(clientInfo.clientAddr, rawBatchFrame, UDPWriteTimeout); err != nil {
+		if _, err := p.writeToClient(clientInfo.clientAddr, rawBatchFrame); err != nil {
 			logger.Debug("Failed to send raw batch %s packet to client: %v", packetName, err)
 		}
 	}
@@ -4453,7 +4385,7 @@ func (p *RawUDPProxy) sendEncodedGamePacketVariants(clientInfo *rawUDPClientInfo
 	if options.SendLegacy && len(legacyPacket) > 0 {
 		legacyFrame := buildInjectedReliableOrderedFrame(clientInfo, legacyPacket)
 		time.Sleep(35 * time.Millisecond)
-		if _, err := p.writeToClient(clientInfo.clientAddr, legacyFrame, UDPWriteTimeout); err != nil {
+		if _, err := p.writeToClient(clientInfo.clientAddr, legacyFrame); err != nil {
 			logger.Debug("Failed to send legacy %s packet to client: %v", packetName, err)
 		}
 	}
@@ -4575,7 +4507,7 @@ func (p *RawUDPProxy) sendRakNetACKsToClient(clientAddr *net.UDPAddr, seqs []uin
 		writeUint24LE(&ack, seq)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := p.writeToClient(clientAddr, ack.Bytes(), UDPWriteTimeout); err != nil {
+		if _, err := p.writeToClient(clientAddr, ack.Bytes()); err != nil {
 			logger.Debug("Failed to send RakNet ACK to client %s: %v", clientAddr.String(), err)
 			return
 		}
@@ -4592,7 +4524,7 @@ func (p *RawUDPProxy) sendRakNetDisconnect(clientInfo *rawUDPClientInfo) {
 
 	// Send multiple times
 	for i := 0; i < 3; i++ {
-		_, err := p.writeToClient(clientInfo.clientAddr, disconnectPacket, UDPWriteTimeout)
+		_, err := p.writeToClient(clientInfo.clientAddr, disconnectPacket)
 		if err != nil {
 			logger.Debug("Failed to send RakNet disconnect (attempt %d): %v", i+1, err)
 		}
