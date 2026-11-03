@@ -32,8 +32,8 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
-	"mcpeserverproxy/internal/singboxcore"
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/singboxcore"
 
 	hy2 "github.com/apernet/hysteria/core/v2/client"
 	hy2obfs "github.com/apernet/hysteria/extras/v2/obfs"
@@ -71,7 +71,8 @@ type SingboxOutbound struct {
 	ssKeyLen        int                                   // Key/salt length
 	ssCipher        func(key []byte) (cipher.AEAD, error) // Cipher constructor
 	hy2Client       hy2.Client
-	hy2Mu           sync.Mutex // Protects hy2Client for reconnection
+	hy2Mu           sync.Mutex // 只保护 client 指针与拨号门，不在锁内等待网络。
+	hy2DialGate     chan struct{}
 	anytlsClient    *anytls.Client
 	anytlsUOTClient *uot.Client
 	mihomo          *mihomoOutbound
@@ -731,9 +732,12 @@ func (s *SingboxOutbound) initAnyTLS(cfg *config.ProxyOutbound) error {
 	}
 
 	client, err := anytls.NewClient(context.Background(), anytls.ClientConfig{
-		Password: cfg.Password,
-		DialOut:  dialOut,
-		Logger:   slog.NOP(),
+		Password:                 cfg.Password,
+		IdleSessionCheckInterval: time.Duration(cfg.IdleSessionCheckInterval) * time.Second,
+		IdleSessionTimeout:       time.Duration(cfg.IdleSessionTimeout) * time.Second,
+		MinIdleSession:           cfg.MinIdleSession,
+		DialOut:                  dialOut,
+		Logger:                   slog.NOP(),
 	})
 	if err != nil {
 		return err
@@ -1861,121 +1865,93 @@ func getUTLSFingerprint(name string) utls.ClientHelloID {
 	}
 }
 
-// dialHysteria2UDP creates a UDP connection through Hysteria2.
-// It handles connection failures by attempting to reconnect.
+// dialHysteria2UDP 为每个玩家分配独立 UDP session；取消等待不能关闭节点共享的 QUIC client。
 func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksaddr) (net.PacketConn, error) {
-	s.hy2Mu.Lock()
-	defer s.hy2Mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
-	if s.hy2Client == nil {
+	s.hy2Mu.Lock()
+	if s.hy2DialGate == nil {
+		s.hy2DialGate = make(chan struct{}, 1)
+	}
+	gate := s.hy2DialGate
+	s.hy2Mu.Unlock()
+
+	// 上游 UDP() 没有 context。每个出站最多允许一个尚未结束的操作，避免
+	// 慢握手期间每个玩家取消都留下新的后台任务；排队本身也必须可取消。
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		<-gate
+		return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", err)
+	}
+	s.hy2Mu.Lock()
+	client := s.hy2Client
+	s.hy2Mu.Unlock()
+	if client == nil {
+		<-gate
 		return nil, errors.New("hysteria2 client not initialized")
 	}
 
-	logger.Debug("Hysteria2: creating UDP session for %s", dest.String())
-
-	// Create UDP session with timeout
-	// Note: We call UDP() directly without a goroutine because:
-	// 1. The Hysteria2 client should handle timeouts internally
-	// 2. Creating a goroutine for each call can lead to goroutine leaks if the call blocks
-	// 3. The context timeout will be respected by the underlying QUIC connection
-
-	// Use a longer timeout for UDP session creation
-	udpTimeout := 15 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining < udpTimeout {
-			udpTimeout = remaining
-		}
+	type result struct {
+		conn hy2.HyUDPConn
+		err  error
 	}
-
-	// Try up to 2 times (initial + 1 retry after reconnect)
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		currentClient := s.hy2Client
-		if currentClient == nil {
-			return nil, errors.New("hysteria2 client not initialized")
+	ready := make(chan result)
+	go func() {
+		defer func() { <-gate }()
+		var conn hy2.HyUDPConn
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			if err = ctx.Err(); err != nil {
+				break
+			}
+			conn, err = client.UDP()
+			if err == nil || attempt != 0 {
+				break
+			}
+			if conn != nil {
+				_ = conn.Close()
+				conn = nil
+			}
+			// ReconnectableClient 已把失效的底层连接标为待重连；下一次 UDP()
+			// 自行恢复，不重建/关闭共享 client，也不额外固定等待半秒。
+			message := err.Error()
+			if !strings.Contains(message, "closed") && !strings.Contains(message, "EOF") {
+				break
+			}
 		}
-
-		// Check context before attempting
 		select {
+		case ready <- result{conn: conn, err: err}:
 		case <-ctx.Done():
-			return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
-		default:
-		}
-
-		attemptCtx, cancel := context.WithTimeout(ctx, udpTimeout)
-		stopClose := context.AfterFunc(attemptCtx, func() {
-			_ = currentClient.Close()
-		})
-
-		conn, err := currentClient.UDP()
-		stopClose()
-		cancel()
-
-		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			// 取消后晚到的 session 没有玩家接管，只关闭它自己的关联。
 			if conn != nil {
 				_ = conn.Close()
 			}
-			logger.Warn("Hysteria2: UDP session creation timeout for %s (attempt %d)", dest.String(), attempt+1)
-			lastErr = fmt.Errorf("hysteria2 UDP timeout after %v", udpTimeout)
-			if attempt == 0 {
-				if currentClient != nil {
-					_ = currentClient.Close()
-				}
-				s.hy2Client = nil
-				if err := s.initHysteria2(s.config); err != nil {
-					return nil, fmt.Errorf("failed to recreate hysteria2 client: %w", err)
-				}
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
-			return nil, lastErr
 		}
+	}()
 
-		if ctx.Err() != nil {
-			if conn != nil {
-				_ = conn.Close()
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
+	case r := <-ready:
+		if err := ctx.Err(); err != nil {
+			if r.conn != nil {
+				_ = r.conn.Close()
 			}
-			return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", ctx.Err())
+			return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", err)
 		}
-
-		if err != nil {
-			errStr := err.Error()
-			logger.Debug("Hysteria2: UDP session error: %s (attempt %d)", errStr, attempt+1)
-			lastErr = err
-
-			// Check for specific errors that indicate we should not retry
-			if strings.Contains(errStr, "UDP not enabled") {
-				logger.Error("Hysteria2: Server UDP relay disabled!")
-				return nil, fmt.Errorf("hysteria2 UDP failed: %w", err)
+		if r.err != nil {
+			if r.conn != nil {
+				_ = r.conn.Close()
 			}
-
-			// For "connection closed" errors, the ReconnectableClient should auto-reconnect
-			// on the next call, so we can retry once
-			if attempt == 0 && (strings.Contains(errStr, "connection closed") ||
-				strings.Contains(errStr, "closed") ||
-				strings.Contains(errStr, "EOF")) {
-				logger.Info("Hysteria2: connection issue detected, retrying... (attempt %d)", attempt+1)
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-
-			return nil, fmt.Errorf("hysteria2 UDP failed: %w", err)
+			return nil, fmt.Errorf("hysteria2 UDP failed: %w", r.err)
 		}
-
-		logger.Debug("Hysteria2: UDP session created successfully for %s", dest.String())
-		return &hysteria2PacketConn{
-			conn:        conn,
-			destination: dest,
-			destStr:     dest.String(),
-			outbound:    s,
-		}, nil
+		return &hysteria2PacketConn{conn: r.conn, destination: dest, destStr: dest.String(), outbound: s}, nil
 	}
-
-	if lastErr != nil {
-		return nil, fmt.Errorf("hysteria2 UDP failed after retries: %w", lastErr)
-	}
-	return nil, errors.New("hysteria2 UDP failed after retries")
 }
 
 // Close closes the sing-box outbound.
@@ -1987,20 +1963,19 @@ func (s *SingboxOutbound) Close() error {
 	}
 
 	s.hy2Mu.Lock()
-	defer s.hy2Mu.Unlock()
-	if s.hy2Client != nil {
-		s.hy2Client.Close()
-		s.hy2Client = nil
+	client, anytlsClient, mihomo := s.hy2Client, s.anytlsClient, s.mihomo
+	s.hy2Client, s.anytlsClient, s.mihomo = nil, nil, nil
+	s.anytlsUOTClient = nil
+	s.hy2Mu.Unlock()
+	// 关闭握手中的 client 可能等待底层锁，不占用本地状态锁。
+	if client != nil {
+		_ = client.Close()
 	}
-	if s.anytlsClient != nil {
-		s.anytlsClient.Close()
-		s.anytlsClient = nil
-		s.anytlsUOTClient = nil
+	if anytlsClient != nil {
+		_ = anytlsClient.Close()
 	}
-	if s.mihomo != nil {
-		err := s.mihomo.Close()
-		s.mihomo = nil
-		return err
+	if mihomo != nil {
+		return mihomo.Close()
 	}
 	return nil
 }
@@ -2730,9 +2705,12 @@ func (d *SingboxDialer) getOrCreateAnyTLSClient() (*anytls.Client, error) {
 	}
 
 	client, err := anytls.NewClient(context.Background(), anytls.ClientConfig{
-		Password: d.config.Password,
-		DialOut:  dialOut,
-		Logger:   slog.NOP(),
+		Password:                 d.config.Password,
+		IdleSessionCheckInterval: time.Duration(d.config.IdleSessionCheckInterval) * time.Second,
+		IdleSessionTimeout:       time.Duration(d.config.IdleSessionTimeout) * time.Second,
+		MinIdleSession:           d.config.MinIdleSession,
+		DialOut:                  dialOut,
+		Logger:                   slog.NOP(),
 	})
 	if err != nil {
 		return nil, err

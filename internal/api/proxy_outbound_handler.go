@@ -23,10 +23,10 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 	"mcpeserverproxy/internal/proxy"
 	"mcpeserverproxy/internal/singboxcore"
 	"mcpeserverproxy/internal/subscription"
-	"mcpeserverproxy/internal/netroute"
 )
 
 // ProxyOutboundHandler handles REST API requests for proxy outbound management.
@@ -2350,13 +2350,20 @@ type DetailedTestResult struct {
 
 // UDPTestResult represents UDP test result (MCBE server ping through proxy).
 type UDPTestResult struct {
-	Target     string `json:"target"`
-	Success    bool   `json:"success"`
-	LatencyMs  int64  `json:"latency_ms"`
-	ServerName string `json:"server_name,omitempty"`
-	Players    string `json:"players,omitempty"`
-	Version    string `json:"version,omitempty"`
-	Error      string `json:"error,omitempty"`
+	Target    string `json:"target"`
+	Success   bool   `json:"success"`
+	LatencyMs int64  `json:"latency_ms"`
+	// 分开报告建连与数据往返；首测、温测不混入握手耗时。
+	OpenMs         int64  `json:"open_ms"`
+	PingMs         int64  `json:"ping_ms"`
+	TotalMs        int64  `json:"total_ms"`
+	FirstLatencyMs int64  `json:"first_latency_ms"`
+	FromCache      bool   `json:"from_cache"`
+	Warm           bool   `json:"warm"`
+	ServerName     string `json:"server_name,omitempty"`
+	Players        string `json:"players,omitempty"`
+	Version        string `json:"version,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 // MCBETestRequest represents a request for MCBE server UDP test.
@@ -2906,17 +2913,14 @@ func shouldReuseCachedUDPTestOutbound(cfg *config.ProxyOutbound) bool {
 	}
 }
 
-// shouldMeasureWarmUDPTestLatency reports whether a second "warm" RakNet
-// ping should be issued to obtain a steady-state RTT after the first
-// session-establishment cost. For Hysteria2 the first ping pays the QUIC
-// handshake + UDP-session-create cost on a cold outbound, so the warm
-// measurement better represents what the running proxy will see.
+// 流式/会话型隧道统一在同一个 PacketConn 上补一次温测，避免把某协议
+// 的首个 ping 与另一个协议的温态 RTT 并排比较。openMs 单独报告握手成本。
 func shouldMeasureWarmUDPTestLatency(cfg *config.ProxyOutbound) bool {
 	if cfg == nil {
 		return false
 	}
 	switch cfg.Type {
-	case config.ProtocolAnyTLS, config.ProtocolHysteria2:
+	case config.ProtocolAnyTLS, config.ProtocolHysteria2, config.ProtocolVLESS, config.ProtocolTrojan, config.ProtocolVMess:
 		return true
 	default:
 		return false
@@ -3505,12 +3509,13 @@ func (h *ProxyOutboundHandler) GetProxyOutboundLatencyHistory(c *gin.Context) {
 // timeout of 12s. Subsequent tests against the same Hysteria2/AnyTLS node
 // reuse the cached outbound and finish in ~RTT, so this upper bound only
 // matters for cold first-hit measurements.
-func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.ProxyOutbound, address string) UDPTestResult {
+func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.ProxyOutbound, address string) (final UDPTestResult) {
 	if ctx == nil {
 		ctx = h.serverContext()
 	}
 
 	testStart := time.Now()
+	defer func() { final.TotalMs = time.Since(testStart).Milliseconds() }()
 	logger.Info("MCBE UDP test: node=%s type=%s target=%s start=%s", cfg.Name, cfg.Type, address, testStart.Format("15:04:05.000"))
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -3546,7 +3551,7 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 		openMs := time.Since(openStart).Milliseconds()
 		if err != nil {
 			logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v openMs=%d", cfg.Name, cfg.Type, err, openMs)
-			return UDPTestResult{Target: address, Success: false, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}, openMs, 0
+			return UDPTestResult{Target: address, Success: false, OpenMs: openMs, FromCache: fromCache, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}, openMs, 0
 		}
 		defer cleanup()
 
@@ -3560,17 +3565,19 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 		result := performMCBEPing(ctx, packetConn, destAddr, readBudget)
 		pingMs := time.Since(pingStart).Milliseconds()
 		result.Target = address
-		return result, openMs, pingMs
+		result.OpenMs, result.PingMs, result.FromCache = openMs, pingMs, fromCache
+		result.FirstLatencyMs = result.LatencyMs
+		h.measureWarmMCBELatency(ctx, cfg, address, destAddr, packetConn, &result)
+		return result, openMs, result.PingMs
 	}
 
-	// First attempt (inline, not via closure, so we can reuse the conn for
-	// warm ping on Hysteria2/AnyTLS).
+	// 首次允许借用缓存 outbound；温测始终复用本次已建立的 PacketConn。
 	openStart := time.Now()
 	packetConn, cleanup, err, fromCache := h.openMCBEPacketConnWithCache(ctx, cfg, address, false)
 	openMs := time.Since(openStart).Milliseconds()
 	if err != nil {
 		logger.Debug("MCBE UDP test openMCBEPacketConn failed: node=%s type=%s err=%v openMs=%d", cfg.Name, cfg.Type, err, openMs)
-		return UDPTestResult{Target: address, Success: false, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}
+		return UDPTestResult{Target: address, Success: false, OpenMs: openMs, FromCache: fromCache, Error: fmt.Sprintf("Failed to create UDP connection: %v", err)}
 	}
 
 	logger.Debug("MCBE UDP test PacketConn type: node=%s type=%s packetConn=%T openMs=%d fromCache=%v", cfg.Name, cfg.Type, packetConn, openMs, fromCache)
@@ -3583,6 +3590,8 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 	result := performMCBEPing(ctx, packetConn, destAddr, readBudget)
 	pingMs := time.Since(pingStart).Milliseconds()
 	result.Target = address
+	result.OpenMs, result.PingMs, result.FromCache = openMs, pingMs, fromCache
+	result.FirstLatencyMs = result.LatencyMs
 
 	if !result.Success {
 		cleanup()
@@ -3634,29 +3643,37 @@ func (h *ProxyOutboundHandler) testMCBEServer(ctx context.Context, cfg *config.P
 
 	logger.Debug("MCBE UDP test ok: node=%s type=%s target=%s latency=%dms pingMs=%d openMs=%d totalMs=%d server=%s players=%s", cfg.Name, cfg.Type, address, result.LatencyMs, pingMs, openMs, time.Since(testStart).Milliseconds(), result.ServerName, result.Players)
 
-	if shouldMeasureWarmUDPTestLatency(cfg) {
-		warmCtx, warmCancel := context.WithTimeout(ctx, 2*time.Second)
-		defer warmCancel()
-		warmResult := performMCBEPing(warmCtx, packetConn, destAddr, 2*time.Second)
-		if warmResult.Success {
-			logger.Debug("MCBE UDP warm latency node=%s type=%s target=%s cold=%d warm=%d", cfg.Name, cfg.Type, address, result.LatencyMs, warmResult.LatencyMs)
-			warmResult.Target = address
-			if warmResult.ServerName == "" {
-				warmResult.ServerName = result.ServerName
-			}
-			if warmResult.Players == "" {
-				warmResult.Players = result.Players
-			}
-			if warmResult.Version == "" {
-				warmResult.Version = result.Version
-			}
-			result = warmResult
-		} else {
-			logger.Debug("MCBE UDP warm ping failed node=%s type=%s target=%s cold=%d err=%s", cfg.Name, cfg.Type, address, result.LatencyMs, warmResult.Error)
-		}
-	}
-
+	h.measureWarmMCBELatency(ctx, cfg, address, destAddr, packetConn, &result)
 	return result
+}
+
+// 温测只更新 RTT 与采样标记，不覆盖本次连接的 open/first/cache 信息。
+// 失败时保留首个有效结果；pingMs 累计同一次连接上的全部探测耗时。
+func (h *ProxyOutboundHandler) measureWarmMCBELatency(ctx context.Context, cfg *config.ProxyOutbound, address string, destAddr net.Addr, packetConn net.PacketConn, result *UDPTestResult) {
+	if !result.Success || !shouldMeasureWarmUDPTestLatency(cfg) {
+		return
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	warm := performMCBEPing(warmCtx, packetConn, destAddr, 2*time.Second)
+	result.PingMs += time.Since(start).Milliseconds()
+	if !warm.Success {
+		logger.Debug("MCBE UDP warm ping failed node=%s type=%s target=%s cold=%d err=%s", cfg.Name, cfg.Type, address, result.LatencyMs, warm.Error)
+		return
+	}
+	logger.Debug("MCBE UDP warm latency node=%s type=%s target=%s cold=%d warm=%d", cfg.Name, cfg.Type, address, result.FirstLatencyMs, warm.LatencyMs)
+	result.LatencyMs = warm.LatencyMs
+	result.Warm = true
+	if warm.ServerName != "" {
+		result.ServerName = warm.ServerName
+	}
+	if warm.Players != "" {
+		result.Players = warm.Players
+	}
+	if warm.Version != "" {
+		result.Version = warm.Version
+	}
 }
 
 // buildRakNetPing builds a RakNet unconnected ping packet.

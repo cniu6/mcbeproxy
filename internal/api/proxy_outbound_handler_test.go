@@ -1302,13 +1302,11 @@ func TestShouldMeasureWarmUDPTestLatency(t *testing.T) {
 	}{
 		{name: "nil config", cfg: nil, want: false},
 		{name: "anytls enabled", cfg: &config.ProxyOutbound{Type: config.ProtocolAnyTLS}, want: true},
-		// Regression: Hysteria2 pays a full QUIC handshake on a cold outbound,
-		// so the first RakNet ping latency is misleading. A warm measurement
-		// represents the steady-state RTT proxy traffic will see.
+		// 握手在 openMs 单独计时；同连接温测统一比较首包之后的数据往返。
 		{name: "hysteria2 enabled", cfg: &config.ProxyOutbound{Type: config.ProtocolHysteria2}, want: true},
-		{name: "vless disabled", cfg: &config.ProxyOutbound{Type: config.ProtocolVLESS}, want: false},
-		{name: "trojan disabled", cfg: &config.ProxyOutbound{Type: config.ProtocolTrojan}, want: false},
-		{name: "vmess disabled", cfg: &config.ProxyOutbound{Type: config.ProtocolVMess}, want: false},
+		{name: "vless enabled", cfg: &config.ProxyOutbound{Type: config.ProtocolVLESS}, want: true},
+		{name: "trojan enabled", cfg: &config.ProxyOutbound{Type: config.ProtocolTrojan}, want: true},
+		{name: "vmess enabled", cfg: &config.ProxyOutbound{Type: config.ProtocolVMess}, want: true},
 		{name: "shadowsocks disabled", cfg: &config.ProxyOutbound{Type: config.ProtocolShadowsocks}, want: false},
 	}
 

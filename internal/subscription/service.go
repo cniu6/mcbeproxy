@@ -562,6 +562,9 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 	case config.ProtocolAnyTLS:
 		outbound.Password = getString(item, "password")
 		outbound.TLS = true
+		outbound.IdleSessionCheckInterval = getIntAlt(item, "idle-session-check-interval", "idle_session_check_interval")
+		outbound.IdleSessionTimeout = getIntAlt(item, "idle-session-timeout", "idle_session_timeout")
+		outbound.MinIdleSession = getIntAlt(item, "min-idle-session", "min_idle_session")
 	case config.ProtocolVLESS:
 		outbound.UUID = getString(item, "uuid")
 		outbound.Flow = getString(item, "flow")
