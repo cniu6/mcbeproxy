@@ -164,6 +164,10 @@ func (p *NetherNetProxy) handleConnection(ctx context.Context, clientConn *minec
 		}
 		if !allowed {
 			logger.LogAccessDenied(playerName, p.config.GetACLServerID(), clientAddr, reason)
+			if reason == "" {
+				reason = "访问被拒绝"
+			}
+			_ = p.listener.Disconnect(clientConn, proxyNotice("§c"+reason))
 			return
 		}
 	}
@@ -202,6 +206,7 @@ func (p *NetherNetProxy) handleConnection(ctx context.Context, clientConn *minec
 	}, p.config.NetherNetUpstream)
 	if err != nil {
 		logger.Error("NetherNet upstream dial failed: server=%s player=%s err=%v", p.serverID, playerName, err)
+		_ = p.listener.Disconnect(clientConn, proxyNotice(fmt.Sprintf("§c连接目标服务器失败\n§7%v", err)))
 		return
 	}
 	defer remote.Close()
@@ -212,6 +217,11 @@ func (p *NetherNetProxy) handleConnection(ctx context.Context, clientConn *minec
 	for i := 0; i < 2; i++ {
 		if err := <-spawnErr; err != nil {
 			logger.Error("NetherNet spawn failed: server=%s player=%s err=%v", p.serverID, playerName, err)
+			if msg, ok := remoteDisconnectMessage(err); ok {
+				_ = p.listener.Disconnect(clientConn, msg) // 目标服的原话，不加前缀
+			} else {
+				_ = p.listener.Disconnect(clientConn, proxyNotice(fmt.Sprintf("§c进入服务器失败\n§7%v", err)))
+			}
 			return
 		}
 	}
@@ -255,6 +265,7 @@ func (p *NetherNetProxy) handleConnection(ctx context.Context, clientConn *minec
 		for {
 			pk, err := remote.ReadPacket()
 			if err != nil {
+				forwardRemoteDisconnect(clientConn, err)
 				stop()
 				return
 			}

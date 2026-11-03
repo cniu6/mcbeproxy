@@ -4129,6 +4129,8 @@ type PlayerStats struct {
 // sendDisconnectToClient sends a Minecraft disconnect packet to the client
 // This constructs a proper RakNet frame with a Disconnect game packet
 func (p *RawUDPProxy) sendDisconnectToClient(clientInfo *rawUDPClientInfo, message string) {
+	// 这里的调用方（ACL、外部验证、管理员踢出）都是代理自己发起的，统一加「[加速]：」。
+	message = proxyNotice(message)
 	clientInfo.kicked.Store(true)
 	clientInfo.mu.Lock()
 	clientInfo.kickMessage = message
@@ -4221,7 +4223,7 @@ func (p *RawUDPProxy) kickMessageOf(clientInfo *rawUDPClientInfo) string {
 	if clientInfo.kickMessage != "" {
 		return clientInfo.kickMessage
 	}
-	return "§c访问被拒绝"
+	return proxyNotice("§c访问被拒绝")
 }
 
 func (p *RawUDPProxy) snapshotKickReplay(clientInfo *rawUDPClientInfo, message string) *rawUDPKickReplay {

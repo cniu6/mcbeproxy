@@ -15,7 +15,6 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
-	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
 
 	"github.com/sandertv/go-raknet"
@@ -410,6 +409,11 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 	serverCfg, exists := p.configMgr.GetServer(p.serverID)
 	if !exists || !serverCfg.Enabled {
 		logger.Warn("Connection rejected: server %s is disabled", p.serverID)
+		msg := "服务器已停用"
+		if exists {
+			msg = serverCfg.GetDisabledMessage()
+		}
+		p.sendDisconnect(clientConn, proxyNotice("§c"+msg))
 		return
 	}
 
@@ -470,6 +474,7 @@ func (p *RakNetProxy) handleConnection(ctx context.Context, clientConn *raknet.C
 		} else {
 			logger.Error("Failed to connect to remote %s after 3 attempts: %v", targetAddr, err)
 		}
+		p.sendDisconnect(clientConn, proxyNotice(fmt.Sprintf("§c连接目标服务器失败\n§7目标: %s\n§7错误: %v", targetAddr, err)))
 		return
 	}
 	defer remoteConn.Close()
@@ -630,9 +635,7 @@ func (p *RakNetProxy) forwardPacketsTracked(ctx context.Context, src, dst *rakne
 					// 尝试主动向客户端发送一个带完整理由的 MCBE Disconnect 包
 					// 注意：在 RakNet 代理模式下，登录完成后的数据同样会被加密，
 					// 这里的做法只能在尚未开启加密/或服务端在登录阶段下发 Disconnect 时生效。
-					if err := p.sendDisconnect(dst, disconnectMsg); err != nil {
-						logger.Debug("Failed to send translated disconnect packet to client %s: %v", sess.ClientAddr, err)
-					}
+					p.sendDisconnect(dst, disconnectMsg) // 目标服的原话，不加前缀
 					// 发送完踢出提示后可以直接结束当前转发循环，让客户端尽快看到提示
 					return
 				}
@@ -730,9 +733,7 @@ func (p *RakNetProxy) enforceACL(sess *session.Session, name string) {
 		logger.Debug("RakNet proxy: no active conn found for ACL-denied client %s", sess.ClientAddr)
 		return
 	}
-	if err := p.sendDisconnect(conn, reason); err != nil {
-		logger.Debug("Failed to send ACL disconnect packet to client %s: %v", sess.ClientAddr, err)
-	}
+	p.sendDisconnect(conn, proxyNotice(reason))
 	_ = conn.Close()
 }
 
@@ -946,21 +947,15 @@ func (p *RakNetProxy) parseDisconnectData(data []byte) string {
 //  1. RakNet 模式下，MCBE 在登录完成后会开启加密通道，本方法只能在「未加密阶段的 Disconnect」
 //     或服务端在登录阶段下发的明文踢出包上生效。
 //  2. 即使客户端已经处于加密阶段，我们仍然尝试发送一次，失败会被捕获记录为调试日志，不影响现有连接关闭流程。
-func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) error {
-	// 使用内部 protocol.Handler 构造一个标准 MCBE Disconnect 包（0xfe 包头 + 0x05 + 文本）。
-	// 这里直接构造明文游戏层数据并通过 RakNet 连接发送，由客户端自行解码显示。
-	handler := protocol.NewProtocolHandler()
-	pkt := handler.BuildDisconnectPacket(message)
-
-	if len(pkt) == 0 {
-		return fmt.Errorf("empty disconnect packet")
-	}
-
-	if _, err := conn.Write(pkt); err != nil {
-		return fmt.Errorf("write disconnect packet: %w", err)
-	}
-	return nil
+func (p *RakNetProxy) sendDisconnect(conn *raknet.Conn, message string) {
+	// RakNet 模式不知道客户端此刻是否已协商压缩，复用 passthrough 的发送方式：
+	// 未压缩、flate 压缩、手工字节三种都发，客户端认得哪种就显示哪种。
+	// 旧实现的包缺少批次长度与 Disconnect 的 Reason 字段，新版客户端解不出来。
+	rakNetDisconnectSender.sendDisconnect(conn, message, nil)
 }
+
+// rakNetDisconnectSender 复用 passthrough 的无状态 Disconnect 编码发送。
+var rakNetDisconnectSender = &PassthroughProxy{}
 
 // dialViaNode dials targetAddr through the server's outbound. A node's first
 // UDP association often never answers (dead relay), so a second association

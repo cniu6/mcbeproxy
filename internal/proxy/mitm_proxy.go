@@ -201,7 +201,7 @@ func (p *MITMProxy) handleConnection(ctx context.Context, clientConn *minecraft.
 		if !allowed {
 			// Send disconnect packet with denial reason (Requirement 5.2)
 			_ = clientConn.WritePacket(&packet.Disconnect{
-				Message:                 reason,
+				Message:                 proxyNotice(reason),
 				HideDisconnectionScreen: false,
 			})
 			return
@@ -308,6 +308,10 @@ func (p *MITMProxy) forwardPackets(ctx context.Context, src, dst *minecraft.Conn
 				if isMITMTimeout(err) {
 					continue
 				}
+				// 目标服主动踢人时，把它的原因转给玩家，而不是无声断开。
+				if !isClientToRemote {
+					forwardRemoteDisconnect(dst, err)
+				}
 				return
 			}
 
@@ -392,7 +396,7 @@ func (p *MITMProxy) handleConnectionError(clientConn *minecraft.Conn, playerName
 
 	// Requirement 3.5: Send disconnect packet to client with appropriate error message
 	_ = clientConn.WritePacket(&packet.Disconnect{
-		Message:                 errMsg,
+		Message:                 proxyNotice(errMsg),
 		HideDisconnectionScreen: false,
 	})
 }
@@ -478,7 +482,7 @@ func (p *MITMProxy) KickPlayer(playerName, reason string) int {
 		}
 		logger.Info("Sending disconnect to player %s: %s", playerName, kickMsg)
 		_ = conn.WritePacket(&packet.Disconnect{
-			Message:                 "§c" + kickMsg,
+			Message:                 proxyNotice("§c" + kickMsg),
 			HideDisconnectionScreen: false,
 		})
 		// Close connection after sending disconnect

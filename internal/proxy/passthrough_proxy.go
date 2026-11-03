@@ -649,7 +649,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 
 		// 这里还没协商压缩/加密，传入 nil 让 sendDisconnect 尝试多种方式发送，
 		// 即使客户端忽略该包，最坏情况也与之前一样只是连接失败。
-		p.sendDisconnect(clientConn, reason, nil)
+		p.sendDisconnect(clientConn, proxyNotice(reason), nil)
 		return
 	}
 	defer remoteConn.Close()
@@ -759,7 +759,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 					sess.SetDisconnectStatus(string(decision.Type), decision.Reason)
 				}
 				// Send disconnect packet with denial reason (Requirement 5.2)
-				p.sendDisconnect(clientConn, formattedReason, compression)
+				p.sendDisconnect(clientConn, proxyNotice(formattedReason), compression)
 				// Remove session so persistSession callback fires and record is saved
 				_ = p.sessionMgr.Remove(clientAddr)
 				return
@@ -779,7 +779,7 @@ func (p *PassthroughProxy) handleConnection(ctx context.Context, clientConn *rak
 				if sess != nil {
 					sess.SetDisconnectStatus("auth_failed", reason)
 				}
-				p.sendDisconnect(clientConn, "§c"+reason, compression)
+				p.sendDisconnect(clientConn, proxyNotice("§c"+reason), compression)
 				// Remove session so persistSession callback fires and record is saved
 				_ = p.sessionMgr.Remove(clientAddr)
 				return
@@ -1778,6 +1778,7 @@ func (p *PassthroughProxy) KickPlayer(playerName, reason string) int {
 		if reason != "" {
 			kickMsg = "§c" + reason
 		}
+		kickMsg = proxyNotice(kickMsg)
 		info.kickReason = kickMsg
 		info.kickMu.Unlock()
 
