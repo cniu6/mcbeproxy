@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,7 @@ const (
 	netherNetRelayUpstreamOKTTL      = 5 * time.Minute
 	netherNetRelayUpstreamBadTTL     = 30 * time.Second
 	netherNetRelayProbeTimeout       = 4 * time.Second
+	netherNetRelayInitialProbeWait   = 200 * time.Millisecond
 	netherNetRelayOfferTimeout       = 15 * time.Second
 	netherNetRelayWriteQueue         = 128
 	netherNetRelayPacketSize         = 2048
@@ -85,6 +87,7 @@ type netherNetRelay struct {
 	upstreamBase    string
 	upstreamErr     error
 	upstreamChecked time.Time
+	upstreamProbe   netherNetProbeResult
 	probing         atomic.Bool
 
 	done      chan struct{}
@@ -126,6 +129,13 @@ type netherNetSession struct {
 type netherNetPacket struct {
 	buf *[]byte
 	n   int
+}
+
+// 能力响应属于目标服；只缓存完整快照，不推测或伪造游戏版本及扩展字段。
+type netherNetProbeResult struct {
+	status      int
+	contentType string
+	body        []byte
 }
 
 // newNetherNetRelay starts the signaling listener on the TCP twin of udp's
@@ -365,18 +375,42 @@ func (r *netherNetRelay) closeSession(s *netherNetSession, reason string) {
 // handleProbe answers GET /v1/join. A non-2xx makes the client fall back to
 // RakNet, so only say yes when the upstream really speaks NetherNet.
 func (r *netherNetRelay) handleProbe(w http.ResponseWriter, req *http.Request) {
-	if _, err := r.upstream(req.Context()); err != nil {
+	_, err := r.upstream(req.Context())
+	if errors.Is(err, errNetherNetUpstreamUnknown) {
+		// 客户端可能只做一次能力探测。首次请求允许快目标完成初探，但不
+		// 跟随上游数秒的超时；未探测完成不冒充目标支持 NetherNet。
+		timer := time.NewTimer(netherNetRelayInitialProbeWait)
+		defer timer.Stop()
+		select {
+		case <-r.firstProbe:
+		case <-timer.C:
+		case <-req.Context().Done():
+		case <-r.done:
+		}
+		_, err = r.upstream(req.Context())
+	}
+	r.upstreamMu.Lock()
+	probe := r.upstreamProbe
+	probeErr := r.upstreamErr
+	r.upstreamMu.Unlock()
+	if err != nil || probeErr != nil || probe.status < 200 || probe.status >= 300 {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	if probe.contentType != "" {
+		w.Header().Set("Content-Type", probe.contentType)
+	}
+	w.WriteHeader(probe.status)
+	_, _ = w.Write(probe.body)
 }
 
 func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 	req.Close = true
 	networkID := req.PathValue("networkID")
-	if _, err := strconv.ParseUint(networkID, 10, 64); err != nil {
-		http.Error(w, "Network ID must be uint64", http.StatusBadRequest)
+	// 新版规范将 NetworkID 定义为不透明字符串；校验交给目标服，不能
+	// 因旧库使用十进制 uint64 就在透明代理额外拒绝 GUID 等合法形式。
+	if networkID == "" {
+		http.Error(w, "Missing Network ID", http.StatusBadRequest)
 		return
 	}
 	offer, err := io.ReadAll(http.MaxBytesReader(w, req.Body, netherNetMaxSDPSize))
@@ -404,7 +438,7 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/join/"+networkID, bytes.NewReader(offer))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/join/"+url.PathEscape(networkID), bytes.NewReader(offer))
 	if err != nil {
 		http.Error(w, "Bad upstream", http.StatusBadGateway)
 		return
@@ -419,13 +453,13 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "Timed out waiting for answer", http.StatusBadGateway)
 		return
 	}
-	answer, err := io.ReadAll(io.LimitReader(resp.Body, netherNetMaxSDPSize))
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, netherNetMaxSDPSize+1))
 	resp.Body.Close()
-	if err != nil {
+	if err != nil || len(answer) > netherNetMaxSDPSize {
 		http.Error(w, "Bad upstream answer", http.StatusBadGateway)
 		return
 	}
-	if resp.StatusCode != http.StatusOK || !bytes.HasPrefix(answer, []byte("v=0")) {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !bytes.HasPrefix(answer, []byte("v=0")) {
 		// Error codes and non-SDP bodies are the client's business.
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		w.WriteHeader(resp.StatusCode)
@@ -440,7 +474,7 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/sdp")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write([]byte(rewritten))
 }
 
@@ -559,11 +593,9 @@ func (r *netherNetRelay) upstreamIP(ctx context.Context) netip.Addr {
 
 var errNetherNetUpstreamUnknown = errors.New("upstream signaling not probed yet")
 
-// upstream returns the cached upstream signaling base URL. It never blocks on
-// the network: a stale or missing result triggers a background probe and the
-// current answer is served meanwhile (clients fall back to RakNet until the
-// first probe succeeds). A client's own connect attempt is never held up by
-// a slow or silent upstream port.
+// upstream 返回缓存的目标信令地址，不在这里同步访问网络；过期时触发后台探测。
+// GET 初次请求在 handleProbe 中有独立的短等待上限，慢目标仍明确返回不可用。
+// 是否能回退 RakNet 由客户端/目标的实际支持决定，不保证所有26.60构建都能回退。
 func (r *netherNetRelay) upstream(context.Context) (string, error) {
 	r.upstreamMu.Lock()
 	defer r.upstreamMu.Unlock()
@@ -610,8 +642,9 @@ func (r *netherNetRelay) probeUpstream() {
 		}
 	}()
 	base, err := "", error(nil)
+	var probe netherNetProbeResult
 	for _, b := range bases {
-		if err = r.probeBase(ctx, b); err == nil {
+		if probe, err = r.probeBase(ctx, b); err == nil {
 			base = b
 			break
 		}
@@ -629,6 +662,7 @@ func (r *netherNetRelay) probeUpstream() {
 		logger.Info("NetherNet relay: upstream has no NetherNet signaling, clients fall back to RakNet: server=%s err=%v", r.serverID, err)
 	}
 	r.upstreamBase, r.upstreamErr, r.upstreamChecked = base, err, time.Now()
+	r.upstreamProbe = probe
 	r.firstProbeOnce.Do(func() { close(r.firstProbe) })
 }
 
@@ -655,22 +689,29 @@ func (r *netherNetRelay) track(n int) bool {
 	return true
 }
 
-func (r *netherNetRelay) probeBase(ctx context.Context, base string) error {
+func (r *netherNetRelay) probeBase(ctx context.Context, base string) (netherNetProbeResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, netherNetRelayProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/join", nil)
 	if err != nil {
-		return err
+		return netherNetProbeResult{}, err
 	}
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		return err
+		return netherNetProbeResult{}, err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s/v1/join: %s", base, resp.Status)
+		return netherNetProbeResult{}, fmt.Errorf("%s/v1/join: %s", base, resp.Status)
 	}
-	return nil
+	body, err := io.ReadAll(io.LimitReader(resp.Body, netherNetMaxSDPSize+1))
+	if err != nil {
+		return netherNetProbeResult{}, fmt.Errorf("read upstream capability response: %w", err)
+	}
+	if len(body) > netherNetMaxSDPSize {
+		return netherNetProbeResult{}, errors.New("upstream capability response too large")
+	}
+	return netherNetProbeResult{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), body: body}, nil
 }
 
 type netherNetTCPDialer interface {
@@ -886,46 +927,35 @@ func (c *rejectTLSConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// startNetherNetRelayIfEnabled starts the relay for a RakNet UDP listener when
-// the server opts in. A failure only disables NetherNet: RakNet keeps working
-// and clients fall back to it because the TCP port does not answer.
-func startNetherNetRelayIfEnabled(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) *netherNetRelay {
-	if cfg := conf(); cfg == nil || !cfg.NetherNetRelay || udp == nil {
+// 透明UDP监听自动附带同号TCP信令；端口冲突只影响NetherNet入口，不关闭原UDP。
+func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) *netherNetRelay {
+	if conf() == nil || udp == nil {
 		return nil
 	}
 	r, err := newNetherNetRelay(serverID, conf, outboundMgr, udp)
 	if err != nil {
-		logger.Error("NetherNet relay disabled for server %s: %v", serverID, err)
+		logger.Error("NetherNet relay unavailable for server %s: %v", serverID, err)
 		return nil
 	}
 	return r
 }
 
-// syncNetherNetRelay applies a hot config update to the relay slot of a
-// running proxy: it starts the relay when nethernet_relay was switched on,
-// stops it when switched off, and otherwise lets the live relay re-probe the
-// upstream. closed reports whether the owning proxy has been stopped.
+// 热更新仅重新探测目标；入口随UDP监听启动/停止，不再维护独立启用状态。
 func syncNetherNetRelay(slot *atomic.Pointer[netherNetRelay], serverID string, conf func() *config.ServerConfig,
 	outboundMgr OutboundManager, udp *net.UDPConn, closed func() bool) {
-	cfg := conf()
-	want := cfg != nil && cfg.NetherNetRelay && udp != nil && !closed()
-	cur := slot.Load()
-	switch {
-	case want && cur == nil:
-		r := startNetherNetRelayIfEnabled(serverID, conf, outboundMgr, udp)
-		if r == nil {
-			return
-		}
-		if !slot.CompareAndSwap(nil, r) || closed() {
-			slot.CompareAndSwap(r, nil)
-			_ = r.Close()
-		}
-	case !want && cur != nil:
-		if slot.CompareAndSwap(cur, nil) {
-			_ = cur.Close()
-			logger.Info("NetherNet relay stopped: server=%s (disabled in config)", serverID)
-		}
-	case cur != nil:
+	if udp == nil || closed() {
+		return
+	}
+	if cur := slot.Load(); cur != nil {
 		cur.configChanged()
+		return
+	}
+	r := startNetherNetRelay(serverID, conf, outboundMgr, udp)
+	if r == nil {
+		return
+	}
+	if !slot.CompareAndSwap(nil, r) || closed() {
+		slot.CompareAndSwap(r, nil)
+		_ = r.Close()
 	}
 }

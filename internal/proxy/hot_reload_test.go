@@ -107,46 +107,42 @@ func TestUpdateConfigWhileForwarding(t *testing.T) {
 	}
 }
 
-// TestNetherNetRelayHotToggle switches nethernet_relay on and off on a
-// running listener through UpdateConfig; before the fix the relay was only
-// created in Start, so the switch had no effect until a restart.
-func TestNetherNetRelayHotToggle(t *testing.T) {
-	cfg := &config.ServerConfig{ID: "toggle", Target: "127.0.0.1", Port: 1, ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
+// 自动入口与UDP监听同生命周期；热更新只重新探测，停止后不能被更新复活。
+func TestNetherNetRelayHotUpdateKeepsAutomaticListener(t *testing.T) {
+	cfg := &config.ServerConfig{ID: "automatic", Target: "127.0.0.1", Port: 1, ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
 	p := NewPlainUDPProxy(cfg.ID, cfg)
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer p.Stop()
+	relay := p.nnRelay.Load()
+	if relay == nil {
+		t.Fatal("automatic relay not started")
+	}
 	addr := p.listener.LocalAddr().String()
 	probe := func() bool {
 		c, err := net.DialTimeout("tcp", addr, time.Second)
 		if err != nil {
 			return false
 		}
-		c.Close()
+		_ = c.Close()
 		return true
 	}
-	if probe() {
-		t.Fatal("signaling port open while relay is off")
+	if !probe() {
+		t.Fatal("automatic signaling port unavailable")
 	}
-
-	on := *cfg
-	on.NetherNetRelay = true
-	p.UpdateConfig(&on)
-	if p.nnRelay.Load() == nil || !probe() {
-		t.Fatal("relay not started by UpdateConfig")
+	updated := *cfg
+	updated.Name = "updated"
+	p.UpdateConfig(&updated)
+	if p.nnRelay.Load() != relay || !probe() {
+		t.Fatal("hot update replaced or closed automatic relay")
 	}
-
+	if err := p.Stop(); err != nil {
+		t.Fatal(err)
+	}
 	p.UpdateConfig(cfg)
-	if p.nnRelay.Load() != nil {
-		t.Fatal("relay not stopped by UpdateConfig")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for probe() && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if probe() {
-		t.Fatal("signaling port still open after relay was disabled")
+	if p.nnRelay.Load() != nil || probe() {
+		t.Fatal("config update revived a stopped relay")
 	}
 }
 
@@ -157,7 +153,7 @@ func newTestRelay(t *testing.T) (*netherNetRelay, *net.UDPConn) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { udp.Close() })
-	cfg := &config.ServerConfig{ID: "relay-unit", Target: "127.0.0.1", Port: 1, NetherNetRelay: true}
+	cfg := &config.ServerConfig{ID: "relay-unit", Target: "127.0.0.1", Port: 1}
 	r, err := newNetherNetRelay("relay-unit", func() *config.ServerConfig { return cfg }, nil, udp)
 	if err != nil {
 		t.Fatal(err)

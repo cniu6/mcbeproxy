@@ -116,19 +116,18 @@
               <template #feedback>RakNet / Raw UDP 模式。填略低于服务器出口带宽的值(如 3Mbps 填 2400)：进服大包先由代理收下再匀速发给玩家，不再被云厂商限速丢包卡死。Raw UDP 下代理替玩家向服务器确认收包、自己补发丢包，不解密。0=不限速。</template>
             </n-form-item>
           </n-gi>
-          <template v-if="canUseNetherNetRelay">
-            <n-gi>
-              <n-form-item label="NetherNet 中继">
-                <n-switch v-model:value="form.nethernet_relay" />
-                <template #feedback>新版客户端(26.x)走 NetherNet 时透明中继：信令用同号 TCP 端口，媒体与 RakNet 共用 UDP 端口，不解密。需放行 TCP 同号端口；该路径看不到玩家名。</template>
-              </n-form-item>
-            </n-gi>
-            <n-gi v-if="form.nethernet_relay">
-              <n-form-item label="对外地址">
-                <n-input v-model:value="form.nethernet_public_addr" placeholder="留空=客户端连接用的地址，如 139.9.2.172:20002" />
-              </n-form-item>
-            </n-gi>
-          </template>
+          <n-gi v-if="isAdaptiveUDP" :span="2">
+            <n-form-item label="传输自适应">
+              <div>
+                <n-tag type="success" size="small">RakNet / NetherNet 自动兼容</n-tag>
+                <details style="margin-top: 8px">
+                  <summary>公网映射（可选）</summary>
+                  <n-input v-model:value="form.nethernet_public_addr" placeholder="通常留空；仅 NAT 映射不同地址或端口时填写 ip:port" style="margin-top: 8px" />
+                </details>
+              </div>
+              <template #feedback>保持当前模式即可自动兼容，不转换协议、不解密。需放行入口同号 TCP + UDP 端口；NetherNet 路径看不到玩家名。</template>
+            </n-form-item>
+          </n-gi>
           <n-gi>
             <n-form-item label="延迟模式">
               <n-select v-model:value="form.latency_mode" :options="latencyModeOptions" />
@@ -1309,7 +1308,7 @@ const baseDefaultForm = {
   auto_ping_full_scan_time: '04:00',
   auto_ping_full_scan_interval_hours: 24,
   nethernet_listen_addr: '', nethernet_cert_file: '', nethernet_key_file: '', nethernet_identity_file: '', nethernet_upstream: '', nethernet_ice_gather_policy: '', nethernet_ice_servers_json: '', nethernet_allow_anonymous: false,
-  nethernet_relay: false, nethernet_public_addr: ''
+  nethernet_public_addr: ''
 }
 
 const makeDefaultForm = () => ({
@@ -1526,8 +1525,8 @@ const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase(
 // downstream_limit_kbps paces raknet and raw_udp (proxy/raw_udp_pacer.go).
 const canLimitDownstream = computed(() => isRaknetProtocol.value && ['raknet', 'raw_udp'].includes(String(form.value.proxy_mode || '').toLowerCase()))
 const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
-// The NetherNet relay rides on a RakNet UDP listener: raw_udp, or protocol=udp (plain UDP).
-const canUseNetherNetRelay = computed(() => {
+// 透明UDP入口按传输能力自动分流，无额外开关。
+const isAdaptiveUDP = computed(() => {
   const protocol = String(form.value.protocol || '').toLowerCase()
   return protocol === 'udp' || (isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'raw_udp')
 })

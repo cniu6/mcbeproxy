@@ -25,9 +25,9 @@ import (
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/db"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 	internalprotocol "mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
-	"mcpeserverproxy/internal/netroute"
 
 	"github.com/golang-jwt/jwt/v4"
 	mcprotocol "github.com/sandertv/gophertunnel/minecraft/protocol"
@@ -239,8 +239,8 @@ type rawUDPClientInfo struct {
 	slowWriteClientCount   atomic.Int64
 	maxClientPacketGapMs   atomic.Int64
 	maxTargetPacketGapMs   atomic.Int64
-	upLeg                  rakLegStats // RakNet seq/NACK accounting for packets from the client
-	downLeg                rakLegStats // ... and for packets from the target
+	upLeg                  rakLegStats  // RakNet seq/NACK accounting for packets from the client
+	downLeg                rakLegStats  // ... and for packets from the target
 	pacer                  *rawUDPPacer // downstream_limit_kbps (raw_udp_pacer.go); nil when off
 	writeMetricWindowAt    atomic.Int64
 	recentMaxWriteTargetMs atomic.Int64
@@ -1033,7 +1033,7 @@ type RawUDPProxy struct {
 	aclManager       ACLManager       // ACL manager for whitelist/blacklist
 	externalVerifier ExternalVerifier // External auth verifier (defined in passthrough_proxy.go)
 	listener         *net.UDPConn
-	nnRelay          atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
+	nnRelay          atomic.Pointer[netherNetRelay] // 自动NetherNet媒体与RakNet共用监听；TCP入口启动失败时为nil
 	targets          atomic.Pointer[rawUDPTargets]  // resolved target, swapped by UpdateConfig
 	clients          sync.Map                       // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
 	bannedIPs        sync.Map                       // map[string]*bannedIPInfo (IP without port -> ban info)
@@ -1279,7 +1279,7 @@ func (p *RawUDPProxy) Start() error {
 
 	// Create cancellable context before any background work can observe it.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.nnRelay.Store(startNetherNetRelayIfEnabled(p.serverID, p.conf, p.outboundMgr, listener))
+	p.nnRelay.Store(startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, listener))
 
 	// Initialize cached latency state
 	p.latencyMu.Lock()

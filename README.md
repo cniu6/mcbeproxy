@@ -8,7 +8,7 @@
 - **多协议支持**: Shadowsocks / ShadowsocksR / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / TUIC / WireGuard / Naive / SOCKS5 / HTTP
 - **链式代理**: 支持多级代理嵌套（A → B → C），自动展开嵌套链，内置循环引用检测
 - **智能负载均衡**: 支持按组/节点列表做负载均衡与自动故障切换
-- **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm / nethernet；另有 `nethernet_relay`（不解密转发 NetherNet/WebRTC）
+- **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm / nethernet；Raw UDP 自动兼容 RakNet 与 NetherNet（不解密、不转换协议）
 - **实时延迟检测**: 自动选择最优节点，确保最佳游戏体验
 - **节点订阅**: 支持 Clash/Mihomo 订阅链接（`proxy_subscriptions.json`），可定时自动更新节点
 - **网络路由**: `network.json` 提供 Proxifier 式目的地址规则 + 全局出口网卡绑定
@@ -328,7 +328,6 @@ flowchart TD
     "disabled_message": "§c服务器维护中§r\n§7请稍后再试",
     "custom_motd": "MCPE;§aCubeCraft Proxy;712;1.21.50;0;100;12345678901234567;CubeCraft;Survival;1;19132;19132;0;",
     "proxy_mode": "passthrough",
-    "nethernet_relay": false,
     "xbox_auth_enabled": false,
     "xbox_token_path": "xbox_token.json",
     "proxy_outbound": "全三网入口IPLC专线节点",
@@ -369,7 +368,6 @@ flowchart TD
 | `disabled_message` | string | ⚪ | 服务器禁用时的自定义消息 |
 | `custom_motd` | string | ⚪ | 自定义 MOTD（服务器描述） |
 | `proxy_mode` | string | ⚪ | 代理模式（见[代理模式说明](#代理模式-proxy_mode)，仅 `protocol=raknet` 时有效） |
-| `nethernet_relay` | bool | ⚪ | 为 `raw_udp`/`udp` 服务器增加 NetherNet 信令+媒体转发（见[NetherNet relay](#nethernet-转发-nethernet_relay)） |
 | `nethernet_*` | — | ⚪ | `nethernet` 模式的信令/证书/ICE 配置（见[NetherNet 模式](#6-nethernetnethernet-中间人)） |
 | `raw_udp_kick_strategy` | string | ⚪ | raw_udp 踢人策略（如 `disconnect_only`，默认即此） |
 | `xbox_auth_enabled` | bool | ⚪ | 是否启用 Xbox Live 认证 |
@@ -773,27 +771,43 @@ flowchart TD
 
 ---
 
-### NetherNet 转发 (nethernet_relay)
+### NetherNet 自动转发
 
-`nethernet_relay: true` 是给 `raw_udp` / `udp` 服务器加的开源替代：
+保持面板「RakNet → Raw UDP」（`protocol=raknet`、`proxy_mode=raw_udp`）即可**自动同时提供 RakNet 与 NetherNet 透明转发**，无需额外参数或开关。普通 `protocol=udp` 也使用同一自动入口。客户端根据目标能力选择传输，代理按信令/数据报分流，不把两种协议互相转换，也不是 `proxy_mode=nethernet` 的双端协议终止。
 
-- 26.x 客户端会先探测服务器端口 TCP 孪生的 NetherNet HTTPS 信令，再回落 RakNet。
-- 开启 relay 后，代理在同一 UDP 端口应答信令、把 SDP offer 经上游转发给真实服务器，只改写 answer 中的 ICE 候选为代理地址，加密 WebRTC 媒体仍走同一 UDP 端口（按 STUN ufrag 分流）。
-- 不解密、不需要额外端口；该路径看不到玩家名。
-- 上游无 NetherNet 信令时 `GET /v1/join` 返回 503，客户端自动回落 RakNet。
-- 需要同时开放 TCP + UDP 端口。
+- 在客户端入口的**同号 TCP 端口**接收 HTTP 信令，媒体与旧 RakNet 共用该数字的 UDP 端口。例如入口是 20002，就需要放行 TCP/20002 和 UDP/20002，而不是只放行 UDP。
+- 后台按目标的 HTTPS/HTTP 信令探测能力；GET `/v1/join` 的成功状态、内容类型和元数据原样从目标缓存返回，不伪造 `protocol` / `version`。初探中的首次 GET 最多额外等 200ms；慢目标可能仍暂时返回 503，不能把它直接解释为目标永久不支持。
+- POST `/v1/join/{networkId}` 转发原始 SDP offer；NetworkID 当作不透明字符串交给目标验证，目标的非 2xx 错误原样返回，2xx SDP answer 只替换 ICE candidates。
+- DTLS 指纹、`a=identity`、ICE 凭据保持不变；后续 STUN/DTLS/SCTP UDP 字节只转发、不解密，不重新编码游戏包，也不做版本转换。该路径不能解析明文玩家名/XUID；不能假定依赖这些字段的 ACL 仍能在中继中执行。
+- 没有可用上游信令时返回非 2xx，不假装支持。旧 RakNet 仍可按原路径转发，但**是否回退取决于客户端和目标服实际支持**，不保证 26.60 构建都保留回退。
+- Raw UDP / 普通 UDP 的入口随监听启动和停止，热更新只重新探测目标，不维护独立开关。旧 JSON 中多余的开关字段会被忽略，保存或 API 输出时不再携带。不自动修改 `raknet` / `passthrough` / `mitm` 等其他模式。同号 TCP 端口被其他服务占用时记录错误，不抢占服务，旧 UDP 路径继续运行，但此时 NetherNet 信令不可用。
+
+示例中的目标、端口和对外地址应替换为实际部署值；这里不指定上游代理节点时是直连：
 
 ```json
 {
   "id": "relay-example",
+  "name": "自适应透明中继",
+  "target": "backend.example.com",
+  "port": 19132,
+  "listen_addr": "0.0.0.0:20002",
   "protocol": "raknet",
   "proxy_mode": "raw_udp",
-  "nethernet_relay": true,
-  "nethernet_public_addr": "203.0.113.5:19132"
+  "nethernet_public_addr": "203.0.113.5:20002"
 }
 ```
 
-`nethernet_public_addr` 为对客户端宣告的 `ip:port`（空=客户端拨入的地址）。
+`nethernet_public_addr` 是客户端可达的公网 `ip:port`（空=客户端 HTTP Host 的地址）；NAT/Docker 改端口时应填映射后的 UDP 端口。默认在目标 `target:port` 探测信令；如果目标信令单独部署，可设置 `nethernet_upstream` 为真实 `http(s)://host:port`。目标媒体端口从 SDP candidate 获取，不硬编码成 19132/19134。
+
+**26.60 的验证边界与排错顺序：**
+
+1. 先确认 26.60 客户端直连同一目标可进服，再核对代理保持「RakNet → Raw UDP」，以及 TCP+UDP 防火墙/NAT 映射；Raw UDP 无需再开中继开关。目标与客户端之间的游戏版本支持由目标负责。
+2. 看 `NetherNet relay started` 与 `upstream signaling`：只有 TCP/UDP listener 启动不等于目标探测已经成功。
+3. 看 `session created`：说明目标 SDP 成功并建立了媒体转发关联；`client bound` 说明客户端 STUN 已到达代理。只有 HTTP 2xx 不代表 ICE/DTLS、登录或进世界成功。
+4. 看 `session closed` 的 `up_packets/down_packets`、写超时与错误计数，区分客户端到代理、代理到目标两段是否有回包。日志只作阶段定位，不把 ufrag、网络 ID 或 HTTP 成功当成可信玩家身份。
+5. `Terracotta / InitialConnection-149` 不是本项目已确认的单一根因映射，需结合上述阶段和实际目标日志；不靠替换游戏协议号或关闭认证来解决。
+
+本地已覆盖目标元数据透传、不透明 ID、非 200 的 2xx SDP answer、中继响应大小限制、初探竞态、同 IP 两会话的双向字节一致性，以及 `raw_udp` / `udp` 上真实 go-nethernet 客户端的媒体往返。**这不等于已经完成 Windows GDK 1.26.60 实机登录验收**，也不代表所有上游节点、NAT 或目标 candidate 组合都已验证。
 
 #### 根据需求选择
 
@@ -1640,7 +1654,7 @@ go run . -debug
 ## 版本历史
 
 ### v2.5.0
-- ✨ **NetherNet 支持**: 新增 `nethernet` 中间人模式与 `nethernet_relay` 不解密转发（26.x 客户端探测路径）
+- ✨ **NetherNet 支持**: 提供 `nethernet` 中间人模式；透明 UDP 入口自动兼容 NetherNet 不解密转发。
 - ✨ **新节点协议**: 新增 ShadowsocksR / TUIC / WireGuard / Naive / TUIC-UDP，Clash/Mihomo 订阅完整保留 `provider_options`
 - ✨ **节点订阅**: `proxy_subscriptions.json` 支持 Clash/URI 订阅链接，可定时自动更新
 - ✨ **网络路由**: `network.json` 提供全局出口网卡绑定 + Proxifier 式目的地址规则（direct/proxy/block）

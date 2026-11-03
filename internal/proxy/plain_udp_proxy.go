@@ -154,7 +154,7 @@ type PlainUDPProxy struct {
 	cfgPtr      atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
 	outboundMgr OutboundManager
 	listener    *net.UDPConn
-	nnRelay     atomic.Pointer[netherNetRelay] // NetherNet media shares listener; nil unless nethernet_relay
+	nnRelay     atomic.Pointer[netherNetRelay] // 自动NetherNet入口；TCP监听启动失败时为nil
 	targetPtr   atomic.Pointer[plainUDPTarget] // resolved target, swapped by UpdateConfig
 	clients     sync.Map
 	closed      atomic.Bool
@@ -246,7 +246,7 @@ func (p *PlainUDPProxy) Start() error {
 	// Own lifecycle context, created before any background work can observe
 	// it — see the PlainUDPProxy.ctx doc comment.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.nnRelay.Store(startNetherNetRelayIfEnabled(p.serverID, p.conf, p.outboundMgr, conn))
+	p.nnRelay.Store(startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, conn))
 
 	return nil
 }

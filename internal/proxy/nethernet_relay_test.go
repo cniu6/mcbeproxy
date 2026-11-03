@@ -123,7 +123,7 @@ func lanIPv4(t *testing.T) netip.Addr {
 }
 
 // TestNetherNetRelay_EndToEnd runs a real go-nethernet server behind a
-// plain_udp listener with nethernet_relay enabled and dials it with a real
+// automatic plain_udp/raw_udp listener and dials it with a real
 // go-nethernet client through the proxy: signaling over the TCP twin of the
 // listen port, WebRTC media over the same UDP port as RakNet.
 func TestNetherNetRelay_EndToEnd(t *testing.T) {
@@ -156,18 +156,17 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 	defer sigSrv.Close()
 
 	cfg := &config.ServerConfig{
-		ID:             "nethernet-relay-e2e",
-		Target:         "127.0.0.1",
-		Port:           sigLn.Addr().(*net.TCPAddr).Port,
-		ListenAddr:     "0.0.0.0:0",
-		IdleTimeout:    300,
-		NetherNetRelay: true,
-	}
+		ID:          "nethernet-relay-e2e",
+		Target:      "127.0.0.1",
+		Port:        sigLn.Addr().(*net.TCPAddr).Port,
+		ListenAddr:  "0.0.0.0:0",
+		IdleTimeout: 300}
 	var p relayHost
 	var relay func() *netherNetRelay
 	var udp func() *net.UDPConn
 	if mode == "raw_udp" {
-		cfg.ProxyMode = "raw_udp"
+		cfg.Protocol = config.ProxyModeRakNet
+		cfg.ProxyMode = config.ProxyModeRawUDP
 		raw := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
 		p, relay, udp = raw, func() *netherNetRelay { return raw.nnRelay.Load() }, func() *net.UDPConn { return raw.listener }
 	} else {
@@ -257,7 +256,7 @@ func TestNetherNetRelay_SilentUpstreamDoesNotDelayClient(t *testing.T) {
 	}()
 
 	cfg := &config.ServerConfig{ID: "nethernet-relay-silent", Target: "127.0.0.1", Port: silent.Addr().(*net.TCPAddr).Port,
-		ListenAddr: "127.0.0.1:0", IdleTimeout: 300, NetherNetRelay: true}
+		ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
 	p := NewPlainUDPProxy(cfg.ID, cfg)
 	if err := p.Start(); err != nil {
 		t.Fatalf("start proxy: %v", err)
@@ -290,7 +289,7 @@ func TestNetherNetRelay_ProbeFailsWithoutUpstream(t *testing.T) {
 	dead.Close()
 
 	cfg := &config.ServerConfig{ID: "nethernet-relay-probe", Target: "127.0.0.1", Port: deadPort,
-		ListenAddr: "127.0.0.1:0", IdleTimeout: 300, NetherNetRelay: true}
+		ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
 	p := NewPlainUDPProxy(cfg.ID, cfg)
 	if err := p.Start(); err != nil {
 		t.Fatalf("start proxy: %v", err)

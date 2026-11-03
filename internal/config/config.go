@@ -127,9 +127,9 @@ type NetherNetICEServer struct {
 
 // ServerConfig represents a proxy target server configuration.
 type ServerConfig struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Target     string `json:"target"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Target string `json:"target"`
 	// TargetIP pins the upstream IP for multi-IP / GeoDNS targets. When set,
 	// no DNS lookup is done at all and every dial (direct or via proxy node)
 	// goes to exactly this IP; Target stays as the display/hostname.
@@ -161,7 +161,6 @@ type ServerConfig struct {
 	NetherNetDisableTrickleICE bool                 `json:"nethernet_disable_trickle_ice,omitempty"`
 	NetherNetICEServers        []NetherNetICEServer `json:"nethernet_ice_servers,omitempty"`
 	NetherNetAllowAnonymous    bool                 `json:"nethernet_allow_anonymous,omitempty"`
-	NetherNetRelay             bool                 `json:"nethernet_relay,omitempty"`       // Relay NetherNet (signaling on TCP twin of listen_addr, media on the same UDP port) without decrypting; raw_udp/plain_udp only
 	NetherNetPublicAddr        string               `json:"nethernet_public_addr,omitempty"` // ip:port advertised in the relayed SDP answer; empty = the host:port the client dialed
 	ACLServerID                string               `json:"acl_server_id,omitempty"`
 	RawUDPKickStrategy         string               `json:"raw_udp_kick_strategy,omitempty"`
@@ -568,52 +567,52 @@ func ServerConfigFromJSON(data []byte) (*ServerConfig, error) {
 }
 
 type RawUDPClientStatsDTO struct {
-	Client                 string    `json:"client"`
-	ClientAddr             string    `json:"client_addr"`
-	SessionKey             string    `json:"session_key,omitempty"`
-	PlayerName             string    `json:"player_name,omitempty"`
-	PlayerUUID             string    `json:"player_uuid,omitempty"`
-	PlayerXUID             string    `json:"player_xuid,omitempty"`
-	ConnectedAt            time.Time `json:"connected_at,omitempty"`
-	DurationSeconds        int64     `json:"duration_seconds"`
-	Route                  string    `json:"route"`
-	Target                 string    `json:"target"`
-	UpPackets              int64     `json:"up_packets"`
-	DownPackets            int64     `json:"down_packets"`
-	UpBytes                int64     `json:"up_bytes"`
-	DownBytes              int64     `json:"down_bytes"`
-	UpBytesPerSecond       int64     `json:"up_bytes_per_second"`
-	DownBytesPerSecond     int64     `json:"down_bytes_per_second"`
-	SinceClientMs          int64     `json:"since_client_ms"`
-	SinceTargetMs          int64     `json:"since_target_ms"`
-	WriteTargetErrors      int64     `json:"write_target_errors"`
-	WriteTargetTimeouts    int64     `json:"write_target_timeouts"`
-	WriteClientErrors      int64     `json:"write_client_errors"`
-	WriteClientTimeouts    int64     `json:"write_client_timeouts"`
-	ReadTargetTimeouts     int64     `json:"read_target_timeouts"`
-	UpstreamQueueLen       int       `json:"upstream_queue_len"`
-	UpstreamQueueCap       int       `json:"upstream_queue_cap"`
-	UpstreamQueueDrops     int64     `json:"upstream_queue_drops"`
-	LoginParseAttempts     int64     `json:"login_parse_attempts"`
-	LoginParseDone         bool      `json:"login_parse_done"`
-	LoginParsed            bool      `json:"login_parsed"`
-	Encrypted              bool      `json:"encrypted"`
-	LastWriteTargetMs      int64     `json:"last_write_target_ms"`
-	MaxWriteTargetMs       int64     `json:"max_write_target_ms"`
-	SlowWriteTarget        int64     `json:"slow_write_target_count"`
-	LastWriteClientMs      int64     `json:"last_write_client_ms"`
-	MaxWriteClientMs       int64     `json:"max_write_client_ms"`
-	SlowWriteClient        int64     `json:"slow_write_client_count"`
-	StallReason            string    `json:"stall_reason,omitempty"`
+	Client              string    `json:"client"`
+	ClientAddr          string    `json:"client_addr"`
+	SessionKey          string    `json:"session_key,omitempty"`
+	PlayerName          string    `json:"player_name,omitempty"`
+	PlayerUUID          string    `json:"player_uuid,omitempty"`
+	PlayerXUID          string    `json:"player_xuid,omitempty"`
+	ConnectedAt         time.Time `json:"connected_at,omitempty"`
+	DurationSeconds     int64     `json:"duration_seconds"`
+	Route               string    `json:"route"`
+	Target              string    `json:"target"`
+	UpPackets           int64     `json:"up_packets"`
+	DownPackets         int64     `json:"down_packets"`
+	UpBytes             int64     `json:"up_bytes"`
+	DownBytes           int64     `json:"down_bytes"`
+	UpBytesPerSecond    int64     `json:"up_bytes_per_second"`
+	DownBytesPerSecond  int64     `json:"down_bytes_per_second"`
+	SinceClientMs       int64     `json:"since_client_ms"`
+	SinceTargetMs       int64     `json:"since_target_ms"`
+	WriteTargetErrors   int64     `json:"write_target_errors"`
+	WriteTargetTimeouts int64     `json:"write_target_timeouts"`
+	WriteClientErrors   int64     `json:"write_client_errors"`
+	WriteClientTimeouts int64     `json:"write_client_timeouts"`
+	ReadTargetTimeouts  int64     `json:"read_target_timeouts"`
+	UpstreamQueueLen    int       `json:"upstream_queue_len"`
+	UpstreamQueueCap    int       `json:"upstream_queue_cap"`
+	UpstreamQueueDrops  int64     `json:"upstream_queue_drops"`
+	LoginParseAttempts  int64     `json:"login_parse_attempts"`
+	LoginParseDone      bool      `json:"login_parse_done"`
+	LoginParsed         bool      `json:"login_parsed"`
+	Encrypted           bool      `json:"encrypted"`
+	LastWriteTargetMs   int64     `json:"last_write_target_ms"`
+	MaxWriteTargetMs    int64     `json:"max_write_target_ms"`
+	SlowWriteTarget     int64     `json:"slow_write_target_count"`
+	LastWriteClientMs   int64     `json:"last_write_client_ms"`
+	MaxWriteClientMs    int64     `json:"max_write_client_ms"`
+	SlowWriteClient     int64     `json:"slow_write_client_count"`
+	StallReason         string    `json:"stall_reason,omitempty"`
 	// Round-trip times of each leg (raknet mode; raw_udp reports the client
 	// leg when paced) and bytes waiting in the downstream_limit_kbps pacer.
-	ClientRTTMs            int64     `json:"client_rtt_ms,omitempty"`
-	TargetRTTMs            int64     `json:"target_rtt_ms,omitempty"`
-	DownstreamPendingBytes int64     `json:"downstream_pending_bytes,omitempty"`
-	MaxClientPacketGapMs   int64     `json:"max_client_packet_gap_ms"`
-	MaxTargetPacketGapMs   int64     `json:"max_target_packet_gap_ms"`
-	RecentMaxWriteTargetMs int64     `json:"recent_max_write_target_ms"`
-	RecentMaxWriteClientMs int64     `json:"recent_max_write_client_ms"`
+	ClientRTTMs            int64 `json:"client_rtt_ms,omitempty"`
+	TargetRTTMs            int64 `json:"target_rtt_ms,omitempty"`
+	DownstreamPendingBytes int64 `json:"downstream_pending_bytes,omitempty"`
+	MaxClientPacketGapMs   int64 `json:"max_client_packet_gap_ms"`
+	MaxTargetPacketGapMs   int64 `json:"max_target_packet_gap_ms"`
+	RecentMaxWriteTargetMs int64 `json:"recent_max_write_target_ms"`
+	RecentMaxWriteClientMs int64 `json:"recent_max_write_client_ms"`
 }
 
 // ServerConfigDTO is the data transfer object for server config API responses.
@@ -644,7 +643,6 @@ type ServerConfigDTO struct {
 	NetherNetDisableTrickleICE bool                   `json:"nethernet_disable_trickle_ice,omitempty"`
 	NetherNetICEServers        []NetherNetICEServer   `json:"nethernet_ice_servers,omitempty"`
 	NetherNetAllowAnonymous    bool                   `json:"nethernet_allow_anonymous,omitempty"`
-	NetherNetRelay             bool                   `json:"nethernet_relay,omitempty"`
 	NetherNetPublicAddr        string                 `json:"nethernet_public_addr,omitempty"`
 	ACLServerID                string                 `json:"acl_server_id,omitempty"`
 	RawUDPKickStrategy         string                 `json:"raw_udp_kick_strategy,omitempty"`
@@ -659,7 +657,7 @@ type ServerConfigDTO struct {
 	ResolvedIP                 string                 `json:"resolved_ip,omitempty"`
 	RakNetMTU                  int                    `json:"raknet_mtu,omitempty"`
 	DownstreamLimitKbps        int                    `json:"downstream_limit_kbps,omitempty"`
-	Status                     string                 `json:"status"`                 // running, stopped
+	Status                     string                 `json:"status"` // running, stopped
 	ActiveSessions             int                    `json:"active_sessions"`
 	ActiveProxyClients         int                    `json:"active_proxy_clients"`
 	RawUDPClients              []RawUDPClientStatsDTO `json:"raw_udp_clients,omitempty"`
@@ -703,7 +701,6 @@ func (sc *ServerConfig) ToDTO(status string, activeSessions int) ServerConfigDTO
 		NetherNetDisableTrickleICE:    sc.NetherNetDisableTrickleICE,
 		NetherNetICEServers:           sc.NetherNetICEServers,
 		NetherNetAllowAnonymous:       sc.NetherNetAllowAnonymous,
-		NetherNetRelay:                sc.NetherNetRelay,
 		NetherNetPublicAddr:           sc.NetherNetPublicAddr,
 		ACLServerID:                   sc.GetACLServerID(),
 		RawUDPKickStrategy:            sc.GetRawUDPKickStrategy(),
