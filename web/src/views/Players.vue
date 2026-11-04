@@ -1,16 +1,16 @@
 <template>
   <div class="page-container">
-    <n-h2>玩家列表</n-h2>
-    <n-card>
+    <n-h3>玩家列表</n-h3>
+    <n-card size="small">
       <template #header-extra>
         <n-space>
-          <n-input v-model:value="search" placeholder="搜索玩家名" style="width: 200px" clearable @keyup.enter="filterPlayers" />
-          <n-button @click="filterPlayers">搜索</n-button>
-          <n-button @click="clearSearch">清除</n-button>
+          <n-input size="small" v-model:value="search" placeholder="搜索玩家名" style="width: 200px" clearable @keyup.enter="filterPlayers" />
+          <n-button size="small" @click="filterPlayers">搜索</n-button>
+          <n-button size="small" @click="clearSearch">清除</n-button>
         </n-space>
       </template>
       <div class="table-wrapper">
-        <n-data-table :columns="columns" :data="displayPlayers" :bordered="false" :pagination="pagination" :scroll-x="1200" @update:page="p => pagination.page = p" @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }" />
+        <n-data-table size="small" :columns="columns" :data="displayPlayers" :bordered="false" :pagination="pagination" :scroll-x="1200" @update:page="p => pagination.page = p" @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }" />
       </div>
     </n-card>
   </div>

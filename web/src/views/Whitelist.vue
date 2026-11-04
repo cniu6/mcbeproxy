@@ -1,33 +1,33 @@
 <template>
   <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">白名单</n-h2>
+      <n-h3 style="margin: 0">白名单</n-h3>
       <n-space>
-        <n-input
+        <n-input size="small"
           v-model:value="search"
           placeholder="搜索玩家名 / 原因 / 服务器"
           style="width: 220px"
           clearable
           @keyup.enter="load"
         />
-        <n-button @click="load">搜索</n-button>
-        <n-button @click="clearSearch">清空搜索</n-button>
+        <n-button size="small" @click="load">搜索</n-button>
+        <n-button size="small" @click="clearSearch">清空搜索</n-button>
         <n-popconfirm v-if="checkedRowKeys.length > 0" @positive-click="batchRemove">
           <template #trigger>
-            <n-button type="error">批量移除 ({{ checkedRowKeys.length }})</n-button>
+            <n-button size="small" type="error">批量移除 ({{ checkedRowKeys.length }})</n-button>
           </template>
           确定移除选中的 {{ checkedRowKeys.length }} 条白名单吗？
         </n-popconfirm>
-        <n-button @click="openExportModal">导出</n-button>
-        <n-button @click="openImportModal">导入</n-button>
-        <n-button type="primary" @click="openAddModal">添加</n-button>
+        <n-button size="small" @click="openExportModal">导出</n-button>
+        <n-button size="small" @click="openImportModal">导入</n-button>
+        <n-button size="small" type="primary" @click="openAddModal">添加</n-button>
       </n-space>
     </n-space>
     <n-card size="small" style="margin-bottom: 16px">
       <n-space justify="space-between" align="center">
         <n-space align="center">
           <n-text>白名单拦截</n-text>
-          <n-switch
+          <n-switch size="small"
             :value="aclSettings.whitelist_enabled"
             :loading="savingSettings"
             :disabled="loadingSettings || savingSettings"
@@ -40,9 +40,9 @@
         <n-text depth="3">关闭后会保留名单数据，但不会拦截非白名单玩家</n-text>
       </n-space>
     </n-card>
-    <n-card>
+    <n-card size="small">
       <div class="table-wrapper">
-        <n-data-table
+        <n-data-table size="small"
           :columns="columns"
           :data="filteredWhitelist"
           :bordered="false"
@@ -57,69 +57,69 @@
     </n-card>
 
     <!-- 添加 / 编辑 Modal -->
-    <n-modal
+    <n-modal size="small"
       v-model:show="showAddModal"
       preset="card"
       :title="editingEntry ? '编辑白名单' : '添加白名单'"
       style="width: 450px"
-    >
+>
       <n-space vertical>
-        <n-input v-model:value="form.player_name" placeholder="玩家名" />
-        <n-input v-model:value="form.reason" placeholder="原因 (可选)" />
+        <n-input size="small" v-model:value="form.player_name" placeholder="玩家名" />
+        <n-input size="small" v-model:value="form.reason" placeholder="原因 (可选)" />
         <n-space :size="6" wrap>
-          <n-button v-for="reason in reasonOptions" :key="reason" size="small" secondary @click="form.reason = reason">{{ reason }}</n-button>
+          <n-button size="small" v-for="reason in reasonOptions" :key="reason" secondary @click="form.reason = reason">{{ reason }}</n-button>
         </n-space>
-        <n-input v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
-        <n-select v-model:value="form.expiry_mode" :options="expiryOptions" />
-        <n-date-picker v-if="form.expiry_mode === 'custom'" v-model:value="form.custom_expires_at" type="datetime" clearable style="width: 100%" />
-        <n-alert v-if="expiryPreviewText" type="info">{{ expiryPreviewText }}</n-alert>
+        <n-input size="small" v-model:value="form.server_id" placeholder="服务器ID (可选，留空为全局)" />
+        <n-select size="small" v-model:value="form.expiry_mode" :options="expiryOptions" />
+        <n-date-picker size="small" v-if="form.expiry_mode === 'custom'" v-model:value="form.custom_expires_at" type="datetime" clearable style="width: 100%" />
+        <n-alert size="small" v-if="expiryPreviewText" type="info">{{ expiryPreviewText }}</n-alert>
         <n-space justify="space-between" align="center">
           <n-text>启用该白名单条目</n-text>
-          <n-switch v-model:value="form.enabled" />
+          <n-switch size="small" v-model:value="form.enabled" />
         </n-space>
-        <n-button type="primary" block @click="submitForm">
+        <n-button size="small" type="primary" block @click="submitForm">
           {{ editingEntry ? '保存修改' : '添加' }}
         </n-button>
       </n-space>
     </n-modal>
 
     <!-- 导出 Modal -->
-    <n-modal v-model:show="showExportModal" preset="card" title="导出白名单" style="width: 600px">
-      <n-tabs type="line" animated v-model:value="exportTab">
+    <n-modal size="small" v-model:show="showExportModal" preset="card" title="导出白名单" style="width: 600px">
+      <n-tabs size="small" type="line" animated v-model:value="exportTab">
         <n-tab-pane name="json" tab="JSON 格式">
-          <n-input v-model:value="exportJson" type="textarea" :rows="12" readonly />
+          <n-input size="small" v-model:value="exportJson" type="textarea" :rows="12" readonly />
         </n-tab-pane>
         <n-tab-pane name="text" tab="用户名列表">
-          <n-input v-model:value="exportText" type="textarea" :rows="12" readonly />
+          <n-input size="small" v-model:value="exportText" type="textarea" :rows="12" readonly />
         </n-tab-pane>
       </n-tabs>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="copyExport">复制</n-button>
-          <n-button type="primary" @click="downloadExport">下载</n-button>
-          <n-button @click="showExportModal = false">关闭</n-button>
+          <n-button size="small" @click="copyExport">复制</n-button>
+          <n-button size="small" type="primary" @click="downloadExport">下载</n-button>
+          <n-button size="small" @click="showExportModal = false">关闭</n-button>
         </n-space>
       </template>
     </n-modal>
 
     <!-- 导入 Modal -->
-    <n-modal v-model:show="showImportModal" preset="card" title="导入白名单" style="width: 600px">
-      <n-tabs type="line" animated>
+    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入白名单" style="width: 600px">
+      <n-tabs size="small" type="line" animated>
         <n-tab-pane name="json" tab="JSON 格式">
-          <n-alert type="info" style="margin-bottom: 12px">JSON 数组格式，每项需包含 player_name 字段</n-alert>
-          <n-input v-model:value="importJson" type="textarea" :rows="10" placeholder="粘贴 JSON..." />
+          <n-alert size="small" type="info" style="margin-bottom: 12px">JSON 数组格式，每项需包含 player_name 字段</n-alert>
+          <n-input size="small" v-model:value="importJson" type="textarea" :rows="10" placeholder="粘贴 JSON..." />
         </n-tab-pane>
         <n-tab-pane name="text" tab="用户名列表">
-          <n-alert type="info" style="margin-bottom: 12px">每行一个用户名，可选添加原因（用逗号分隔）</n-alert>
-          <n-input v-model:value="importText" type="textarea" :rows="10" placeholder="用户名1&#10;用户名2,活动服豁免&#10;用户名3" />
+          <n-alert size="small" type="info" style="margin-bottom: 12px">每行一个用户名，可选添加原因（用逗号分隔）</n-alert>
+          <n-input size="small" v-model:value="importText" type="textarea" :rows="10" placeholder="用户名1&#10;用户名2,活动服豁免&#10;用户名3" />
         </n-tab-pane>
       </n-tabs>
       <template #footer>
         <n-space justify="end">
-          <n-upload :show-file-list="false" accept=".json,.txt" @change="handleUpload"><n-button>上传文件</n-button></n-upload>
-          <n-button @click="pasteImport">粘贴</n-button>
-          <n-button type="primary" @click="importData">导入</n-button>
-          <n-button @click="showImportModal = false">取消</n-button>
+          <n-upload :show-file-list="false" accept=".json,.txt" @change="handleUpload"><n-button size="small">上传文件</n-button></n-upload>
+          <n-button size="small" @click="pasteImport">粘贴</n-button>
+          <n-button size="small" type="primary" @click="importData">导入</n-button>
+          <n-button size="small" @click="showImportModal = false">取消</n-button>
         </n-space>
       </template>
     </n-modal>

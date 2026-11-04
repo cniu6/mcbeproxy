@@ -1,5 +1,5 @@
 <template>
-  <n-space vertical size="large">
+  <n-space vertical size="small">
     <!-- 出站网卡 -->
     <n-card size="small" bordered>
       <template #header>出站网卡</template>
@@ -14,7 +14,7 @@
       <n-space vertical>
         <n-space align="center" wrap>
           <n-text>所有出站流量使用</n-text>
-          <n-select
+          <n-select size="small"
             v-model:value="cfg.interface"
             :options="interfaceOptions"
             filterable
@@ -46,7 +46,7 @@
     <n-card size="small" bordered>
       <template #header>路由规则</template>
       <template #header-extra>
-        <n-space size="small">
+        <n-space>
           <n-button size="small" type="primary" secondary @click="openRule(null)">+ 添加规则</n-button>
           <n-button size="small" type="primary" :disabled="!dirty" :loading="saving" @click="save">保存并生效</n-button>
           <n-button size="small" :disabled="!dirty" @click="load">放弃修改</n-button>
@@ -83,7 +83,7 @@
     <!-- 规则测试 -->
     <n-card size="small" bordered title="规则测试">
       <n-space align="center" wrap>
-        <n-input v-model:value="testTarget" placeholder="例如 play.example.com:19132 或 10.2.3.4:443" style="width: 320px" @keyup.enter="runTest" />
+        <n-input size="small" v-model:value="testTarget" placeholder="例如 play.example.com:19132 或 10.2.3.4:443" style="width: 320px" @keyup.enter="runTest" />
         <n-select v-model:value="testProbe" :options="probeOptions" size="small" style="width: 150px" />
         <n-button size="small" :loading="testing" @click="runTest">测试</n-button>
         <n-text depth="3" style="font-size: 12px">测试的是已保存生效的配置, 修改后请先保存。</n-text>
@@ -112,29 +112,29 @@
     </n-card>
 
     <!-- 规则编辑 -->
-    <n-modal :show="!!editing" preset="card" :title="editingIndex < 0 ? '添加规则' : '编辑规则'" style="width: 640px; max-width: 95vw" @update:show="v => { if (!v) editing = null }">
+    <n-modal size="small" :show="!!editing" preset="card" :title="editingIndex < 0 ? '添加规则' : '编辑规则'" style="width: 640px; max-width: 95vw" @update:show="v => { if (!v) editing = null }">
       <n-form v-if="editing" label-placement="left" label-width="90" size="small">
         <n-form-item label="名称">
-          <n-input v-model:value="editing.name" placeholder="便于识别, 如: 内网直连" />
+          <n-input size="small" v-model:value="editing.name" placeholder="便于识别, 如: 内网直连" />
         </n-form-item>
         <n-form-item label="启用">
-          <n-switch v-model:value="editing.enabled" />
+          <n-switch size="small" v-model:value="editing.enabled" />
         </n-form-item>
         <n-form-item label="目标">
-          <n-input v-model:value="editing.targets" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }"
+          <n-input size="small" v-model:value="editing.targets" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }"
             placeholder="127.0.0.1; *.example.com; 192.168.1.*; 10.1.0.0-10.5.255.255" />
         </n-form-item>
         <n-form-item label="端口">
-          <n-input v-model:value="editing.ports" placeholder="留空 = 任意; 例: 80; 443; 8000-9000" />
+          <n-input size="small" v-model:value="editing.ports" placeholder="留空 = 任意; 例: 80; 443; 8000-9000" />
         </n-form-item>
         <n-form-item label="动作">
-          <n-radio-group v-model:value="editing.action">
-            <n-radio-button v-for="a in actionOptions" :key="a.value" :value="a.value">{{ a.label }}</n-radio-button>
+          <n-radio-group size="small" v-model:value="editing.action">
+            <n-radio-button size="small" v-for="a in actionOptions" :key="a.value" :value="a.value">{{ a.label }}</n-radio-button>
           </n-radio-group>
         </n-form-item>
         <template v-if="editing.action === 'proxy'">
           <n-form-item label="线路">
-            <n-select
+            <n-select size="small"
               :value="outboundSelection"
               :options="outboundOptions"
               multiple
@@ -146,21 +146,21 @@
           <n-grid v-if="needsLB" :cols="2" :x-gap="12">
             <n-gi>
               <n-form-item label="负载均衡">
-                <n-select v-model:value="editing.load_balance" :options="lbOptions" clearable placeholder="最低延迟" />
+                <n-select size="small" v-model:value="editing.load_balance" :options="lbOptions" clearable placeholder="最低延迟" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="排序类型">
-                <n-select v-model:value="editing.load_balance_sort" :options="lbSortOptions" clearable placeholder="TCP" />
+                <n-select size="small" v-model:value="editing.load_balance_sort" :options="lbSortOptions" clearable placeholder="TCP" />
               </n-form-item>
             </n-gi>
           </n-grid>
         </template>
         <n-form-item label="指定网卡">
-          <n-select v-model:value="editing.interface" :options="ruleInterfaceOptions" filterable tag clearable placeholder="使用全局网卡" />
+          <n-select size="small" v-model:value="editing.interface" :options="ruleInterfaceOptions" filterable tag clearable placeholder="使用全局网卡" />
         </n-form-item>
         <n-form-item label="备注">
-          <n-input v-model:value="editing.remark" placeholder="可选" />
+          <n-input size="small" v-model:value="editing.remark" placeholder="可选" />
         </n-form-item>
       </n-form>
       <template #footer>

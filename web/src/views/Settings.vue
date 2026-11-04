@@ -1,17 +1,17 @@
 <template>
   <div>
-    <n-h2>设置</n-h2>
+    <n-h3>设置</n-h3>
 
     <!-- 动态入口路径 -->
-    <n-card title="管理面板入口 (动态)" style="margin-bottom: 24px">
-      <n-alert type="warning" style="margin-bottom: 16px">
+    <n-card size="small" title="管理面板入口 (动态)" style="margin-bottom: 24px">
+      <n-alert size="small" type="warning" style="margin-bottom: 16px">
         修改入口路径后立即生效，无需重启。修改后请使用新路径访问管理面板。
       </n-alert>
       <n-space vertical>
         <n-form-item label="当前入口路径">
           <n-input-group>
-            <n-input v-model:value="entryPath" placeholder="/mc_admin_114514" style="width: 300px" />
-            <n-button type="primary" @click="updateEntryPath">立即更新</n-button>
+            <n-input size="small" v-model:value="entryPath" placeholder="/mc_admin_114514" style="width: 300px" />
+            <n-button size="small" type="primary" @click="updateEntryPath">立即更新</n-button>
           </n-input-group>
         </n-form-item>
         <n-text depth="3">当前访问地址: http://服务器IP:{{ config.api_port }}{{ entryPath }}</n-text>
@@ -19,16 +19,16 @@
     </n-card>
 
     <!-- 本地 API Key 设置 -->
-    <n-card title="API 认证 (本地)" style="margin-bottom: 24px">
-      <n-alert type="info" style="margin-bottom: 16px">
+    <n-card size="small" title="API 认证 (本地)" style="margin-bottom: 24px">
+      <n-alert size="small" type="info" style="margin-bottom: 16px">
         此 API Key 保存在浏览器本地，用于访问需要认证的 API。如果服务器未设置 API Key，则无需填写。
       </n-alert>
       <n-space vertical>
         <n-form-item label="API Key">
           <n-input-group>
-            <n-input v-model:value="localApiKey" type="password" show-password-on="click" placeholder="输入 API Key" style="width: 400px" />
-            <n-button type="primary" @click="saveLocalApiKey">保存到本地</n-button>
-            <n-button @click="clearLocalApiKey">清除</n-button>
+            <n-input size="small" v-model:value="localApiKey" type="password" show-password-on="click" placeholder="输入 API Key" style="width: 400px" />
+            <n-button size="small" type="primary" @click="saveLocalApiKey">保存到本地</n-button>
+            <n-button size="small" @click="clearLocalApiKey">清除</n-button>
           </n-input-group>
         </n-form-item>
         <n-text v-if="hasLocalApiKey" type="success">✓ 已设置本地 API Key</n-text>
@@ -37,21 +37,21 @@
     </n-card>
     
     <!-- ACL 设置 -->
-    <n-card title="访问控制 (ACL)" style="margin-bottom: 24px">
-      <n-alert type="info" style="margin-bottom: 16px">
+    <n-card size="small" title="访问控制 (ACL)" style="margin-bottom: 24px">
+      <n-alert size="small" type="info" style="margin-bottom: 16px">
         这些设置将应用到所有服务器。黑名单提示消息用于封禁玩家时显示，白名单提示消息用于非白名单玩家连接时显示。
       </n-alert>
-      <n-space vertical size="large">
+      <n-space vertical size="small">
         <n-form-item label="启用黑名单拦截">
-          <n-switch v-model:value="aclSettings.blacklist_enabled" />
+          <n-switch size="small" v-model:value="aclSettings.blacklist_enabled" />
         </n-form-item>
         <n-form-item label="启用白名单模式">
-          <n-switch v-model:value="aclSettings.whitelist_enabled" />
+          <n-switch size="small" v-model:value="aclSettings.whitelist_enabled" />
         </n-form-item>
         <n-form-item label="黑名单提示消息">
-          <n-input 
-            v-model:value="aclSettings.default_ban_message" 
-            placeholder="你已被封禁" 
+          <n-input size="small"
+            v-model:value="aclSettings.default_ban_message"
+            placeholder="你已被封禁"
             :maxlength="200"
             show-count
           />
@@ -60,9 +60,9 @@
           </template>
         </n-form-item>
         <n-form-item label="白名单提示消息">
-          <n-input 
-            v-model:value="aclSettings.whitelist_message" 
-            placeholder="你不在白名单中" 
+          <n-input size="small"
+            v-model:value="aclSettings.whitelist_message"
+            placeholder="你不在白名单中"
             :maxlength="200"
             show-count
           />
@@ -70,93 +70,93 @@
             <n-text depth="3">当白名单模式启用且玩家不在白名单时，会显示此消息</n-text>
           </template>
         </n-form-item>
-        <n-button type="primary" @click="saveACL" :loading="savingACL">保存 ACL 设置</n-button>
+        <n-button size="small" type="primary" @click="saveACL" :loading="savingACL">保存 ACL 设置</n-button>
       </n-space>
     </n-card>
 
     <!-- 系统配置 -->
-    <n-card title="系统配置" style="margin-bottom: 24px">
-      <n-alert type="warning" style="margin-bottom: 16px">
+    <n-card size="small" title="系统配置" style="margin-bottom: 24px">
+      <n-alert size="small" type="warning" style="margin-bottom: 16px">
         修改以下配置后将自动重启服务，请确保配置正确
       </n-alert>
-      <n-form :model="config" label-placement="left" label-width="150">
+      <n-form size="small" :model="config" label-placement="left" label-width="150">
         <n-grid :cols="2" :x-gap="24">
           <n-gi>
             <n-form-item label="API 端口">
-              <n-input-number v-model:value="config.api_port" :min="1" :max="65535" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.api_port" :min="1" :max="65535" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="API 入口路径">
-              <n-input v-model:value="config.api_entry_path" placeholder="/mcpe-admin" />
+              <n-input size="small" v-model:value="config.api_entry_path" placeholder="/mcpe-admin" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="API 密钥">
-              <n-input v-model:value="config.api_key" type="password" show-password-on="click" placeholder="留空不验证" />
+              <n-input size="small" v-model:value="config.api_key" type="password" show-password-on="click" placeholder="留空不验证" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="数据库路径">
-              <n-input v-model:value="config.database_path" placeholder="data.db" />
+              <n-input size="small" v-model:value="config.database_path" placeholder="data.db" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="最大会话记录">
-              <n-input-number v-model:value="config.max_session_records" :min="10" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.max_session_records" :min="10" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="最大访问日志">
-              <n-input-number v-model:value="config.max_access_log_records" :min="10" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.max_access_log_records" :min="10" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="Pass offline timeout (s)">
-              <n-input-number v-model:value="config.passthrough_idle_timeout" :min="0" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.passthrough_idle_timeout" :min="0" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="Public ping timeout (s)">
-              <n-input-number v-model:value="config.public_ping_timeout_seconds" :min="0" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.public_ping_timeout_seconds" :min="0" style="width: 100%" />
             </n-form-item>
           </n-gi>
         </n-grid>
       </n-form>
     </n-card>
 
-    <n-card title="新建默认值" style="margin-bottom: 24px">
-      <n-alert type="info" style="margin-bottom: 16px">
+    <n-card size="small" title="新建默认值" style="margin-bottom: 24px">
+      <n-alert size="small" type="info" style="margin-bottom: 16px">
         这里控制“新建代理服务器 / 新建代理端口”时自动带出的默认测速参数。不会强制覆盖你已经创建好的现有配置。
       </n-alert>
-      <n-form :model="config" label-placement="left" label-width="180">
+      <n-form size="small" :model="config" label-placement="left" label-width="180">
         <n-grid :cols="2" :x-gap="24">
           <n-gi :span="2">
-            <n-divider style="margin-top: 0">新建代理服务器默认值</n-divider>
+            <n-divider size="small" style="margin-top: 0">新建代理服务器默认值</n-divider>
           </n-gi>
           <n-gi>
             <n-form-item label="服务器 Ping 间隔 (分钟)">
-              <n-input-number v-model:value="config.server_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.server_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="服务器 Top N 候选">
-              <n-input-number v-model:value="config.server_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.server_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="服务器全量扫描模式">
-              <n-select v-model:value="config.server_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
+              <n-select size="small" v-model:value="config.server_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
             </n-form-item>
           </n-gi>
           <n-gi v-if="config.server_auto_ping_full_scan_mode_default === 'daily'">
             <n-form-item label="服务器扫描时间">
-              <n-input v-model:value="config.server_auto_ping_full_scan_time_default" placeholder="04:00" />
+              <n-input size="small" v-model:value="config.server_auto_ping_full_scan_time_default" placeholder="04:00" />
             </n-form-item>
           </n-gi>
           <n-gi v-else-if="config.server_auto_ping_full_scan_mode_default === 'interval'">
             <n-form-item label="服务器扫描间隔 (小时)">
-              <n-input-number v-model:value="config.server_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.server_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
 
@@ -165,57 +165,57 @@
           </n-gi>
           <n-gi>
             <n-form-item label="端口 Ping 间隔 (分钟)">
-              <n-input-number v-model:value="config.proxy_port_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.proxy_port_auto_ping_interval_minutes_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="端口 Top N 候选">
-              <n-input-number v-model:value="config.proxy_port_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.proxy_port_auto_ping_top_candidates_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="端口全量扫描模式">
-              <n-select v-model:value="config.proxy_port_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
+              <n-select size="small" v-model:value="config.proxy_port_auto_ping_full_scan_mode_default" :options="autoPingFullScanModeOptions" />
             </n-form-item>
           </n-gi>
           <n-gi v-if="config.proxy_port_auto_ping_full_scan_mode_default === 'daily'">
             <n-form-item label="端口扫描时间">
-              <n-input v-model:value="config.proxy_port_auto_ping_full_scan_time_default" placeholder="04:00" />
+              <n-input size="small" v-model:value="config.proxy_port_auto_ping_full_scan_time_default" placeholder="04:00" />
             </n-form-item>
           </n-gi>
           <n-gi v-else-if="config.proxy_port_auto_ping_full_scan_mode_default === 'interval'">
             <n-form-item label="端口扫描间隔 (小时)">
-              <n-input-number v-model:value="config.proxy_port_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.proxy_port_auto_ping_full_scan_interval_hours_default" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
         </n-grid>
       </n-form>
     </n-card>
 
-    <n-card title="历史延迟限制" style="margin-bottom: 24px">
-      <n-alert type="info" style="margin-bottom: 16px">
+    <n-card size="small" title="历史延迟限制" style="margin-bottom: 24px">
+      <n-alert size="small" type="info" style="margin-bottom: 16px">
         统一控制服务器历史延迟、代理节点历史延迟以及相关趋势图的采样间隔、渲染上限、后端保留数量和最长保留周期。对于自动Ping历史，实际记录间隔会自动取“采样最小间隔”和对应自动Ping间隔中的较小值，避免 1 分钟自动Ping 只显示一个点。
       </n-alert>
-      <n-form :model="config" label-placement="left" label-width="170">
+      <n-form size="small" :model="config" label-placement="left" label-width="170">
         <n-grid :cols="2" :x-gap="24">
           <n-gi>
             <n-form-item label="采样最小间隔 (分钟)">
-              <n-input-number v-model:value="config.latency_history_min_interval_minutes" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.latency_history_min_interval_minutes" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="前端渲染上限">
-              <n-input-number v-model:value="config.latency_history_render_limit" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.latency_history_render_limit" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="后端存储上限">
-              <n-input-number v-model:value="config.latency_history_storage_limit" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.latency_history_storage_limit" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="最长保留周期 (天)">
-              <n-input-number v-model:value="config.latency_history_retention_days" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.latency_history_retention_days" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -223,27 +223,27 @@
     </n-card>
 
     <!-- 日志配置 -->
-    <n-card title="日志配置" style="margin-bottom: 24px">
-      <n-form :model="config" label-placement="left" label-width="150">
+    <n-card size="small" title="日志配置" style="margin-bottom: 24px">
+      <n-form size="small" :model="config" label-placement="left" label-width="150">
         <n-grid :cols="2" :x-gap="24">
           <n-gi>
             <n-form-item label="日志目录">
-              <n-input v-model:value="config.log_dir" placeholder="logs" />
+              <n-input size="small" v-model:value="config.log_dir" placeholder="logs" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="日志保留天数">
-              <n-input-number v-model:value="config.log_retention_days" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.log_retention_days" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="日志最大大小 (MB)">
-              <n-input-number v-model:value="config.log_max_size_mb" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.log_max_size_mb" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="调试模式">
-              <n-switch v-model:value="config.debug_mode" />
+              <n-switch size="small" v-model:value="config.debug_mode" />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -251,22 +251,22 @@
     </n-card>
 
     <!-- 外部验证配置 -->
-    <n-card title="外部验证配置" style="margin-bottom: 24px">
-      <n-form :model="config" label-placement="left" label-width="150">
+    <n-card size="small" title="外部验证配置" style="margin-bottom: 24px">
+      <n-form size="small" :model="config" label-placement="left" label-width="150">
         <n-grid :cols="2" :x-gap="24">
           <n-gi>
             <n-form-item label="启用外部验证">
-              <n-switch v-model:value="config.auth_verify_enabled" />
+              <n-switch size="small" v-model:value="config.auth_verify_enabled" />
             </n-form-item>
           </n-gi>
           <n-gi>
             <n-form-item label="缓存时间 (分钟)">
-              <n-input-number v-model:value="config.auth_cache_minutes" :min="1" style="width: 100%" />
+              <n-input-number size="small" v-model:value="config.auth_cache_minutes" :min="1" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi :span="2">
             <n-form-item label="验证 URL">
-              <n-input v-model:value="config.auth_verify_url" placeholder="http://..." />
+              <n-input size="small" v-model:value="config.auth_verify_url" placeholder="http://..." />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -276,11 +276,11 @@
     <n-space>
       <n-popconfirm @positive-click="saveConfigAndRestart">
         <template #trigger>
-          <n-button type="primary" size="large">保存配置</n-button>
+          <n-button type="primary" size="small">保存配置</n-button>
         </template>
         确认保存配置？
       </n-popconfirm>
-      <n-button size="large" @click="loadConfig">重新加载</n-button>
+      <n-button size="small" @click="loadConfig">重新加载</n-button>
     </n-space>
   </div>
 </template>

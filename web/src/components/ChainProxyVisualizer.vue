@@ -1,12 +1,12 @@
 <template>
-  <n-modal
+  <n-modal size="small"
     :show="show"
     @update:show="$emit('update:show', $event)"
     preset="card"
     title="链式代理可视化编辑器"
     style="width: 1100px; max-width: 96vw"
     :bordered="false"
-  >
+>
     <div class="chain-viz-container">
       <!-- Top toolbar -->
       <div class="chain-viz-toolbar">
@@ -212,8 +212,8 @@
 
     <template #footer>
       <n-space justify="end">
-        <n-button @click="$emit('update:show', false)">取消</n-button>
-        <n-button type="primary" @click="saveChain">
+        <n-button size="small" @click="$emit('update:show', false)">取消</n-button>
+        <n-button size="small" type="primary" @click="saveChain">
           保存链路 ({{ chainNodes.length }}跳)
         </n-button>
       </n-space>
@@ -894,11 +894,6 @@ function getProtocolIcon(type) {
   color: #000;
   font-size: 12px;
   font-weight: 600;
-  animation: pulse-hint 1s ease-in-out infinite;
-}
-@keyframes pulse-hint {
-  0%, 100% { opacity: 0.8; }
-  50% { opacity: 1; }
 }
 
 /* Flow preview */

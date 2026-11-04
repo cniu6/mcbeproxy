@@ -1,15 +1,15 @@
 ﻿<template>
   <div class="proxy-ports-page">
-    <n-space vertical size="large">
+    <n-space vertical size="small">
       <n-card size="small" bordered>
         <div class="section-title">代理端口</div>
         <n-space align="center" justify="space-between" wrap>
           <n-space align="center">
-            <n-switch v-model:value="globalConfig.proxy_ports_enabled" />
+            <n-switch size="small" v-model:value="globalConfig.proxy_ports_enabled" />
             <n-text>启用代理端口功能</n-text>
           </n-space>
           <n-space>
-            <n-button type="primary" @click="saveGlobal" :loading="savingGlobal">保存全局设置</n-button>
+            <n-button size="small" type="primary" @click="saveGlobal" :loading="savingGlobal">保存全局设置</n-button>
           </n-space>
         </n-space>
         <n-text depth="3" style="display: block; margin-top: 8px;">
@@ -23,7 +23,7 @@
             <n-button type="primary" size="small" @click="addPort">新增</n-button>
             <n-button size="small" secondary @click="openBulkCreateModal">批量新增</n-button>
             <n-button size="small" @click="loadAll" :loading="loading">刷新</n-button>
-            <n-divider vertical />
+            <n-divider size="small" vertical />
             <n-input v-model:value="filterState.search" placeholder="搜索名称/监听地址" clearable size="small" style="width: 180px" />
             <n-select v-model:value="filterState.type" :options="filterTypeOptions" placeholder="类型" clearable size="small" style="width: 110px" />
             <n-select v-model:value="filterState.enabled" :options="filterEnabledOptions" placeholder="启用状态" clearable size="small" style="width: 130px" />
@@ -40,8 +40,8 @@
               @change="persistTestUrl"
             />
             <n-button size="small" @click="testAllVisiblePorts" :loading="batchTestRunning">测试全部</n-button>
-            <n-divider vertical />
-            <n-tag v-if="selectedPortIds.length > 0" type="info" size="small">已选 {{ selectedPortIds.length }} 个</n-tag>
+            <n-divider size="small" vertical />
+            <n-tag size="small" v-if="selectedPortIds.length > 0" type="info">已选 {{ selectedPortIds.length }} 个</n-tag>
             <n-text depth="3" style="font-size: 12px">
               {{ filteredPorts.length }} / {{ ports.length }}
             </n-text>
@@ -83,13 +83,13 @@
         />
       </n-card>
 
-      <n-modal
+      <n-modal size="small"
         :show="!!newPortDraft"
         preset="card"
         title="新增代理端口"
         style="width: 760px; max-width: 95vw"
         @update:show="(v) => { if (!v) newPortDraft = null }"
-      >
+>
         <PortEditForm
           v-if="newPortDraft"
           :port="newPortDraft"
@@ -113,15 +113,15 @@
         </template>
       </n-modal>
 
-      <n-modal
+      <n-modal size="small"
         :show="!!usersModal"
         preset="card"
         :title="usersModal ? `用户管理 · ${usersModal.port.name || usersModal.port.id} (${usersModal.port.listen_addr})` : ''"
         style="width: 820px; max-width: 95vw"
         @update:show="(v) => { if (!v) usersModal = null }"
-      >
+>
         <template v-if="usersModal">
-          <n-alert type="info" :show-icon="false" style="margin-bottom: 10px; font-size: 12px">
+          <n-alert size="small" type="info" :show-icon="false" style="margin-bottom: 10px; font-size: 12px">
             同一个端口, 客户端用不同的用户名/密码登录, 就走不同的线路; 线路留空则继承端口线路
             ({{ getProxyOutboundDisplay(usersModal.port.proxy_outbound) || '直连' }})。保存后立即生效, 已连接的客户端不会被断开。
           </n-alert>
@@ -148,17 +148,17 @@
       </n-modal>
     </n-space>
 
-    <n-modal v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: 520px; max-width: 95vw">
-      <n-space vertical size="medium">
-        <n-alert v-if="batchProxyAssignment === 'shared'" type="info" :show-icon="false">
+    <n-modal size="small" v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: 520px; max-width: 95vw">
+      <n-space vertical size="small">
+        <n-alert size="small" v-if="batchProxyAssignment === 'shared'" type="info" :show-icon="false">
           将为选中的 <b>{{ selectedPortIds.length }}</b> 个代理端口一次性应用相同的代理选择（分组/单节点/多节点均可）。
         </n-alert>
-        <n-alert v-else type="warning" :show-icon="false">
+        <n-alert size="small" v-else type="warning" :show-icon="false">
           将按顺序为选中的 <b>{{ selectedPortIds.length }}</b> 个代理端口 <b>轮换分配</b> 当前选择的节点（仅在选择多个单节点时生效）。
         </n-alert>
         <n-space align="center">
           <n-text>当前代理选择:</n-text>
-          <n-tag>{{ getProxyOutboundDisplay(batchProxyFormTarget.proxy_outbound) }}</n-tag>
+          <n-tag size="small">{{ getProxyOutboundDisplay(batchProxyFormTarget.proxy_outbound) }}</n-tag>
           <n-button size="small" @click="openFormProxySelector(batchProxyFormTarget)">选择代理</n-button>
           <n-button v-if="batchProxyFormTarget.proxy_outbound" size="small" quaternary @click="clearProxySelection(batchProxyFormTarget)">清除</n-button>
         </n-space>
@@ -174,24 +174,24 @@
       </n-space>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showBatchProxyModal = false">取消</n-button>
-          <n-button type="primary" @click="applyBatchProxy" :loading="batchActionRunning" :disabled="!canApplyBatchProxy">
+          <n-button size="small" @click="showBatchProxyModal = false">取消</n-button>
+          <n-button size="small" type="primary" @click="applyBatchProxy" :loading="batchActionRunning" :disabled="!canApplyBatchProxy">
             应用到 {{ selectedPortIds.length }} 个端口
           </n-button>
         </n-space>
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
-      <n-spin :show="formProxySelectorLoading">
+    <n-modal size="small" v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
+      <n-spin size="small" :show="formProxySelectorLoading">
         <n-space style="margin-bottom: 16px" align="center">
           <n-radio-group v-model:value="formProxyMode" size="small">
-            <n-radio-button value="direct">直连</n-radio-button>
-            <n-radio-button value="group">分组负载均衡</n-radio-button>
-            <n-radio-button value="single">节点选择</n-radio-button>
+            <n-radio-button size="small" value="direct">直连</n-radio-button>
+            <n-radio-button size="small" value="group">分组负载均衡</n-radio-button>
+            <n-radio-button size="small" value="single">节点选择</n-radio-button>
           </n-radio-group>
           <template v-if="formProxyMode === 'single'">
-            <n-divider vertical />
+            <n-divider size="small" vertical />
             <span style="font-size: 13px; color: var(--n-text-color-3)">负载均衡:</span>
             <n-select v-model:value="formLoadBalance" :options="loadBalanceOptions" style="width: 130px" size="small" />
             <span style="font-size: 13px; color: var(--n-text-color-3)">排序:</span>
@@ -212,12 +212,12 @@
         <div v-else-if="formProxyMode === 'group'">
           <n-space style="margin-bottom: 12px" align="center">
             <span>选择分组:</span>
-            <n-select v-model:value="formSelectedGroup" :options="formGroupOptions" style="width: 220px" placeholder="选择分组" />
-            <n-divider vertical />
+            <n-select size="small" v-model:value="formSelectedGroup" :options="formGroupOptions" style="width: 220px" placeholder="选择分组" />
+            <n-divider size="small" vertical />
             <span>负载均衡:</span>
-            <n-select v-model:value="formLoadBalance" :options="loadBalanceOptions" style="width: 140px" />
+            <n-select size="small" v-model:value="formLoadBalance" :options="loadBalanceOptions" style="width: 140px" />
             <span>排序:</span>
-            <n-select v-model:value="formLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 120px" />
+            <n-select size="small" v-model:value="formLoadBalanceSort" :options="loadBalanceSortOptions" style="width: 120px" />
           </n-space>
 
           <div class="group-cards-container" style="max-height: 400px">
@@ -265,16 +265,16 @@
         <div v-else-if="formProxyMode === 'single'">
           <n-space style="margin-bottom: 12px" align="center" justify="space-between" wrap>
             <n-space align="center">
-              <n-select v-model:value="formProxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 150px" clearable />
-              <n-select v-model:value="formProxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 130px" clearable />
-              <n-checkbox v-model:checked="formProxyFilter.udpOnly">仅UDP可用</n-checkbox>
-              <n-input v-model:value="formProxyFilter.search" placeholder="搜索节点" style="width: 180px" clearable />
+              <n-select size="small" v-model:value="formProxyFilter.group" :options="proxyGroups" placeholder="分组" style="width: 150px" clearable />
+              <n-select size="small" v-model:value="formProxyFilter.protocol" :options="proxyProtocolOptions" placeholder="协议" style="width: 130px" clearable />
+              <n-checkbox size="small" v-model:checked="formProxyFilter.udpOnly">仅UDP可用</n-checkbox>
+              <n-input size="small" v-model:value="formProxyFilter.search" placeholder="搜索节点" style="width: 180px" clearable />
             </n-space>
             <n-space align="center">
-              <n-tag v-if="formFilteredProxyOutbounds.length !== allProxyOutbounds.length" type="info" size="small">
+              <n-tag size="small" v-if="formFilteredProxyOutbounds.length !== allProxyOutbounds.length" type="info">
                 {{ formFilteredProxyOutbounds.length }} / {{ allProxyOutbounds.length }}
               </n-tag>
-              <n-tag v-if="formSelectedNodes.length > 0" type="success" size="small">
+              <n-tag size="small" v-if="formSelectedNodes.length > 0" type="success">
                 已选 {{ formSelectedNodes.length }} 个节点
               </n-tag>
               <n-dropdown v-if="formSelectedNodes.length > 0" trigger="click" :options="batchTestOptions" @select="handleFormNodesBatchTest">
@@ -305,30 +305,30 @@
       <template #footer>
         <n-space justify="space-between">
           <div>
-            <n-tag v-if="formProxyMode === 'direct'" type="info">直连模式</n-tag>
-            <n-tag v-else-if="formProxyMode === 'group' && formSelectedGroup" type="success">
+            <n-tag size="small" v-if="formProxyMode === 'direct'" type="info">直连模式</n-tag>
+            <n-tag size="small" v-else-if="formProxyMode === 'group' && formSelectedGroup" type="success">
               分组: {{ formSelectedGroup === '_ungrouped' ? '@(未分组)' : '@' + formSelectedGroup }}
               ({{ loadBalanceOptions.find(o => o.value === formLoadBalance)?.label || '最低延迟' }})
             </n-tag>
-            <n-tag v-else-if="formProxyMode === 'single' && formSelectedNodes.length > 1" type="success">
+            <n-tag size="small" v-else-if="formProxyMode === 'single' && formSelectedNodes.length > 1" type="success">
               多节点 {{ formSelectedNodes.length }} 个 ({{ loadBalanceOptions.find(o => o.value === formLoadBalance)?.label || '最低延迟' }})
             </n-tag>
-            <n-tag v-else-if="formProxyMode === 'single' && formSelectedNodes.length === 1" type="info">
+            <n-tag size="small" v-else-if="formProxyMode === 'single' && formSelectedNodes.length === 1" type="info">
               节点: {{ formSelectedNodes[0] }}
             </n-tag>
           </div>
           <n-space>
-            <n-button @click="refreshFormProxyList" :loading="formProxySelectorLoading">刷新</n-button>
-            <n-button @click="showFormProxySelector = false">取消</n-button>
-            <n-button type="primary" @click="confirmFormProxySelection" :disabled="!canConfirmFormProxy">确定</n-button>
+            <n-button size="small" @click="refreshFormProxyList" :loading="formProxySelectorLoading">刷新</n-button>
+            <n-button size="small" @click="showFormProxySelector = false">取消</n-button>
+            <n-button size="small" type="primary" @click="confirmFormProxySelection" :disabled="!canConfirmFormProxy">确定</n-button>
           </n-space>
         </n-space>
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showBulkCreate" preset="card" title="批量新增代理端口" style="width: 1100px; max-width: 95vw">
-      <n-space vertical size="large">
-        <n-alert type="info" :show-icon="false">
+    <n-modal size="small" v-model:show="showBulkCreate" preset="card" title="批量新增代理端口" style="width: 1100px; max-width: 95vw">
+      <n-space vertical size="small">
+        <n-alert size="small" type="info" :show-icon="false">
           支持端口列表与范围，例如 `1080, 1081, 2000-2005`。可为整批端口复用同一代理选择，或将多节点按端口轮换分配。
         </n-alert>
 
@@ -336,12 +336,12 @@
           <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
             <n-gi>
               <n-form-item label="名称模板">
-                <n-input v-model:value="bulkForm.name_template" placeholder="proxy-{port}" />
+                <n-input size="small" v-model:value="bulkForm.name_template" placeholder="proxy-{port}" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="监听主机">
-                <n-select
+                <n-select size="small"
                   v-model:value="bulkForm.listen_host"
                   :options="listenHostOptions"
                   filterable
@@ -355,7 +355,7 @@
             </n-gi>
             <n-gi>
               <n-form-item label="端口列表">
-                <n-input
+                <n-input size="small"
                   v-model:value="bulkForm.port_expression"
                   type="textarea"
                   :autosize="{ minRows: 2, maxRows: 4 }"
@@ -365,27 +365,27 @@
             </n-gi>
             <n-gi>
               <n-form-item label="代理类型">
-                <n-select v-model:value="bulkForm.type" :options="proxyTypeOptions" />
+                <n-select size="small" v-model:value="bulkForm.type" :options="proxyTypeOptions" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="账号">
-                <n-input v-model:value="bulkForm.username" placeholder="可选" />
+                <n-input size="small" v-model:value="bulkForm.username" placeholder="可选" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="密码">
-                <n-input v-model:value="bulkForm.password" type="password" show-password-on="click" placeholder="可选" />
+                <n-input size="small" v-model:value="bulkForm.password" type="password" show-password-on="click" placeholder="可选" />
               </n-form-item>
             </n-gi>
           </n-grid>
 
           <n-form-item label="启用状态">
-            <n-switch v-model:value="bulkForm.enabled" />
+            <n-switch size="small" v-model:value="bulkForm.enabled" />
           </n-form-item>
 
           <n-form-item label="白名单">
-            <n-input
+            <n-input size="small"
               v-model:value="bulkForm.allow_list_text"
               type="textarea"
               :autosize="{ minRows: 2, maxRows: 4 }"
@@ -395,40 +395,40 @@
 
           <n-form-item label="代理节点">
             <n-space align="center" style="width: 100%">
-              <n-input :value="getProxyOutboundDisplay(bulkForm.proxy_outbound)" readonly placeholder="点击选择代理" style="flex: 1" />
-              <n-button @click="openFormProxySelector(bulkForm)">选择</n-button>
-              <n-button v-if="bulkForm.proxy_outbound" quaternary @click="clearBulkProxySelection">清除</n-button>
+              <n-input size="small" :value="getProxyOutboundDisplay(bulkForm.proxy_outbound)" readonly placeholder="点击选择代理" style="flex: 1" />
+              <n-button size="small" @click="openFormProxySelector(bulkForm)">选择</n-button>
+              <n-button size="small" v-if="bulkForm.proxy_outbound" quaternary @click="clearBulkProxySelection">清除</n-button>
             </n-space>
           </n-form-item>
 
           <n-grid v-if="bulkCanRotateNodes || bulkUsesSharedLoadBalance" :cols="isMobile ? 1 : 2" :x-gap="16">
             <n-gi v-if="bulkCanRotateNodes">
               <n-form-item label="节点分配">
-                <n-select v-model:value="bulkForm.assignment_mode" :options="bulkAssignmentOptions" />
+                <n-select size="small" v-model:value="bulkForm.assignment_mode" :options="bulkAssignmentOptions" />
               </n-form-item>
             </n-gi>
             <n-gi v-if="bulkUsesSharedLoadBalance">
               <n-form-item label="负载均衡">
-                <n-select v-model:value="bulkForm.load_balance" :options="loadBalanceOptions" />
+                <n-select size="small" v-model:value="bulkForm.load_balance" :options="loadBalanceOptions" />
               </n-form-item>
             </n-gi>
             <n-gi v-if="bulkUsesSharedLoadBalance">
               <n-form-item label="排序类型">
-                <n-select v-model:value="bulkForm.load_balance_sort" :options="loadBalanceSortOptions" />
+                <n-select size="small" v-model:value="bulkForm.load_balance_sort" :options="loadBalanceSortOptions" />
               </n-form-item>
             </n-gi>
           </n-grid>
         </n-form>
 
-        <n-alert v-if="bulkPreviewError" type="error" :show-icon="false">
+        <n-alert size="small" v-if="bulkPreviewError" type="error" :show-icon="false">
           {{ bulkPreviewError }}
         </n-alert>
 
         <n-space align="center" justify="space-between" wrap>
           <n-space align="center" wrap>
-            <n-tag type="info">预览 {{ bulkPreviewRows.length }} 个端口</n-tag>
-            <n-tag v-if="bulkForm.assignment_mode === 'rotate-single' && bulkCanRotateNodes" type="warning">按节点轮换单独绑定</n-tag>
-            <n-tag v-else-if="bulkForm.proxy_outbound" type="success">整批复用同一代理选择</n-tag>
+            <n-tag size="small" type="info">预览 {{ bulkPreviewRows.length }} 个端口</n-tag>
+            <n-tag size="small" v-if="bulkForm.assignment_mode === 'rotate-single' && bulkCanRotateNodes" type="warning">按节点轮换单独绑定</n-tag>
+            <n-tag size="small" v-else-if="bulkForm.proxy_outbound" type="success">整批复用同一代理选择</n-tag>
           </n-space>
           <n-text v-if="bulkPreviewRows.length > bulkPreviewLimit" depth="3">
             仅展示前 {{ bulkPreviewLimit }} 条预览
@@ -447,8 +447,8 @@
       </n-space>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showBulkCreate = false">取消</n-button>
-          <n-button type="primary" @click="createBulkPorts" :loading="bulkSaving" :disabled="!canCreateBulkPorts">创建这批端口</n-button>
+          <n-button size="small" @click="showBulkCreate = false">取消</n-button>
+          <n-button size="small" type="primary" @click="createBulkPorts" :loading="bulkSaving" :disabled="!canCreateBulkPorts">创建这批端口</n-button>
         </n-space>
       </template>
     </n-modal>

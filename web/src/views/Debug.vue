@@ -1,15 +1,15 @@
 <template>
   <n-space vertical>
     <!-- 系统概览 -->
-    <n-card title="📊 系统概览">
+    <n-card size="small" title="📊 系统概览">
       <template #header-extra>
         <n-space align="center">
-          <n-switch v-model:value="autoRefresh" @update:value="toggleAutoRefresh">
+          <n-switch size="small" v-model:value="autoRefresh" @update:value="toggleAutoRefresh">
             <template #checked>自动刷新</template>
             <template #unchecked>手动刷新</template>
           </n-switch>
-          <n-button @click="loadStats" :loading="loading">刷新</n-button>
-          <n-button type="warning" @click="forceGC">强制GC</n-button>
+          <n-button size="small" @click="loadStats" :loading="loading">刷新</n-button>
+          <n-button size="small" type="warning" @click="forceGC">强制GC</n-button>
         </n-space>
       </template>
 
@@ -131,7 +131,7 @@
     </n-card>
 
     <!-- pprof 性能分析 -->
-    <n-card title="🔬 性能分析 (pprof)">
+    <n-card size="small" title="🔬 性能分析 (pprof)">
       <template #header-extra>
         <n-button size="small" @click="clearAllPprofResults">清空结果</n-button>
       </template>
@@ -218,7 +218,7 @@
         <!-- CPU Profile 结果 -->
         <n-collapse-item v-if="pprofResults.cpu" title="📊 CPU Profile 结果" name="cpu-result">
           <template #header-extra>
-            <n-tag type="success" size="small">{{ pprofConfig.cpuSeconds }}秒</n-tag>
+            <n-tag size="small" type="success">{{ pprofConfig.cpuSeconds }}秒</n-tag>
           </template>
           <n-code :code="pprofResults.cpuText || ''" language="text" style="font-size: 11px; max-height: 500px; overflow: auto" word-wrap />
         </n-collapse-item>
@@ -227,7 +227,7 @@
         <n-collapse-item v-if="pprofResults.heap" title="💾 Heap Profile 结果" name="heap-result">
           <template #header-extra>
             <n-space>
-              <n-tag type="info" size="small">{{ formatBytes(pprofResults.heapStats?.alloc || 0) }}</n-tag>
+              <n-tag size="small" type="info">{{ formatBytes(pprofResults.heapStats?.alloc || 0) }}</n-tag>
               <n-tag size="small">{{ pprofResults.heapStats?.objects || 0 }} 对象</n-tag>
             </n-space>
           </template>
@@ -237,7 +237,7 @@
         <!-- Goroutine Profile 结果 -->
         <n-collapse-item v-if="pprofResults.goroutine" title="🔄 Goroutine Profile 结果" name="goroutine-result">
           <template #header-extra>
-            <n-tag type="info" size="small">{{ pprofResults.goroutineCount || 0 }} 协程</n-tag>
+            <n-tag size="small" type="info">{{ pprofResults.goroutineCount || 0 }} 协程</n-tag>
           </template>
           <n-code :code="pprofResults.goroutine" language="text" style="font-size: 11px; max-height: 500px; overflow: auto" word-wrap />
         </n-collapse-item>
@@ -258,11 +258,11 @@
         </n-collapse-item>
       </n-collapse>
 
-      <n-empty v-else-if="!hasAnyPprofResult" description="点击上方按钮采集性能数据" style="margin-top: 16px" />
+      <n-empty size="small" v-else-if="!hasAnyPprofResult" description="点击上方按钮采集性能数据" style="margin-top: 16px" />
     </n-card>
 
     <!-- 内存详情 -->
-    <n-card title="💾 内存详情" v-if="stats.mem_stats">
+    <n-card size="small" title="💾 内存详情" v-if="stats.mem_stats">
       <n-grid :cols="4" :x-gap="16" :y-gap="12">
         <n-gi>
           <n-statistic label="堆分配" :value="formatBytes(stats.mem_stats.heap_alloc)" />
@@ -343,7 +343,7 @@
           </n-grid>
           
           <!-- 内存泄漏指标 -->
-          <n-alert v-if="memoryLeakIndicators.length > 0" type="warning" title="⚠️ 潜在内存问题" style="margin-top: 12px">
+          <n-alert size="small" v-if="memoryLeakIndicators.length > 0" type="warning" title="⚠️ 潜在内存问题" style="margin-top: 12px">
             <n-space vertical>
               <n-text v-for="(indicator, idx) in memoryLeakIndicators" :key="idx">• {{ indicator }}</n-text>
             </n-space>
@@ -353,26 +353,26 @@
     </n-card>
 
     <!-- 服务器状态 -->
-    <n-card title="🖥️ 服务器状态" v-if="stats.servers && stats.servers.length > 0">
+    <n-card size="small" title="🖥️ 服务器状态" v-if="stats.servers && stats.servers.length > 0">
       <n-data-table :columns="serverColumns" :data="stats.servers" :bordered="false" size="small" />
     </n-card>
 
     <!-- 协程调试 -->
-    <n-card title="🔧 协程调试">
+    <n-card size="small" title="🔧 协程调试">
       <template #header-extra>
         <n-button type="error" @click="cancelAll" size="small">取消所有</n-button>
       </template>
 
       <!-- 按组件分类 -->
       <n-space style="margin-bottom: 12px">
-        <n-tag v-for="(count, component) in (stats.by_component || {})" :key="component" type="info">
+        <n-tag size="small" v-for="(count, component) in (stats.by_component || {})" :key="component" type="info">
           {{ component }}: {{ count }}
         </n-tag>
         <n-text v-if="Object.keys(stats.by_component || {}).length === 0" depth="3">无跟踪的协程</n-text>
       </n-space>
 
       <!-- 潜在泄漏 -->
-      <n-alert v-if="(stats.potential_leaks || []).length > 0" type="error" title="潜在泄漏" style="margin-bottom: 12px">
+      <n-alert size="small" v-if="(stats.potential_leaks || []).length > 0" type="error" title="潜在泄漏" style="margin-bottom: 12px">
         发现 {{ stats.potential_leaks.length }} 个可能泄漏的协程
         <n-data-table :columns="goroutineColumns" :data="stats.potential_leaks" :bordered="false" size="small" style="margin-top: 8px" />
       </n-alert>
@@ -393,7 +393,7 @@
     </n-card>
 
     <!-- 运行时堆栈 -->
-    <n-card title="📚 运行时协程堆栈">
+    <n-card size="small" title="📚 运行时协程堆栈">
       <template #header-extra>
         <n-space>
           <n-input-number v-model:value="stackFilter.minWaitMinutes" placeholder="最小等待分钟" size="small" style="width: 140px" :min="0" />
@@ -403,12 +403,12 @@
       
       <!-- 状态汇总 -->
       <n-space style="margin-bottom: 12px" v-if="runtimeStacks.length > 0" wrap>
-        <n-tag type="info">总计: {{ runtimeStacks.length }}</n-tag>
-        <n-tag type="success">running: {{ runtimeStacks.filter(s => s.state === 'running').length }}</n-tag>
-        <n-tag type="warning">waiting/select: {{ runtimeStacks.filter(s => s.state?.includes('wait') || s.state?.includes('select')).length }}</n-tag>
-        <n-tag type="default">chan: {{ runtimeStacks.filter(s => s.state?.includes('chan')).length }}</n-tag>
-        <n-tag type="info">syscall/IO: {{ runtimeStacks.filter(s => s.state?.includes('syscall') || s.state?.includes('IO') || s.state?.includes('poll')).length }}</n-tag>
-        <n-tag type="error">semacquire(锁): {{ runtimeStacks.filter(s => s.state?.includes('semacquire')).length }}</n-tag>
+        <n-tag size="small" type="info">总计: {{ runtimeStacks.length }}</n-tag>
+        <n-tag size="small" type="success">running: {{ runtimeStacks.filter(s => s.state === 'running').length }}</n-tag>
+        <n-tag size="small" type="warning">waiting/select: {{ runtimeStacks.filter(s => s.state?.includes('wait') || s.state?.includes('select')).length }}</n-tag>
+        <n-tag size="small" type="default">chan: {{ runtimeStacks.filter(s => s.state?.includes('chan')).length }}</n-tag>
+        <n-tag size="small" type="info">syscall/IO: {{ runtimeStacks.filter(s => s.state?.includes('syscall') || s.state?.includes('IO') || s.state?.includes('poll')).length }}</n-tag>
+        <n-tag size="small" type="error">semacquire(锁): {{ runtimeStacks.filter(s => s.state?.includes('semacquire')).length }}</n-tag>
       </n-space>
       
       <!-- 运行时状态分布 -->
@@ -440,7 +440,7 @@
           </n-space>
         </n-collapse-item>
       </n-collapse>
-      <n-empty v-else-if="!loadingStacks" description="点击加载堆栈查看运行时协程信息" />
+      <n-empty size="small" v-else-if="!loadingStacks" description="点击加载堆栈查看运行时协程信息" />
     </n-card>
   </n-space>
 </template>

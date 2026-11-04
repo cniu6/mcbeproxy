@@ -10,8 +10,14 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-//go:embed dist/*
+// all: 前缀必须保留：Vite 会生成 assets/_plugin-vue_export-helper-*.js，
+// 普通 embed 模式会跳过以 _ 开头的文件，导致面板动态导入 404。
+//go:embed all:dist
 var distFS embed.FS
+
+// 公开状态页是构建时内联好的单个 HTML 文件。
+//go:embed all:status-dist
+var statusDistFS embed.FS
 
 // getEntryPath returns the current entry path from config
 func (a *APIServer) getEntryPath() string {

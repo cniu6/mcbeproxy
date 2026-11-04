@@ -1,35 +1,35 @@
 <template>
   <div>
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">系统日志</n-h2>
+      <n-h3 style="margin: 0">系统日志</n-h3>
       <n-space>
-        <n-select v-model:value="logFile" :options="logFileOptions" style="width: 220px" placeholder="选择日志文件" @update:value="loadLog" />
-        <n-input-number v-model:value="lines" :min="50" :max="5000" style="width: 100px" @update:value="loadLog">
+        <n-select size="small" v-model:value="logFile" :options="logFileOptions" style="width: 220px" placeholder="选择日志文件" @update:value="loadLog" />
+        <n-input-number size="small" v-model:value="lines" :min="50" :max="5000" style="width: 100px" @update:value="loadLog">
           <template #suffix>行</template>
         </n-input-number>
-        <n-switch v-model:value="autoRefresh" @update:value="toggleAutoRefresh">
+        <n-switch size="small" v-model:value="autoRefresh" @update:value="toggleAutoRefresh">
           <template #checked>自动刷新</template>
           <template #unchecked>手动刷新</template>
         </n-switch>
-        <n-button @click="loadLog" :loading="loading">刷新</n-button>
-        <n-button @click="downloadLog" :disabled="!logContent">下载</n-button>
+        <n-button size="small" @click="loadLog" :loading="loading">刷新</n-button>
+        <n-button size="small" @click="downloadLog" :disabled="!logContent">下载</n-button>
         <n-popconfirm @positive-click="deleteLog" :disabled="!logFile">
-          <template #trigger><n-button type="warning" :disabled="!logFile">删除此日志</n-button></template>
+          <template #trigger><n-button size="small" type="warning" :disabled="!logFile">删除此日志</n-button></template>
           确定删除日志文件 {{ logFile }} 吗？
         </n-popconfirm>
         <n-popconfirm @positive-click="clearAllLogs">
-          <template #trigger><n-button type="error">清空所有日志</n-button></template>
+          <template #trigger><n-button size="small" type="error">清空所有日志</n-button></template>
           确定清空所有日志文件吗？此操作不可恢复。
         </n-popconfirm>
       </n-space>
     </n-space>
     
-    <n-card>
-      <n-input v-model:value="filter" placeholder="过滤关键词..." style="margin-bottom: 12px" clearable />
+    <n-card size="small">
+      <n-input size="small" v-model:value="filter" placeholder="过滤关键词..." style="margin-bottom: 12px" clearable />
       <div ref="logContainer" v-if="logContent" style="height: calc(100vh - 280px); min-height: 400px; overflow: auto; background: #1a1a1a; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;">
         <div v-for="(line, idx) in filteredLines" :key="idx" :style="getLineStyle(line)">{{ line }}</div>
       </div>
-      <n-empty v-else description="请选择日志文件" />
+      <n-empty size="small" v-else description="请选择日志文件" />
     </n-card>
   </div>
 </template>

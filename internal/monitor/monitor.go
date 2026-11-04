@@ -4,6 +4,7 @@ package monitor
 import (
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,11 @@ type Monitor struct {
 	lastNetStatsAt time.Time
 	lastNetStatsMu sync.Mutex
 
+	// 磁盘 IO 累计计数的上一次快照，用于换算实时读写速率。
+	lastDiskIO   diskIOSnapshot
+	lastDiskIOAt time.Time
+	lastDiskIOMu sync.Mutex
+
 	// statsMu serialises GetSystemStats and guards its short-lived cache, so a
 	// burst of status requests costs one collection (100ms CPU sample plus a
 	// stop-the-world ReadMemStats) instead of one each.
@@ -33,6 +39,12 @@ type Monitor struct {
 // They are exposed on unauthenticated endpoints, and each collection pauses
 // the whole process briefly, which shows up as packet-forwarding jitter.
 const systemStatsCacheTTL = 2 * time.Second
+
+type diskIOSnapshot struct {
+	readBytes  uint64
+	writeBytes uint64
+	valid      bool
+}
 
 type netSnapshot struct {
 	bytesSent uint64
@@ -85,6 +97,16 @@ type NetworkStats struct {
 	SpeedOut    float64 `json:"speed_out_bps"` // Bytes per second (calculated)
 }
 
+// DiskIOStats 为所有物理磁盘的累计读写量与实时速率（字节/秒）。
+type DiskIOStats struct {
+	ReadBytes  uint64  `json:"read_bytes"`
+	WriteBytes uint64  `json:"write_bytes"`
+	ReadCount  uint64  `json:"read_count"`
+	WriteCount uint64  `json:"write_count"`
+	ReadBps    float64 `json:"read_bps"`
+	WriteBps   float64 `json:"write_bps"`
+}
+
 // ProcessInfo represents current process information.
 type ProcessInfo struct {
 	PID         int32   `json:"pid"`
@@ -100,6 +122,14 @@ type RuntimeStats struct {
 	HeapInuse      uint64 `json:"heap_inuse"`
 	StackInuse     uint64 `json:"stack_inuse"`
 	NumGC          uint32 `json:"num_gc"`
+
+	HeapObjects    uint64  `json:"heap_objects"`
+	NextGC         uint64  `json:"next_gc"`
+	TotalSys       uint64  `json:"total_sys"`
+	GCPauseTotalNs uint64  `json:"gc_pause_total_ns"`
+	LastGCPauseNs  uint64  `json:"last_gc_pause_ns"`
+	LastGCUnixMs   int64   `json:"last_gc_unix_ms"`
+	GCCPUFraction  float64 `json:"gc_cpu_fraction"`
 }
 
 // SystemStats represents all system statistics.
@@ -107,6 +137,7 @@ type SystemStats struct {
 	CPU          CPUStats       `json:"cpu"`
 	Memory       MemoryStats    `json:"memory"`
 	Disk         []DiskStats    `json:"disk"`
+	DiskIO       DiskIOStats    `json:"disk_io"`
 	Network      []NetworkStats `json:"network"`
 	NetworkTotal NetworkTotal   `json:"network_total"`
 	Process      ProcessInfo    `json:"process"`
@@ -205,6 +236,70 @@ func (m *Monitor) GetDiskUsage() ([]DiskStats, error) {
 	return stats, nil
 }
 
+// isPartitionOf 判断 name 是否为 parent 的分区（sda1/sda、nvme0n1p1/nvme0n1），避免累计 IO 重复统计。
+func isPartitionOf(name, parent string) bool {
+	if len(name) <= len(parent) || !strings.HasPrefix(name, parent) {
+		return false
+	}
+	rest := strings.TrimPrefix(name[len(parent):], "p")
+	if rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// GetDiskIO 汇总所有物理磁盘的累计读写量并换算实时速率；平台不支持时返回零值（非致命）。
+func (m *Monitor) GetDiskIO() DiskIOStats {
+	counters, err := disk.IOCounters()
+	if err != nil {
+		return DiskIOStats{}
+	}
+
+	var total DiskIOStats
+	for name, c := range counters {
+		if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") || strings.HasPrefix(name, "dm-") {
+			continue
+		}
+		isPart := false
+		for other := range counters {
+			if isPartitionOf(name, other) {
+				isPart = true
+				break
+			}
+		}
+		if isPart {
+			continue
+		}
+		total.ReadBytes += c.ReadBytes
+		total.WriteBytes += c.WriteBytes
+		total.ReadCount += c.ReadCount
+		total.WriteCount += c.WriteCount
+	}
+
+	m.lastDiskIOMu.Lock()
+	defer m.lastDiskIOMu.Unlock()
+	now := time.Now()
+	if m.lastDiskIO.valid {
+		if elapsed := now.Sub(m.lastDiskIOAt).Seconds(); elapsed > 0 {
+			// 计数器回绕或被重置时不产生负速率。
+			if total.ReadBytes >= m.lastDiskIO.readBytes {
+				total.ReadBps = float64(total.ReadBytes-m.lastDiskIO.readBytes) / elapsed
+			}
+			if total.WriteBytes >= m.lastDiskIO.writeBytes {
+				total.WriteBps = float64(total.WriteBytes-m.lastDiskIO.writeBytes) / elapsed
+			}
+		}
+	}
+	m.lastDiskIO = diskIOSnapshot{readBytes: total.ReadBytes, writeBytes: total.WriteBytes, valid: true}
+	m.lastDiskIOAt = now
+	return total
+}
+
 // GetNetworkStats returns network interface statistics with speed calculation.
 // Requirements: 6.4
 func (m *Monitor) GetNetworkStats() ([]NetworkStats, error) {
@@ -286,6 +381,14 @@ func (m *Monitor) GetGoRuntimeStats() *RuntimeStats {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
+	// PauseNs 是 256 项环形缓冲，最近一次 GC 暂停位于 (NumGC+255)%256。
+	var lastPause uint64
+	var lastGCMs int64
+	if memStats.NumGC > 0 {
+		lastPause = memStats.PauseNs[(memStats.NumGC+255)%256]
+		lastGCMs = int64(memStats.LastGC / 1e6)
+	}
+
 	return &RuntimeStats{
 		GoroutineCount: runtime.NumGoroutine(),
 		HeapAlloc:      memStats.HeapAlloc,
@@ -293,6 +396,13 @@ func (m *Monitor) GetGoRuntimeStats() *RuntimeStats {
 		HeapInuse:      memStats.HeapInuse,
 		StackInuse:     memStats.StackInuse,
 		NumGC:          memStats.NumGC,
+		HeapObjects:    memStats.HeapObjects,
+		NextGC:         memStats.NextGC,
+		TotalSys:       memStats.Sys,
+		GCPauseTotalNs: memStats.PauseTotalNs,
+		LastGCPauseNs:  lastPause,
+		LastGCUnixMs:   lastGCMs,
+		GCCPUFraction:  memStats.GCCPUFraction,
 	}
 }
 
@@ -354,6 +464,7 @@ func (m *Monitor) collectSystemStats() (*SystemStats, error) {
 		CPU:          *cpuStats,
 		Memory:       *memStats,
 		Disk:         diskStats,
+		DiskIO:       m.GetDiskIO(),
 		Network:      netStats,
 		NetworkTotal: netTotal,
 		Process:      *procInfo,

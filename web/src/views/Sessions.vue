@@ -1,25 +1,25 @@
 <template>
   <div class="page-container">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
-      <n-h2 style="margin: 0">连接记录</n-h2>
+      <n-h3 style="margin: 0">连接记录</n-h3>
       <n-space>
-        <n-input v-model:value="search" placeholder="搜索玩家名" style="width: 180px" clearable @keyup.enter="load" />
-        <n-button @click="load">搜索</n-button>
-        <n-button @click="clearSearch">清除搜索</n-button>
+        <n-input size="small" v-model:value="search" placeholder="搜索玩家名" style="width: 180px" clearable @keyup.enter="load" />
+        <n-button size="small" @click="load">搜索</n-button>
+        <n-button size="small" @click="clearSearch">清除搜索</n-button>
         <n-popconfirm @positive-click="clearAll">
-          <template #trigger><n-button type="error">清空全部</n-button></template>
+          <template #trigger><n-button size="small" type="error">清空全部</n-button></template>
           确定清空所有会话记录吗？此操作不可恢复。
         </n-popconfirm>
       </n-space>
     </n-space>
-    <n-card style="margin-bottom: 16px">
+    <n-card size="small" style="margin-bottom: 16px">
       <n-space align="center" justify="space-between">
         <n-space align="center">
           <n-text>最大连接记录数：</n-text>
-          <n-input-number 
-            v-model:value="maxSessionRecords" 
-            :min="10" 
-            :max="100000" 
+          <n-input-number size="small"
+            v-model:value="maxSessionRecords"
+            :min="10"
+            :max="100000"
             :step="10"
             style="width: 120px"
             :loading="updatingMaxRecords"
@@ -36,12 +36,12 @@
         <n-text depth="3">当前限制：最多保留 {{ maxSessionRecords }} 条连接记录</n-text>
       </n-space>
     </n-card>
-    <n-card>
+    <n-card size="small">
       <div class="table-wrapper">
-        <n-data-table 
-          :columns="columns" 
-          :data="sessions" 
-          :bordered="false" 
+        <n-data-table size="small"
+          :columns="columns"
+          :data="sessions"
+          :bordered="false"
           :pagination="pagination"
           :scroll-x="1410"
           @update:page="p => pagination.page = p"

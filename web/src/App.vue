@@ -1,17 +1,15 @@
 <template>
   <n-config-provider :theme="darkTheme" :theme-overrides="themeOverrides">
+    <n-global-style />
     <n-message-provider>
       <n-dialog-provider>
-        <n-layout class="app-shell" style="min-height: 100vh">
+        <n-layout style="min-height: 100vh">
           <!-- TopBar for mobile -->
-          <n-layout-header v-if="isMobile" bordered class="mobile-header">
+          <n-layout-header v-if="isMobile" bordered style="height: 54px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 20;">
             <n-button quaternary circle @click="showMobileMenu = true">
               <template #icon><n-icon :component="MenuOutline" /></template>
             </n-button>
-            <div class="mobile-brand">
-              <span class="brand-mark small">🎮</span>
-              <span>MCPE Proxy</span>
-            </div>
+            <n-text strong>MCPE Proxy</n-text>
             <div style="width: 34px"></div>
           </n-layout-header>
 
@@ -28,23 +26,13 @@
               show-trigger
               @collapse="siderCollapsed = true"
               @expand="siderCollapsed = false"
-              class="app-sider"
               style="height: 100vh; position: sticky; top: 0;"
             >
-              <div class="brand" :class="{ collapsed: siderCollapsed }">
-                <div class="brand-mark">🎮</div>
-                <div v-if="!siderCollapsed" class="brand-text">
-                  <span class="brand-title">MCPE Proxy</span>
-                  <span class="brand-sub">Bedrock 加速面板</span>
-                </div>
-              </div>
-              <div class="nav-scroll">
-                <n-menu :value="currentPage" :options="menuOptions" :collapsed="siderCollapsed" :collapsed-width="64" :collapsed-icon-size="22" @update:value="navigateTo" />
-              </div>
-              <div v-if="!siderCollapsed" class="version-info">
+              <n-menu :value="currentPage" :options="siderCollapsed ? flatMenuOptions : menuOptions" :collapsed="siderCollapsed" :collapsed-width="64" :collapsed-icon-size="20" @update:value="navigateTo" />
+              <div v-if="!siderCollapsed" style="text-align: center; padding: 8px 0">
                 <n-tooltip trigger="hover" placement="top">
                   <template #trigger>
-                    <span class="version-pill">{{ versionLabel }}</span>
+                    <n-text depth="3" style="font-size: 12px">{{ versionLabel }}</n-text>
                   </template>
                   <div>版本：{{ versionInfo.version }}</div>
                   <div>提交：{{ versionInfo.git_commit }}</div>
@@ -55,23 +43,13 @@
 
             <!-- Mobile Drawer -->
             <n-drawer v-model:show="showMobileMenu" :width="248" placement="left">
-              <n-drawer-content body-content-style="padding: 0;" class="mobile-drawer">
-                <div class="brand">
-                  <div class="brand-mark">🎮</div>
-                  <div class="brand-text">
-                    <span class="brand-title">MCPE Proxy</span>
-                    <span class="brand-sub">Bedrock 加速面板</span>
-                  </div>
-                </div>
-                <div class="nav-scroll mobile">
-                  <n-menu :value="currentPage" :options="menuOptions" @update:value="handleMobileNav" />
-                </div>
+              <n-drawer-content body-content-style="padding: 0;">
+                <n-menu :value="currentPage" :options="menuOptions" @update:value="handleMobileNav" />
               </n-drawer-content>
             </n-drawer>
 
-            <n-layout-content class="app-main" :style="{ padding: isMobile ? '12px' : '20px 24px 32px' }">
-              <div class="app-content">
-                <Suspense>
+            <n-layout-content :style="{ padding: isMobile ? '8px' : '10px' }">
+              <Suspense>
                   <template #default>
                     <component
                       :is="currentView"
@@ -80,12 +58,11 @@
                     />
                   </template>
                   <template #fallback>
-                    <div class="page-loading">
-                      <n-spin size="large" />
+                    <div style="display: flex; justify-content: center; padding: 64px 0">
+                      <n-spin size="small" />
                     </div>
                   </template>
-                </Suspense>
-              </div>
+              </Suspense>
             </n-layout-content>
           </n-layout>
         </n-layout>
@@ -100,6 +77,14 @@ import { darkTheme } from 'naive-ui'
 import { api } from './api'
 import { HomeOutline, ServerOutline, PeopleOutline, BanOutline, CheckmarkCircleOutline, TimeOutline, SettingsOutline, DocumentTextOutline, GitNetworkOutline, MenuOutline, BugOutline, SwapHorizontalOutline, GlobeOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
+
+// 全局紧凑：只收紧统计数字与小卡片内边距，配色仍用 naive-ui 默认深色。
+const themeOverrides = {
+  Card: { paddingSmall: '8px 10px' },
+  Statistic: { valueFontSize: '18px', labelFontSize: '12px' },
+  Table: { fontSizeSmall: '12px', tdPaddingSmall: '4px 8px', thPaddingSmall: '4px 8px' },
+  Dialog: { titleFontSize: '16px', padding: '12px 16px 16px', iconSize: '24px' }
+}
 
 // 视图按需加载（每个页面一个 chunk），减小入口体积
 const Dashboard = defineAsyncComponent(() => import('./views/Dashboard.vue'))
@@ -118,78 +103,6 @@ const NetworkRoute = defineAsyncComponent(() => import('./views/NetworkRoute.vue
 
 const versionInfo = ref({ version: 'dev', build_time: 'unknown', git_commit: 'unknown' })
 
-// Naive UI theme overrides: a single source of truth for the dashboard palette.
-// Component keys that a given Naive UI version does not know are ignored.
-const themeOverrides = {
-  common: {
-    primaryColor: '#63e2b7',
-    primaryColorHover: '#7cecc5',
-    primaryColorPressed: '#4fc9a0',
-    primaryColorSuppl: '#63e2b7',
-    infoColor: '#38bdf8',
-    successColor: '#63e2b7',
-    warningColor: '#fbbf24',
-    errorColor: '#fb7185',
-    bodyColor: '#0b0f16',
-    cardColor: 'rgba(20, 26, 38, 0.72)',
-    modalColor: '#111722',
-    popoverColor: '#111722',
-    tableColor: 'rgba(15, 20, 30, 0.6)',
-    tableHeaderColor: 'rgba(255, 255, 255, 0.04)',
-    borderColor: 'rgba(255, 255, 255, 0.08)',
-    dividerColor: 'rgba(255, 255, 255, 0.08)',
-    textColorBase: '#e7eefb',
-    textColor1: '#e7eefb',
-    textColor2: '#c3cede',
-    textColor3: '#8b98ad',
-    borderRadius: '10px',
-    borderRadiusSmall: '8px',
-    fontFamily: "Inter, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, sans-serif",
-    fontFamilyMono: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace"
-  },
-  Layout: {
-    color: 'transparent',
-    siderColor: 'rgba(14, 19, 28, 0.82)',
-    headerColor: 'rgba(14, 19, 28, 0.82)',
-    siderBorderColor: 'rgba(255, 255, 255, 0.07)',
-    headerBorderColor: 'rgba(255, 255, 255, 0.07)'
-  },
-  Card: {
-    borderRadius: '14px',
-    color: 'rgba(20, 26, 38, 0.72)',
-    borderColor: 'rgba(255, 255, 255, 0.07)',
-    titleFontWeight: '600'
-  },
-  Menu: {
-    borderRadius: '10px',
-    itemHeight: '40px',
-    itemColorActive: 'rgba(99, 226, 183, 0.12)',
-    itemColorActiveHover: 'rgba(99, 226, 183, 0.18)',
-    itemTextColor: '#a9b6c9',
-    itemTextColorActive: '#63e2b7',
-    itemTextColorActiveHover: '#7cecc5',
-    itemIconColor: '#7d8ba1',
-    itemIconColorActive: '#63e2b7',
-    itemIconColorActiveHover: '#7cecc5',
-    groupTextColor: '#5f6d82'
-  },
-  Button: { borderRadiusMedium: '10px', borderRadiusSmall: '8px' },
-  Input: { borderRadius: '10px' },
-  Tag: { borderRadius: '999px' },
-  DataTable: {
-    thColor: 'rgba(255, 255, 255, 0.035)',
-    thTextColor: '#9fadc2',
-    thFontWeight: '600',
-    tdColor: 'transparent',
-    tdColorHover: 'rgba(99, 226, 183, 0.05)',
-    borderColor: 'rgba(255, 255, 255, 0.06)'
-  },
-  Drawer: { color: '#0e131c' },
-  Modal: { color: '#0e131c' },
-  Dialog: { color: '#0e131c' },
-  Tooltip: { color: '#1a2231' },
-  Popover: { color: '#141a26' }
-}
 const versionLabel = computed(() => {
   const v = versionInfo.value || {}
   const commit = v.git_commit && v.git_commit !== 'unknown' ? ` (${v.git_commit})` : ''
@@ -251,7 +164,10 @@ const menuOptions = [
   }
 ]
 
-const pageKeys = menuOptions.flatMap(group => group.children.map(item => item.key))
+// 折叠成图标栏时分组标题与子项缩进会让图标右偏，所以折叠态改用无分组的扁平菜单
+const flatMenuOptions = menuOptions.flatMap(group => group.children)
+
+const pageKeys = flatMenuOptions.map(item => item.key)
 
 const highlightParam = ref('')
 
@@ -380,67 +296,3 @@ onUnmounted(() => {
   window.removeEventListener('hashchange', handleHashChange)
 })
 </script>
-
-<style scoped>
-.app-shell { background: transparent; }
-.app-sider { backdrop-filter: blur(16px); }
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 18px 16px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-.brand.collapsed { justify-content: center; padding: 18px 0 14px; }
-.brand-mark {
-  width: 38px;
-  height: 38px;
-  flex: none;
-  display: grid;
-  place-items: center;
-  font-size: 19px;
-  border-radius: 12px;
-  border: 1px solid rgba(99, 226, 183, 0.35);
-  background: linear-gradient(135deg, rgba(99, 226, 183, 0.22), rgba(56, 189, 248, 0.16));
-  box-shadow: 0 0 24px rgba(99, 226, 183, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.14);
-}
-.brand-mark.small { width: 30px; height: 30px; border-radius: 9px; font-size: 15px; }
-.brand-text { display: flex; flex-direction: column; min-width: 0; }
-.brand-title { font-size: 15px; font-weight: 700; color: #eafaf4; letter-spacing: 0.01em; }
-.brand-sub { font-size: 11px; color: #7f8ea4; margin-top: 2px; }
-
-.nav-scroll {
-  height: calc(100vh - 190px);
-  overflow-y: auto;
-  padding: 8px 8px 0;
-}
-.nav-scroll.mobile { height: auto; }
-
-.version-info { position: absolute; bottom: 0; left: 0; right: 0; padding: 10px 14px 14px; text-align: center; }
-.version-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  color: #8b98ad;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-}
-
-.mobile-header {
-  height: 54px;
-  padding: 0 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  backdrop-filter: blur(14px);
-}
-.mobile-brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; color: #eafaf4; }
-.page-loading { display: flex; justify-content: center; align-items: center; padding: 64px 0; }
-</style>

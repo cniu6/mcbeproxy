@@ -9,25 +9,25 @@
           </n-text>
         </n-space>
         <n-space>
-          <n-button @click="loadSubscriptions" :loading="loading">刷新列表</n-button>
-          <n-button
+          <n-button size="small" @click="loadSubscriptions" :loading="loading">刷新列表</n-button>
+          <n-button size="small"
             type="info"
             secondary
             @click="updateSelectedSubscriptions"
             :loading="batchUpdatingSelected"
             :disabled="checkedSubscriptionIds.length === 0"
-          >
+>
             {{ batchUpdatingSelected ? `更新中 ${batchProgress.current}/${batchProgress.total}` : `更新选中 (${checkedSubscriptionIds.length})` }}
           </n-button>
-          <n-button type="info" @click="updateAllSubscriptions" :loading="updatingAll" :disabled="subscriptions.length === 0">更新全部</n-button>
-          <n-button type="primary" @click="openCreateModal">新增订阅</n-button>
+          <n-button size="small" type="info" @click="updateAllSubscriptions" :loading="updatingAll" :disabled="subscriptions.length === 0">更新全部</n-button>
+          <n-button size="small" type="primary" @click="openCreateModal">新增订阅</n-button>
         </n-space>
       </n-space>
 
       <n-space justify="space-between" align="center" wrap>
         <n-space align="center" wrap>
           <n-text depth="3" style="font-size: 12px">本次手动更新使用代理</n-text>
-          <n-select
+          <n-select size="small"
             v-model:value="updateProxySelection"
             :options="updateProxyOptions"
             filterable
@@ -47,13 +47,13 @@
         collapsible list so it never dominates the layout when everything
         succeeded.
       -->
-      <n-alert
+      <n-alert size="small"
         v-if="lastRunSummary"
         :type="lastRunSummary.type"
         :title="lastRunSummary.title"
         closable
         @close="lastRunSummary = null"
-      >
+>
         <template v-if="lastRunSummary.failures?.length">
           <n-space vertical :size="6" style="margin-top: 4px">
             <div
@@ -80,7 +80,7 @@
         </template>
       </n-alert>
 
-      <n-data-table
+      <n-data-table size="small"
         :columns="subscriptionColumns"
         :data="subscriptions"
         :row-key="subscriptionRowKey"
@@ -99,7 +99,7 @@
     traces, server HTML bodies) out of the table cell and gives users a
     copyable block to share.
   -->
-  <n-modal v-model:show="showErrorDetailModal" preset="card" title="订阅错误详情" style="width: 640px; max-width: 92vw">
+  <n-modal size="small" v-model:show="showErrorDetailModal" preset="card" title="订阅错误详情" style="width: 640px; max-width: 92vw">
     <n-space vertical :size="12">
       <div>
         <n-text depth="3" style="font-size: 12px">订阅名称</n-text>
@@ -111,7 +111,7 @@
       </div>
       <div>
         <n-text depth="3" style="font-size: 12px">错误信息</n-text>
-        <n-input
+        <n-input size="small"
           :value="errorDetail?.error || ''"
           type="textarea"
           :autosize="{ minRows: 4, maxRows: 12 }"
@@ -121,38 +121,38 @@
     </n-space>
     <template #footer>
       <n-space justify="end">
-        <n-button @click="copyErrorToClipboard" :disabled="!errorDetail?.error">复制</n-button>
-        <n-button @click="showErrorDetailModal = false">关闭</n-button>
+        <n-button size="small" @click="copyErrorToClipboard" :disabled="!errorDetail?.error">复制</n-button>
+        <n-button size="small" @click="showErrorDetailModal = false">关闭</n-button>
       </n-space>
     </template>
   </n-modal>
 
-  <n-modal v-model:show="showEditModal" preset="card" :title="editingId ? '编辑订阅' : '新增订阅'" style="width: 760px; max-width: 95vw">
-    <n-form :model="form" label-placement="left" label-width="110">
+  <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingId ? '编辑订阅' : '新增订阅'" style="width: 760px; max-width: 95vw">
+    <n-form size="small" :model="form" label-placement="left" label-width="110">
       <n-grid :cols="2" :x-gap="16">
         <n-gi>
           <n-form-item label="订阅名称" required>
-            <n-input v-model:value="form.name" placeholder="例如：机场 A / HK 专线" />
+            <n-input size="small" v-model:value="form.name" placeholder="例如：机场 A / HK 专线" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="启用">
-            <n-switch v-model:value="form.enabled" />
+            <n-switch size="small" v-model:value="form.enabled" />
           </n-form-item>
         </n-gi>
         <n-gi :span="2">
           <n-form-item label="订阅地址" required>
-            <n-input v-model:value="form.url" type="textarea" :autosize="{ minRows: 2, maxRows: 4 }" placeholder="https://example.com/subscription" />
+            <n-input size="small" v-model:value="form.url" type="textarea" :autosize="{ minRows: 2, maxRows: 4 }" placeholder="https://example.com/subscription" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="节点分组">
-            <n-input v-model:value="form.group" placeholder="留空则默认使用订阅名称作为分组" />
+            <n-input size="small" v-model:value="form.group" placeholder="留空则默认使用订阅名称作为分组" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="更新走代理">
-            <n-select
+            <n-select size="small"
               v-model:value="form.proxy_name"
               :options="proxyOptions"
               filterable
@@ -163,17 +163,17 @@
         </n-gi>
         <n-gi :span="2">
           <n-form-item label="User-Agent">
-            <n-input v-model:value="form.user_agent" placeholder="默认 Mozilla/5.0" />
+            <n-input size="small" v-model:value="form.user_agent" placeholder="默认 Mozilla/5.0" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="自动更新">
-            <n-switch v-model:value="form.auto_update_enabled" />
+            <n-switch size="small" v-model:value="form.auto_update_enabled" />
           </n-form-item>
         </n-gi>
         <n-gi v-if="form.auto_update_enabled">
           <n-form-item label="调度方式">
-            <n-select
+            <n-select size="small"
               v-model:value="form.auto_update_mode"
               :options="autoUpdateModeOptions"
               :clearable="false"
@@ -182,16 +182,16 @@
         </n-gi>
         <n-gi v-if="form.auto_update_enabled && form.auto_update_mode === 'daily'">
           <n-form-item label="每日时间">
-            <n-input v-model:value="form.auto_update_time" placeholder="04:00" />
+            <n-input size="small" v-model:value="form.auto_update_time" placeholder="04:00" />
           </n-form-item>
         </n-gi>
         <n-gi v-if="form.auto_update_enabled && form.auto_update_mode === 'interval'">
           <n-form-item label="间隔天数">
-            <n-input-number v-model:value="form.auto_update_interval_days" :min="1" style="width: 100%" />
+            <n-input-number size="small" v-model:value="form.auto_update_interval_days" :min="1" style="width: 100%" />
           </n-form-item>
         </n-gi>
         <n-gi v-if="form.auto_update_enabled" :span="2">
-          <n-alert type="info" :show-icon="false">
+          <n-alert size="small" type="info" :show-icon="false">
             仅在无人连接时自动执行。如果到点还有玩家在线，会顺延到连接清空后再补更新。
           </n-alert>
         </n-gi>
@@ -199,10 +199,10 @@
     </n-form>
     <template #footer>
       <n-space justify="space-between" wrap>
-        <n-button v-if="editingId" @click="updateSingleSubscription(editingId, false)" :loading="updatingSingleId === editingId">保存并更新</n-button>
+        <n-button size="small" v-if="editingId" @click="updateSingleSubscription(editingId, false)" :loading="updatingSingleId === editingId">保存并更新</n-button>
         <n-space justify="end">
-          <n-button @click="showEditModal = false">取消</n-button>
-          <n-button type="primary" @click="saveSubscription" :loading="saving">保存</n-button>
+          <n-button size="small" @click="showEditModal = false">取消</n-button>
+          <n-button size="small" type="primary" @click="saveSubscription" :loading="saving">保存</n-button>
         </n-space>
       </n-space>
     </template>

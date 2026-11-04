@@ -10,7 +10,7 @@
       <n-text depth="3" style="font-size: 12px">
         {{ users.length ? `共 ${users.length} 个用户, 客户端用各自的账号密码连接同一端口` : '未添加用户: 端口按上面的单账号 (或免认证) 工作' }}
       </n-text>
-      <n-space size="small">
+      <n-space>
         <n-input v-if="users.length > 6" v-model:value="filter" size="small" placeholder="筛选用户" clearable style="width: 140px" />
         <n-button size="small" type="primary" secondary @click="addUser">+ 添加用户</n-button>
       </n-space>
@@ -36,14 +36,14 @@
           <n-grid :cols="isMobile ? 1 : 2" :x-gap="14">
             <n-gi>
               <n-form-item label="用户名">
-                <n-input v-model:value="item.user.username" placeholder="必填, 端口内唯一" />
+                <n-input size="small" v-model:value="item.user.username" placeholder="必填, 端口内唯一" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="密码">
                 <n-input-group>
-                  <n-input v-model:value="item.user.password" type="password" show-password-on="click" placeholder="可留空" />
-                  <n-button @click="item.user.password = randomPassword()">随机</n-button>
+                  <n-input size="small" v-model:value="item.user.password" type="password" show-password-on="click" placeholder="可留空" />
+                  <n-button size="small" @click="item.user.password = randomPassword()">随机</n-button>
                 </n-input-group>
               </n-form-item>
             </n-gi>
@@ -51,7 +51,7 @@
 
           <n-form-item label="线路">
             <n-space align="center" style="width: 100%">
-              <n-input :value="routeLabel(item.user)" readonly style="flex: 1; min-width: 180px" />
+              <n-input size="small" :value="routeLabel(item.user)" readonly style="flex: 1; min-width: 180px" />
               <n-button size="small" @click="$emit('pick-outbound', item.user)">选择</n-button>
               <n-button v-if="item.user.proxy_outbound" size="small" quaternary @click="inherit(item.user)">继承端口</n-button>
             </n-space>
@@ -59,12 +59,12 @@
           <n-grid v-if="item.user.proxy_outbound && needsLoadBalance(item.user.proxy_outbound)" :cols="isMobile ? 1 : 2" :x-gap="14">
             <n-gi>
               <n-form-item label="负载均衡">
-                <n-select v-model:value="item.user.load_balance" :options="loadBalanceOptions" clearable placeholder="继承端口" />
+                <n-select size="small" v-model:value="item.user.load_balance" :options="loadBalanceOptions" clearable placeholder="继承端口" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="排序类型">
-                <n-select v-model:value="item.user.load_balance_sort" :options="loadBalanceSortOptions" clearable placeholder="继承端口" />
+                <n-select size="small" v-model:value="item.user.load_balance_sort" :options="loadBalanceSortOptions" clearable placeholder="继承端口" />
               </n-form-item>
             </n-gi>
           </n-grid>
@@ -72,12 +72,12 @@
           <n-grid :cols="isMobile ? 1 : 2" :x-gap="14">
             <n-gi>
               <n-form-item label="最大连接">
-                <n-input-number v-model:value="item.user.max_connections" :min="0" placeholder="0 = 不限" style="width: 100%" />
+                <n-input-number size="small" v-model:value="item.user.max_connections" :min="0" placeholder="0 = 不限" style="width: 100%" />
               </n-form-item>
             </n-gi>
             <n-gi>
               <n-form-item label="到期时间">
-                <n-date-picker
+                <n-date-picker size="small"
                   v-model:formatted-value="item.user.expire_at"
                   value-format="yyyy-MM-dd HH:mm"
                   type="datetime"
@@ -90,7 +90,7 @@
             <n-gi>
               <n-form-item label="状态">
                 <n-space align="center">
-                  <n-switch :value="!item.user.disabled" @update:value="v => item.user.disabled = !v" />
+                  <n-switch size="small" :value="!item.user.disabled" @update:value="v => item.user.disabled = !v" />
                   <n-text depth="3" style="font-size: 12px">{{ item.user.disabled ? '禁用 (拒绝登录)' : '启用' }}</n-text>
                 </n-space>
               </n-form-item>
@@ -98,7 +98,7 @@
             <n-gi>
               <n-form-item label="UDP">
                 <n-space align="center">
-                  <n-switch :value="!item.user.disable_udp" @update:value="v => item.user.disable_udp = !v" />
+                  <n-switch size="small" :value="!item.user.disable_udp" @update:value="v => item.user.disable_udp = !v" />
                   <n-text depth="3" style="font-size: 12px">{{ item.user.disable_udp ? '仅 TCP' : '允许 UDP 转发' }}</n-text>
                 </n-space>
               </n-form-item>
@@ -106,7 +106,7 @@
           </n-grid>
 
           <n-form-item label="路由规则">
-            <n-select
+            <n-select size="small"
               :value="ruleModeValue(item.user)"
               :options="ruleModeOptions"
               style="max-width: 260px"
@@ -118,7 +118,7 @@
             <n-text depth="3" style="font-size: 12px; margin-left: 8px">留空 = 只受端口白名单限制; 例: 1.2.3.4 或 10.0.0.0/8</n-text>
           </n-form-item>
           <n-form-item label="备注">
-            <n-input v-model:value="item.user.remark" placeholder="可选" />
+            <n-input size="small" v-model:value="item.user.remark" placeholder="可选" />
           </n-form-item>
 
           <div v-if="statOf(item.user)" class="user-stats">

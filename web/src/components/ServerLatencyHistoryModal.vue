@@ -1,7 +1,7 @@
 <template>
-  <n-modal v-model:show="modalShow" preset="card" :title="modalTitle" style="width: 1180px; max-width: 96vw">
+  <n-modal size="small" v-model:show="modalShow" preset="card" :title="modalTitle" style="width: 1180px; max-width: 96vw">
     <n-space vertical :size="12">
-      <n-alert type="info">
+      <n-alert size="small" type="info">
         上半部分展示当前代理服务器自身的历史延迟趋势；下半部分展示候选节点按当前负载均衡延迟类型记录的自动Ping历史。
       </n-alert>
       <div class="server-history-toolbar">
@@ -22,7 +22,7 @@
           <n-button size="small" @click="refreshDetail" :loading="serverHistoryLoading || nodeHistoryLoading">刷新</n-button>
         </n-space>
       </div>
-      <n-alert v-if="serverHistoryError" type="warning">{{ serverHistoryError }}</n-alert>
+      <n-alert size="small" v-if="serverHistoryError" type="warning">{{ serverHistoryError }}</n-alert>
       <div class="server-history-summary-grid">
         <n-card size="small">
           <div class="server-history-summary-title">当前视窗</div>
@@ -45,7 +45,7 @@
           <div class="server-history-summary-sub">{{ summary.lastSuccessText }}</div>
         </n-card>
       </div>
-      <n-empty v-if="!visibleSamples.length && !serverHistoryLoading" description="当前时间范围没有历史数据" />
+      <n-empty size="small" v-if="!visibleSamples.length && !serverHistoryLoading" description="当前时间范围没有历史数据" />
       <n-card v-else size="small">
         <template #header>服务器自身历史延迟趋势</template>
         <div class="server-history-large-chart">
@@ -65,7 +65,7 @@
           <span>时间滑块缩放</span>
           <span>{{ visibleWindowLabel || '全部' }}</span>
         </div>
-        <n-slider v-model:value="viewportPercent" range :min="0" :max="100" :step="1" />
+        <n-slider size="small" v-model:value="viewportPercent" range :min="0" :max="100" :step="1" />
       </div>
       <n-card size="small">
         <template #header>服务器自身延迟明细</template>
@@ -96,14 +96,14 @@
           </div>
         </div>
       </n-card>
-      <n-divider style="margin: 4px 0 0">候选节点自动Ping历史</n-divider>
+      <n-divider size="small" style="margin: 4px 0 0">候选节点自动Ping历史</n-divider>
       <n-space align="center" wrap>
         <n-tag type="info" size="small">当前延迟类型 {{ nodeMetricLabel }}</n-tag>
         <n-tag size="small" :bordered="false">有样本 {{ nodeSummary.sampled }} / {{ nodeSummary.candidates }}</n-tag>
         <n-tag v-if="nodeSummary.samples > 0" type="success" size="small" :bordered="false">总样本 {{ nodeSummary.samples }}</n-tag>
-        <n-input v-model:value="nodeHistorySearch" placeholder="搜索候选节点" clearable style="width: 220px" />
+        <n-input size="small" v-model:value="nodeHistorySearch" placeholder="搜索候选节点" clearable style="width: 220px" />
       </n-space>
-      <n-alert v-if="nodeHistoryError" type="warning">{{ nodeHistoryError }}</n-alert>
+      <n-alert size="small" v-if="nodeHistoryError" type="warning">{{ nodeHistoryError }}</n-alert>
       <div class="server-history-table-wrapper">
         <n-table v-if="filteredNodeRows.length > 0" size="small" :bordered="true" :single-line="false" style="min-width: 960px">
           <thead>
@@ -138,13 +138,13 @@
             </tr>
           </tbody>
         </n-table>
-        <n-empty v-else-if="!nodeHistoryLoading" description="当前时间范围没有候选节点自动Ping历史" />
+        <n-empty size="small" v-else-if="!nodeHistoryLoading" description="当前时间范围没有候选节点自动Ping历史" />
       </div>
     </n-space>
     <template #footer>
       <slot name="footer">
         <n-space justify="end">
-          <n-button @click="modalShow = false">关闭</n-button>
+          <n-button size="small" @click="modalShow = false">关闭</n-button>
         </n-space>
       </slot>
     </template>

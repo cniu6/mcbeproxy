@@ -15,12 +15,12 @@
     <n-grid :cols="isMobile ? 1 : 2" :x-gap="16" :y-gap="0">
       <n-gi>
         <n-form-item label="名称">
-          <n-input v-model:value="port.name" placeholder="便于识别的名称" />
+          <n-input size="small" v-model:value="port.name" placeholder="便于识别的名称" />
         </n-form-item>
       </n-gi>
       <n-gi>
         <n-form-item label="启用状态">
-          <n-switch v-model:value="port.enabled" />
+          <n-switch size="small" v-model:value="port.enabled" />
           <n-text depth="3" style="margin-left: 10px; font-size: 12px">
             {{ port.enabled ? '启用后立即监听' : '保存后释放端口' }}
           </n-text>
@@ -33,17 +33,17 @@
       </n-gi>
       <n-gi>
         <n-form-item label="代理类型">
-          <n-select v-model:value="port.type" :options="proxyTypeOptions" />
+          <n-select size="small" v-model:value="port.type" :options="proxyTypeOptions" />
         </n-form-item>
       </n-gi>
       <n-gi>
         <n-form-item label="账号">
-          <n-input v-model:value="port.username" placeholder="可选, 不填则无需认证" clearable />
+          <n-input size="small" v-model:value="port.username" placeholder="可选, 不填则无需认证" clearable />
         </n-form-item>
       </n-gi>
       <n-gi>
         <n-form-item label="密码">
-          <n-input
+          <n-input size="small"
             v-model:value="port.password"
             type="password"
             show-password-on="click"
@@ -56,7 +56,7 @@
 
     <n-form-item label="代理节点">
       <n-space align="center" style="width: 100%">
-        <n-input
+        <n-input size="small"
           :value="getProxyOutboundDisplay(port.proxy_outbound)"
           readonly
           placeholder="点击右侧'选择'"
@@ -70,12 +70,12 @@
     <n-grid v-if="needsLoadBalance(port.proxy_outbound)" :cols="isMobile ? 1 : 2" :x-gap="16">
       <n-gi>
         <n-form-item label="负载均衡">
-          <n-select v-model:value="port.load_balance" :options="loadBalanceOptions" />
+          <n-select size="small" v-model:value="port.load_balance" :options="loadBalanceOptions" />
         </n-form-item>
       </n-gi>
       <n-gi>
         <n-form-item label="排序类型">
-          <n-select v-model:value="port.load_balance_sort" :options="loadBalanceSortOptions" />
+          <n-select size="small" v-model:value="port.load_balance_sort" :options="loadBalanceSortOptions" />
         </n-form-item>
       </n-gi>
     </n-grid>
@@ -83,12 +83,12 @@
       <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
         <n-gi>
           <n-form-item label="自动 Ping">
-            <n-switch v-model:value="port.auto_ping_enabled" />
+            <n-switch size="small" v-model:value="port.auto_ping_enabled" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="Ping 间隔">
-            <n-input-number v-model:value="port.auto_ping_interval_minutes" :min="1" style="width: 100%">
+            <n-input-number size="small" v-model:value="port.auto_ping_interval_minutes" :min="1" style="width: 100%">
               <template #suffix>分钟</template>
             </n-input-number>
           </n-form-item>
@@ -97,24 +97,24 @@
       <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
         <n-gi>
           <n-form-item label="Top N 候选">
-            <n-input-number v-model:value="port.auto_ping_top_candidates" :min="1" style="width: 100%" />
+            <n-input-number size="small" v-model:value="port.auto_ping_top_candidates" :min="1" style="width: 100%" />
           </n-form-item>
         </n-gi>
         <n-gi>
           <n-form-item label="全量扫描">
-            <n-select v-model:value="port.auto_ping_full_scan_mode" :options="autoPingFullScanModeOptions" />
+            <n-select size="small" v-model:value="port.auto_ping_full_scan_mode" :options="autoPingFullScanModeOptions" />
           </n-form-item>
         </n-gi>
       </n-grid>
       <n-grid v-if="port.auto_ping_full_scan_mode" :cols="isMobile ? 1 : 2" :x-gap="16">
         <n-gi v-if="port.auto_ping_full_scan_mode === 'daily'">
           <n-form-item label="扫描时间">
-            <n-input v-model:value="port.auto_ping_full_scan_time" placeholder="04:00" />
+            <n-input size="small" v-model:value="port.auto_ping_full_scan_time" placeholder="04:00" />
           </n-form-item>
         </n-gi>
         <n-gi v-if="port.auto_ping_full_scan_mode === 'interval'">
           <n-form-item label="扫描间隔">
-            <n-input-number v-model:value="port.auto_ping_full_scan_interval_hours" :min="1" style="width: 100%">
+            <n-input-number size="small" v-model:value="port.auto_ping_full_scan_interval_hours" :min="1" style="width: 100%">
               <template #suffix>小时</template>
             </n-input-number>
           </n-form-item>
@@ -160,19 +160,19 @@
     <n-form-item label="白名单 CIDR">
       <n-dynamic-input v-model:value="port.allow_list" :min="1">
         <template #default="{ index }">
-          <n-input v-model:value="port.allow_list[index]" placeholder="0.0.0.0/0" />
+          <n-input size="small" v-model:value="port.allow_list[index]" placeholder="0.0.0.0/0" />
         </template>
       </n-dynamic-input>
     </n-form-item>
 
     <n-form-item label="全局路由规则">
-      <n-switch :value="!port.ignore_route_rules" @update:value="v => port.ignore_route_rules = !v" />
+      <n-switch size="small" :value="!port.ignore_route_rules" @update:value="v => port.ignore_route_rules = !v" />
       <n-text depth="3" style="margin-left: 10px; font-size: 12px">
         {{ port.ignore_route_rules ? '忽略「路由网络」里的规则 (用户可单独覆盖)' : '套用「路由网络」里的直连/代理/阻止规则' }}
       </n-text>
     </n-form-item>
 
-    <n-divider title-placement="left" style="margin: 8px 0">多用户 (同一端口按账号分流)</n-divider>
+    <n-divider size="small" title-placement="left" style="margin: 8px 0">多用户 (同一端口按账号分流)</n-divider>
     <PortUsersEditor
       :users="port.users"
       :stats="port.user_stats || []"

@@ -2,59 +2,43 @@
   <div class="page-container">
     <n-space justify="space-between" align="center" class="page-header" wrap>
       <n-space vertical :size="6">
-        <n-h2 style="margin: 0">代理节点管理</n-h2>
+        <n-h3 style="margin: 0">代理节点管理</n-h3>
         <n-space :size="8" wrap>
-          <n-tag type="info" bordered="false">总计 {{ outbounds.length }}</n-tag>
-          <n-tag type="success" bordered="false">在线连接 {{ activeRuntimeCount }}</n-tag>
-          <n-tag v-if="checkedRowKeys.length > 0" type="warning" bordered="false">已选 {{ checkedRowKeys.length }}</n-tag>
+          <n-tag size="small" type="info" bordered="false">总计 {{ outbounds.length }}</n-tag>
+          <n-tag size="small" type="success" bordered="false">在线连接 {{ activeRuntimeCount }}</n-tag>
+          <n-tag size="small" v-if="checkedRowKeys.length > 0" type="warning" bordered="false">已选 {{ checkedRowKeys.length }}</n-tag>
         </n-space>
       </n-space>
       <n-space class="page-actions" wrap>
         <n-dropdown v-if="filteredOutbounds.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleQuickBatchTestSelect">
-          <n-button type="info" secondary>一键测试当前筛选 ({{ filteredOutbounds.length }})</n-button>
+          <n-button size="small" type="info" secondary>一键测试当前筛选 ({{ filteredOutbounds.length }})</n-button>
         </n-dropdown>
         <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
-          <n-button type="info" secondary>批量测试 ({{ checkedRowKeys.length }})</n-button>
+          <n-button size="small" type="info" secondary>批量测试 ({{ checkedRowKeys.length }})</n-button>
         </n-dropdown>
-        <n-button v-if="batchTesting" type="info" :loading="true" secondary>
+        <n-button size="small" v-if="batchTesting" type="info" :loading="true" secondary>
           测试中 {{ batchTestProgress.current }}/{{ batchTestProgress.total }}
         </n-button>
-        <n-button v-if="checkedRowKeys.length > 0 && !batchTesting" type="error" secondary @click="openBatchAutoSelectBlockModal()">
+        <n-button size="small" v-if="checkedRowKeys.length > 0 && !batchTesting" type="error" secondary @click="openBatchAutoSelectBlockModal()">
           批量封禁 ({{ checkedRowKeys.length }})
         </n-button>
         <n-popconfirm v-if="checkedRowKeys.length > 0 && !batchTesting" @positive-click="clearAutoSelectBlock(checkedRowKeys)">
-          <template #trigger><n-button type="success" secondary>批量解封 ({{ checkedRowKeys.length }})</n-button></template>
+          <template #trigger><n-button size="small" type="success" secondary>批量解封 ({{ checkedRowKeys.length }})</n-button></template>
           确定解除选中的 {{ checkedRowKeys.length }} 个节点自动选择封禁吗？
         </n-popconfirm>
         <n-popconfirm v-if="checkedRowKeys.length > 0 && !batchTesting" @positive-click="batchDelete">
-          <template #trigger><n-button type="error" secondary>批量删除 ({{ checkedRowKeys.length }})</n-button></template>
+          <template #trigger><n-button size="small" type="error" secondary>批量删除 ({{ checkedRowKeys.length }})</n-button></template>
           确定删除选中的 {{ checkedRowKeys.length }} 个节点吗？
         </n-popconfirm>
-        <n-popover trigger="click" placement="bottom-end">
-          <template #trigger>
-            <n-button secondary>显示字段 ({{ proxyTableVisibleColumnKeys.length }}/{{ proxyTableColumnOptions.length }})</n-button>
-          </template>
-          <n-space vertical size="small" style="width: 220px">
-            <div style="font-size: 12px; color: var(--n-text-color-3);">节点、操作固定显示，其余列可按需勾选。</div>
-            <n-checkbox-group v-model:value="proxyTableVisibleColumnKeys">
-              <n-space vertical size="small">
-                <n-checkbox v-for="option in proxyTableColumnOptions" :key="option.value" :value="option.value">
-                  {{ option.label }}
-                </n-checkbox>
-              </n-space>
-            </n-checkbox-group>
-            <n-button text type="primary" style="align-self: flex-start" @click="resetProxyTableVisibleColumns">恢复默认</n-button>
-          </n-space>
-        </n-popover>
-        <n-button secondary @click="openLatencyOverviewModal">延迟历史总表</n-button>
-        <n-button secondary @click="showSubscriptionsModal = true">订阅管理</n-button>
-        <n-button secondary @click="openImportModal">导入节点</n-button>
-        <n-button type="primary" @click="openAddModal">添加代理节点</n-button>
+        <n-button size="small" secondary @click="openLatencyOverviewModal">延迟历史总表</n-button>
+        <n-button size="small" secondary @click="showSubscriptionsModal = true">订阅管理</n-button>
+        <n-button size="small" secondary @click="openImportModal">导入节点</n-button>
+        <n-button size="small" type="primary" @click="openAddModal">添加代理节点</n-button>
       </n-space>
     </n-space>
 
     <!-- 订阅管理入口：从顶部常驻面板挪到按钮弹窗，节省垂直空间让节点列表更高 -->
-    <n-modal v-model:show="showSubscriptionsModal" preset="card" title="订阅管理" style="width: 1280px; max-width: 96vw">
+    <n-modal size="small" v-model:show="showSubscriptionsModal" preset="card" title="订阅管理" style="width: 1280px; max-width: 96vw">
       <ProxySubscriptionsPanel
         v-if="showSubscriptionsModal"
         :outbounds="outbounds"
@@ -146,7 +130,7 @@
         </n-space>
         <n-space align="center" wrap class="filter-row">
           <span class="filter-label">协议</span>
-          <n-select
+          <n-select size="small"
             v-model:value="selectedProtocol"
             :options="protocolFilterOptions"
             style="width: 150px"
@@ -154,7 +138,7 @@
             clearable
           />
           <span class="filter-label">状态</span>
-          <n-select
+          <n-select size="small"
             v-model:value="selectedStatus"
             :options="statusFilterOptions"
             style="width: 120px"
@@ -162,39 +146,50 @@
             clearable
           />
           <span class="filter-label">运行态</span>
-          <n-switch v-model:value="showRuntimeOnly" />
+          <n-switch size="small" v-model:value="showRuntimeOnly" />
         </n-space>
         <n-space align="center" wrap class="filter-row">
           <span class="filter-label">质量排序</span>
-          <n-select
+          <n-select size="small"
             v-model:value="qualitySortMetric"
             :options="qualitySortOptions"
             style="width: 140px"
             placeholder="默认排序"
             clearable
           />
-          <n-select
+          <n-select size="small"
             v-model:value="qualitySortOrder"
             :options="qualitySortOrderOptions"
             style="width: 110px"
             :disabled="!qualitySortMetric"
           />
-          <n-input
+          <n-input size="small"
             v-model:value="searchKeywordInput"
             placeholder="搜索节点名称/服务器/订阅"
             class="filter-search"
             clearable
           />
           <n-button quaternary size="small" @click="clearFilters">重置筛选</n-button>
-          <n-tag v-if="filteredOutbounds.length !== outbounds.length" type="info">
+          <n-tag size="small" v-if="filteredOutbounds.length !== outbounds.length" type="info">
             {{ filteredOutbounds.length }} / {{ outbounds.length }}
           </n-tag>
-          <n-tag v-if="showRuntimeOnly" type="success" bordered="false">仅看有流量/连接的节点</n-tag>
+          <n-tag size="small" v-if="showRuntimeOnly" type="success" bordered="false">仅看有流量/连接的节点</n-tag>
         </n-space>
       </div>
     </n-card>
 
-    <n-card class="proxy-outbound-list-card">
+    <n-card size="small" class="proxy-outbound-list-card">
+      <n-space vertical :size="6">
+        <!-- 显示字段：直接展开在表格上方，不再藏在弹出层里 -->
+        <n-space align="center" :size="[10, 4]">
+          <n-text depth="3">显示字段（节点、操作固定显示）:</n-text>
+          <n-checkbox-group size="small" v-model:value="proxyTableVisibleColumnKeys">
+            <n-space :size="[10, 2]">
+              <n-checkbox v-for="option in proxyTableColumnOptions" :key="option.value" :value="option.value" :label="option.label" size="small" />
+            </n-space>
+          </n-checkbox-group>
+          <n-button text type="primary" size="small" @click="resetProxyTableVisibleColumns">恢复默认</n-button>
+        </n-space>
       <div class="table-wrapper">
         <n-data-table
           class="proxy-table proxy-table-compact"
@@ -212,14 +207,15 @@
           :pagination="mainTablePagination"
         />
       </div>
+      </n-space>
     </n-card>
 
-    <n-modal v-model:show="showLatencyOverviewModal" preset="card" title="代理节点延迟历史总表" style="width: 1460px; max-width: 97vw">
+    <n-modal size="small" v-model:show="showLatencyOverviewModal" preset="card" title="代理节点延迟历史总表" style="width: 1460px; max-width: 97vw">
       <n-space vertical :size="12">
-        <n-alert type="info">
+        <n-alert size="small" type="info">
           总表固定展示最近 1 小时三类延迟小图，点击任意小图即可展开查看完整历史、时间范围和下方滑块缩放。
         </n-alert>
-        <n-alert v-if="proxyHistoryOverviewError" type="warning">{{ proxyHistoryOverviewError }}</n-alert>
+        <n-alert size="small" v-if="proxyHistoryOverviewError" type="warning">{{ proxyHistoryOverviewError }}</n-alert>
         <n-data-table
           :columns="latencyOverviewColumns"
           :data="sortedOutbounds"
@@ -232,9 +228,9 @@
       </n-space>
     </n-modal>
 
-    <n-modal v-model:show="showLatencyHistoryModal" preset="card" :title="proxyHistoryModalTitle" style="width: 1180px; max-width: 96vw">
+    <n-modal size="small" v-model:show="showLatencyHistoryModal" preset="card" :title="proxyHistoryModalTitle" style="width: 1180px; max-width: 96vw">
       <n-space vertical :size="12">
-        <n-alert type="info">
+        <n-alert size="small" type="info">
           上方控制后端请求时间范围；下方滑块会在已加载的时间段内继续滚动 / 缩放查看。
         </n-alert>
         <div class="proxy-history-toolbar">
@@ -254,7 +250,7 @@
             <n-button size="small" @click="refreshProxyLatencyHistoryDetail" :loading="proxyHistoryDetailLoading">刷新</n-button>
           </n-space>
         </div>
-        <n-alert v-if="proxyHistoryDetailError" type="warning">{{ proxyHistoryDetailError }}</n-alert>
+        <n-alert size="small" v-if="proxyHistoryDetailError" type="warning">{{ proxyHistoryDetailError }}</n-alert>
         <div class="proxy-history-summary-grid">
           <n-card size="small">
             <div class="proxy-history-summary-title">当前视窗</div>
@@ -298,7 +294,7 @@
             <n-descriptions-item v-if="selectedProxyHistoryOutbound.last_error" label="最近错误" :span="3">{{ selectedProxyHistoryOutbound.last_error }}</n-descriptions-item>
           </n-descriptions>
         </n-card>
-        <n-empty v-if="!proxyHistoryHasAnySamples && !proxyHistoryDetailLoading" description="暂无历史数据" />
+        <n-empty size="small" v-if="!proxyHistoryHasAnySamples && !proxyHistoryDetailLoading" description="暂无历史数据" />
         <div v-else class="proxy-history-chart-grid">
           <n-card size="small" v-for="metric in proxyHistoryMetricOrder" :key="`chart-${metric}`">
             <template #header>{{ proxyHistoryMetricLabels[metric] }} 历史</template>
@@ -320,7 +316,7 @@
             <span>时间滑块缩放</span>
             <span>{{ proxyHistoryVisibleWindowLabel || '全部' }}</span>
           </div>
-          <n-slider v-model:value="proxyHistoryViewportPercent" range :min="0" :max="100" :step="1" />
+          <n-slider size="small" v-model:value="proxyHistoryViewportPercent" range :min="0" :max="100" :step="1" />
         </div>
         <div class="proxy-history-detail-grid">
           <n-card size="small" v-for="metric in proxyHistoryMetricOrder" :key="`detail-${metric}`">
@@ -359,17 +355,17 @@
     </n-modal>
 
     <!-- 编辑 Modal -->
-    <n-modal v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" :style="{ width: form.type === 'chain' ? '1000px' : '700px', maxWidth: '96vw' }">
-      <n-form :model="form" label-placement="left" label-width="100">
+    <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" :style="{ width: form.type === 'chain' ? '1000px' : '700px', maxWidth: '96vw' }">
+      <n-form size="small" :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
-          <n-gi><n-form-item label="节点名称" required><n-input v-model:value="form.name" :disabled="!!editingName" placeholder="唯一标识（建议英文）" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="协议类型" required><n-select v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="节点名称" required><n-input size="small" v-model:value="form.name" :disabled="!!editingName" placeholder="唯一标识（建议英文）" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="协议类型" required><n-select size="small" v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
 
           <!-- 代理链条：内嵌链路编辑器 -->
           <template v-if="form.type === 'chain'">
             <n-gi :span="2">
-              <n-divider style="margin: 8px 0">链路配置</n-divider>
-              <n-alert type="info" style="margin-bottom: 8px">
+              <n-divider size="small" style="margin: 8px 0">链路配置</n-divider>
+              <n-alert size="small" type="info" style="margin-bottom: 8px">
                 选择节点组成代理链路，流量将按顺序经过每个节点到达目标。支持嵌套（可选择已有的链式节点），自动检测循环引用。
               </n-alert>
             </n-gi>
@@ -468,131 +464,131 @@
                 </div>
               </div>
             </n-gi>
-            <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选" clearable /></n-form-item></n-gi>
-            <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="分组"><n-auto-complete size="small" v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="启用"><n-switch size="small" v-model:value="form.enabled" /></n-form-item></n-gi>
           </template>
 
           <!-- 普通协议字段 -->
           <template v-else>
-            <n-gi><n-form-item label="服务器地址" required><n-input v-model:value="form.server" placeholder="example.com" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="端口" required><n-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="分组"><n-auto-complete v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
-            <n-gi><n-form-item label="启用"><n-switch v-model:value="form.enabled" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="服务器地址" required><n-input size="small" v-model:value="form.server" placeholder="example.com" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="端口" required><n-input-number size="small" v-model:value="form.port" :min="1" :max="65535" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="分组"><n-auto-complete size="small" v-model:value="form.group" :options="groupAutoCompleteOptions" placeholder="可选，用于分类管理" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="启用"><n-switch size="small" v-model:value="form.enabled" /></n-form-item></n-gi>
             <n-gi :span="2">
               <n-form-item label="UDP缓冲">
-                <n-input-number v-model:value="form.udp_socket_buffer_size" :min="-1" :step="262144" style="width: 100%" placeholder="0=跟随服务器" />
+                <n-input-number size="small" v-model:value="form.udp_socket_buffer_size" :min="-1" :step="262144" style="width: 100%" placeholder="0=跟随服务器" />
                 <template #feedback>经此节点的 UDP 收发缓冲（字节）。0=跟随服务器设置（默认自动 1MB，推荐），-1=系统默认，正数=指定字节数，如 2097152=2MB。</template>
               </n-form-item>
             </n-gi>
-            <n-gi><n-form-item label="TLS"><n-switch v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="TLS"><n-switch size="small" v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
           
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
-            <n-gi><n-form-item label="加密方式"><n-select v-model:value="form.method" :options="ssMethodOptions" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="加密方式"><n-select size="small" v-model:value="form.method" :options="ssMethodOptions" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
           </template>
           
           <!-- VMess 字段 -->
           <template v-if="form.type === 'vmess'">
-            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="AlterID"><n-input-number v-model:value="form.alter_id" :min="0" style="width: 100%" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="加密方式"><n-select v-model:value="form.security" :options="vmessSecurityOptions" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="UUID"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="AlterID"><n-input-number size="small" v-model:value="form.alter_id" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="加密方式"><n-select size="small" v-model:value="form.security" :options="vmessSecurityOptions" /></n-form-item></n-gi>
           </template>
           
           <!-- Trojan 字段 -->
           <template v-if="form.type === 'trojan'">
-            <n-gi :span="2"><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
           </template>
 
           <!-- SOCKS5 / HTTP 字段 -->
           <template v-if="['socks5', 'http'].includes(form.type)">
-            <n-gi><n-form-item label="用户名"><n-input v-model:value="form.username" placeholder="可选" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password', '可选')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="用户名"><n-input size="small" v-model:value="form.username" placeholder="可选" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password', '可选')" /></n-form-item></n-gi>
           </template>
 
           <!-- AnyTLS 字段 -->
           <template v-if="form.type === 'anytls'">
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="如: h2,http/1.1" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="空闲检查(s)"><n-input-number v-model:value="form.idle_session_check_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="空闲超时(s)"><n-input-number v-model:value="form.idle_session_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="最小空闲会话"><n-input-number v-model:value="form.min_idle_session" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input size="small" v-model:value="form.alpn" placeholder="如: h2,http/1.1" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="空闲检查(s)"><n-input-number size="small" v-model:value="form.idle_session_check_interval" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="空闲超时(s)"><n-input-number size="small" v-model:value="form.idle_session_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="最小空闲会话"><n-input-number size="small" v-model:value="form.min_idle_session" :min="0" style="width: 100%" /></n-form-item></n-gi>
           </template>
           
           <!-- VLESS 字段 -->
           <template v-if="form.type === 'vless'">
-            <n-gi><n-form-item label="UUID"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="Flow"><n-select v-model:value="form.flow" :options="vlessFlowOptions" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="UUID"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="Flow"><n-select size="small" v-model:value="form.flow" :options="vlessFlowOptions" clearable /></n-form-item></n-gi>
           </template>
           
           <!-- Hysteria v1 / v2 字段 -->
           <template v-if="['hysteria', 'hysteria2'].includes(form.type)">
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="端口跳跃"><n-input v-model:value="form.port_hopping" placeholder="如: 20000-55000 (可选)" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="端口跳跃"><n-input size="small" v-model:value="form.port_hopping" placeholder="如: 20000-55000 (可选)" /></n-form-item></n-gi>
             <n-gi>
               <n-form-item label="混淆类型">
-                <n-input v-if="form.type === 'hysteria'" v-model:value="form.obfs" placeholder="如 xplus（可选）" />
-                <n-select v-else v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable />
+                <n-input size="small" v-if="form.type === 'hysteria'" v-model:value="form.obfs" placeholder="如 xplus（可选）" />
+                <n-select size="small" v-else v-model:value="form.obfs" :options="hysteria2ObfsOptions" clearable />
               </n-form-item>
             </n-gi>
-            <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input v-model:value="form.obfs_password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('obfs_password')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="SNI"><n-input v-model:value="form.sni" placeholder="节点域名（可选）" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="跳过验证"><n-switch v-model:value="form.insecure" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="上行 Mbps"><n-input-number v-model:value="form.up_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="下行 Mbps"><n-input-number v-model:value="form.down_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi v-if="form.obfs"><n-form-item label="混淆密码"><n-input size="small" v-model:value="form.obfs_password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('obfs_password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input size="small" v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="SNI"><n-input size="small" v-model:value="form.sni" placeholder="节点域名（可选）" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="跳过验证"><n-switch size="small" v-model:value="form.insecure" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="上行 Mbps"><n-input-number size="small" v-model:value="form.up_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="下行 Mbps"><n-input-number size="small" v-model:value="form.down_mbps" :min="0" style="width: 100%" /></n-form-item></n-gi>
           </template>
 
           <!-- Snell 字段 -->
           <template v-if="form.type === 'snell'">
-            <n-gi :span="2"><n-form-item label="PSK"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
-            <n-gi :span="2"><n-alert type="info">Snell 默认 v4 并开启 UDP，适合 MCPE；高级版本/混淆参数请通过订阅导入。</n-alert></n-gi>
+            <n-gi :span="2"><n-form-item label="PSK"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-alert size="small" type="info">Snell 默认 v4 并开启 UDP，适合 MCPE；高级版本/混淆参数请通过订阅导入。</n-alert></n-gi>
           </template>
           
           <!-- TUIC 字段 -->
           <template v-if="form.type === 'tuic'">
-            <n-gi><n-form-item label="UUID / Token"><n-input v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="密码"><n-input v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="ALPN"><n-input v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="UUID / Token"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="ALPN"><n-input size="small" v-model:value="form.alpn" placeholder="默认 h3" /></n-form-item></n-gi>
           </template>
 
           <!-- TLS 通用字段 -->
           <template v-if="form.tls || form.reality">
-            <n-gi><n-form-item label="SNI"><n-input v-model:value="form.sni" placeholder="服务器名称指示" /></n-form-item></n-gi>
-            <n-gi><n-form-item label="跳过验证"><n-switch v-model:value="form.insecure" /></n-form-item></n-gi>
-            <n-gi :span="2"><n-form-item label="TLS 指纹"><n-select v-model:value="form.fingerprint" :options="fingerprintOptions" clearable /></n-form-item></n-gi>
+            <n-gi><n-form-item label="SNI"><n-input size="small" v-model:value="form.sni" placeholder="服务器名称指示" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="跳过验证"><n-switch size="small" v-model:value="form.insecure" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-form-item label="TLS 指纹"><n-select size="small" v-model:value="form.fingerprint" :options="fingerprintOptions" clearable /></n-form-item></n-gi>
           </template>
 
           <!-- Reality 字段 (VLESS/AnyTLS) -->
           <template v-if="['vless', 'anytls'].includes(form.type)">
-            <n-gi><n-form-item label="Reality"><n-switch v-model:value="form.reality" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="Reality"><n-switch size="small" v-model:value="form.reality" /></n-form-item></n-gi>
             <template v-if="form.reality">
-              <n-gi><n-form-item label="公钥"><n-input v-model:value="form.reality_public_key" placeholder="Reality Public Key (pbk)" /></n-form-item></n-gi>
-              <n-gi><n-form-item label="Short ID"><n-input v-model:value="form.reality_short_id" placeholder="Reality Short ID (sid)" /></n-form-item></n-gi>
+              <n-gi><n-form-item label="公钥"><n-input size="small" v-model:value="form.reality_public_key" placeholder="Reality Public Key (pbk)" /></n-form-item></n-gi>
+              <n-gi><n-form-item label="Short ID"><n-input size="small" v-model:value="form.reality_short_id" placeholder="Reality Short ID (sid)" /></n-form-item></n-gi>
             </template>
           </template>
 
           <!-- 传输层设置 -->
           <template v-if="['vmess', 'trojan', 'vless'].includes(form.type)">
-            <n-gi :span="2"><n-divider style="margin: 8px 0">传输层设置</n-divider></n-gi>
-            <n-gi><n-form-item label="传输协议"><n-select v-model:value="form.network" :options="networkOptions" clearable placeholder="tcp (默认)" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-divider size="small" style="margin: 8px 0">传输层设置</n-divider></n-gi>
+            <n-gi><n-form-item label="传输协议"><n-select size="small" v-model:value="form.network" :options="networkOptions" clearable placeholder="tcp (默认)" /></n-form-item></n-gi>
             <template v-if="['ws', 'httpupgrade', 'xhttp'].includes(form.network)">
-              <n-gi><n-form-item :label="form.network === 'xhttp' ? 'XHTTP 路径' : 'WS 路径'"><n-input v-model:value="form.ws_path" placeholder="/" /></n-form-item></n-gi>
-              <n-gi :span="2"><n-form-item :label="form.network === 'httpupgrade' ? 'HTTPUpgrade Host' : (form.network === 'xhttp' ? 'XHTTP Host' : 'WS Host')"><n-input v-model:value="form.ws_host" placeholder="可选，默认使用服务器地址" /></n-form-item></n-gi>
+              <n-gi><n-form-item :label="form.network === 'xhttp' ? 'XHTTP 路径' : 'WS 路径'"><n-input size="small" v-model:value="form.ws_path" placeholder="/" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item :label="form.network === 'httpupgrade' ? 'HTTPUpgrade Host' : (form.network === 'xhttp' ? 'XHTTP Host' : 'WS Host')"><n-input size="small" v-model:value="form.ws_host" placeholder="可选，默认使用服务器地址" /></n-form-item></n-gi>
             </template>
             <template v-if="form.network === 'xhttp'">
-              <n-gi :span="2"><n-form-item label="XHTTP Mode"><n-input v-model:value="form.xhttp_mode" placeholder="可选，如 auto / packet-up / stream-up" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item label="XHTTP Mode"><n-input size="small" v-model:value="form.xhttp_mode" placeholder="可选，如 auto / packet-up / stream-up" /></n-form-item></n-gi>
             </template>
             <template v-if="form.network === 'grpc'">
-              <n-gi :span="2"><n-form-item label="gRPC 服务名"><n-input v-model:value="form.grpc_service_name" placeholder="如 grpc、GunService、/custom/Tun" /></n-form-item></n-gi>
-              <n-gi :span="2"><n-form-item label="gRPC Authority"><n-input v-model:value="form.grpc_authority" placeholder="可选，覆盖 :authority / Host" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item label="gRPC 服务名"><n-input size="small" v-model:value="form.grpc_service_name" placeholder="如 grpc、GunService、/custom/Tun" /></n-form-item></n-gi>
+              <n-gi :span="2"><n-form-item label="gRPC Authority"><n-input size="small" v-model:value="form.grpc_authority" placeholder="可选，覆盖 :authority / Host" /></n-form-item></n-gi>
             </template>
           </template>
 
           <!-- 链式代理设置 -->
-          <n-gi :span="2"><n-divider style="margin: 8px 0">链式代理</n-divider></n-gi>
+          <n-gi :span="2"><n-divider size="small" style="margin: 8px 0">链式代理</n-divider></n-gi>
           <n-gi :span="2">
-            <n-alert type="info" style="margin-bottom: 8px">
+            <n-alert size="small" type="info" style="margin-bottom: 8px">
               选择一个或多个节点作为前置代理，流量将按顺序经过这些节点后再通过当前节点到达目标。支持嵌套链式（可选择已有的链式节点），自动检测循环引用。
             </n-alert>
           </n-gi>
@@ -600,7 +596,7 @@
             <n-form-item label="链式节点">
               <n-space vertical :size="8" style="width: 100%">
                 <n-space :size="8" align="center">
-                  <n-select
+                  <n-select size="small"
                     v-model:value="form.chain"
                     multiple
                     filterable
@@ -628,85 +624,85 @@
           </template>
         </n-grid>
       </n-form>
-      <template #footer><n-space justify="end"><n-button @click="showEditModal = false">取消</n-button><n-button type="primary" @click="saveOutbound">保存</n-button></n-space></template>
+      <template #footer><n-space justify="end"><n-button size="small" @click="showEditModal = false">取消</n-button><n-button size="small" type="primary" @click="saveOutbound">保存</n-button></n-space></template>
     </n-modal>
 
-    <n-modal v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
+    <n-modal size="small" v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
       <n-space vertical>
-        <n-alert type="warning">封禁后该节点不会再被负载均衡和自动候选池选中，但你手动指定单节点时仍可使用。</n-alert>
-        <n-form :model="autoSelectBlockForm" label-placement="left" label-width="96">
+        <n-alert size="small" type="warning">封禁后该节点不会再被负载均衡和自动候选池选中，但你手动指定单节点时仍可使用。</n-alert>
+        <n-form size="small" :model="autoSelectBlockForm" label-placement="left" label-width="96">
           <n-form-item :label="autoSelectBlockTargetNames.length > 1 ? '节点数量' : '节点'">
-            <n-input v-if="autoSelectBlockTargetNames.length <= 1" :value="autoSelectBlockForm.name" readonly />
-            <n-input v-else :value="`已选择 ${autoSelectBlockTargetNames.length} 个节点`" readonly />
+            <n-input size="small" v-if="autoSelectBlockTargetNames.length <= 1" :value="autoSelectBlockForm.name" readonly />
+            <n-input size="small" v-else :value="`已选择 ${autoSelectBlockTargetNames.length} 个节点`" readonly />
           </n-form-item>
-          <n-alert v-if="autoSelectBlockTargetNames.length > 1" type="info">
+          <n-alert size="small" v-if="autoSelectBlockTargetNames.length > 1" type="info">
             {{ autoSelectBlockTargetSummary }}
           </n-alert>
           <n-form-item label="原因">
-            <n-input v-model:value="autoSelectBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
+            <n-input size="small" v-model:value="autoSelectBlockForm.reason" placeholder="例如：被封禁IP / 报VPN / 不稳定" clearable />
           </n-form-item>
           <n-space :size="6" wrap>
             <n-button v-for="reason in autoSelectBlockReasonOptions" :key="reason" size="small" secondary @click="autoSelectBlockForm.reason = reason">{{ reason }}</n-button>
           </n-space>
           <n-form-item label="时长" style="margin-top: 8px">
-            <n-select v-model:value="autoSelectBlockForm.duration" :options="autoSelectBlockDurationOptions" />
+            <n-select size="small" v-model:value="autoSelectBlockForm.duration" :options="autoSelectBlockDurationOptions" />
           </n-form-item>
           <n-form-item v-if="autoSelectBlockForm.duration === 'custom'" label="到期时间">
-            <n-date-picker v-model:value="autoSelectBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
+            <n-date-picker size="small" v-model:value="autoSelectBlockForm.customExpiresAt" type="datetime" clearable style="width: 100%" />
           </n-form-item>
-          <n-alert v-if="autoSelectBlockPreviewText" type="info">{{ autoSelectBlockPreviewText }}</n-alert>
+          <n-alert size="small" v-if="autoSelectBlockPreviewText" type="info">{{ autoSelectBlockPreviewText }}</n-alert>
         </n-form>
       </n-space>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showAutoSelectBlockModal = false">取消</n-button>
-          <n-button type="error" :loading="savingAutoSelectBlock" @click="submitAutoSelectBlock">{{ autoSelectBlockTargetNames.length > 1 ? '确认批量封禁' : '确认封禁' }}</n-button>
+          <n-button size="small" @click="showAutoSelectBlockModal = false">取消</n-button>
+          <n-button size="small" type="error" :loading="savingAutoSelectBlock" @click="submitAutoSelectBlock">{{ autoSelectBlockTargetNames.length > 1 ? '确认批量封禁' : '确认封禁' }}</n-button>
         </n-space>
       </template>
     </n-modal>
 
     <!-- 导入 Modal -->
-    <n-modal v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
-      <n-alert type="info" style="margin-bottom: 12px">
+    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
+      <n-alert size="small" type="info" style="margin-bottom: 12px">
         支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、tuic://、hysteria://、hysteria2://、hy2://，也支持 Clash/Mihomo YAML 订阅<br/>
         每行一个链接，支持批量导入，支持 Base64 编码的订阅内容
       </n-alert>
       <n-form-item label="导入分组" style="margin-bottom: 12px">
-        <n-auto-complete 
-          v-model:value="importGroupName" 
-          :options="groupAutoCompleteOptions" 
-          placeholder="输入分组名称（可选，留空则不设置分组）" 
-          clearable 
+        <n-auto-complete size="small"
+          v-model:value="importGroupName"
+          :options="groupAutoCompleteOptions"
+          placeholder="输入分组名称（可选，留空则不设置分组）"
+          clearable
         />
       </n-form-item>
-      <n-tabs type="line" animated>
+      <n-tabs size="small" type="line" animated>
         <n-tab-pane name="links" tab="链接导入">
-          <n-input v-model:value="importText" type="textarea" :rows="8" placeholder="粘贴分享链接，每行一个..." />
+          <n-input size="small" v-model:value="importText" type="textarea" :rows="8" placeholder="粘贴分享链接，每行一个..." />
         </n-tab-pane>
         <n-tab-pane name="subscription" tab="订阅导入">
           <n-space vertical :size="10">
-            <n-input v-model:value="subscriptionUrl" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" placeholder="https://example.com/subscribe" />
+            <n-input size="small" v-model:value="subscriptionUrl" type="textarea" :autosize="{ minRows: 1, maxRows: 4 }" placeholder="https://example.com/subscribe" />
             <n-space align="center" :size="8" wrap>
               <n-button size="small" @click="showSubProxySelectorModal = true">
                 {{ subscriptionProxy ? `代理: ${subscriptionProxy}` : '直连 (不使用代理)' }}
               </n-button>
               <n-button type="primary" size="small" @click="fetchSubscription" :loading="fetchingSubscription">获取订阅</n-button>
             </n-space>
-            <n-input v-model:value="importText" type="textarea" :autosize="{ minRows: 6, maxRows: 20 }" placeholder="获取订阅后内容显示在此处..." />
+            <n-input size="small" v-model:value="importText" type="textarea" :autosize="{ minRows: 6, maxRows: 20 }" placeholder="获取订阅后内容显示在此处..." />
           </n-space>
         </n-tab-pane>
       </n-tabs>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="pasteImport">从剪贴板粘贴</n-button>
-          <n-button type="primary" @click="importNodes">导入</n-button>
-          <n-button @click="showImportModal = false">取消</n-button>
+          <n-button size="small" @click="pasteImport">从剪贴板粘贴</n-button>
+          <n-button size="small" type="primary" @click="importNodes">导入</n-button>
+          <n-button size="small" @click="showImportModal = false">取消</n-button>
         </n-space>
       </template>
     </n-modal>
 
     <!-- 订阅代理选择器 Modal -->
-    <n-modal v-model:show="showSubProxySelectorModal" preset="card" title="选择获取订阅使用的代理" style="width: 1100px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showSubProxySelectorModal" preset="card" title="选择获取订阅使用的代理" style="width: 1100px; max-width: 95vw">
       <n-space vertical :size="8">
         <n-space align="center" :size="8" wrap>
           <n-input v-model:value="subProxySearch" size="small" placeholder="搜索节点..." clearable style="width: 200px" />
@@ -730,65 +726,65 @@
     </n-modal>
 
     <!-- 测试选项 Modal -->
-    <n-modal v-model:show="showTestOptionsModal" preset="card" title="连接测试" style="width: 600px">
-      <n-form label-placement="left" label-width="100">
+    <n-modal size="small" v-model:show="showTestOptionsModal" preset="card" title="连接测试" style="width: 600px">
+      <n-form size="small" label-placement="left" label-width="100">
         <n-form-item label="HTTP测试目标">
-          <n-checkbox-group v-model:value="selectedTargets">
+          <n-checkbox-group size="small" v-model:value="selectedTargets">
             <n-space vertical>
-              <n-checkbox value="cloudflare">Cloudflare (1.1.1.1)</n-checkbox>
-              <n-checkbox value="google">Google</n-checkbox>
-              <n-checkbox value="baidu">百度</n-checkbox>
-              <n-checkbox value="github">GitHub</n-checkbox>
-              <n-checkbox value="youtube">YouTube</n-checkbox>
-              <n-checkbox value="twitter">Twitter</n-checkbox>
+              <n-checkbox size="small" value="cloudflare">Cloudflare (1.1.1.1)</n-checkbox>
+              <n-checkbox size="small" value="google">Google</n-checkbox>
+              <n-checkbox size="small" value="baidu">百度</n-checkbox>
+              <n-checkbox size="small" value="github">GitHub</n-checkbox>
+              <n-checkbox size="small" value="youtube">YouTube</n-checkbox>
+              <n-checkbox size="small" value="twitter">Twitter</n-checkbox>
             </n-space>
           </n-checkbox-group>
         </n-form-item>
-        <n-divider style="margin: 12px 0" />
+        <n-divider size="small" style="margin: 12px 0" />
         <n-form-item label="UDP(MCBE)">
-          <n-switch v-model:value="enableDetailedUdp" />
+          <n-switch size="small" v-model:value="enableDetailedUdp" />
           <span style="margin-left: 8px; color: #999">通过代理测试游戏 UDP</span>
         </n-form-item>
         <template v-if="enableDetailedUdp">
           <n-form-item label="UDP地址">
-            <n-input v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
+            <n-input size="small" v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
           </n-form-item>
         </template>
-        <n-divider style="margin: 12px 0" />
+        <n-divider size="small" style="margin: 12px 0" />
         <n-form-item label="自定义HTTP">
-          <n-switch v-model:value="enableCustomHttp" />
+          <n-switch size="small" v-model:value="enableCustomHttp" />
         </n-form-item>
         <template v-if="enableCustomHttp">
           <n-form-item label="直连测试">
-            <n-switch v-model:value="customHttpConfig.directTest" />
+            <n-switch size="small" v-model:value="customHttpConfig.directTest" />
             <span style="margin-left: 8px; color: #999">不通过代理</span>
           </n-form-item>
           <n-form-item label="请求方法">
-            <n-select v-model:value="customHttpConfig.method" :options="httpMethodOptions" style="width: 120px" />
+            <n-select size="small" v-model:value="customHttpConfig.method" :options="httpMethodOptions" style="width: 120px" />
           </n-form-item>
           <n-form-item label="URL">
-            <n-input v-model:value="customHttpConfig.url" placeholder="https://httpbin.org/get" />
+            <n-input size="small" v-model:value="customHttpConfig.url" placeholder="https://httpbin.org/get" />
           </n-form-item>
           <n-form-item label="请求头">
-            <n-input v-model:value="customHttpConfig.headersText" type="textarea" :rows="2" placeholder="Header-Name: value (每行一个)" />
+            <n-input size="small" v-model:value="customHttpConfig.headersText" type="textarea" :rows="2" placeholder="Header-Name: value (每行一个)" />
           </n-form-item>
           <n-form-item v-if="['POST', 'PUT', 'PATCH'].includes(customHttpConfig.method)" label="请求体">
-            <n-input v-model:value="customHttpConfig.body" type="textarea" :rows="3" placeholder="请求体内容" />
+            <n-input size="small" v-model:value="customHttpConfig.body" type="textarea" :rows="3" placeholder="请求体内容" />
           </n-form-item>
         </template>
       </n-form>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showTestOptionsModal = false">取消</n-button>
-          <n-button type="primary" @click="runDetailedTest">开始测试</n-button>
+          <n-button size="small" @click="showTestOptionsModal = false">取消</n-button>
+          <n-button size="small" type="primary" @click="runDetailedTest">开始测试</n-button>
         </n-space>
       </template>
     </n-modal>
 
     <!-- 测试结果 Modal -->
-    <n-modal v-model:show="showTestResultModal" preset="card" title="测试结果" style="width: 900px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showTestResultModal" preset="card" title="测试结果" style="width: 900px; max-width: 95vw">
       <template v-if="testResultData">
-        <n-alert :type="testResultData.success ? 'success' : 'warning'" style="margin-bottom: 16px">
+        <n-alert size="small" :type="testResultData.success ? 'success' : 'warning'" style="margin-bottom: 16px">
           {{ testResultData.success ? '所有测试通过' : '部分测试失败' }}
           <template v-if="testResultData.error"> - {{ testResultData.error }}</template>
         </n-alert>
@@ -808,7 +804,7 @@
               <template #icon><n-icon :component="RefreshOutline" /></template>
             </n-button>
           </div>
-          <n-descriptions :column="3" bordered style="margin-bottom: 16px">
+          <n-descriptions size="small" :column="3" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="服务器">{{ testResultData.ping_test.host }}</n-descriptions-item>
             <n-descriptions-item label="延迟">{{ testResultData.ping_test.latency_ms }} ms</n-descriptions-item>
             <n-descriptions-item label="状态">
@@ -834,7 +830,7 @@
               <template #icon><n-icon :component="RefreshOutline" /></template>
             </n-button>
           </div>
-          <n-descriptions :column="2" bordered style="margin-bottom: 16px">
+          <n-descriptions size="small" :column="2" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="目标">{{ testResultData.udp_test.target }}</n-descriptions-item>
             <n-descriptions-item label="延迟">{{ testResultData.udp_test.latency_ms }} ms</n-descriptions-item>
             <n-descriptions-item label="状态">
@@ -872,7 +868,7 @@
               <template #icon><n-icon :component="RefreshOutline" /></template>
             </n-button>
           </div>
-          <n-descriptions :column="2" bordered style="margin-bottom: 16px">
+          <n-descriptions size="small" :column="2" bordered style="margin-bottom: 16px">
             <n-descriptions-item label="URL" :span="2">{{ testResultData.custom_http.url }}</n-descriptions-item>
             <n-descriptions-item label="状态">
               <n-tag :type="testResultData.custom_http.success ? 'success' : 'error'" size="small">
@@ -905,22 +901,22 @@
           </template>
         </template>
       </template>
-      <n-spin v-else size="large" :description="testLoading" />
+      <n-spin v-else size="small" :description="testLoading" />
     </n-modal>
 
     <!-- MCBE UDP 测试结果 Modal -->
-    <n-modal v-model:show="showMcbeResultModal" preset="card" title="UDP 测试 (MCBE 服务器)" style="width: 500px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showMcbeResultModal" preset="card" title="UDP 测试 (MCBE 服务器)" style="width: 500px; max-width: 95vw">
       <n-form-item label="测试地址" style="margin-bottom: 16px">
-        <n-input v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
+        <n-input size="small" v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
       </n-form-item>
       <template v-if="mcbeTestLoading">
-        <n-spin size="large" description="正在测试 UDP 连接..." />
+        <n-spin size="small" description="正在测试 UDP 连接..." />
       </template>
       <template v-else-if="mcbeTestResult">
-        <n-alert :type="mcbeTestResult.success ? 'success' : 'error'" style="margin-bottom: 16px">
+        <n-alert size="small" :type="mcbeTestResult.success ? 'success' : 'error'" style="margin-bottom: 16px">
           {{ mcbeTestResult.success ? 'UDP 连接成功' : 'UDP 连接失败' }}
         </n-alert>
-        <n-descriptions :column="1" bordered>
+        <n-descriptions size="small" :column="1" bordered>
           <n-descriptions-item label="目标">{{ mcbeTestResult.target }}</n-descriptions-item>
           <n-descriptions-item label="延迟">{{ mcbeTestResult.latency_ms }} ms</n-descriptions-item>
           <n-descriptions-item v-if="mcbeTestResult.server_name" label="服务器名">{{ mcbeTestResult.server_name }}</n-descriptions-item>
@@ -933,44 +929,44 @@
       </template>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="testMCBE(testingName)" :loading="mcbeTestLoading">重新测试</n-button>
-          <n-button @click="showMcbeResultModal = false">关闭</n-button>
+          <n-button size="small" @click="testMCBE(testingName)" :loading="mcbeTestLoading">重新测试</n-button>
+          <n-button size="small" @click="showMcbeResultModal = false">关闭</n-button>
         </n-space>
       </template>
     </n-modal>
 
     <!-- 批量测试配置 Modal (HTTP/UDP/ALL) -->
-    <n-modal v-model:show="showBatchTestModal" preset="card" :title="batchTestModalTitle" style="width: 500px">
-      <n-form label-placement="left" label-width="100">
+    <n-modal size="small" v-model:show="showBatchTestModal" preset="card" :title="batchTestModalTitle" style="width: 500px">
+      <n-form size="small" label-placement="left" label-width="100">
         <n-form-item label="节点数量">
-          <n-tag type="info">{{ checkedRowKeys.length }} 个节点</n-tag>
+          <n-tag size="small" type="info">{{ checkedRowKeys.length }} 个节点</n-tag>
         </n-form-item>
         <template v-if="batchTestType === 'all'">
-          <n-alert type="info" style="margin-bottom: 12px">
+          <n-alert size="small" type="info" style="margin-bottom: 12px">
             将依次执行 TCP、HTTP、UDP 测试，共 {{ checkedRowKeys.length * 3 }} 个请求
           </n-alert>
         </template>
         <template v-if="batchTestType === 'http' || batchTestType === 'all'">
           <n-form-item label="HTTP 目标">
-            <n-select v-model:value="batchHttpTarget" :options="batchHttpTargetOptions" />
+            <n-select size="small" v-model:value="batchHttpTarget" :options="batchHttpTargetOptions" />
           </n-form-item>
           <n-form-item v-if="batchHttpTarget === 'custom'" label="自定义 URL">
-            <n-input v-model:value="batchHttpCustomUrl" placeholder="https://example.com" />
+            <n-input size="small" v-model:value="batchHttpCustomUrl" placeholder="https://example.com" />
           </n-form-item>
         </template>
         <template v-if="batchTestType === 'udp' || batchTestType === 'all'">
           <n-form-item label="MCBE 地址">
-            <n-input v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" />
+            <n-input size="small" v-model:value="batchMcbeAddress" placeholder="mco.cubecraft.net:19132" />
           </n-form-item>
         </template>
-        <n-alert type="info" style="margin-top: 8px">
+        <n-alert size="small" type="info" style="margin-top: 8px">
           所有请求将同时发出，先返回的结果会立即更新到表格
         </n-alert>
       </n-form>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showBatchTestModal = false">取消</n-button>
-          <n-button type="primary" @click="startBatchTest">开始测试</n-button>
+          <n-button size="small" @click="showBatchTestModal = false">取消</n-button>
+          <n-button size="small" type="primary" @click="startBatchTest">开始测试</n-button>
         </n-space>
       </template>
     </n-modal>
