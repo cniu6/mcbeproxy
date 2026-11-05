@@ -18,9 +18,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/session"
 )
 
 // NetherNet transparent relay.
@@ -68,7 +70,20 @@ var netherNetPacketPool = sync.Pool{New: func() any {
 	return &b
 }}
 
+type netherNetRelayDependencies struct {
+	verifier   netherNetIdentityVerifier
+	sessionMgr *session.SessionManager
+}
+
+type netherNetBridgeInfo struct {
+	offer    []byte
+	identity netherNetIdentityObservation
+}
+
 type netherNetRelay struct {
+	netherNetRelayDependencies
+	ctx         context.Context
+	cancel      context.CancelFunc
 	serverID    string
 	conf        func() *config.ServerConfig // live server config of the owning proxy (hot-reloaded)
 	outboundMgr OutboundManager
@@ -82,6 +97,7 @@ type netherNetRelay struct {
 	sessions sync.Map // server ufrag -> *netherNetSession
 	byAddr   sync.Map // client netip.AddrPort -> *netherNetSession
 	count    atomic.Int32
+	offers   chan struct{} // 在读取 SDP 和观察身份前限制并发半连接
 
 	upstreamMu      sync.Mutex
 	upstreamBase    string
@@ -94,6 +110,7 @@ type netherNetRelay struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 	lifeMu    sync.Mutex // guards stopped vs. wg.Add so no goroutine starts after Close waits
+	draining  bool       // 重建前阻止新 offer 发布，活动连接检查和标记使用同一锁
 	stopped   bool
 
 	firstProbe     chan struct{} // closed when the first upstream probe has finished
@@ -101,13 +118,24 @@ type netherNetRelay struct {
 }
 
 type netherNetSession struct {
-	ufrag      string
-	upstream   net.PacketConn
-	mediaAddr  net.Addr
-	created    time.Time
-	lastActive atomic.Int64
-	client     atomic.Pointer[netip.AddrPort]
-	bound      atomic.Bool
+	id                  string
+	identity            netherNetIdentityObservation
+	binding             netherNetICEBinding
+	ingressMu           sync.Mutex // 单会话入队与关停互斥，防止 drain 后仍归还不了缓冲
+	syncMu              sync.Mutex // 保护统一会话注册、累计同步与关闭，不能复活已关闭的会话
+	activeSession       *session.Session
+	closed              bool
+	closeReason         string
+	workers             sync.WaitGroup
+	bindingTransactions map[[12]byte]netip.AddrPort // 在 lifeMu 下限制已认证 STUN 跨地址重放
+	bindingOrder        [][12]byte
+	ufrag               string
+	upstream            net.PacketConn
+	mediaAddr           net.Addr
+	created             time.Time
+	lastActive          atomic.Int64
+	client              atomic.Pointer[netip.AddrPort]
+	bound               atomic.Bool
 
 	addrsMu sync.Mutex
 	addrs   []netip.AddrPort
@@ -140,7 +168,7 @@ type netherNetProbeResult struct {
 
 // newNetherNetRelay starts the signaling listener on the TCP twin of udp's
 // port. The caller routes datagrams through handleDatagram.
-func newNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) (*netherNetRelay, error) {
+func newNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn, deps ...netherNetRelayDependencies) (*netherNetRelay, error) {
 	if !conf().IsDirectConnection() && outboundMgr == nil {
 		return nil, fmt.Errorf("nethernet relay: outbound manager unavailable for %s", serverID)
 	}
@@ -162,6 +190,11 @@ func newNetherNetRelay(serverID string, conf func() *config.ServerConfig, outbou
 		tcp:         ln,
 		done:        make(chan struct{}),
 		firstProbe:  make(chan struct{}),
+		offers:      make(chan struct{}, 32),
+	}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+	if len(deps) > 0 {
+		r.netherNetRelayDependencies = deps[0]
 	}
 	r.httpClient = &http.Client{
 		Transport: &http.Transport{
@@ -201,6 +234,7 @@ func (r *netherNetRelay) Close() error {
 	}
 	r.closeOnce.Do(func() {
 		close(r.done)
+		r.cancel()
 		r.lifeMu.Lock()
 		r.stopped = true
 		r.lifeMu.Unlock()
@@ -222,11 +256,16 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 	if r == nil || r.count.Load() == 0 {
 		return false
 	}
-	if v, ok := r.byAddr.Load(from); ok {
-		v.(*netherNetSession).fromClient(pkt, from)
+	ufrag, isBinding := stunRequestServerUfrag(pkt)
+	if v, ok := r.byAddr.Load(from); ok && !isBinding {
+		s := v.(*netherNetSession)
+		// 旧候选地址不能用任意密文抢回 NAT 重绑定后的下行目的地址。
+		if current := s.client.Load(); current != nil && *current == from {
+			s.fromClient(pkt, from)
+		}
 		return true
 	}
-	ufrag, ok := stunRequestServerUfrag(pkt)
+	ok := isBinding
 	if !ok {
 		return false
 	}
@@ -235,24 +274,76 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 		return false
 	}
 	s := v.(*netherNetSession)
+	if s.binding.CheckClientBinding(pkt) != nil {
+		return true
+	}
+	r.lifeMu.Lock()
+	defer r.lifeMu.Unlock()
+	select {
+	case <-s.done:
+		return true
+	default:
+	}
+	if r.stopped {
+		return true
+	}
+	if owner, occupied := r.byAddr.Load(from); occupied && owner != s {
+		return true
+	}
+	var transaction [12]byte
+	copy(transaction[:], pkt[8:20])
+	if s.bindingTransactions == nil {
+		s.bindingTransactions = make(map[[12]byte]netip.AddrPort)
+	}
+	if previous, exists := s.bindingTransactions[transaction]; exists {
+		current := s.client.Load()
+		if previous != from || (current != nil && *current != from) {
+			return true
+		}
+	} else {
+		if len(s.bindingOrder) == 64 {
+			delete(s.bindingTransactions, s.bindingOrder[0])
+			s.bindingOrder = s.bindingOrder[1:]
+		}
+		s.bindingOrder = append(s.bindingOrder, transaction)
+		s.bindingTransactions[transaction] = from
+	}
 	// A client binds a handful of addresses (one per ICE candidate, plus NAT
 	// rebinding); cap it so nobody can grow a session's address list.
 	s.addrsMu.Lock()
-	if len(s.addrs) >= netherNetRelayMaxAddrsPerSession {
+	currentAddr, alreadyBound := r.byAddr.Load(from)
+	if len(s.addrs) >= netherNetRelayMaxAddrsPerSession && (!alreadyBound || currentAddr != s) {
 		s.addrsMu.Unlock()
 		return true // ours, but not bound: drop
 	}
-	s.addrs = append(s.addrs, from)
+	known := false
+	for _, addr := range s.addrs {
+		if addr == from {
+			known = true
+			break
+		}
+	}
+	if !known {
+		s.addrs = append(s.addrs, from)
+	}
 	s.addrsMu.Unlock()
 	r.byAddr.Store(from, s)
 	if s.bound.CompareAndSwap(false, true) {
 		logger.Info("NetherNet relay: client bound server=%s client=%s ufrag=%s media=%s", r.serverID, from, ufrag, s.mediaAddr)
 	}
 	s.fromClient(pkt, from)
+	r.registerMediaSession(s, from)
 	return true
 }
 
 func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
+	s.ingressMu.Lock()
+	defer s.ingressMu.Unlock()
+	select {
+	case <-s.done:
+		return
+	default:
+	}
 	s.lastActive.Store(time.Now().UnixNano())
 	if cur := s.client.Load(); cur == nil || *cur != from {
 		addr := from
@@ -273,12 +364,29 @@ func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
 
 func (r *netherNetRelay) forwardUpstream(s *netherNetSession) {
 	defer r.wg.Done()
+	defer s.workers.Done()
+	defer func() {
+		for {
+			select {
+			case packet := <-s.writeCh:
+				netherNetPacketPool.Put(packet.buf)
+			default:
+				return
+			}
+		}
+	}()
 	var writeDeadlineAt time.Time // refreshed only when under half the timeout is left
 	for {
 		select {
 		case <-s.done:
 			return
 		case p := <-s.writeCh:
+			select {
+			case <-s.done:
+				netherNetPacketPool.Put(p.buf)
+				return
+			default:
+			}
 			if now := time.Now(); writeDeadlineAt.Sub(now) < 125*time.Millisecond {
 				writeDeadlineAt = now.Add(250 * time.Millisecond)
 				_ = s.upstream.SetWriteDeadline(writeDeadlineAt)
@@ -298,6 +406,7 @@ func (r *netherNetRelay) forwardUpstream(s *netherNetSession) {
 
 func (r *netherNetRelay) forwardDownstream(s *netherNetSession) {
 	defer r.wg.Done()
+	defer s.workers.Done()
 	defer r.closeSession(s, "upstream closed")
 	buf := make([]byte, netherNetRelayPacketSize)
 	for {
@@ -338,6 +447,7 @@ func (r *netherNetRelay) sweep() {
 		case now := <-t.C:
 			r.sessions.Range(func(_, v any) bool {
 				s := v.(*netherNetSession)
+				r.syncSessionStats(s, now)
 				switch {
 				case !s.bound.Load() && now.Sub(s.created) > netherNetRelayUnboundTimeout:
 					r.closeSession(s, "client never reached the relay")
@@ -352,8 +462,15 @@ func (r *netherNetRelay) sweep() {
 
 func (r *netherNetRelay) closeSession(s *netherNetSession, reason string) {
 	s.closeOnce.Do(func() {
+		s.syncMu.Lock()
+		s.closed = true
+		s.closeReason = reason
+		s.ingressMu.Lock()
 		close(s.done)
+		s.ingressMu.Unlock()
+		s.syncMu.Unlock()
 		_ = s.upstream.Close()
+		r.lifeMu.Lock()
 		r.sessions.CompareAndDelete(s.ufrag, s)
 		s.addrsMu.Lock()
 		for _, a := range s.addrs {
@@ -361,6 +478,8 @@ func (r *netherNetRelay) closeSession(s *netherNetSession, reason string) {
 		}
 		s.addrsMu.Unlock()
 		r.count.Add(-1)
+		r.lifeMu.Unlock()
+		// 最终快照由发布时已注册的回收器等待双向转发退出后写入。
 		client := "-"
 		if c := s.client.Load(); c != nil {
 			client = c.String()
@@ -405,6 +524,18 @@ func (r *netherNetRelay) handleProbe(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
+	if !r.track(1) {
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer r.wg.Done()
+	select {
+	case r.offers <- struct{}{}:
+		defer func() { <-r.offers }()
+	default:
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	req.Close = true
 	networkID := req.PathValue("networkID")
 	// 新版规范将 NetworkID 定义为不透明字符串；校验交给目标服，不能
@@ -424,6 +555,16 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), netherNetRelayOfferTimeout)
 	defer cancel()
+
+	stop := context.AfterFunc(r.ctx, cancel)
+	defer stop()
+	identity := netherNetIdentityObservation{Status: "unavailable", ReasonCode: "verifier_unavailable"}
+	if r.verifier != nil {
+		observed, verifyErr := r.verifier.VerifyOffer(ctx, offer)
+		if verifyErr == nil {
+			identity = observed
+		}
+	}
 
 	base, err := r.upstream(ctx)
 	if errors.Is(err, errNetherNetUpstreamUnknown) {
@@ -467,7 +608,7 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	rewritten, err := r.bridge(ctx, req, string(answer))
+	rewritten, err := r.bridge(ctx, req, string(answer), netherNetBridgeInfo{offer: offer, identity: identity})
 	if err != nil {
 		logger.Warn("NetherNet relay: cannot bridge answer server=%s err=%v", r.serverID, err)
 		http.Error(w, "An error has occurred while handling this request", http.StatusInternalServerError)
@@ -480,7 +621,16 @@ func (r *netherNetRelay) handleOffer(w http.ResponseWriter, req *http.Request) {
 
 // bridge opens the upstream media leg for an SDP answer and returns the
 // answer with its candidates replaced by the relay's public address.
-func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer string) (string, error) {
+func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer string, infos ...netherNetBridgeInfo) (string, error) {
+	var binding netherNetICEBinding
+	identity := netherNetIdentityObservation{Status: "missing", ReasonCode: "identity_missing"}
+	if len(infos) > 0 {
+		var err error
+		if binding, err = newNetherNetICEBinding(infos[0].offer, []byte(answer)); err != nil {
+			return "", err
+		}
+		identity = infos[0].identity
+	}
 	ufrag, candidates := parseSDPICE(answer)
 	if ufrag == "" {
 		return "", errors.New("answer has no ice-ufrag")
@@ -499,6 +649,9 @@ func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer s
 		return "", fmt.Errorf("dial media %s: %w", media, err)
 	}
 	s := &netherNetSession{
+		id:        uuid.NewString(),
+		identity:  identity,
+		binding:   binding,
 		ufrag:     ufrag,
 		upstream:  upstream,
 		mediaAddr: mediaAddr,
@@ -512,20 +665,36 @@ func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer s
 	// here or seen (and closed) by that sweep. Publishing it after the check
 	// let Close miss it and hang in wg.Wait on its forwarders.
 	r.lifeMu.Lock()
-	if r.stopped {
+	if r.stopped || r.draining {
 		r.lifeMu.Unlock()
 		_ = upstream.Close()
 		return "", errors.New("relay stopped")
 	}
-	r.wg.Add(2)
-	old, replaced := r.sessions.Swap(ufrag, s)
+	// ufrag 冲突或重复 offer 不能替换现存连接，也不能转移地址所有权。
+	if r.count.Load() >= netherNetRelayMaxSessions {
+		r.lifeMu.Unlock()
+		_ = upstream.Close()
+		return "", errors.New("relay full")
+	}
+	if _, loaded := r.sessions.LoadOrStore(ufrag, s); loaded {
+		r.lifeMu.Unlock()
+		_ = upstream.Close()
+		return "", errors.New("ICE session collision")
+	}
+	r.wg.Add(3)
+	s.workers.Add(2)
 	r.count.Add(1)
 	r.lifeMu.Unlock()
-	if replaced {
-		r.closeSession(old.(*netherNetSession), "replaced by new offer") // decrements count
-	}
 	go r.forwardUpstream(s)
 	go r.forwardDownstream(s)
+	go func() {
+		defer r.wg.Done()
+		s.workers.Wait()
+		s.syncMu.Lock()
+		reason := s.closeReason
+		s.syncMu.Unlock()
+		r.finishMediaSession(s, reason)
+	}()
 	logger.Info("NetherNet relay: session created server=%s ufrag=%s media=%s advertised=%s route=%s",
 		r.serverID, ufrag, media, public, r.routeName())
 	return rewriteSDPCandidates(answer, public), nil
@@ -928,11 +1097,11 @@ func (c *rejectTLSConn) Read(p []byte) (int, error) {
 }
 
 // 透明UDP监听自动附带同号TCP信令；端口冲突只影响NetherNet入口，不关闭原UDP。
-func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn) *netherNetRelay {
+func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn, deps ...netherNetRelayDependencies) *netherNetRelay {
 	if conf() == nil || udp == nil {
 		return nil
 	}
-	r, err := newNetherNetRelay(serverID, conf, outboundMgr, udp)
+	r, err := newNetherNetRelay(serverID, conf, outboundMgr, udp, deps...)
 	if err != nil {
 		logger.Error("NetherNet relay unavailable for server %s: %v", serverID, err)
 		return nil
@@ -942,7 +1111,7 @@ func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outb
 
 // 热更新仅重新探测目标；入口随UDP监听启动/停止，不再维护独立启用状态。
 func syncNetherNetRelay(slot *atomic.Pointer[netherNetRelay], serverID string, conf func() *config.ServerConfig,
-	outboundMgr OutboundManager, udp *net.UDPConn, closed func() bool) {
+	outboundMgr OutboundManager, udp *net.UDPConn, closed func() bool, deps ...netherNetRelayDependencies) {
 	if udp == nil || closed() {
 		return
 	}
@@ -950,7 +1119,7 @@ func syncNetherNetRelay(slot *atomic.Pointer[netherNetRelay], serverID string, c
 		cur.configChanged()
 		return
 	}
-	r := startNetherNetRelay(serverID, conf, outboundMgr, udp)
+	r := startNetherNetRelay(serverID, conf, outboundMgr, udp, deps...)
 	if r == nil {
 		return
 	}

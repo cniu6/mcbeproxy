@@ -8,7 +8,7 @@
   <div class="users-editor">
     <n-space align="center" justify="space-between" wrap style="margin-bottom: 8px">
       <n-text depth="3" style="font-size: 12px">
-        {{ users.length ? `共 ${users.length} 个用户, 客户端用各自的账号密码连接同一端口` : '未添加用户: 端口按上面的单账号 (或免认证) 工作' }}
+        {{ users.length ? `共 ${users.length} 个用户, 客户端用各自的账号密码连接同一端口` : (secure ? '未添加附加用户：使用上方默认账号，HY2 / Mieru 同样支持多用户与独立线路' : '未添加用户: 端口按上面的单账号 (或免认证) 工作') }}
       </n-text>
       <n-space>
         <n-input v-if="users.length > 6" v-model:value="filter" size="small" placeholder="筛选用户" clearable style="width: 140px" />
@@ -42,7 +42,7 @@
             <n-gi>
               <n-form-item label="密码">
                 <n-input-group>
-                  <n-input size="small" v-model:value="item.user.password" type="password" show-password-on="click" placeholder="可留空" />
+                  <n-input size="small" v-model:value="item.user.password" type="password" show-password-on="click" :placeholder="secure ? '新建留空生成，编辑留空保留' : '可留空'" />
                   <n-button size="small" @click="item.user.password = randomPassword()">随机</n-button>
                 </n-input-group>
               </n-form-item>
@@ -151,6 +151,7 @@ import { formatBytes } from '../../api'
 
 const props = defineProps({
   users: { type: Array, required: true },
+  secure: { type: Boolean, default: false },
   stats: { type: Array, default: () => [] },
   isMobile: { type: Boolean, default: false },
   loadBalanceOptions: { type: Array, required: true },

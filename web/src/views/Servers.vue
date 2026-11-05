@@ -10,23 +10,24 @@
     </n-space>
     
     <n-card size="small" class="server-list-card">
-      <div class="table-wrapper">
         <n-data-table
           :columns="columns"
           :data="sortedServers"
           :bordered="false"
-          :scroll-x="1820"
+          :scroll-x="serverTableScrollX"
+          :scrollbar-props="{ trigger: 'none' }"
           size="small"
           class="server-table"
           :pagination="pagination"
           @update:page="p => pagination.page = p"
           @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }"
         />
-      </div>
     </n-card>
 
+    <LastDisconnectModal v-model:show="showLastDisconnect" :server="lastDisconnectServer" />
+
     <!-- 编辑 Modal -->
-    <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingId ? '编辑服务器' : '创建服务器'" style="width: 650px">
+    <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingId ? '编辑服务器' : '创建服务器'" style="width: min(650px, 98vw); max-width: 98vw">
       <n-form size="small" :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="服务器 ID" required><n-input size="small" v-model:value="form.id" :disabled="!!editingId" placeholder="唯一标识" /></n-form-item></n-gi>
@@ -44,6 +45,8 @@
           <n-gi><n-form-item label="启用"><n-switch size="small" v-model:value="form.enabled" /></n-form-item></n-gi>
           <n-gi><n-form-item label="Xbox 验证"><n-switch size="small" v-model:value="form.xbox_auth_enabled" /></n-form-item></n-gi>
           <n-gi :span="2" v-if="isRaknetProtocol"><n-form-item label="代理模式"><n-select size="small" v-model:value="form.proxy_mode" :options="proxyModeOptions" /></n-form-item></n-gi>
+          <n-gi :span="2" v-if="isAutoMode"><n-alert size="small" type="info">自动分流 RakNet / NetherNet。NetherNet 透明中继只观察信令身份，不代表已取得游戏 Login；验证不可用时匿名透传。</n-alert></n-gi>
+          <n-gi :span="2" v-else-if="usesRawUDPTransport"><n-alert size="small" type="warning">Raw UDP 仅处理 RakNet。旧实例若依赖隐式 NetherNet，需等待连接空闲后明确选择「自动（RakNet / NetherNet）」，旧配置不会自动迁移。</n-alert></n-gi>
           <template v-if="isNetherNetMode">
             <n-gi :span="2">
               <n-alert size="small" type="warning">NetherNet 需要 HTTPS 信令、TLS 证书/私钥和上游 HTTPS 信令 URL；Raw UDP 仍只用于 RakNet。</n-alert>
@@ -319,7 +322,7 @@
                 </div>
               </div>
             </div>
-            <n-modal size="small" v-model:show="showCurrentNodeBlockModal" preset="card" title="封禁当前节点" style="width: 520px; max-width: 96vw">
+            <n-modal size="small" v-model:show="showCurrentNodeBlockModal" preset="card" title="封禁当前节点" style="width: min(520px, 98vw); max-width: 98vw">
               <n-space vertical>
                 <n-alert size="small" type="warning">该操作只会让当前节点退出自动候选池，不会强行禁用节点本身。</n-alert>
                 <n-form size="small" :model="currentNodeBlockForm" label-placement="left" label-width="96">
@@ -354,7 +357,7 @@
                 </n-space>
               </template>
             </n-modal>
-            <n-modal size="small" v-model:show="showFinalServerLoadBalanceModal" preset="card" :title="finalServerLoadBalanceModalTitle" style="width: 100vw; max-width: 1800px">
+            <n-modal class="app-modal-workspace" size="small" v-model:show="showFinalServerLoadBalanceModal" preset="card" :title="finalServerLoadBalanceModalTitle" style="width: min(1800px, 98vw); max-width: 98vw">
               <n-space vertical>
                 <n-alert size="small" type="info">
                   自动Ping的部分扫描范围 = 当前最终服务器 + 额外 Top {{ finalServerTopCandidateLimit }} 候选。额外 Top N 只按当前延迟类型的已缓存样本计算；还没测到的节点会显示为 “-”，等待后续自动或手动测试补样本。
@@ -402,6 +405,7 @@
                 <n-alert size="small" v-else-if="!finalServerNodeLatencyLoading && !finalServerHasRuntimeLatencySamples" type="warning">
                   当前延迟类型还没有这台服务器的自动Ping样本，所以 Top N 暂时无法按真实延迟展示。你可以先手动点 TCP / HTTP / UDP 补样本。
                 </n-alert>
+                <NodeFilters v-model="finalNodeFilter" :nodes="finalServerCandidates" />
                 <n-space align="center" wrap>
                   <n-button size="small" v-if="finalServerCandidateCheckedKeys.length > 0" secondary @click="finalServerCandidateCheckedKeys = []">清空选择</n-button>
                   <n-dropdown v-if="finalServerCandidateCheckedKeys.length > 0" trigger="click" :options="batchTestOptions" @select="handleFinalServerCandidatesBatchTest">
@@ -477,7 +481,7 @@
     </n-modal>
 
     <!-- 导出 Modal -->
-    <n-modal size="small" v-model:show="showExportModal" preset="card" title="批量导出服务器" style="width: 700px">
+    <n-modal size="small" v-model:show="showExportModal" preset="card" title="批量导出服务器" style="width: min(700px, 98vw); max-width: 98vw">
       <n-input size="small" v-model:value="exportJson" type="textarea" :rows="15" readonly />
       <template #footer>
         <n-space justify="end">
@@ -489,7 +493,7 @@
     </n-modal>
 
     <!-- 代理选择器 Modal -->
-    <n-modal size="small" v-model:show="showProxySelector" preset="card" title="快速切换代理节点" style="width: 1400px; max-width: 95vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showProxySelector" preset="card" title="快速切换代理节点" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-spin size="small" :show="proxySelectorLoading">
         <div class="toolbar-stack">
           <div class="toolbar-panel">
@@ -665,7 +669,7 @@
     </n-modal>
 
     <!-- 导入 Modal -->
-    <n-modal size="small" v-model:show="showImportModal" preset="card" title="批量导入服务器" style="width: 700px">
+    <n-modal size="small" v-model:show="showImportModal" preset="card" title="批量导入服务器" style="width: min(700px, 98vw); max-width: 98vw">
       <n-alert size="small" type="info" style="margin-bottom: 12px">支持单个服务器对象或服务器数组 JSON 格式</n-alert>
       <n-input size="small" v-model:value="importJson" type="textarea" :rows="12" placeholder="粘贴 JSON 配置..." />
       <template #footer>
@@ -681,7 +685,7 @@
     </n-modal>
 
     <!-- 表单代理选择器 Modal -->
-    <n-modal size="small" v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-spin size="small" :show="formProxySelectorLoading">
         <!-- 选择模式 -->
         <n-space style="margin-bottom: 16px" align="center">
@@ -842,7 +846,7 @@
     </n-modal>
 
     <!-- 代理节点详情弹窗 -->
-    <n-modal size="small" v-model:show="showProxyDetailModal" preset="card" :title="proxyDetailTitle" style="width: 900px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showProxyDetailModal" preset="card" :title="proxyDetailTitle" style="width: min(900px, 98vw); max-width: 98vw">
       <template v-if="proxyDetailType === 'single'">
         <!-- 单节点完整详情 -->
         <n-tabs size="small" type="line" animated v-if="proxyDetailData">
@@ -1017,7 +1021,7 @@
     </n-modal>
 
     <!-- 单节点完整详情弹窗（独立弹窗） -->
-    <n-modal size="small" v-model:show="showSingleNodeModal" preset="card" :title="singleNodeData?.name || '节点详情'" style="width: 850px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showSingleNodeModal" preset="card" :title="singleNodeData?.name || '节点详情'" style="width: min(850px, 98vw); max-width: 98vw">
       <n-tabs size="small" type="line" animated v-if="singleNodeData">
         <n-tab-pane name="info" tab="配置与延迟">
           <!-- 延迟测试区域 -->
@@ -1140,7 +1144,7 @@
       </template>
     </ServerLatencyHistoryModal>
 
-    <n-modal size="small" v-model:show="showServerNodeBlockModal" preset="card" :title="serverNodeBlockModalTitle" style="width: 920px; max-width: 96vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showServerNodeBlockModal" preset="card" :title="serverNodeBlockModalTitle" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical>
         <n-alert size="small" type="info">这里只管理当前服务器候选节点的自动选择封禁，不会删除节点，也不会影响你手动单独指定它。</n-alert>
         <n-space align="center" wrap>
@@ -1202,6 +1206,9 @@
 </template>
 
 <script setup>
+import NodeFilters from '../components/NodeFilters.vue'
+import LastDisconnectModal from '../components/LastDisconnectModal.vue'
+import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
  import { ref, reactive, computed, onMounted, onUnmounted, h, nextTick, watch } from 'vue'
  import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip, NSwitch } from 'naive-ui'
  import { api, apiStream } from '../api'
@@ -1209,10 +1216,16 @@
  import ServerLatencyHistoryModal from '../components/ServerLatencyHistoryModal.vue'
  import ListenAddrInput from '../components/ListenAddrInput.vue'
  import { useDragSelect } from '../composables/useDragSelect'
- import { createAdaptivePoll } from '../composables/useAdaptivePoll'
+ import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
 
  const message = useMessage()
 const servers = ref([])
+const showLastDisconnect = ref(false)
+const lastDisconnectServer = ref(null)
+const openLastDisconnect = row => {
+  lastDisconnectServer.value = { id: row.id, name: row.name }
+  showLastDisconnect.value = true
+}
 const showEditModal = ref(false)
 const showExportModal = ref(false)
 const showImportModal = ref(false)
@@ -1241,7 +1254,8 @@ const protocolOptions = [
   { label: 'TCP+UDP', value: 'tcp_udp' }
 ]
 const proxyModeOptions = [
-  { label: 'Raw UDP (反检测推荐)', value: 'raw_udp' },
+  { label: '自动（RakNet / NetherNet）', value: 'auto' },
+  { label: 'Raw UDP（仅 RakNet）', value: 'raw_udp' },
   { label: 'Passthrough', value: 'passthrough' },
   { label: 'Transparent', value: 'transparent' },
   { label: 'RakNet', value: 'raknet' },
@@ -1294,7 +1308,7 @@ const baseDefaultForm = {
   hidden: false,
   disabled_message: '§c服务器维护中§r\n§7请稍后再试',
   custom_motd: '', // 留空则从远程服务器获取
-  xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'passthrough', show_real_latency: true,
+  xbox_auth_enabled: false, idle_timeout: 300, resolve_interval: 300, proxy_outbound: '', proxy_mode: 'auto', show_real_latency: true,
   udp_socket_buffer_size: 0,
   target_ip: '',
   raknet_mtu: 0,
@@ -1331,7 +1345,7 @@ const normalizeServerProxyMode = (protocol, mode) => {
   if (!normalizedMode || normalizedMode === 'transparent') {
     return ''
   }
-  return ['raw_udp', 'passthrough', 'raknet', 'mitm', 'nethernet'].includes(normalizedMode) ? normalizedMode : ''
+  return ['auto', 'raw_udp', 'passthrough', 'raknet', 'mitm', 'nethernet'].includes(normalizedMode) ? normalizedMode : ''
 }
 const getServerModeTag = (server) => {
   const protocol = normalizeProtocolValue(server?.protocol)
@@ -1339,6 +1353,7 @@ const getServerModeTag = (server) => {
     return { label: 'Plain', type: 'default' }
   }
   const modeMap = {
+    auto: { label: 'Auto', type: 'info' },
     raw_udp: { label: 'Raw UDP', type: 'success' },
     passthrough: { label: 'Pass', type: 'info' },
     transparent: { label: 'Trans', type: 'warning' },
@@ -1378,7 +1393,7 @@ const normalizeServerForm = (server = {}) => {
     },
     protocol: normalizeProtocolValue(server.protocol ?? defaults.protocol),
     proxy_outbound: normalizeProxyOutboundValue(server.proxy_outbound ?? defaults.proxy_outbound),
-    proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? defaults.proxy_mode),
+    proxy_mode: normalizeServerProxyMode(server.protocol ?? defaults.protocol, server.proxy_mode ?? (server.id ? '' : defaults.proxy_mode)),
     nethernet_ice_servers_json: Array.isArray(server.nethernet_ice_servers)
       ? JSON.stringify(server.nethernet_ice_servers, null, 2)
       : String(server.nethernet_ice_servers_json ?? defaults.nethernet_ice_servers_json)
@@ -1523,12 +1538,14 @@ const generateDefaultMOTD = (name, port) => {
 const form = ref(makeDefaultForm())
 const isRaknetProtocol = computed(() => (form.value.protocol || '').toLowerCase() === 'raknet')
 // downstream_limit_kbps paces raknet and raw_udp (proxy/raw_udp_pacer.go).
-const canLimitDownstream = computed(() => isRaknetProtocol.value && ['raknet', 'raw_udp'].includes(String(form.value.proxy_mode || '').toLowerCase()))
+const canLimitDownstream = computed(() => isRaknetProtocol.value && ['raknet', 'raw_udp', 'auto'].includes(String(form.value.proxy_mode || '').toLowerCase()))
+const isAutoMode = computed(() => isRaknetProtocol.value && form.value.proxy_mode === 'auto')
+const usesRawUDPTransport = computed(() => isRaknetProtocol.value && ['auto', 'raw_udp'].includes(form.value.proxy_mode))
 const isNetherNetMode = computed(() => isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'nethernet')
 // 透明UDP入口按传输能力自动分流，无额外开关。
 const isAdaptiveUDP = computed(() => {
   const protocol = String(form.value.protocol || '').toLowerCase()
-  return protocol === 'udp' || (isRaknetProtocol.value && String(form.value.proxy_mode || '').toLowerCase() === 'raw_udp')
+  return protocol === 'udp' || usesRawUDPTransport.value
 })
 const hasEnabledUDPSpeeder = computed(() => !!form.value?.udp_speeder?.enabled)
 const showUDPSpeederAdvanced = computed(() => hasEnabledUDPSpeeder.value || (form.value?.latency_mode || 'normal') === 'fec_tunnel')
@@ -1662,12 +1679,10 @@ const loadProxyOutbounds = async () => {
     const groupOptions = []
     if (groupsRes.success && groupsRes.data) {
       groupsRes.data.forEach(g => {
-        if (g.name) { // Skip ungrouped
-          groupOptions.push({ 
-            label: `@${g.name} (${g.healthy_count}/${g.total_count}节点)`, 
-            value: '@' + g.name 
-          })
-        }
+        groupOptions.push({
+          label: `@${g.name || '(未分类)'} (${g.healthy_count}/${g.total_count}节点)`,
+          value: '@' + g.name
+        })
       })
     }
     
@@ -1861,6 +1876,7 @@ const quickBatchTesting = ref(false)
 const formBatchTesting = ref(false)
 const showFinalServerLoadBalanceModal = ref(false)
 const finalServerCandidateSearch = ref('')
+const finalNodeFilter=ref(emptyNodeFilter())
 const finalServerCandidateScope = ref('all')
 const finalServerCandidateCheckedKeys = ref([])
 const finalServerBatchTesting = ref(false)
@@ -1911,7 +1927,7 @@ const countdownNow = ref(Date.now())
 let serverOverviewFetchToken = 0
 let editServerLiveSessionsFetchToken = 0
 let finalServerNodeLatencyFetchToken = 0
-const serverOverviewPoller = createAdaptivePoll(() => refreshServerLatencyOverview(), { interval: 30000 })
+const serverOverviewPoller = createPageRefreshPoll(() => refreshServerLatencyOverview())
 let serverStatsTimer = null
 let serverStatsPollCancelled = false
 let countdownTimer = null
@@ -2133,7 +2149,7 @@ const finalServerCandidateRankMap = computed(() => {
 
 const filteredFinalServerCandidates = computed(() => {
   const keyword = String(finalServerCandidateSearch.value || '').trim().toLowerCase()
-  return finalServerSortedCandidates.value.filter(node => {
+  return filterNodes(finalServerSortedCandidates.value,finalNodeFilter.value).filter(node => {
     if (finalServerCandidateScope.value === 'selected' && !finalServerAutoPingSelectedNameSet.value.has(node.name)) return false
     if (finalServerCandidateScope.value === 'top' && !finalServerExtraTopNameSet.value.has(node.name)) return false
     if (finalServerCandidateScope.value === 'outside' && finalServerExtraTopNameSet.value.has(node.name)) return false
@@ -4644,7 +4660,7 @@ const renderConnectionCell = (row) => {
 
 const renderServerActionsCell = (row) => {
   const running = row.status === 'running'
-  return h(NSpace, { size: 4, wrap: false, align: 'center', class: 'server-row-actions' }, () => [
+  return h(NSpace, { size: 4, wrap: true, align: 'center', class: 'server-row-actions' }, () => [
     running
       ? h(NButton, {
           size: 'tiny',
@@ -4665,6 +4681,7 @@ const renderServerActionsCell = (row) => {
       onClick: () => controlServer(row.id, 'reload')
     }, () => '重载'),
     h(NButton, { size: 'tiny', onClick: () => openEditModal(row) }, () => '编辑'),
+    h(NButton, { size: 'tiny', onClick: () => openLastDisconnect(row) }, () => '最近断线'),
     h(NPopconfirm, { onPositiveClick: () => deleteServer(row.id) }, {
       trigger: () => h(NButton, { size: 'tiny', type: 'error' }, () => '删除'),
       default: () => '确定删除?'
@@ -4681,8 +4698,10 @@ const columns = [
   { title: '连接 / RawUDP', key: 'connections', width: 190, render: renderConnectionCell },
   { title: '延迟', key: 'latency', width: 150, render: r => renderServerLatencyCell(r) },
   { title: '历史趋势', key: 'latency_history', width: 170, render: r => renderServerLatencyHistoryCell(r) },
-  { title: '操作', key: 'actions', width: 230, fixed: 'right', className: 'server-actions-column', render: renderServerActionsCell }
+  { title: '操作', key: 'actions', width: 230, render: renderServerActionsCell }
 ]
+// 横向滚动宽度跟随真实列宽，避免新增列后滚动范围不足。
+const serverTableScrollX = columns.reduce((sum, column) => sum + column.width, 0)
 
 // ...
 
@@ -5053,7 +5072,7 @@ onMounted(async () => {
 onUnmounted(() => {
   serverStatsPollCancelled = true
   if (serverStatsTimer) clearTimeout(serverStatsTimer)
-  serverOverviewPoller.stop()
+  serverOverviewPoller.dispose()
   if (countdownTimer) clearInterval(countdownTimer)
 })
 </script>
@@ -5061,7 +5080,8 @@ onUnmounted(() => {
 <style scoped>
 .page-container {
   width: 100%;
-  overflow-x: auto;
+  min-width: 0;
+  max-width: 100%;
 }
 .table-wrapper {
   width: 100%;
@@ -5211,19 +5231,6 @@ onUnmounted(() => {
 
 .raw-udp-tooltip-muted {
   color: var(--n-text-color-3);
-}
-
-.server-row-actions {
-  white-space: nowrap;
-}
-
-:deep(.server-actions-column) {
-  background: var(--n-td-color);
-}
-
-:deep(.n-data-table-th--fixed-right),
-:deep(.n-data-table-td--fixed-right) {
-  box-shadow: -12px 0 18px rgba(0, 0, 0, 0.18);
 }
 
 :deep(.n-data-table-td) {

@@ -61,7 +61,7 @@
       v-model:show="showAddModal"
       preset="card"
       :title="editingEntry ? '编辑黑名单' : '添加黑名单'"
-      style="width: 450px"
+      style="width: min(450px, 98vw); max-width: 98vw"
 >
       <n-space vertical>
         <n-input size="small" v-model:value="form.player_name" placeholder="玩家名" />
@@ -84,7 +84,7 @@
     </n-modal>
 
     <!-- 导出 Modal -->
-    <n-modal size="small" v-model:show="showExportModal" preset="card" title="导出黑名单" style="width: 600px">
+    <n-modal size="small" v-model:show="showExportModal" preset="card" title="导出黑名单" style="width: min(600px, 98vw); max-width: 98vw">
       <n-tabs size="small" type="line" animated v-model:value="exportTab">
         <n-tab-pane name="json" tab="JSON 格式">
           <n-input size="small" v-model:value="exportJson" type="textarea" :rows="12" readonly />
@@ -103,7 +103,7 @@
     </n-modal>
 
     <!-- 导入 Modal -->
-    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入黑名单" style="width: 600px">
+    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入黑名单" style="width: min(600px, 98vw); max-width: 98vw">
       <n-tabs size="small" type="line" animated>
         <n-tab-pane name="json" tab="JSON 格式">
           <n-alert size="small" type="info" style="margin-bottom: 12px">JSON 数组格式，每项需包含 player_name 字段</n-alert>

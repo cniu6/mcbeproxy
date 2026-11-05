@@ -153,12 +153,11 @@ func main() {
 	)
 	proxyOutboundHandler.SetUsageContext(proxyServer.GetProxyPortConfigManager(), proxyServer)
 	proxyOutboundHandler.SetSubscriptionUpdateHook(proxyServer.TriggerAutoLatencyRefresh)
+	subscriptionService := subscription.NewService(proxyServer.GetProxyOutboundConfigManager(), proxyServer.GetOutboundManager())
 	subscriptionScheduler := subscription.NewScheduler(
 		proxySubscriptionMgr,
-		subscription.NewService(proxyServer.GetProxyOutboundConfigManager(), proxyServer.GetOutboundManager()),
-		func() int {
-			return proxyServer.GetActiveSessionCount() + proxyServer.GetActiveProxyPortConnectionCount()
-		},
+		subscriptionService,
+		subscriptionService.ActiveSubscriptionConnections,
 	)
 	subscriptionScheduler.SetAfterUpdateHook(func(sub *config.ProxySubscription, result *subscription.UpdateResult) {
 		reason := "subscription auto update"

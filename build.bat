@@ -95,8 +95,8 @@ echo.
 set "SUCCESS_COUNT=0"
 set "FAIL_COUNT=0"
 
-:: Windows
-call :build_target windows amd64 .exe
+@REM :: Windows
+@REM call :build_target windows amd64 .exe
 
 :: Linux
 call :build_target linux amd64

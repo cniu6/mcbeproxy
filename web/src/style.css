@@ -1,3 +1,11 @@
+/* 只给国旗补 Windows 缺失的字形，不改变普通文字与组件样式。字体随构建自托管。 */
+@font-face {
+  font-family: 'Twemoji Country Flags';
+  src: url('./assets/TwemojiCountryFlags.woff2') format('woff2');
+  font-display: swap;
+  unicode-range: U+1F1E6-1F1FF, U+1F3F4, U+E0062-E0063, U+E0065, U+E0067, U+E006C, U+E006E, U+E0073-E0074, U+E0077, U+E007F;
+}
+
 /* 只保留最基础的盒模型/边距重置；外观全部交给 naive-ui 默认样式。
    .table-wrapper 是页面里必需的横向溢出容器，不是美化。 */
 * {
@@ -9,6 +17,31 @@ html,
 body,
 #app {
   min-height: 100%;
+}
+
+/* 管理弹窗统一使用视口尺寸，正文单独滚动，标题和操作不随长表单消失。 */
+.n-modal.n-card { width:min(1200px,calc(100vw - 32px)) !important; max-width:calc(100vw - 32px) !important; max-height:calc(100dvh - 48px); margin-block:24px; display:flex; flex-direction:column; }
+.n-modal.n-card > .n-card__content { min-height:0; overflow:auto; overscroll-behavior:contain; }
+.n-modal.n-card > .n-card-header, .n-modal.n-card > .n-card__footer, .n-modal.n-card > .n-card__action { flex-shrink:0; }
+.n-modal.n-card .n-input, .n-modal.n-card .n-select, .n-modal.n-card .n-input-number { max-width:100%; min-width:0; }
+.n-modal .n-space { max-width:100%; flex-wrap:wrap; }
+.n-modal .node-filters { min-width:0; }
+.n-modal.n-card.app-modal-workspace { width:min(1680px,calc(100vw - 32px)) !important; }
+@media(max-width:700px) {
+  .n-modal.n-card { width:calc(100vw - 16px) !important; max-width:calc(100vw - 16px) !important; max-height:calc(100dvh - 16px); margin-block:8px; }
+  .n-modal.n-card > .n-card__content { padding-inline:12px; }
+  .n-modal .n-form-item-label { overflow-wrap:anywhere; }
+  .n-modal.n-card .chain-inline-body, .n-modal.n-card .chain-viz-body { flex-direction:column; }
+  .n-modal.n-card .chain-inline-pool, .n-modal.n-card .chain-viz-pool { width:100%; min-width:0; flex-basis:auto; }
+  .n-modal.n-card .chain-inline-pool-list, .n-modal.n-card .chain-viz-pool-list { max-height:240px; overflow:auto; }
+  .n-modal.n-card .chain-inline-body, .n-modal.n-card .chain-viz-body { height:auto; max-height:none; }
+  .n-modal .n-grid { grid-template-columns:minmax(0,1fr) !important; }
+  .n-modal .n-grid > * { grid-column:auto !important; }
+}
+@media(min-width:701px) {
+  .n-modal.n-card .chain-inline-body, .n-modal.n-card .chain-viz-body { height:clamp(360px,60dvh,760px); max-height:none; }
+  .n-modal.n-card .chain-inline-pool, .n-modal.n-card .chain-viz-pool { width:clamp(300px,32%,520px); min-width:0; }
+  .n-modal.n-card .chain-inline-canvas, .n-modal.n-card .chain-viz-canvas { min-width:0; }
 }
 
 .table-wrapper {

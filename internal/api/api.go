@@ -32,8 +32,8 @@ import (
 	"mcpeserverproxy/internal/db"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
-	"mcpeserverproxy/internal/session"
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/session"
 )
 
 // APIServer provides REST API endpoints for proxy management.
@@ -228,6 +228,8 @@ func NewAPIServer(
 	if api.proxyOutboundHandler != nil {
 		api.proxyOutboundHandler.SetLifecycleContext(api.serverContext())
 		api.proxyOutboundHandler.SetOutboundReloadHook(api.reloadServersUsingOutbound)
+		api.proxyOutboundHandler.portConfigMgr = proxyPortConfigMgr
+		api.proxyOutboundHandler.prepareRename = api.prepareOutboundRename
 	}
 
 	api.registerSessionPersisterMetrics()
@@ -282,12 +284,14 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/servers/latency-overview", a.getServerLatencyOverview)
 		serverAdminGroup := api.Group("/servers")
 		serverAdminGroup.Use(a.requireAdminMiddleware())
+		serverAdminGroup.GET("/:id/last-disconnect", a.getLastDisconnectReport)
 		serverAdminGroup.POST("", a.createServer)
 		serverAdminGroup.PUT("/:id", a.updateServer)
 		serverAdminGroup.DELETE("/:id", a.deleteServer)
 		serverAdminGroup.POST("/:id/start", a.startServer)
 		serverAdminGroup.POST("/:id/stop", a.stopServer)
 		serverAdminGroup.POST("/:id/reload", a.reloadServer)
+		serverAdminGroup.POST("/:id/sessions/:sessionID/close", a.closeSession)
 		serverAdminGroup.POST("/:id/hide", a.hideServer)
 		serverAdminGroup.POST("/:id/show", a.showServer)
 		// Backward-compatible aliases: the old disable/enable toggle now only
@@ -449,6 +453,9 @@ func (a *APIServer) setupRoutes() {
 				proxyPortGroup.GET("/:id/runtime", a.getProxyPortRuntime)
 				proxyPortAdminGroup.POST("", a.createProxyPort)
 				proxyPortAdminGroup.POST("/bulk", a.createProxyPortsBulk)
+				proxyPortAdminGroup.POST("/identities", a.createSecureIdentity)
+				proxyPortAdminGroup.POST("/profile/validate", a.validateSecureProfile)
+				proxyPortAdminGroup.POST("/:id/export", a.exportSecurePort)
 				proxyPortAdminGroup.PUT("/:id", a.updateProxyPort)
 				proxyPortAdminGroup.DELETE("/:id", a.deleteProxyPort)
 				proxyPortGroup.POST("/:id/test", a.testProxyPort)
@@ -775,6 +782,14 @@ func (a *APIServer) updateServer(c *gin.Context) {
 	// 路由参数是唯一可信目标；请求体 id 仅用于兼容输入，并在此覆盖为路径 id。
 	serverCfg.ID = serverID
 
+	if validator, ok := a.proxyController.(interface {
+		ValidateServerTransportChange(*config.ServerConfig) error
+	}); ok {
+		if err := validator.ValidateServerTransportChange(&serverCfg); err != nil {
+			respondError(c, http.StatusConflict, "存在活动连接，请等待空闲后切换传输模式", err.Error())
+			return
+		}
+	}
 	if err := a.configMgr.UpdateServer(serverID, &serverCfg); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to update server", err.Error())
 		return
@@ -790,6 +805,8 @@ func (a *APIServer) updateServer(c *gin.Context) {
 		case running && serverCfg.Enabled:
 			if err := a.proxyController.ReloadServer(serverID); err != nil {
 				logger.Error("Failed to reload server %s after config update: %v", serverID, err)
+				respondError(c, http.StatusConflict, "配置已保存但未应用，原连接保留；请等待空闲后重试", err.Error())
+				return
 			}
 		case running && !serverCfg.Enabled:
 			if err := a.proxyController.StopServer(serverID); err != nil {
@@ -1043,6 +1060,12 @@ func rawUDPClientStartTime(raw config.RawUDPClientStatsDTO, now time.Time) time.
 }
 
 func applyRawUDPClientStatsToSessionDTO(dto session.SessionDTO, raw config.RawUDPClientStatsDTO, now time.Time) session.SessionDTO {
+	dto.Transport = "raknet"
+	if raw.LoginParsed {
+		dto.IdentitySource = "login"
+		dto.LoginObserved = true
+		dto.ConnectionPhase = "login_observed"
+	}
 	if clientAddr := strings.TrimSpace(raw.ClientAddr); clientAddr != "" {
 		dto.ClientAddr = clientAddr
 	}
@@ -1089,18 +1112,19 @@ func rawUDPClientStatsToSessionDTO(serverID string, raw config.RawUDPClientStats
 		idleSeconds = 0
 	}
 	return session.SessionDTO{
-		ID:          key,
-		ClientAddr:  strings.TrimSpace(raw.ClientAddr),
-		ServerID:    serverID,
-		UUID:        strings.TrimSpace(raw.PlayerUUID),
-		DisplayName: strings.TrimSpace(raw.PlayerName),
-		XUID:        strings.TrimSpace(raw.PlayerXUID),
-		BytesUp:     raw.UpBytes,
-		BytesDown:   raw.DownBytes,
-		StartTime:   startTime,
-		LastSeen:    lastSeen,
-		Duration:    rawUDPClientDurationSeconds(raw, now),
-		IdleSeconds: idleSeconds,
+		ConnectionInfo: session.ConnectionInfo{Transport: "raknet", IdentitySource: "login", LoginObserved: raw.LoginParsed, ConnectionPhase: "login_observed"},
+		ID:             key,
+		ClientAddr:     strings.TrimSpace(raw.ClientAddr),
+		ServerID:       serverID,
+		UUID:           strings.TrimSpace(raw.PlayerUUID),
+		DisplayName:    strings.TrimSpace(raw.PlayerName),
+		XUID:           strings.TrimSpace(raw.PlayerXUID),
+		BytesUp:        raw.UpBytes,
+		BytesDown:      raw.DownBytes,
+		StartTime:      startTime,
+		LastSeen:       lastSeen,
+		Duration:       rawUDPClientDurationSeconds(raw, now),
+		IdleSeconds:    idleSeconds,
 	}
 }
 
@@ -1133,7 +1157,7 @@ func (a *APIServer) buildActiveSessionDTOs(servers []config.ServerConfigDTO) []s
 	seenRaw := make(map[string]bool)
 	for _, sess := range sessions {
 		dto := sess.ToDTO()
-		if raw, ok := rawByKey[strings.TrimSpace(dto.ClientAddr)]; ok {
+		if raw, ok := rawByKey[strings.TrimSpace(dto.ClientAddr)]; ok && dto.Transport != "nethernet" {
 			dto = applyRawUDPClientStatsToSessionDTO(dto, raw, now)
 			if key := rawUDPClientIdentityKey(raw); key != "" {
 				seenRaw[key] = true
@@ -1204,6 +1228,21 @@ func (a *APIServer) kickSession(c *gin.Context) {
 		return
 	}
 
+	// 中继会话必须由传输 owner 关闭，不能只删展示记录留下媒体转发。
+	for _, active := range a.sessionMgr.GetAllSessions() {
+		snap := active.Snapshot()
+		if snap.ID == sessionID && snap.Transport == "nethernet" {
+			closer, ok := a.proxyController.(interface {
+				CloseSession(string, string, string) bool
+			})
+			if !ok || !closer.CloseSession(snap.ServerID, sessionID, "管理员关闭中继连接") {
+				respondError(c, http.StatusConflict, "中继连接状态已变化，请刷新后重试", "")
+				return
+			}
+			respondSuccess(c, map[string]string{"message": "Relay terminated"})
+			return
+		}
+	}
 	// Find and remove the session
 	removed := a.sessionMgr.RemoveByID(sessionID)
 	if !removed {
@@ -1429,8 +1468,14 @@ func (a *APIServer) getPublicStatus(c *gin.Context) {
 
 	servers := a.proxyController.GetAllServerStatuses()
 
-	// Build active sessions snapshot
+	// 新增信令身份不扩大公开接口的身份敏感字段。
 	sessionDTOs := a.buildActiveSessionDTOs(servers)
+	for i := range sessionDTOs {
+		if sessionDTOs[i].Transport == "nethernet" {
+			sessionDTOs[i].XUID = ""
+			sessionDTOs[i].UUID = ""
+		}
+	}
 	activeSessions := make(map[string][]session.SessionDTO)
 	for _, dto := range sessionDTOs {
 		activeSessions[dto.ServerID] = append(activeSessions[dto.ServerID], dto)

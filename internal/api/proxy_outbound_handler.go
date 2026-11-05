@@ -44,6 +44,9 @@ type ProxyOutboundHandler struct {
 	activityProvider       proxyOutboundUsageActivityProvider
 	subscriptionUpdateHook func(string)
 	outboundReloadHook     func(string)
+	portConfigMgr          *config.ProxyPortConfigManager
+	prepareRename          func(string, string) ([]outboundRenameChange, error)
+	mutationMu             sync.Mutex
 }
 
 type proxyOutboundUsageActivityProvider interface {
@@ -314,25 +317,27 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 
 // CreateProxyOutboundRequest represents the request body for creating a proxy outbound.
 type CreateProxyOutboundRequest struct {
-	Name         string `json:"name" binding:"required"`
-	Type         string `json:"type" binding:"required"`
-	Server       string `json:"server"`
-	Port         int    `json:"port"`
-	Enabled      bool   `json:"enabled"`
-	Group        string `json:"group,omitempty"`
-	Username     string `json:"username,omitempty"`
-	Method       string `json:"method,omitempty"`
-	Password     string `json:"password,omitempty"`
-	UUID         string `json:"uuid,omitempty"`
-	AlterID      int    `json:"alter_id,omitempty"`
-	Security     string `json:"security,omitempty"`
-	Flow         string `json:"flow,omitempty"`
-	Obfs         string `json:"obfs,omitempty"`
-	ObfsPassword string `json:"obfs_password,omitempty"`
-	TLS          bool   `json:"tls,omitempty"`
-	SNI          string `json:"sni,omitempty"`
-	Insecure     bool   `json:"insecure,omitempty"`
-	Fingerprint  string `json:"fingerprint,omitempty"`
+	OriginalName   string                 `json:"original_name,omitempty"`
+	SecureUpstream *config.SecureUpstream `json:"secure_upstream,omitempty"`
+	Name           string                 `json:"name" binding:"required"`
+	Type           string                 `json:"type" binding:"required"`
+	Server         string                 `json:"server"`
+	Port           int                    `json:"port"`
+	Enabled        bool                   `json:"enabled"`
+	Group          string                 `json:"group,omitempty"`
+	Username       string                 `json:"username,omitempty"`
+	Method         string                 `json:"method,omitempty"`
+	Password       string                 `json:"password,omitempty"`
+	UUID           string                 `json:"uuid,omitempty"`
+	AlterID        int                    `json:"alter_id,omitempty"`
+	Security       string                 `json:"security,omitempty"`
+	Flow           string                 `json:"flow,omitempty"`
+	Obfs           string                 `json:"obfs,omitempty"`
+	ObfsPassword   string                 `json:"obfs_password,omitempty"`
+	TLS            bool                   `json:"tls,omitempty"`
+	SNI            string                 `json:"sni,omitempty"`
+	Insecure       bool                   `json:"insecure,omitempty"`
+	Fingerprint    string                 `json:"fingerprint,omitempty"`
 
 	// Hysteria2 specific fields
 	PortHopping              string `json:"port_hopping,omitempty"`
@@ -372,25 +377,26 @@ type CreateProxyOutboundRequest struct {
 // toProxyOutbound converts the request to a ProxyOutbound config.
 func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 	result := &config.ProxyOutbound{
-		Name:         r.Name,
-		Type:         r.Type,
-		Server:       r.Server,
-		Port:         r.Port,
-		Enabled:      r.Enabled,
-		Group:        r.Group,
-		Username:     r.Username,
-		Method:       r.Method,
-		Password:     r.Password,
-		UUID:         r.UUID,
-		AlterID:      r.AlterID,
-		Security:     r.Security,
-		Flow:         r.Flow,
-		Obfs:         r.Obfs,
-		ObfsPassword: r.ObfsPassword,
-		TLS:          r.TLS,
-		SNI:          r.SNI,
-		Insecure:     r.Insecure,
-		Fingerprint:  r.Fingerprint,
+		SecureUpstream: r.SecureUpstream,
+		Name:           r.Name,
+		Type:           r.Type,
+		Server:         r.Server,
+		Port:           r.Port,
+		Enabled:        r.Enabled,
+		Group:          r.Group,
+		Username:       r.Username,
+		Method:         r.Method,
+		Password:       r.Password,
+		UUID:           r.UUID,
+		AlterID:        r.AlterID,
+		Security:       r.Security,
+		Flow:           r.Flow,
+		Obfs:           r.Obfs,
+		ObfsPassword:   r.ObfsPassword,
+		TLS:            r.TLS,
+		SNI:            r.SNI,
+		Insecure:       r.Insecure,
+		Fingerprint:    r.Fingerprint,
 		// Hysteria2 specific
 		PortHopping:              r.PortHopping,
 		HopInterval:              r.HopInterval,
@@ -559,6 +565,9 @@ type ProxySubscriptionDTO struct {
 	AutoUpdateMode                string `json:"auto_update_mode,omitempty"`
 	AutoUpdateTime                string `json:"auto_update_time,omitempty"`
 	AutoUpdateIntervalDays        int    `json:"auto_update_interval_days,omitempty"`
+	AutoUpdateLastAttemptAt       string `json:"auto_update_last_attempt_at,omitempty"`
+	AutoUpdateNextAt              string `json:"auto_update_next_at,omitempty"`
+	AutoUpdateTimezone            string `json:"auto_update_timezone"`
 	LastUpdatedAt                 string `json:"last_updated_at,omitempty"`
 	LastNodeCount                 int    `json:"last_node_count,omitempty"`
 	LastAdded                     int    `json:"last_added,omitempty"`
@@ -876,6 +885,14 @@ func (h *ProxyOutboundHandler) toSubscriptionDTO(cfg *config.ProxySubscription) 
 		LastSubscriptionTotalBytes:    cfg.LastSubscriptionTotalBytes,
 		LastError:                     cfg.LastError,
 	}
+	now := time.Now()
+	dto.AutoUpdateTimezone = now.Format("MST (UTC-07:00)")
+	if !cfg.AutoUpdateLastAttemptAt.IsZero() {
+		dto.AutoUpdateLastAttemptAt = cfg.AutoUpdateLastAttemptAt.Format(time.RFC3339)
+	}
+	if next, err := subscription.NextAutoUpdateAt(cfg, now); err == nil && !next.IsZero() {
+		dto.AutoUpdateNextAt = next.Format(time.RFC3339)
+	}
 	if !cfg.LastUpdatedAt.IsZero() {
 		dto.LastUpdatedAt = cfg.LastUpdatedAt.Format(time.RFC3339)
 	}
@@ -1170,6 +1187,16 @@ func (h *ProxyOutboundHandler) ParseImportContent(c *gin.Context) {
 		return
 	}
 
+	if strings.HasPrefix(content, "{") {
+		profile, err := config.ParseSecureProfile([]byte(content))
+		if err != nil {
+			respondError(c, 400, err.Error(), "")
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		respondSuccess(c, gin.H{"items": []*config.ProxyOutbound{profile.Outbound(profile.NodeName())}, "count": 1, "filtered": 0})
+		return
+	}
 	parsed, err := subscription.ParseSubscriptionContent([]byte(content))
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "解析导入内容失败", err.Error())
@@ -1182,6 +1209,7 @@ func (h *ProxyOutboundHandler) ParseImportContent(c *gin.Context) {
 		return
 	}
 
+	c.Header("Cache-Control", "no-store")
 	respondSuccess(c, map[string]interface{}{
 		"items":    items,
 		"count":    len(items),
@@ -1220,6 +1248,13 @@ func (h *ProxyOutboundHandler) applySensitiveFieldDefaults(name string, cfg *con
 	if cfg.ProviderOptions == nil && cfg.Type == existing.Type {
 		cfg.ProviderOptions = existing.Clone().ProviderOptions
 	}
+	if cfg.SecureUpstream == nil && cfg.Type == existing.Type && existing.SecureUpstream != nil {
+		u := *existing.SecureUpstream
+		if cfg.Password != "" {
+			u.Password = cfg.Password
+		}
+		cfg.SecureUpstream = &u
+	}
 	if cfg.Password == "" {
 		cfg.Password = existing.Password
 	}
@@ -1238,8 +1273,11 @@ func (h *ProxyOutboundHandler) updateProxyOutboundConfig(name string, cfg *confi
 	if cfg == nil {
 		return fmt.Errorf("proxy outbound cannot be nil")
 	}
-	if strings.TrimSpace(cfg.Name) != name {
-		return fmt.Errorf("renaming proxy outbounds is not supported; create a new node and update references explicitly")
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	cfg.Name = strings.TrimSpace(cfg.Name)
+	if cfg.Name != name {
+		return h.renameProxyOutboundConfig(name, cfg)
 	}
 	h.applySensitiveFieldDefaults(name, cfg)
 	if err := h.configMgr.UpdateOutbound(name, cfg); err != nil {
@@ -2170,7 +2208,11 @@ func (h *ProxyOutboundHandler) UpdateProxyOutboundByBody(c *gin.Context) {
 	// Use the name from the request body
 	cfg := req.toProxyOutbound()
 
-	if err := h.updateProxyOutboundConfig(req.Name, cfg); err != nil {
+	originalName := strings.TrimSpace(req.OriginalName)
+	if originalName == "" {
+		originalName = req.Name
+	}
+	if err := h.updateProxyOutboundConfig(originalName, cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to update proxy outbound", err.Error())
 		return
 	}

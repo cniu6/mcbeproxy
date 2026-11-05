@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -22,9 +23,9 @@ import (
 	proxyerrors "mcpeserverproxy/internal/errors"
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/monitor"
+	"mcpeserverproxy/internal/netroute"
 	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
-	"mcpeserverproxy/internal/netroute"
 )
 
 // Listener is an interface for proxy listeners (both transparent and RakNet).
@@ -177,6 +178,7 @@ type ProxyServer struct {
 	configMgr              *config.ConfigManager
 	sessionMgr             *session.SessionManager
 	sessionPersister       *sessionPersister
+	identityProvider       *netherNetIdentityProvider
 	db                     *db.Database
 	sessionRepo            *db.SessionRepository
 	playerRepo             *db.PlayerRepository
@@ -555,7 +557,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 	// (so the player shows online even if their Login can't be decoded). If we
 	// never learned any identity, there is no player to attribute the record to;
 	// skip persistence so transient pre-login probes don't pollute history.
-	if snap.DisplayName == "" && snap.UUID == "" {
+	if snap.DisplayName == "" && snap.UUID == "" && snap.Transport != "nethernet" {
 		logger.LogSessionEnded(snap.ClientAddr, snap.ServerID, duration)
 		return
 	}
@@ -582,8 +584,13 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 		StatusReason: statusReason,
 	}
 
-	// Log player disconnect event (requirement 9.5)
-	if snap.UUID != "" {
+	if snap.Transport != "" || snap.IdentitySource != "" {
+		metadata, _ := json.Marshal(snap.ConnectionInfo)
+		record.Metadata = string(metadata)
+	}
+
+	// 信令身份不是游戏 Login，不生成玩家登录/退出事件。
+	if snap.UUID != "" && snap.IdentitySource != "nethernet_signaling" {
 		logger.LogPlayerDisconnect(snap.UUID, snap.DisplayName, snap.ServerID, snap.ClientAddr, duration, snap.BytesUp, snap.BytesDown)
 	}
 	logger.LogSessionEnded(snap.ClientAddr, snap.ServerID, duration)
@@ -605,7 +612,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 	}
 
 	// Update player stats if we have player info (use DisplayName as primary key)
-	if snap.DisplayName != "" {
+	if snap.DisplayName != "" && snap.IdentitySource != "nethernet_signaling" && snap.Transport != "nethernet" {
 		totalBytes := snap.BytesUp + snap.BytesDown
 
 		// Try to get existing player by display name
@@ -650,6 +657,7 @@ func (p *ProxyServer) Start() error {
 
 	// Create context for graceful shutdown
 	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.identityProvider = newNetherNetIdentityProvider(p.ctx, nil)
 	p.running = true
 	p.runningMu.Unlock()
 
@@ -2293,7 +2301,7 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			}
 			listener = passthroughProxy
 			logger.Info("Using passthrough proxy mode for server %s (auth forwarded)", serverCfg.ID)
-		case "raw_udp":
+		case config.ProxyModeRawUDP, config.ProxyModeAuto:
 			// Use raw UDP forwarding proxy (no RakNet processing, pure UDP forwarding)
 			rawUDPProxy := NewRawUDPProxy(
 				serverCfg.ID,
@@ -2312,6 +2320,9 @@ func (p *ProxyServer) startListener(serverCfg *config.ServerConfig) error {
 			// Inject outbound manager for proxy routing
 			if p.outboundMgr != nil {
 				rawUDPProxy.SetOutboundManager(p.outboundMgr)
+			}
+			if p.identityProvider != nil {
+				rawUDPProxy.SetNetherNetIdentityVerifier(p.identityProvider)
 			}
 			listener = rawUDPProxy
 			logger.Info("Using raw UDP forwarding mode for server %s (no RakNet processing)", serverCfg.ID)
@@ -2367,7 +2378,7 @@ func (p *ProxyServer) removeSessionsForServer(serverID string) {
 	}
 	for _, sess := range p.sessionMgr.GetAllSessions() {
 		if sess != nil && sess.ServerID == serverID {
-			_ = p.sessionMgr.Remove(sess.ClientAddr)
+			p.sessionMgr.RemoveByID(sess.ID)
 		}
 	}
 }
@@ -2414,6 +2425,10 @@ func (p *ProxyServer) Stop() error {
 		p.cancel()
 	}
 
+	if p.identityProvider != nil {
+		p.identityProvider.Close()
+	}
+
 	// Stop config watcher
 	p.configMgr.StopWatch()
 
@@ -2446,7 +2461,7 @@ func (p *ProxyServer) Stop() error {
 	// Clean up all sessions (persist to database)
 	sessions := p.sessionMgr.GetAllSessions()
 	for _, sess := range sessions {
-		p.sessionMgr.Remove(sess.ClientAddr)
+		p.sessionMgr.RemoveByID(sess.ID)
 	}
 	if p.sessionPersister != nil && !p.sessionPersister.Flush(30*time.Second) {
 		logger.Warn("Timed out flushing session records to the database")
@@ -2501,6 +2516,13 @@ func (p *ProxyServer) Reload() error {
 	}
 	p.listenersMu.RUnlock()
 
+	// 先预检全部传输变更，拒绝时保留原监听器及其真实运行模式。
+	for _, next := range servers {
+		if err := p.ValidateServerTransportChange(next); err != nil {
+			return err
+		}
+	}
+
 	// Stop listeners for removed or disabled servers
 	for serverID := range currentListeners {
 		serverCfg, exists := serverMap[serverID]
@@ -2530,6 +2552,9 @@ func (p *ProxyServer) Reload() error {
 				oldAddr := currentListenAddrs[serverCfg.ID]
 				addrChanged := oldAddr != "" && oldAddr != serverCfg.ListenAddr
 				if existingKind != desiredKind || addrChanged {
+					if err := p.reserveServerTransportChange(serverCfg.ID); err != nil {
+						return err
+					}
 					if addrChanged {
 						logger.Info("Listen address changed for server %s: %s -> %s, restarting listener", serverCfg.ID, oldAddr, serverCfg.ListenAddr)
 					}
@@ -2556,7 +2581,10 @@ func (p *ProxyServer) Reload() error {
 }
 
 func listenerKind(l Listener) string {
-	switch l.(type) {
+	if wrapped, ok := l.(*listenerWithCleanup); ok {
+		return listenerKind(wrapped.inner)
+	}
+	switch v := l.(type) {
 	case *PlainUDPProxy:
 		return "udp"
 	case *PlainTCPProxy:
@@ -2570,7 +2598,9 @@ func listenerKind(l Listener) string {
 	case *PassthroughProxy:
 		return "passthrough"
 	case *RawUDPProxy:
-		return "raw_udp"
+		return v.conf().GetProxyMode()
+	case *NetherNetProxy:
+		return config.ProxyModeNetherNet
 	case *UDPListener:
 		return "transparent"
 	default:
@@ -2603,8 +2633,8 @@ func listenerKindFromConfig(serverCfg *config.ServerConfig) string {
 		return "raknet"
 	case "passthrough":
 		return "passthrough"
-	case "raw_udp":
-		return "raw_udp"
+	case config.ProxyModeRawUDP, config.ProxyModeAuto, config.ProxyModeNetherNet:
+		return proxyMode
 	default:
 		return "transparent"
 	}
@@ -2745,7 +2775,25 @@ func (p *ProxyServer) ReloadServer(serverID string) error {
 	_, running := p.listeners[serverID]
 	p.listenersMu.RUnlock()
 
+	if err := p.ValidateServerTransportChange(serverCfg); err != nil {
+		return err
+	}
 	if running {
+		p.listenersMu.RLock()
+		existing := p.listeners[serverID]
+		same := listenerKind(existing) == listenerKindFromConfig(serverCfg) && p.listenAddrs[serverID] == serverCfg.ListenAddr
+		p.listenersMu.RUnlock()
+		if same && serverCfg.Enabled {
+			if updater, ok := existing.(interface{ UpdateConfig(*config.ServerConfig) }); ok {
+				updater.UpdateConfig(serverCfg)
+				p.invalidateServerStatusCache()
+				return nil
+			}
+		}
+		// 原子冻结新连接后再次检查，避免预检与 stop 之间刚好有人接入。
+		if err := p.reserveServerTransportChange(serverID); err != nil {
+			return err
+		}
 		// Stop the existing listener
 		if err := p.stopListener(serverID); err != nil {
 			return fmt.Errorf("failed to stop server %s: %w", serverID, err)
@@ -3000,7 +3048,7 @@ func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 	if p.sessionMgr != nil {
 		sessions := p.sessionMgr.GetAllSessions()
 		for _, sess := range sessions {
-			if sess != nil && strings.TrimSpace(sess.GetDisplayName()) != "" {
+			if sess != nil && (strings.TrimSpace(sess.GetDisplayName()) != "" || sess.Snapshot().Transport == "nethernet") {
 				sessionCounts[sess.ServerID]++
 			}
 		}
@@ -3010,6 +3058,21 @@ func (p *ProxyServer) GetAllServerStatuses() []config.ServerConfigDTO {
 		status := p.GetServerStatus(server.ID)
 		activeSessions := sessionCounts[server.ID]
 		dto := server.ToDTO(status, activeSessions)
+		p.listenersMu.RLock()
+		listener := p.listeners[server.ID]
+		p.listenersMu.RUnlock()
+		if listener != nil {
+			dto.EffectiveProxyMode = listenerKind(listener)
+		}
+		if wrapped, ok := listener.(*listenerWithCleanup); ok {
+			listener = wrapped.inner
+		}
+		if raw, ok := listener.(*RawUDPProxy); ok && raw.conf().SupportsNetherNetRelay() {
+			dto.NetherNetRelayStatus = "unavailable"
+			if raw.nnRelay.Load() != nil {
+				dto.NetherNetRelayStatus = "listening"
+			}
+		}
 		dto.ActiveProxyClients = p.GetActiveProxyClientsForServer(server.ID)
 		dto.RawUDPClients = p.GetRawUDPClientStatsForServer(server.ID)
 		dto.AutoPingIntervalMinutes = p.effectiveServerAutoPingIntervalMinutes(server)
@@ -3057,7 +3120,11 @@ func (p *ProxyServer) KickPlayer(playerName string, reason string) int {
 	// Also remove from session manager
 	sessions := p.sessionMgr.GetAllSessions()
 	for _, sess := range sessions {
-		name := sess.GetDisplayName()
+		snapshot := sess.Snapshot()
+		name := snapshot.DisplayName
+		if snapshot.IdentitySource == "nethernet_signaling" {
+			continue
+		}
 		if name != "" && strings.EqualFold(name, playerName) {
 			status := "kicked"
 			switch {

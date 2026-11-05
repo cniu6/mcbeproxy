@@ -1,5 +1,5 @@
 <template>
-  <n-modal size="small" v-model:show="modalShow" preset="card" :title="modalTitle" style="width: 1180px; max-width: 96vw">
+  <n-modal class="app-modal-workspace" size="small" v-model:show="modalShow" preset="card" :title="modalTitle" style="width: min(1800px, 98vw); max-width: 98vw">
     <n-space vertical :size="12">
       <n-alert size="small" type="info">
         上半部分展示当前代理服务器自身的历史延迟趋势；下半部分展示候选节点按当前负载均衡延迟类型记录的自动Ping历史。

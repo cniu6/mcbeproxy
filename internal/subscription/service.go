@@ -210,9 +210,61 @@ func waitForSubscriptionRetry(ctx context.Context, attempt int) error {
 	}
 }
 
+// ErrSubscriptionBusy 表示因本订阅节点仍有连接而顺延；不算更新失败。
+var ErrSubscriptionBusy = errors.New("subscription nodes have active connections")
+
+// ActiveSubscriptionConnections 只统计本订阅节点与依赖这些节点的链式出站。
+// 使用运行时计数（包含正在拨号及退役但仍未关闭的连接），不以分组名或全局玩家数判断。
+func (s *Service) ActiveSubscriptionConnections(sub *config.ProxySubscription) int {
+	if sub == nil || s.configMgr == nil || s.outboundMgr == nil {
+		return 0
+	}
+	nodes := s.configMgr.GetAllOutbounds()
+	related := make(map[string]bool)
+	for _, node := range nodes {
+		if node.SubscriptionID == sub.ID {
+			related[node.Name] = true
+		}
+	}
+	// 依赖闭包同时覆盖多层链式节点；每轮只新增名字，遇到循环引用也会收敛。
+	for changed := true; changed; {
+		changed = false
+		for _, node := range nodes {
+			if related[node.Name] {
+				continue
+			}
+			for _, hop := range node.GetChain() {
+				if related[strings.TrimSpace(hop)] {
+					related[node.Name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+	var count int64
+	for name := range related {
+		count += s.outboundMgr.GetOutboundConnectionCount(name)
+	}
+	return int(count)
+}
+
+// UpdateSubscription 用于显式手动更新，保留原有操作语义。
 func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubscription) (*UpdateResult, error) {
+	return s.updateSubscription(ctx, sub, false)
+}
+
+// UpdateSubscriptionWhenIdle 用于后台自动更新：拉取前和写入前均检查本订阅连接。
+func (s *Service) UpdateSubscriptionWhenIdle(ctx context.Context, sub *config.ProxySubscription) (*UpdateResult, error) {
+	return s.updateSubscription(ctx, sub, true)
+}
+
+func (s *Service) updateSubscription(ctx context.Context, sub *config.ProxySubscription, onlyWhenIdle bool) (*UpdateResult, error) {
 	if sub == nil {
 		return nil, fmt.Errorf("proxy subscription is nil")
+	}
+	if onlyWhenIdle && s.ActiveSubscriptionConnections(sub) > 0 {
+		return nil, ErrSubscriptionBusy
 	}
 	fetchResult, err := s.FetchContent(ctx, sub)
 	if err != nil {
@@ -313,6 +365,10 @@ func (s *Service) UpdateSubscription(ctx context.Context, sub *config.ProxySubsc
 		}
 	}
 
+	// 网络拉取可能耗时，应用前再次确认本订阅（含链式引用）没有连接。
+	if onlyWhenIdle && s.ActiveSubscriptionConnections(sub) > 0 {
+		return nil, ErrSubscriptionBusy
+	}
 	if err := s.configMgr.ReplaceSubscriptionOutbounds(sub.ID, next); err != nil {
 		return nil, err
 	}
@@ -767,6 +823,14 @@ func parseLink(link string) (ParsedOutbound, bool) {
 		return ParsedOutbound{}, false
 	}
 	switch {
+	case strings.HasPrefix(trimmed, config.SecureSharePrefix):
+		p, err := config.ParseSecureProfile([]byte(trimmed))
+		if err != nil {
+			return ParsedOutbound{}, false
+		}
+		name := p.NodeName()
+		out := p.Outbound(name)
+		return ParsedOutbound{Outbound: out, BaseName: name, SourceKey: computeSourceKey(out)}, true
 	case hasSchemePrefix(trimmed, "ssr"):
 		return parseShadowsocksR(trimmed)
 	case hasSchemePrefix(trimmed, "tuic"):

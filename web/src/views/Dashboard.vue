@@ -26,11 +26,12 @@
       actions
       @player="goToPlayer"
       @kick="showKickDialog"
+      @close-session="confirmCloseRelaySession"
       @whitelist="addToWhitelist"
       @blacklist="addToBlacklist"
     />
 
-    <n-modal size="small" v-model:show="kickDialogVisible" preset="dialog" title="踢出玩家" positive-text="确认踢出" negative-text="取消" @positive-click="confirmKick">
+    <n-modal size="small" v-model:show="kickDialogVisible" preset="dialog" style="max-width: 98vw" title="踢出玩家" positive-text="确认踢出" negative-text="取消" @positive-click="confirmKick">
       <n-space vertical>
         <n-text>确定要踢出玩家 <n-text strong>{{ kickTarget?.display_name }}</n-text> 吗？</n-text>
         <n-input size="small" v-model:value="kickReason" type="textarea" placeholder="踢出原因（可选）" :rows="2" />
@@ -45,6 +46,7 @@ import { useMessage } from 'naive-ui'
 import { api } from '../api'
 import { isRunning } from '../composables/serverStatus'
 import { useAutoRefresh } from '../composables/useAutoRefresh'
+import { pageRefreshOptions as refreshOptions } from '../composables/pageRefreshSettings'
 import StatusToolbar from '../components/StatusToolbar.vue'
 import SystemStatusPanel from '../components/SystemStatusPanel.vue'
 import ServerStatusList from '../components/ServerStatusList.vue'
@@ -62,7 +64,6 @@ const kickReason = ref('')
 // 丢弃过期响应：只采用最近一次 loadData 发起的请求结果
 let loadSeq = 0
 
-const refreshOptions = [0, 5, 10, 15, 30, 60].map((v) => ({ label: v ? `${v}秒` : '关闭', value: v }))
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 const runningServers = computed(() => servers.value.filter(isRunning).length)
@@ -93,7 +94,7 @@ const loadData = () => {
   }).catch(() => {})
 }
 
-const { refreshInterval, now, countdownText, setup, manualRefresh } = useAutoRefresh(loadData, 15)
+const { refreshInterval, now, countdownText, setup, manualRefresh } = useAutoRefresh(loadData)
 
 const hasName = (sess) => String(sess?.display_name || '').trim() !== ''
 const goToPlayer = (name) => window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'players', search: name } }))
@@ -115,6 +116,12 @@ const showKickDialog = (sess) => {
   kickTarget.value = sess
   kickReason.value = ''
   kickDialogVisible.value = true
+}
+
+const confirmCloseRelaySession = async (sess) => {
+  const res = await api(`/api/servers/${encodeURIComponent(sess.server_id)}/sessions/${encodeURIComponent(sess.id)}/close`, 'POST')
+  if (res.success) { message.success('中继连接已断开'); loadData() }
+  else message.error(res.msg || res.error || '断开失败')
 }
 
 const confirmKick = async () => {

@@ -32,6 +32,7 @@ import { ref, reactive, computed } from 'vue'
 import { apiBase } from '../api'
 import { isRunning } from '../composables/serverStatus'
 import { useAutoRefresh } from '../composables/useAutoRefresh'
+import { pageRefreshOptions as refreshOptions } from '../composables/pageRefreshSettings'
 import StatusToolbar from '../components/StatusToolbar.vue'
 import SystemStatusPanel from '../components/SystemStatusPanel.vue'
 import ServerStatusList from '../components/ServerStatusList.vue'
@@ -45,7 +46,6 @@ const serverLatencyHistory = reactive({})
 const latencyRefreshNonce = ref(0)
 let loadSeq = 0
 
-const refreshOptions = [0, 30, 60, 120].map((v) => ({ label: v ? `${v}秒` : '关闭', value: v }))
 
 const totalOnline = computed(() => servers.value.reduce((sum, s) => sum + (s.active_sessions || 0), 0))
 const runningServers = computed(() => servers.value.filter(isRunning).length)
@@ -73,5 +73,5 @@ const loadData = async () => {
   }
 }
 
-const { refreshInterval, now, countdownText, setup, manualRefresh } = useAutoRefresh(loadData, 60)
+const { refreshInterval, now, countdownText, setup, manualRefresh } = useAutoRefresh(loadData)
 </script>

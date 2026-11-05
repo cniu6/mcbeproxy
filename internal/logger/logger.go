@@ -309,6 +309,8 @@ func Configure(config *LogConfig) error {
 
 // Close closes the default logger.
 func Close() {
+	// 先排空低频断线摘要；超时后交由进程退出，不让关闭流程无限等待慢磁盘。
+	FlushDiagnostics(2 * time.Second)
 	defaultLogger.Close()
 }
 

@@ -33,12 +33,12 @@
       </n-gi>
       <n-gi>
         <n-form-item label="代理类型">
-          <n-select size="small" v-model:value="port.type" :options="proxyTypeOptions" />
+          <n-select size="small" v-model:value="port.type" :options="proxyTypeOptions" :disabled="savedSecure" />
         </n-form-item>
       </n-gi>
       <n-gi>
         <n-form-item label="账号">
-          <n-input size="small" v-model:value="port.username" placeholder="可选, 不填则无需认证" clearable />
+          <n-input size="small" v-model:value="port.username"  :placeholder="isSecure ? '留空由创建操作生成' : '可选, 不填则无需认证'" clearable />
         </n-form-item>
       </n-gi>
       <n-gi>
@@ -47,12 +47,37 @@
             v-model:value="port.password"
             type="password"
             show-password-on="click"
-            placeholder="可选"
+            :placeholder="isSecure ? '新建留空生成；编辑留空保留' : '可选'"
             clearable
           />
         </n-form-item>
       </n-gi>
     </n-grid>
+
+    <n-space v-if="isSecure" vertical style="margin-bottom:12px">
+      <n-text depth="3">{{ port.type === 'hysteria2' ? 'HY2 · TCP+UDP，认证与证书自动配置。' : 'Mieru TCP · TCP+UDP，无需证书。' }}</n-text>
+      <n-collapse><n-collapse-item title="高级设置（可选，已配置默认值）" name="limits">
+      <n-text depth="3">新建默认 4096 个连接 / 4096 个 UDP 关联，握手 10 秒、空闲 300 秒。用于防止资源耗尽，不是带宽限速；已有入口保留原值。</n-text>
+      <n-grid v-if="port.secure" responsive="self" cols="1 600:2 1000:4" :x-gap="12">
+        <n-gi><n-form-item label="连接上限"><n-input-number v-model:value="port.secure.limits.max_connections" :min="1" :max="4096" /></n-form-item></n-gi>
+        <n-gi><n-form-item label="UDP关联上限"><n-input-number v-model:value="port.secure.limits.max_udp_associations" :min="1" :max="4096" /></n-form-item></n-gi>
+        <n-gi><n-form-item label="握手秒数"><n-input-number v-model:value="port.secure.limits.handshake_seconds" :min="2" :max="30" /></n-form-item></n-gi>
+        <n-gi><n-form-item label="空闲秒数"><n-input-number v-model:value="port.secure.limits.idle_seconds" :min="2" :max="600" /></n-form-item></n-gi>
+      </n-grid>
+      </n-collapse-item></n-collapse>
+      <template v-if="savedSecure">
+        <n-form-item label="导入后的节点名称"><n-input v-model:value="exportName" placeholder="自定义名称，默认使用端口名称" /></n-form-item>
+        <n-form-item v-if="port.users?.length" label="连接账号"><n-select v-model:value="exportUser" :options="exportUserOptions" /></n-form-item>
+        <n-button size="small" :loading="secureBusy" @click="exportProfile">复制快捷导入链接</n-button>
+        <n-collapse><n-collapse-item title="连接地址（自动填写，仅映射地址不同时修改）" name="address">
+          <n-form-item label="服务器地址"><n-input v-model:value="publicAddress" :placeholder="defaultProxyAddress(port.listen_addr) || '例如 proxy.example.com:18443'" /></n-form-item>
+          <n-text depth="3">默认使用当前面板主机 + 代理端口。可只填 IP/域名；映射端口不同时填 proxy.example.com:18443。监听所有网卡不代表防火墙或 NAT 已放行，CDN/反代域名不通时改用服务器直连地址。</n-text>
+        </n-collapse-item></n-collapse>
+      </template>
+      <n-text v-else depth="3">保存后可直接复制连接链接，账号密码留空会自动生成。</n-text>
+      <n-alert v-if="secureError" type="error" :show-icon="false">{{ secureError }}</n-alert>
+      <template v-if="secureProfile"><n-alert type="warning" :show-icon="false">含密码，仅通过可信渠道传递；不包含服务私钥。</n-alert><n-input :value="secureProfile" type="textarea" :rows="3" readonly aria-label="快捷导入链接" /><n-text depth="3">mcproxy:// 供本项目两端快捷导入；编码不是加密，不是所有第三方客户端通用链接。</n-text></template>
+    </n-space>
 
     <n-form-item label="代理节点">
       <n-space align="center" style="width: 100%">
@@ -174,6 +199,7 @@
 
     <n-divider size="small" title-placement="left" style="margin: 8px 0">多用户 (同一端口按账号分流)</n-divider>
     <PortUsersEditor
+      :secure="isSecure"
       :users="port.users"
       :stats="port.user_stats || []"
       :is-mobile="isMobile"
@@ -187,6 +213,9 @@
 </template>
 
 <script setup>
+import { computed, ref, watch } from 'vue'
+import { api } from '../../api'
+import { defaultProxyAddress, copyShareLink } from '../../composables/secureShare.js'
 import ListenAddrInput from '../../components/ListenAddrInput.vue'
 import PortUsersEditor from './PortUsersEditor.vue'
 
@@ -210,8 +239,9 @@ const getLatencyTagType = (latency, good, medium) => {
   return 'error'
 }
 
-defineProps({
+const props = defineProps({
   port: { type: Object, required: true },
+  savedSecure: {type:Boolean,default:false},
   isMobile: { type: Boolean, default: false },
   proxyTypeOptions: { type: Array, required: true },
   loadBalanceOptions: { type: Array, required: true },
@@ -224,6 +254,25 @@ defineProps({
   runtimeRefreshing: { type: Boolean, default: false }
 })
 
+const isSecure = computed(() => ['hysteria2', 'mieru'].includes(props.port.type))
+watch(() => props.port.type, () => {
+  if (!isSecure.value) return
+  if (!props.port.secure) props.port.secure = { limits: {} }
+  props.port.secure.limits = { max_connections:4096,max_udp_associations:4096,handshake_seconds:10,idle_seconds:300,...props.port.secure.limits }
+}, {immediate:true})
+const secureBusy = ref(false), secureError = ref(''), secureProfile = ref(''), publicAddress = ref(''), exportUser = ref(''), exportName = ref('')
+const exportUserOptions = computed(() => [
+  { label: `默认账号 · ${props.port.username}`, value: '' },
+  ...(props.port.users || []).filter(u => !u.disabled).map(u => ({ label: u.username, value: u.username }))
+])
+watch(() => [props.port.id, props.port.listen_addr], () => {
+  publicAddress.value = defaultProxyAddress(props.port.listen_addr)
+  exportUser.value = ''; exportName.value = props.port.name || ''; secureProfile.value = ''; secureError.value = ''
+}, { immediate: true })
+async function exportProfile() {
+  secureBusy.value = true; secureError.value = ''; secureProfile.value = ''
+  try { const res = await api(`/api/proxy-ports/${encodeURIComponent(props.port.id)}/export?format=link`, 'POST', { address: publicAddress.value, username: exportUser.value, name: exportName.value }); if (!res.success) throw new Error(res.msg || '导出失败'); secureProfile.value = res.data.link; await copyShareLink(secureProfile.value) } catch (e) { secureError.value = e.message } finally { secureBusy.value = false }
+}
 defineEmits(['open-proxy-selector', 'clear-proxy', 'refresh-runtime', 'pick-user-outbound'])
 </script>
 

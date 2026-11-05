@@ -67,10 +67,14 @@ func chainSingboxDialer(cfg *config.ProxyOutbound, prevDialer N.Dialer) (*Singbo
 	if cfg == nil {
 		return nil, fmt.Errorf("chain: outbound config is nil")
 	}
-	return &SingboxDialer{
-		config: cfg,
-		dialer: prevDialer,
-	}, nil
+	if supportsMihomo(cfg) {
+		delegated, err := newMihomoOutboundWithDialer(cfg, prevDialer)
+		if err != nil {
+			return nil, err
+		}
+		return &SingboxDialer{config: cfg, dialer: prevDialer, mihomo: delegated}, nil
+	}
+	return &SingboxDialer{config: cfg, dialer: prevDialer}, nil
 }
 
 // chainSingboxOutbound creates a SingboxOutbound for the given config, but with
@@ -78,6 +82,13 @@ func chainSingboxDialer(cfg *config.ProxyOutbound, prevDialer N.Dialer) (*Singbo
 func chainSingboxOutbound(cfg *config.ProxyOutbound, prevDialer N.Dialer) (*SingboxOutbound, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("chain: outbound config is nil")
+	}
+	if supportsMihomo(cfg) {
+		delegated, err := newMihomoOutboundWithDialer(cfg, prevDialer)
+		if err != nil {
+			return nil, err
+		}
+		return &SingboxOutbound{config: cfg, dialer: prevDialer, mihomo: delegated}, nil
 	}
 	outbound := &SingboxOutbound{
 		config:                         cfg,
@@ -136,6 +147,17 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 	nxDialers := make([]*chainNxDialer, 0, len(chainConfigs))
 	allOutbounds := make([]*SingboxOutbound, 0, len(chainConfigs))
 	var finalSingboxDialer *SingboxDialer
+	complete := false
+	defer func() {
+		if !complete {
+			for i := len(nxDialers) - 1; i >= 0; i-- {
+				_ = nxDialers[i].Close()
+			}
+			for i := len(allOutbounds) - 1; i >= 0; i-- {
+				_ = allOutbounds[i].Close()
+			}
+		}
+	}()
 
 	for i, cfg := range chainConfigs {
 		if cfg == nil {
@@ -150,6 +172,7 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 		// Create outbound for this hop (needed for UDP tunneling via ListenPacket)
 		outbound, err := chainSingboxOutbound(cfg, prevDialer)
 		if err != nil {
+			_ = sd.Close()
 			return nil, fmt.Errorf("chain: failed to create outbound for hop %d (%s): %w", i, cfg.Name, err)
 		}
 		allOutbounds = append(allOutbounds, outbound)
@@ -168,6 +191,7 @@ func CreateChainDialer(chainConfigs []*config.ProxyOutbound) (singboxcore.Dialer
 		return nil, fmt.Errorf("chain: failed to create final dialer")
 	}
 
+	complete = true
 	return &chainDialer{
 		hops:         chainConfigs,
 		dialers:      nxDialers,
@@ -194,15 +218,15 @@ func (d *chainDialer) Close() error {
 	}
 	d.closed = true
 	var lastErr error
-	for _, nxD := range d.dialers {
-		if err := nxD.Close(); err != nil {
+	for i := len(d.dialers) - 1; i >= 0; i-- {
+		if err := d.dialers[i].Close(); err != nil {
 			lastErr = err
 		}
 	}
 	// Close all hop outbounds to release anytls/hy2 background goroutines.
 	// SingboxOutbound.Close() is safe to call multiple times (sets clients to nil).
-	for _, ob := range d.allOutbounds {
-		ob.Close()
+	for i := len(d.allOutbounds) - 1; i >= 0; i-- {
+		_ = d.allOutbounds[i].Close()
 	}
 	return lastErr
 }
@@ -218,6 +242,7 @@ var _ singboxcore.Dialer = (*chainDialer)(nil)
 // completed PacketConns are cached by destination and reused. A background
 // goroutine closes idle entries after 2 minutes.
 type chainUDPOutbound struct {
+	dialers      []*chainNxDialer // UDP链的中间TCP/QUIC客户端也由链owner收尾。
 	hops         []*config.ProxyOutbound
 	outbound     *SingboxOutbound   // the last hop's outbound (with chained dialer)
 	allOutbounds []*SingboxOutbound // all hop outbounds for resource cleanup (anytls/hy2 goroutines)
@@ -430,6 +455,18 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 	var prevDialer N.Dialer = &directDialer{timeout: 30 * time.Second}
 	var finalOutbound *SingboxOutbound
 	allOutbounds := make([]*SingboxOutbound, 0, len(chainConfigs))
+	nxDialers := make([]*chainNxDialer, 0, len(chainConfigs))
+	complete := false
+	defer func() {
+		if !complete {
+			for i := len(nxDialers) - 1; i >= 0; i-- {
+				_ = nxDialers[i].Close()
+			}
+			for i := len(allOutbounds) - 1; i >= 0; i-- {
+				_ = allOutbounds[i].Close()
+			}
+		}
+	}()
 
 	for i, cfg := range chainConfigs {
 		if cfg == nil {
@@ -448,6 +485,7 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 			return nil, fmt.Errorf("chain: failed to create dialer for hop %d (%s): %w", i, cfg.Name, err)
 		}
 		nxD := &chainNxDialer{tcpDialer: sd, udpOutbound: outbound}
+		nxDialers = append(nxDialers, nxD)
 		prevDialer = nxD
 
 		if i == len(chainConfigs)-1 {
@@ -459,7 +497,9 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 		return nil, fmt.Errorf("chain: failed to create final outbound")
 	}
 
+	complete = true
 	return &chainUDPOutbound{
+		dialers:      nxDialers,
 		hops:         chainConfigs,
 		outbound:     finalOutbound,
 		allOutbounds: allOutbounds,
@@ -851,8 +891,11 @@ func (c *chainUDPOutbound) Close() error {
 
 	// Close all hop outbounds to release anytls/hy2 background goroutines.
 	// SingboxOutbound.Close() is safe to call multiple times (sets clients to nil).
-	for _, ob := range c.allOutbounds {
-		ob.Close()
+	for i := len(c.dialers) - 1; i >= 0; i-- {
+		_ = c.dialers[i].Close()
+	}
+	for i := len(c.allOutbounds) - 1; i >= 0; i-- {
+		_ = c.allOutbounds[i].Close()
 	}
 	return nil
 }

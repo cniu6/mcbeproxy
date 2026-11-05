@@ -87,6 +87,44 @@ func (sm *SessionManager) GetOrCreate(clientAddr string, serverID string) (*Sess
 	return session, true
 }
 
+// GetOrCreateWithKey 将中继所有者与显示地址分离；serverID 被纳入内部键。
+func (sm *SessionManager) GetOrCreateWithKey(ownerKey, clientAddr, serverID string) (*Session, bool) {
+	key := "relay\x00" + serverID + "\x00" + ownerKey
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok := sm.sessions[key]; ok {
+		return s, false
+	}
+	now := time.Now()
+	s := &Session{ID: uuid.NewString(), ClientAddr: clientAddr, ServerID: serverID, StartTime: now, LastSeen: now}
+	sm.sessions[key] = s
+	return s, true
+}
+
+// RemoveIfID 必须同时匹配所有者和不可变 ID，回调在锁外且只执行一次。
+func (sm *SessionManager) RemoveIfID(ownerKey, sessionID string) bool {
+	sm.mu.Lock()
+	var removed *Session
+	for key, s := range sm.sessions {
+		if s.ID == sessionID && (key == ownerKey || key == "relay\x00"+s.ServerID+"\x00"+ownerKey) {
+			delete(sm.sessions, key)
+			removed = s
+			break
+		}
+	}
+	sm.mu.Unlock()
+	if removed == nil {
+		return false
+	}
+	if removed.RemoteConn != nil {
+		_ = removed.RemoteConn.Close()
+	}
+	if sm.OnSessionEnd != nil {
+		sm.OnSessionEnd(removed)
+	}
+	return true
+}
+
 // Get retrieves a session by client address.
 // Returns the session and a boolean indicating if it was found.
 func (sm *SessionManager) Get(clientAddr string) (*Session, bool) {
@@ -162,6 +200,9 @@ func (sm *SessionManager) RemoveByPlayerName(displayName string) int {
 	for addr, session := range sm.sessions {
 		session.mu.Lock()
 		name := session.DisplayName
+		if session.IdentitySource == "nethernet_signaling" {
+			name = ""
+		}
 		session.mu.Unlock()
 
 		if name == displayName {
@@ -202,6 +243,9 @@ func (sm *SessionManager) RemoveByXUID(xuid string) int {
 	for addr, session := range sm.sessions {
 		session.mu.Lock()
 		sessionXUID := session.XUID
+		if session.IdentitySource == "nethernet_signaling" {
+			sessionXUID = ""
+		}
 		session.mu.Unlock()
 
 		if sessionXUID == xuid {
@@ -316,10 +360,12 @@ func (sm *SessionManager) cleanupIdleSessions() {
 	for clientAddr, session := range sm.sessions {
 		session.mu.Lock()
 		lastSeen := session.LastSeen
+		transport := session.Transport
 		session.mu.Unlock()
 
 		idleTimeout := sm.getIdleTimeout(session)
-		if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
+		// 中继有自己的媒体计时器与清理 owner，统一 GC 不先删展示记录。
+		if transport != "nethernet" && idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
 			toRemove = append(toRemove, clientAddr)
 		}
 	}
@@ -342,9 +388,10 @@ func (sm *SessionManager) GetIdleSessions(idleThreshold time.Duration) []*Sessio
 	for _, session := range sm.sessions {
 		session.mu.Lock()
 		lastSeen := session.LastSeen
+		transport := session.Transport
 		session.mu.Unlock()
 
-		if idleThreshold > 0 && now.Sub(lastSeen) > idleThreshold {
+		if transport != "nethernet" && idleThreshold > 0 && now.Sub(lastSeen) > idleThreshold {
 			idleSessions = append(idleSessions, session)
 		}
 	}
@@ -362,10 +409,12 @@ func (sm *SessionManager) CleanupNow() int {
 	for clientAddr, session := range sm.sessions {
 		session.mu.Lock()
 		lastSeen := session.LastSeen
+		transport := session.Transport
 		session.mu.Unlock()
 
 		idleTimeout := sm.getIdleTimeout(session)
-		if idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
+		// 中继有自己的媒体计时器与清理 owner，统一 GC 不先删展示记录。
+		if transport != "nethernet" && idleTimeout > 0 && now.Sub(lastSeen) > idleTimeout {
 			toRemove = append(toRemove, clientAddr)
 		}
 	}

@@ -44,6 +44,7 @@ type testProxyPortResult struct {
 }
 
 type proxyPortRuntimeDTO struct {
+	Running           bool   `json:"running"`
 	PortID            string `json:"port_id"`
 	ActiveConnections int    `json:"active_connections"`
 	CurrentNode       string `json:"current_node,omitempty"`
@@ -86,7 +87,7 @@ func (a *APIServer) getProxyPorts(c *gin.Context) {
 		if port == nil {
 			continue
 		}
-		clone := port.Clone()
+		clone := redactSecurePort(port)
 		dtos = append(dtos, proxyPortListDTO{
 			ProxyPortConfig:     clone,
 			proxyPortRuntimeDTO: a.buildProxyPortRuntimeSnapshot(clone),
@@ -123,6 +124,9 @@ func (a *APIServer) buildProxyPortRuntimeSnapshot(port *config.ProxyPortConfig) 
 	}
 
 	dto.PortID = port.ID
+	if owner, ok := a.proxyController.(interface{ IsProxyPortRunning(string) bool }); ok {
+		dto.Running = owner.IsProxyPortRunning(port.ID)
+	}
 	if a.proxyOutboundHandler != nil {
 		ref := a.proxyOutboundHandler.buildProxyPortUsageRef(port)
 		dto.ActiveConnections = ref.ActiveConnections
@@ -167,14 +171,21 @@ func (a *APIServer) createProxyPort(c *gin.Context) {
 		cfg.ID = generateProxyPortID()
 	}
 	cfg.ApplyDefaults()
+	if err := a.prepareSecurePort(&cfg); err != nil {
+		respondError(c, 400, err.Error(), "")
+		return
+	}
 	if err := a.proxyPortConfigMgr.AddPort(&cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to create proxy port", err.Error())
 		return
 	}
 	if a.proxyController != nil {
-		_ = a.proxyController.ReloadProxyPorts()
+		if err := a.proxyController.ReloadProxyPorts(); err != nil {
+			respondError(c, http.StatusConflict, "配置已保存，但监听未应用", err.Error())
+			return
+		}
 	}
-	respondSuccess(c, cfg)
+	respondSuccess(c, redactSecurePort(&cfg))
 }
 
 func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
@@ -202,6 +213,10 @@ func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
 			clone.ID = generateProxyPortID()
 		}
 		clone.ApplyDefaults()
+		if err := a.prepareSecurePort(clone); err != nil {
+			respondError(c, 400, err.Error(), "")
+			return
+		}
 		prepared = append(prepared, clone)
 	}
 	if err := a.proxyPortConfigMgr.AddPorts(prepared); err != nil {
@@ -209,7 +224,13 @@ func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
 		return
 	}
 	if a.proxyController != nil {
-		_ = a.proxyController.ReloadProxyPorts()
+		if err := a.proxyController.ReloadProxyPorts(); err != nil {
+			respondError(c, http.StatusConflict, "配置已保存，但监听未应用", err.Error())
+			return
+		}
+	}
+	for i, p := range prepared {
+		prepared[i] = redactSecurePort(p)
 	}
 	respondSuccess(c, prepared)
 }
@@ -232,15 +253,40 @@ func (a *APIServer) updateProxyPort(c *gin.Context) {
 	if cfg.ID == "" {
 		cfg.ID = portID
 	}
+	if cfg.ID != portID {
+		respondError(c, 400, "入口ID不可修改", "")
+		return
+	}
+	old, exists := a.proxyPortConfigMgr.GetPort(portID)
+	if !exists {
+		respondError(c, 404, "入口不存在", "")
+		return
+	}
+	preserveSecurePortSecrets(&cfg, old)
+	if old.IsSecure() && cfg.Type != old.Type {
+		respondError(c, 400, "安全入口协议不可原位更换，请新建入口", "")
+		return
+	}
 	cfg.ApplyDefaults()
+	if err := a.prepareSecurePort(&cfg); err != nil {
+		respondError(c, 400, err.Error(), "")
+		return
+	}
+	if err := a.validateSecurePortChange(&cfg); err != nil {
+		respondError(c, 409, err.Error(), "")
+		return
+	}
 	if err := a.proxyPortConfigMgr.UpdatePort(portID, &cfg); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to update proxy port", err.Error())
 		return
 	}
 	if a.proxyController != nil {
-		_ = a.proxyController.ReloadProxyPorts()
+		if err := a.proxyController.ReloadProxyPorts(); err != nil {
+			respondError(c, http.StatusConflict, "配置已保存，但监听未应用", err.Error())
+			return
+		}
 	}
-	respondSuccess(c, cfg)
+	respondSuccess(c, redactSecurePort(&cfg))
 }
 
 func (a *APIServer) deleteProxyPort(c *gin.Context) {
@@ -253,12 +299,24 @@ func (a *APIServer) deleteProxyPort(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "Invalid request", "id parameter is required")
 		return
 	}
+	if old, ok := a.proxyPortConfigMgr.GetPort(portID); ok && old.IsSecure() {
+		next := old.Clone()
+		next.ListenAddr = ""
+		next.Enabled = true
+		if err := a.validateSecurePortChange(next); err != nil {
+			respondError(c, 409, err.Error(), "")
+			return
+		}
+	}
 	if err := a.proxyPortConfigMgr.DeletePort(portID); err != nil {
 		respondError(c, http.StatusNotFound, "Failed to delete proxy port", err.Error())
 		return
 	}
 	if a.proxyController != nil {
-		_ = a.proxyController.ReloadProxyPorts()
+		if err := a.proxyController.ReloadProxyPorts(); err != nil {
+			respondError(c, http.StatusConflict, "配置已保存，但监听未应用", err.Error())
+			return
+		}
 	}
 	respondSuccessWithMsg(c, "已删除", nil)
 }
@@ -293,6 +351,11 @@ func (a *APIServer) testProxyPort(c *gin.Context) {
 	port, exists := a.proxyPortConfigMgr.GetPort(id)
 	if !exists {
 		respondError(c, http.StatusNotFound, "Proxy port not found", "no proxy port with id "+id)
+		return
+	}
+
+	if port.IsSecure() {
+		respondError(c, 400, "安全入口请使用导出的可信配置在客户端测试 TCP/UDP", "不能将 HY2/Mieru 当作本地 SOCKS 端口")
 		return
 	}
 

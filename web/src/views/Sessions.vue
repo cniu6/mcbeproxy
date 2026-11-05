@@ -56,6 +56,7 @@
 import { ref, onMounted, h } from 'vue'
 import { NButton, NPopconfirm, NTag, NTooltip, useMessage } from 'naive-ui'
 import { api, formatTime, formatBytes, formatDuration } from '../api'
+import { getSessionDisplayName, getSessionIdentityLabel } from '../composables/sessionPresentation'
 
 const props = defineProps({ initialSearch: { type: String, default: '' } })
 const message = useMessage()
@@ -102,7 +103,7 @@ const renderStatus = (r) => {
 }
 
 const columns = [
-  { title: '玩家', key: 'display_name', width: 110 },
+  { title: '身份 / 来源', key: 'display_name', width: 190, render: r => h('div', [h('div', getSessionDisplayName(r)), h('small', getSessionIdentityLabel(r))]) },
   { title: '服务器', key: 'server_id', width: 90 },
   { title: '连接状态', key: 'status', width: 110, render: renderStatus,
     filterOptions: Object.entries(statusMap).map(([k, v]) => ({ label: v.label, value: k })),

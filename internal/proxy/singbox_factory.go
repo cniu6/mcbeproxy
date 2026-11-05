@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -389,6 +390,7 @@ func parsePortRange(portRange string) (start, end int, err error) {
 // hy2PortHoppingConnFactory implements port hopping for Hysteria2.
 // It creates UDP connections that hop between ports at specified intervals.
 type hy2PortHoppingConnFactory struct {
+	dialer      N.Dialer // 非直连时，QUIC必须使用前跳提供的UDP关联。
 	serverIP    net.IP
 	portStart   int
 	portEnd     int
@@ -398,8 +400,19 @@ type hy2PortHoppingConnFactory struct {
 
 // New creates a new port-hopping UDP connection.
 func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
-	// Create base UDP connection
-	conn, err := netroute.ListenUDP(addrString(addr))
+	// 不能在链式拨号失败时另开本机socket，否则会绕过管理员指定的出口。
+	var conn net.PacketConn
+	var err error
+	if f.dialer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		conn, err = f.dialer.ListenPacket(ctx, M.SocksaddrFromNet(addr))
+		if err == nil {
+			conn = newChainTransportPacket(conn)
+		}
+	} else {
+		conn, err = netroute.ListenUDP(addrString(addr))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -539,7 +552,7 @@ func wrapHysteria2UDPError(err error) error {
 
 // initHysteria2 initializes a Hysteria2 client with full port hopping and TLS support.
 func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
-	serverAddr := fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
+	serverAddr := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
 
 	host, portStr, err := net.SplitHostPort(serverAddr)
 	if err != nil {
@@ -619,6 +632,13 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 		obfs:        obfs,
 	}
 
+	if _, direct := s.dialer.(*directDialer); s.dialer != nil && !direct {
+		if portStart > 0 && portEnd > portStart {
+			return errors.New("链式HY2端口跳跃需要前跳支持多目标UDP关联，请使用固定HY2端口")
+		}
+		connFactory.dialer = s.dialer
+	}
+
 	// Parse certificate fingerprint for pinning
 	var certFingerprint []byte
 	if cfg.CertFingerprint != "" {
@@ -630,6 +650,16 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 			return fmt.Errorf("certificate fingerprint must be SHA256 (32 bytes), got %d bytes", len(certFingerprint))
 		}
 		logger.Info("Hysteria2: certificate pinning enabled")
+	}
+
+	var trustedTLS *tls.Config
+	auth := cfg.Password
+	if cfg.SecureUpstream != nil {
+		trustedTLS, err = cfg.SecureUpstream.ClientTLS()
+		if err != nil {
+			return err
+		}
+		auth = cfg.Username + ":" + cfg.Password
 	}
 
 	// Create reconnectable client
@@ -645,7 +675,7 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 
 			hy2Config := &hy2.Config{
 				ServerAddr:  &net.UDPAddr{IP: serverIP, Port: selectedPort},
-				Auth:        cfg.Password,
+				Auth:        auth,
 				ConnFactory: connFactory,
 				TLSConfig: hy2.TLSConfig{
 					ServerName:         sni,
@@ -664,6 +694,14 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 					MaxTx: uint64(upMbps) * 1024 * 1024 / 8,   // Convert Mbps to bytes/s
 					MaxRx: uint64(downMbps) * 1024 * 1024 / 8, // Convert Mbps to bytes/s
 				},
+			}
+
+			if trustedTLS != nil {
+				hy2Config.TLSConfig.ServerName = trustedTLS.ServerName
+				hy2Config.TLSConfig.RootCAs = trustedTLS.RootCAs
+				hy2Config.TLSConfig.InsecureSkipVerify = false
+				hy2Config.BandwidthConfig = hy2.BandwidthConfig{}
+				hy2Config.CongestionConfig = hy2.CongestionConfig{Type: "bbr"}
 			}
 
 			// Certificate fingerprint pinning via VerifyPeerCertificate
@@ -807,16 +845,18 @@ func (s *SingboxOutbound) dialShadowsocksUDP(ctx context.Context, serverAddr, de
 		return nil, fmt.Errorf("failed to resolve server address: %w", err)
 	}
 
-	// Create UDP socket
-	udpConn, err := netroute.ListenUDP(serverUDPAddr.String())
+	// UDP数据面也必须使用前跳，不能只有TCP控制面经过代理链。
+	udpConn, err := s.dialer.ListenPacket(ctx, M.SocksaddrFromNet(serverUDPAddr))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP socket: %w", err)
+		return nil, fmt.Errorf("failed to create UDP socket through selected hop: %w", err)
 	}
 
 	logger.Debug("Shadowsocks: native UDP to %s for destination %s", serverUDPAddr, dest)
 
+	direct, _ := udpConn.(*net.UDPConn)
 	return &ssNativeUDPPacketConn{
-		UDPConn:     udpConn,
+		UDPConn:     direct,
+		relay:       udpConn,
 		serverAddr:  serverUDPAddr,
 		destination: dest,
 		key:         s.ssKey,
@@ -2079,6 +2119,7 @@ func (c *tcpPacketConn) Close() error {
 // Packet format: [salt][encrypted([destination][payload])]
 type ssNativeUDPPacketConn struct {
 	*net.UDPConn
+	relay       net.PacketConn // 链式UDP；直连保留UDPConn原生快速路径。
 	serverAddr  *net.UDPAddr
 	destination M.Socksaddr
 	key         []byte
@@ -2103,7 +2144,11 @@ func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err er
 	rawBuf := *rawBufPtr
 	defer PutLargeBuffer(rawBufPtr)
 
-	n, _, err = c.UDPConn.ReadFromUDP(rawBuf)
+	if c.UDPConn != nil {
+		n, _, err = c.UDPConn.ReadFromUDP(rawBuf)
+	} else {
+		n, _, err = c.relay.ReadFrom(rawBuf)
+	}
 	if err != nil {
 		logger.Debug("Shadowsocks UDP read error: %v", err)
 		return 0, nil, err
@@ -2143,6 +2188,13 @@ func (c *ssNativeUDPPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err er
 	return n, dest.UDPAddr(), nil
 }
 
+func (c *ssNativeUDPPacketConn) packetTransport() net.PacketConn {
+	if c.relay != nil {
+		return c.relay
+	}
+	return c.UDPConn
+}
+
 // ssUDPZeroNonce is the nonce of every Shadowsocks AEAD UDP packet: each
 // packet has its own random salt and therefore its own subkey.
 var ssUDPZeroNonce [32]byte
@@ -2173,7 +2225,12 @@ func (c *ssNativeUDPPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err err
 	plaintext := packet[saltLen:]
 	ciphertext := aead.Seal(plaintext[:0], ssUDPZeroNonce[:aead.NonceSize()], plaintext, nil)
 
-	if _, err = c.UDPConn.WriteToUDP(packet[:saltLen+len(ciphertext)], c.serverAddr); err != nil {
+	if c.UDPConn != nil {
+		_, err = c.UDPConn.WriteToUDP(packet[:saltLen+len(ciphertext)], c.serverAddr)
+	} else {
+		_, err = c.relay.WriteTo(packet[:saltLen+len(ciphertext)], c.serverAddr)
+	}
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -2197,27 +2254,27 @@ func (c *hysteria2PacketConn) sourceAddr(s string) net.Addr {
 
 // LocalAddr returns the local network address.
 func (c *ssNativeUDPPacketConn) LocalAddr() net.Addr {
-	return c.UDPConn.LocalAddr()
+	return c.packetTransport().LocalAddr()
 }
 
 // SetDeadline sets the read and write deadlines.
 func (c *ssNativeUDPPacketConn) SetDeadline(t time.Time) error {
-	return c.UDPConn.SetDeadline(t)
+	return c.packetTransport().SetDeadline(t)
 }
 
 // SetReadDeadline sets the read deadline.
 func (c *ssNativeUDPPacketConn) SetReadDeadline(t time.Time) error {
-	return c.UDPConn.SetReadDeadline(t)
+	return c.packetTransport().SetReadDeadline(t)
 }
 
 // SetWriteDeadline sets the write deadline.
 func (c *ssNativeUDPPacketConn) SetWriteDeadline(t time.Time) error {
-	return c.UDPConn.SetWriteDeadline(t)
+	return c.packetTransport().SetWriteDeadline(t)
 }
 
 // Close closes the connection.
 func (c *ssNativeUDPPacketConn) Close() error {
-	return c.UDPConn.Close()
+	return c.packetTransport().Close()
 }
 
 // trojanPacketConn wraps a TCP connection for Trojan UDP protocol.
@@ -2654,7 +2711,8 @@ func (d *SingboxDialer) getOrCreateHy2Client() (hy2.Client, error) {
 	}
 
 	// Create new Hysteria2 client
-	outbound, err := CreateSingboxOutbound(d.config)
+	outbound := &SingboxOutbound{config: d.config, dialer: d.dialer}
+	err := outbound.initHysteria2(d.config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hysteria2 outbound: %w", err)
 	}
@@ -2948,13 +3006,37 @@ func (d *SingboxDialer) dialVLESSTCP(ctx context.Context, serverAddr, dest M.Soc
 }
 
 // dialHysteria2TCP creates a TCP connection through Hysteria2.
-func (d *SingboxDialer) dialHysteria2TCP(_ context.Context, _, dest M.Socksaddr) (net.Conn, error) {
+func (d *SingboxDialer) dialHysteria2TCP(ctx context.Context, _, dest M.Socksaddr) (net.Conn, error) {
 	// Get or create cached Hysteria2 client
 	client, err := d.getOrCreateHy2Client()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get hysteria2 client: %w", err)
 	}
 
+	if d.config.SecureUpstream != nil {
+		// 目标拒绝/单流取消不能关闭其他玩家共用的 QUIC 客户端。
+		type result struct {
+			conn net.Conn
+			err  error
+		}
+		ready := make(chan result)
+		go func() {
+			conn, err := client.TCP(dest.String())
+			select {
+			case ready <- result{conn, err}:
+			case <-ctx.Done():
+				if conn != nil {
+					conn.Close()
+				}
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case r := <-ready:
+			return r.conn, r.err
+		}
+	}
 	// Create TCP connection through Hysteria2
 	conn, err := client.TCP(dest.String())
 	if err != nil {
@@ -3011,7 +3093,10 @@ type hysteria2PacketConn struct {
 	// frequent UDP packets, so on a long-lived connection this avoids steady
 	// timer/GC churn. Guarded by mu; see ReadFrom for the Reset/Stop-drain
 	// contract required to reuse a time.Timer safely.
-	readTimer *time.Timer
+	readTimer   *time.Timer
+	readMu      sync.Mutex // 单个读端拥有计时器；期限修改通过通知唤醒。
+	writeMu     sync.Mutex // 官方Send共用缓冲，必须串行写。
+	readChanged chan struct{}
 }
 
 // hy2RecvResult holds the result of a Hysteria2 receive operation.
@@ -3025,8 +3110,13 @@ type hy2RecvResult struct {
 // This avoids creating a new goroutine for each ReadFrom call, preventing goroutine leaks.
 func (c *hysteria2PacketConn) startReceiver() {
 	c.recvOnce.Do(func() {
+		c.mu.Lock()
 		c.recvCtx, c.recvCancel = context.WithCancel(context.Background())
 		c.recvCh = make(chan hy2RecvResult, 1)
+		if c.closed {
+			c.recvCancel()
+		}
+		c.mu.Unlock()
 
 		go func() {
 			for {
@@ -3059,72 +3149,93 @@ func (c *hysteria2PacketConn) startReceiver() {
 
 // ReadFrom reads a packet from the Hysteria2 UDP connection.
 func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return 0, nil, errors.New("connection closed")
-	}
-	deadline := c.readDeadline
-	if c.readTimer == nil {
-		// 首次创建时用 0 直接触发一次并立刻消费掉，让 channel 处于「空」
-		// 状态，后面才能安全地反复 Reset 复用（time.Timer 的 Reset 要求
-		// 在“已停止或已触发且 channel 已排空”的计时器上调用）。
-		c.readTimer = time.NewTimer(0)
-		<-c.readTimer.C
-	}
-	timer := c.readTimer
-	c.mu.Unlock()
-
-	// Start the persistent receiver goroutine (only once)
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 	c.startReceiver()
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return 0, nil, net.ErrClosed
+		}
+		deadline := c.readDeadline
+		if c.readChanged == nil {
+			c.readChanged = make(chan struct{})
+		}
+		changed := c.readChanged
+		if c.readTimer == nil {
+			// 首次创建时用 0 直接触发一次并立刻消费掉，让 channel 处于「空」
+			// 状态，后面才能安全地反复 Reset 复用（time.Timer 的 Reset 要求
+			// 在“已停止或已触发且 channel 已排空”的计时器上调用）。
+			c.readTimer = time.NewTimer(0)
+			<-c.readTimer.C
+		}
+		timer := c.readTimer
+		c.mu.Unlock()
 
-	// Apply timeout if deadline is set, otherwise use a default timeout.
-	// Reuse the per-connection timer instead of time.After: this ReadFrom is
-	// called once per UDP packet for the lifetime of the session, and
-	// time.After would allocate + schedule a brand new timer every single
-	// call, adding steady GC/scheduler pressure on long-running connections.
-	var timeoutDur time.Duration
-	if !deadline.IsZero() {
-		timeoutDur = time.Until(deadline)
-		if timeoutDur <= 0 {
+		// Apply timeout if deadline is set, otherwise use a default timeout.
+		// Reuse the per-connection timer instead of time.After: this ReadFrom is
+		// called once per UDP packet for the lifetime of the session, and
+		// time.After would allocate + schedule a brand new timer every single
+		// call, adding steady GC/scheduler pressure on long-running connections.
+		var timeoutDur time.Duration
+		if !deadline.IsZero() {
+			timeoutDur = time.Until(deadline)
+			if timeoutDur <= 0 {
+				return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
+			}
+		} else {
+			// Default timeout of 30 seconds if no deadline is set
+			timeoutDur = 30 * time.Second
+		}
+		timer.Reset(timeoutDur)
+
+		select {
+		case <-c.recvCtx.Done():
+			stopHY2ReadTimer(timer)
+			return 0, nil, net.ErrClosed
+		case <-changed:
+			stopHY2ReadTimer(timer)
+			continue
+		case r := <-c.recvCh:
+			// 收到数据时手动停表：Stop() 返回 false 说明计时器已经先一步触发
+			// 过了（小概率竞态），此时把已经写进 channel 的那个值排空，保证
+			// 下次进来 Reset 前 channel 一定是空的，否则会读到陈旧的到期事件。
+			stopHY2ReadTimer(timer)
+			if r.err != nil {
+				errStr := r.err.Error()
+				// EOF means the UDP session was closed
+				if errStr == "EOF" || strings.Contains(errStr, "EOF") {
+					logger.Debug("Hysteria2: UDP session EOF for %s", c.destination.String())
+					return 0, nil, io.EOF
+				}
+				// Log other errors for debugging
+				logger.Debug("Hysteria2: UDP receive error for %s: %v", c.destination.String(), r.err)
+				return 0, nil, r.err
+			}
+			n = copy(p, r.data)
+			return n, c.sourceAddr(r.addr), nil
+
+		case <-timer.C:
+			logger.Debug("Hysteria2: read timeout for %s", c.destination.String())
 			return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 		}
-	} else {
-		// Default timeout of 30 seconds if no deadline is set
-		timeoutDur = 30 * time.Second
 	}
-	timer.Reset(timeoutDur)
+}
 
-	select {
-	case r := <-c.recvCh:
-		// 收到数据时手动停表：Stop() 返回 false 说明计时器已经先一步触发
-		// 过了（小概率竞态），此时把已经写进 channel 的那个值排空，保证
-		// 下次进来 Reset 前 channel 一定是空的，否则会读到陈旧的到期事件。
-		if !timer.Stop() {
-			<-timer.C
+func stopHY2ReadTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
-		if r.err != nil {
-			errStr := r.err.Error()
-			// EOF means the UDP session was closed
-			if errStr == "EOF" || strings.Contains(errStr, "EOF") {
-				logger.Debug("Hysteria2: UDP session EOF for %s", c.destination.String())
-				return 0, nil, io.EOF
-			}
-			// Log other errors for debugging
-			logger.Debug("Hysteria2: UDP receive error for %s: %v", c.destination.String(), r.err)
-			return 0, nil, r.err
-		}
-		n = copy(p, r.data)
-		return n, c.sourceAddr(r.addr), nil
-
-	case <-timer.C:
-		logger.Debug("Hysteria2: read timeout for %s", c.destination.String())
-		return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 	}
 }
 
 // WriteTo writes a packet to the Hysteria2 UDP connection.
 func (c *hysteria2PacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -3133,6 +3244,14 @@ func (c *hysteria2PacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	c.mu.Unlock()
 
 	destStr := c.destStr
+	// 锁定的官方 core 的4096字节缓冲包含地址头，超限会静默返回成功。
+	header := 8 + 1 + len(destStr)
+	if len(destStr) >= 64 {
+		header++
+	}
+	if len(p)+header > 4096 {
+		return 0, fmt.Errorf("HY2 报文超过当前协议库上限：本目标最多%d字节", 4096-header)
+	}
 	err = c.conn.Send(p, destStr)
 	if err != nil {
 		logger.Debug("Hysteria2: send error to %s: %v", destStr, err)
@@ -3155,8 +3274,10 @@ func (c *hysteria2PacketConn) Close() error {
 		c.recvCancel()
 	}
 
-	if c.readTimer != nil {
-		c.readTimer.Stop()
+	// 计时器由读端收尾，关闭通知负责立即唤醒阻塞读取。
+	if c.readChanged != nil {
+		close(c.readChanged)
+		c.readChanged = make(chan struct{})
 	}
 
 	if c.conn != nil {
@@ -3179,6 +3300,10 @@ func (c *hysteria2PacketConn) SetDeadline(t time.Time) error {
 func (c *hysteria2PacketConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	c.readDeadline = t
+	if c.readChanged != nil {
+		close(c.readChanged)
+	}
+	c.readChanged = make(chan struct{})
 	c.mu.Unlock()
 	return nil
 }

@@ -201,10 +201,8 @@ func pingThroughChainConn(t *testing.T, pc net.PacketConn, dest *net.UDPAddr) {
 	}
 }
 
-// TestChainSOCKS5UDP_ProbeOKUsesDirectRelay 覆盖 a 类节点（允许直连）：
-// 探测应当通过，末跳 UDP 走本机直连，且**不会**对上一跳再开一层 UDP
-// ASSOCIATE——这正是之前修「单 ASSOCIATE 本地加速器被挤掉」时要保住的行为。
-func TestChainSOCKS5UDP_ProbeOKUsesDirectRelay(t *testing.T) {
+// 显式代理链即使本机直连中继可达，也必须经过前跳，不以探测结果改变路由。
+func TestChainSOCKS5UDP_ReachableRelayStillUsesPreviousHop(t *testing.T) {
 	clearSOCKS5DirectRelayMemo(t)
 	allowLoopbackDirectRelay(t)
 	realServer, stopReal := startFakeRakNetServer(t)
@@ -223,11 +221,11 @@ func TestChainSOCKS5UDP_ProbeOKUsesDirectRelay(t *testing.T) {
 	if got := hop2Assocs.Load(); got != 1 {
 		t.Fatalf("hop2 UDP ASSOCIATE count = %d, want 1", got)
 	}
-	if got := hop1Assocs.Load(); got != 0 {
-		t.Fatalf("hop1 UDP ASSOCIATE count = %d, want 0 (direct relay must not tunnel UDP through hop1)", got)
+	if got := hop1Assocs.Load(); got != 1 {
+		t.Fatalf("hop1 UDP ASSOCIATE count = %d, want 1 (explicit chain cannot bypass previous hop)", got)
 	}
-	if works, known := loadSOCKS5DirectRelayMemo(hop2Key); !known || !works {
-		t.Fatalf("memo after successful probe = (works=%v known=%v), want (true, true)", works, known)
+	if _, known := loadSOCKS5DirectRelayMemo(hop2Key); known {
+		t.Fatal("explicit chain must not probe direct relay")
 	}
 }
 
@@ -260,11 +258,8 @@ func TestChainSOCKS5UDP_MemoBrokenTunnelsViaChain(t *testing.T) {
 	}
 }
 
-// TestChainSOCKS5UDP_MemoSkipsRepeatProbe 验证探测结果确实被复用：同一末跳
-// 第二次 ASSOCIATE 不再探测（探测会向目标多发 ping；这里通过第二次建连
-// 依旧只有各一条新 ASSOCIATE、且立即可用来间接验证），避免每个玩家加入都
-// 多付一次探测延迟。
-func TestChainSOCKS5UDP_MemoSkipsRepeatProbe(t *testing.T) {
+// 显式链首次和再次使用均不探测直连；缓存复用不应增加额外探测延迟。
+func TestChainSOCKS5UDP_ReuseDoesNotProbeDirectRelay(t *testing.T) {
 	clearSOCKS5DirectRelayMemo(t)
 	allowLoopbackDirectRelay(t)
 	realServer, stopReal := startFakeRakNetServer(t)
@@ -279,8 +274,8 @@ func TestChainSOCKS5UDP_MemoSkipsRepeatProbe(t *testing.T) {
 	pingThroughChainConn(t, pc1, realServer)
 	pc1.Close()
 
-	if _, known := loadSOCKS5DirectRelayMemo(hop2Key); !known {
-		t.Fatal("memo should be populated after the first association")
+	if _, known := loadSOCKS5DirectRelayMemo(hop2Key); known {
+		t.Fatal("explicit chain must not populate direct-relay memo")
 	}
 
 	// 第二次建连应当直接命中 memo。链缓存会优先复用旧连接，为了强制新

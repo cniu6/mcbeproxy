@@ -1,0 +1,27 @@
+Twemoji Country Flags — third-party attribution
+
+Asset: TwemojiCountryFlags.woff2
+Source package: country-flag-emoji-polyfill 0.1.10
+Source URL: https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1.10/dist/TwemojiCountryFlags.woff2
+Project: https://github.com/talkjs/country-flag-emoji-polyfill
+
+This font is the upstream country-flag subset of Mozilla's Twemoji Mozilla font.
+The bundled font is redistributed unchanged. The subset was made upstream using
+fonttools pyftsubset. It is served locally to provide flag glyphs on Windows;
+normal UI fonts and node names are unchanged.
+
+Mozilla font/code source: https://github.com/mozilla/twemoji-colr
+Copyright 2016-2018, Mozilla Foundation.
+Font generation code: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0
+
+Flag artwork: Twemoji, Copyright Twitter, Inc. and other contributors.
+Artwork source: https://github.com/twitter/twemoji
+Artwork license: Creative Commons Attribution 4.0 International (CC BY 4.0).
+License: https://creativecommons.org/licenses/by/4.0/legalcode
+Summary: https://creativecommons.org/licenses/by/4.0/
+
+You may share and adapt the artwork, including commercially, provided that you
+give appropriate credit, link to the license, indicate changes, and do not add
+legal or technological restrictions that prevent recipients exercising those
+rights. No endorsement by the upstream authors is implied. No warranties are
+provided. The complete license terms are available at the links above.

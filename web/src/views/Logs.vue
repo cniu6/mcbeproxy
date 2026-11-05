@@ -38,7 +38,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api } from '../api'
-import { createAdaptivePoll } from '../composables/useAdaptivePoll'
+import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
 
 const message = useMessage()
 const logFiles = ref([])
@@ -49,7 +49,8 @@ const filter = ref('')
 const autoRefresh = ref(true)
 const loading = ref(false)
 const logContainer = ref(null)
-const logPoller = createAdaptivePoll(() => (logFile.value ? loadLog() : undefined), { interval: 2000, maxInterval: 15000 })
+const logPoller = createPageRefreshPoll(() => (logFile.value ? loadLog() : undefined))
+onUnmounted(() => logPoller.dispose())
 
 const logFileOptions = computed(() => logFiles.value.map(f => ({ label: f, value: f })))
 
@@ -124,7 +125,7 @@ const toggleAutoRefresh = (enabled) => {
   }
 }
 
-// 2 秒刷新; 不重叠、后台暂停、慢响应自动放缓
+// 跟随浏览器全局刷新间隔；日志页开关仍可单独暂停。
 const startAutoRefresh = () => {
   logPoller.stop()
   logPoller.start()

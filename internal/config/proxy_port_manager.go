@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,14 @@ func NewProxyPortConfigManager(configPath string) *ProxyPortConfigManager {
 		ports:      make(map[string]*ProxyPortConfig),
 		configPath: configPath,
 	}
+}
+
+// IdentityDataDir 将身份放在端口配置所属数据目录，不接受客户端文件路径。
+func (m *ProxyPortConfigManager) IdentityDataDir() string {
+	if m == nil {
+		return "."
+	}
+	return filepath.Dir(m.configPath)
 }
 
 // Load loads proxy port configurations from the JSON file.
@@ -66,7 +75,7 @@ func (m *ProxyPortConfigManager) Load() error {
 		if _, exists := newPorts[cfg.ID]; exists {
 			return fmt.Errorf("duplicate proxy port id %s", cfg.ID)
 		}
-		listenAddr := normalizeProxyPortListenAddr(cfg.ListenAddr)
+		listenAddr := cfg.ListenNetwork() + "|" + normalizeProxyPortListenAddr(cfg.ListenAddr)
 		if existingID, exists := seenListenAddrs[listenAddr]; exists {
 			return fmt.Errorf("duplicate proxy port listen_addr %s for %s and %s", cfg.ListenAddr, existingID, cfg.ID)
 		}
@@ -147,12 +156,12 @@ func (m *ProxyPortConfigManager) ensurePortUniqueLocked(cfg *ProxyPortConfig, ex
 	if current, exists := m.ports[cfg.ID]; exists && (existingID == "" || cfg.ID != existingID) && current != nil {
 		return fmt.Errorf("proxy port with id %s already exists", cfg.ID)
 	}
-	listenAddr := normalizeProxyPortListenAddr(cfg.ListenAddr)
+	listenAddr := cfg.ListenNetwork() + "|" + normalizeProxyPortListenAddr(cfg.ListenAddr)
 	for id, existing := range m.ports {
 		if id == existingID || existing == nil {
 			continue
 		}
-		if normalizeProxyPortListenAddr(existing.ListenAddr) == listenAddr {
+		if existing.ListenNetwork()+"|"+normalizeProxyPortListenAddr(existing.ListenAddr) == listenAddr {
 			return fmt.Errorf("proxy port listen_addr %s already exists", cfg.ListenAddr)
 		}
 	}
@@ -179,7 +188,11 @@ func (m *ProxyPortConfigManager) AddPort(cfg *ProxyPortConfig) error {
 		return err
 	}
 	m.ports[cfg.ID] = cfg.Clone()
-	return m.saveToFile()
+	if err := m.saveToFile(); err != nil {
+		delete(m.ports, cfg.ID)
+		return err
+	}
+	return nil
 }
 
 func (m *ProxyPortConfigManager) AddPorts(cfgs []*ProxyPortConfig) error {
@@ -213,7 +226,13 @@ func (m *ProxyPortConfigManager) AddPorts(cfgs []*ProxyPortConfig) error {
 	for _, cfg := range prepared {
 		m.ports[cfg.ID] = cfg.Clone()
 	}
-	return m.saveToFile()
+	if err := m.saveToFile(); err != nil {
+		for _, cfg := range prepared {
+			delete(m.ports, cfg.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 // UpdatePort updates an existing proxy port configuration.
@@ -226,7 +245,8 @@ func (m *ProxyPortConfigManager) UpdatePort(id string, cfg *ProxyPortConfig) err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.ports[id]; !exists {
+	previous, exists := m.ports[id]
+	if !exists {
 		return fmt.Errorf("proxy port with id %s not found", id)
 	}
 	if err := m.ensurePortUniqueLocked(cfg, id, nil); err != nil {
@@ -236,18 +256,28 @@ func (m *ProxyPortConfigManager) UpdatePort(id string, cfg *ProxyPortConfig) err
 		delete(m.ports, id)
 	}
 	m.ports[cfg.ID] = cfg.Clone()
-	return m.saveToFile()
+	if err := m.saveToFile(); err != nil {
+		delete(m.ports, cfg.ID)
+		m.ports[id] = previous
+		return err
+	}
+	return nil
 }
 
 // DeletePort removes a proxy port configuration.
 func (m *ProxyPortConfigManager) DeletePort(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.ports[id]; !exists {
+	previous, exists := m.ports[id]
+	if !exists {
 		return fmt.Errorf("proxy port with id %s not found", id)
 	}
 	delete(m.ports, id)
-	return m.saveToFile()
+	if err := m.saveToFile(); err != nil {
+		m.ports[id] = previous
+		return err
+	}
+	return nil
 }
 
 // SetOnChange sets a callback for config changes.

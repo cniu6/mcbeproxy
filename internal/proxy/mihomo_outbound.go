@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
+
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"strings"
 
 	mihomo "github.com/metacubex/mihomo/adapter"
@@ -55,6 +59,9 @@ func supportsMihomo(cfg *config.ProxyOutbound) bool {
 	if cfg == nil {
 		return false
 	}
+	if cfg.SecureUpstream != nil {
+		return false
+	}
 	switch outboundCorePreference(cfg) {
 	case "mihomo", "clash":
 		return mihomoSupportsProtocol(cfg.Type)
@@ -75,6 +82,11 @@ func supportsMihomo(cfg *config.ProxyOutbound) bool {
 }
 
 func newMihomoOutbound(cfg *config.ProxyOutbound) (*mihomoOutbound, error) {
+	return newMihomoOutboundWithDialer(cfg, nil)
+}
+
+// 每实例注入前跳，不注册全局代理名，也不回退到本机直连。
+func newMihomoOutboundWithDialer(cfg *config.ProxyOutbound, previous N.Dialer) (*mihomoOutbound, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("proxy outbound configuration cannot be nil")
 	}
@@ -84,11 +96,30 @@ func newMihomoOutbound(cfg *config.ProxyOutbound) (*mihomoOutbound, error) {
 		// whether the Chromium Cronet runtime is available.
 		return nil, fmt.Errorf("NaiveProxy only supports TCP CONNECT and cannot carry MCPE UDP traffic")
 	}
-	proxy, err := mihomo.ParseProxy(buildMihomoMapping(cfg))
+	var options []mihomo.ProxyOption
+	if previous != nil {
+		options = append(options, mihomo.WithDialerForAPI(chainMihomoDialer{previous}))
+	}
+	proxy, err := mihomo.ParseProxy(buildMihomoMapping(cfg), options...)
 	if err != nil {
 		return nil, fmt.Errorf("mihomo %s outbound: %w", cfg.Type, err)
 	}
 	return &mihomoOutbound{proxy: proxy}, nil
+}
+
+type chainMihomoDialer struct{ previous N.Dialer }
+
+func (d chainMihomoDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("链式底层流拨号不支持 %s，请使用UDP关联", network)
+	}
+	return d.previous.DialContext(ctx, network, M.ParseSocksaddr(address))
+}
+func (d chainMihomoDialer) ListenPacket(ctx context.Context, _ string, _ string, remote netip.AddrPort) (net.PacketConn, error) {
+	if !remote.IsValid() {
+		return nil, fmt.Errorf("链式UDP缺少有效目标地址")
+	}
+	return d.previous.ListenPacket(ctx, M.SocksaddrFromNetIP(remote))
 }
 
 func (o *mihomoOutbound) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

@@ -2,6 +2,17 @@
   <div>
     <n-h3>设置</n-h3>
 
+    <n-card size="small" title="页面自动刷新（当前浏览器全局）" style="margin-bottom: 16px">
+      <n-space vertical :size="6">
+        <n-text depth="3">统一控制仪表盘、服务状态、订阅列表、代理节点及服务器概览的状态读取频率；不修改订阅更新时间或节点测速计划。</n-text>
+        <n-space align="center" :size="6">
+          <n-text>刷新间隔</n-text>
+          <n-select size="small" :value="pageRefreshSeconds" :options="pageRefreshOptions" style="width: 120px" @update:value="savePageRefresh" />
+          <n-text depth="3">选择后立即保存，无需重启；关闭后仍可手动刷新。</n-text>
+        </n-space>
+      </n-space>
+    </n-card>
+
     <!-- 动态入口路径 -->
     <n-card size="small" title="管理面板入口 (动态)" style="margin-bottom: 24px">
       <n-alert size="small" type="warning" style="margin-bottom: 16px">
@@ -286,12 +297,25 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useMessage, useDialog } from 'naive-ui'
 import { api, getApiKey, setApiKey, hasApiKey } from '../api'
+import { pageRefreshOptions, getPageRefreshSeconds, setPageRefreshSeconds, subscribePageRefresh } from '../composables/pageRefreshSettings'
 
 const message = useMessage()
 const dialog = useDialog()
+
+const pageRefreshSeconds = ref(getPageRefreshSeconds())
+const unsubscribeRefresh = subscribePageRefresh(value => { pageRefreshSeconds.value = value })
+onUnmounted(unsubscribeRefresh)
+const savePageRefresh = value => {
+  try {
+    setPageRefreshSeconds(value)
+    message.success('页面刷新设置已保存（当前浏览器全局生效）')
+  } catch {
+    message.error('保存失败，请检查浏览器本地存储是否可用')
+  }
+}
 
 // 本地 API Key
 const localApiKey = ref('')

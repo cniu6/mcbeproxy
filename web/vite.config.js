@@ -9,18 +9,12 @@ export default defineConfig({
     vue(),
     // 按需导入 naive-ui：模板里用到哪个组件才打包哪个，替代 app.use(naive) 的全量注册
     Components({ resolvers: [NaiveUiResolver()], dts: false }),
-    // 同时生成 .gz 与 .br，Go 端按 Accept-Encoding 直接吐出预压缩文件，
-    // 把 ~1.9MB 的 JS 在线传输体积降到 ~500KB / ~400KB
+    // 此插件用 algorithms 同时生成两种产物，只注册一次以免重复发射同名文件。
+    // 保留原文件，Go 按 Accept-Encoding 选择 .gz / .br，旧客户端仍可读未压缩资源。
     compression({
       include: [/\.(js|mjs|css|html|svg|json)$/],
       threshold: 1024,
-      algorithm: 'gzip',
-      deleteOriginalAssets: false
-    }),
-    compression({
-      include: [/\.(js|mjs|css|html|svg|json)$/],
-      threshold: 1024,
-      algorithm: 'brotliCompress',
+      algorithms: ['gzip', 'brotliCompress'],
       deleteOriginalAssets: false
     })
   ],

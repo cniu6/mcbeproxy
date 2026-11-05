@@ -7,7 +7,9 @@
             <n-text strong>{{ s.name }}</n-text>
             <n-tag size="tiny" :type="isRunning(s) ? 'success' : 'error'">{{ isRunning(s) ? '运行' : '停止' }}</n-tag>
             <n-tag size="tiny" :type="proxyModeType(s)">{{ proxyModeLabel(s) }}</n-tag>
-            <n-tag size="tiny" :type="sessionsOf(s).length ? 'info' : 'default'">玩家 {{ s.active_sessions || 0 }}</n-tag>
+            <n-tag v-if="s.effective_proxy_mode && s.effective_proxy_mode !== s.proxy_mode" size="tiny" type="warning">实际模式 {{ s.effective_proxy_mode }}，配置尚未生效</n-tag>
+            <n-tag v-if="s.nethernet_relay_status === 'unavailable'" size="tiny" type="error">NetherNet 信令不可用（RakNet 仍可用）</n-tag>
+            <n-tag size="tiny" :type="sessionsOf(s).length ? 'info' : 'default'">连接 {{ s.active_sessions || 0 }}</n-tag>
             <n-tag v-if="isRunning(s)" size="tiny" :type="latencyType(s, pings[s.id])">{{ latencyText(s, pings[s.id]) }}</n-tag>
             <n-tag v-if="motdPlayers(pings[s.id])" size="tiny" type="info">在线 {{ motdPlayers(pings[s.id]) }}</n-tag>
           </n-space>
@@ -40,19 +42,21 @@
                 <tr v-for="sess in sessionsOf(s)" :key="sess.id">
                   <td>
                     <template v-if="hasName(sess)">
-                      <n-button size="small" v-if="actions" text type="primary" @click="emit('player', sess.display_name)">{{ sess.display_name }}</n-button>
+                      <n-button size="small" v-if="actions && canManageSessionAsPlayer(sess)" text type="primary" @click="emit('player', sess.display_name)">{{ sess.display_name }}</n-button>
                       <span v-else>{{ sess.display_name }}</span>
                     </template>
-                    <n-tag v-else size="tiny" type="warning" :bordered="false">解析中</n-tag>
+                    <n-tag v-else size="tiny" type="warning" :bordered="false">{{ getSessionDisplayName(sess) }}</n-tag>
+                    <n-text v-if="getSessionIdentityLabel(sess)" depth="3"> {{ getSessionIdentityLabel(sess) }}</n-text>
                   </td>
                   <td>{{ sess.client_addr }}</td>
                   <td>{{ onlineDuration(sess) }}</td>
                   <td>↑{{ formatBytes(sess.bytes_up) }} ↓{{ formatBytes(sess.bytes_down) }}</td>
                   <td v-if="actions">
                     <n-space :size="4">
-                      <n-button size="tiny" type="warning" :disabled="!hasName(sess)" @click="emit('kick', sess)">踢出</n-button>
-                      <n-button size="tiny" :disabled="!hasName(sess)" @click="emit('whitelist', sess.display_name)">白名单</n-button>
-                      <n-button size="tiny" type="error" :disabled="!hasName(sess)" @click="emit('blacklist', sess.display_name)">封禁</n-button>
+                      <n-popconfirm v-if="canCloseRelaySession(sess)" @positive-click="emit('close-session', sess)"><template #trigger><n-button size="tiny" type="warning">断开中继</n-button></template>仅关闭此中继连接，不发送游戏踢出包，确定断开？</n-popconfirm>
+                      <n-button size="tiny" type="warning" :disabled="!canManageSessionAsPlayer(sess)" @click="emit('kick', sess)">踢出</n-button>
+                      <n-button size="tiny" :disabled="!canManageSessionAsPlayer(sess)" @click="emit('whitelist', sess.display_name)">白名单</n-button>
+                      <n-button size="tiny" type="error" :disabled="!canManageSessionAsPlayer(sess)" @click="emit('blacklist', sess.display_name)">封禁</n-button>
                     </n-space>
                   </td>
                 </tr>
@@ -76,6 +80,7 @@
 
 <script setup>
 import { ref, computed, watch } from 'vue'
+import { getSessionDisplayName, getSessionIdentityLabel, canManageSessionAsPlayer, canCloseRelaySession } from '../composables/sessionPresentation'
 import { formatBytes, formatDuration } from '../api'
 import LatencySparkline from './LatencySparkline.vue'
 import ServerLatencyHistoryModal from './ServerLatencyHistoryModal.vue'
@@ -95,7 +100,7 @@ const props = defineProps({
   refreshNonce: { type: Number, default: 0 },
   actions: { type: Boolean, default: false }
 })
-const emit = defineEmits(['player', 'kick', 'whitelist', 'blacklist'])
+const emit = defineEmits(['player', 'kick', 'whitelist', 'blacklist', 'close-session'])
 
 const expanded = ref([])
 const showHistory = ref(false)

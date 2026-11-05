@@ -303,6 +303,19 @@ func (s *SingboxOutbound) createSOCKS5Association(ctx context.Context, serverAdd
 
 	logger.Info("SOCKS5 UDP ASSOCIATE: server=%s bnd=%s relay=%s",
 		ctrl.RemoteAddr(), bnd, relayAddr)
+	if socks5PrivateRelayBehindPublicProxy(serverAddr, relayAddr) {
+		logger.Warn("SOCKS5 公网代理 %s 返回私网 UDP 中继 %s；没有对应私网路由时将超时，需在服务端设置公网通告、UDP 端口范围及 NAT/容器同号映射；不会自动改写 BND 地址", serverAddr, relayAddr)
+	}
+
+	// 显式代理链必须让数据面与控制面经过同一前跳；探测直连成功也不代表允许绕链。
+	if previous, ok := s.dialer.(*chainNxDialer); ok {
+		pc, err := previous.ListenPacket(ctx, M.SocksaddrFromNet(relayAddr))
+		if err != nil {
+			ctrl.Close()
+			return nil, nil, nil, M.Socksaddr{}, fmt.Errorf("SOCKS5 前跳UDP转发失败，不回退直连: %w", err)
+		}
+		return ctrl, pc, relayAddr, resolvedDest, nil
+	}
 
 	// UDP 中继 socket 选择策略（链式场景两种末跳服务器行为都真实存在，
 	// 必须自适应，不能写死其中一种）：
@@ -502,6 +515,7 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	// 连接一断就直接把玩家踢下线，高并发下会明显增加掉线率。
 	s5pc := &socks5UDPPacketConn{
 		destination:              resolvedDest,
+		proxyServer:              serverAddr,
 		destAddr:                 resolvedDest.UDPAddr(),
 		stopCh:                   make(chan struct{}),
 		disableReactiveReconnect: s.disableSOCKS5ReactiveReconnect,
@@ -512,6 +526,7 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 			return newCtrl, newUdp, newRelay, rerr
 		},
 	}
+	s5pc.diagnostic.initialize()
 	s5pc.state.Store(&connState{
 		udpConn:   udpConn,
 		ctrlConn:  ctrl,
@@ -568,6 +583,8 @@ func (c *socks5UDPPacketConn) monitorCtrlConn() {
 			continue
 		}
 
+		// 先留存实际控制端点与原始错误，再关闭UDP，避免外层只看见衍生的closed。
+		c.recordControlDiagnostic(st, err)
 		// TCP control connection closed by remote. For cached SOCKS5 UDP
 		// associations, do not reconnect in place: the cache needs to observe
 		// the old entry as dead and create a fresh PacketConn on next use.
@@ -656,6 +673,7 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 			*backoff = 1 * time.Second
 			return
 		}
+		c.diagnostic.record("reconnect", err)
 		logger.Debug("SOCKS5 UDP: reactive reconnect failed: err=%v backoff=%v", err, *backoff)
 		select {
 		case <-c.stopCh:
@@ -740,6 +758,7 @@ func (c *socks5UDPPacketConn) udpKeepalive() {
 				if c.reconnecting.Load() {
 					continue // the old socket was swapped out; keep keeping the new one alive
 				}
+				c.diagnostic.record("keepalive_write", err)
 				consecutiveFailures++
 				logger.Debug("SOCKS5 UDP keepalive failed: relay=%s err=%v consecutive=%d",
 					st.relayAddr, err, consecutiveFailures)
@@ -767,7 +786,11 @@ func socks5RelayUDPAddr(ctrl net.Conn, serverAddr M.Socksaddr, bnd M.Socksaddr) 
 		return nil, errors.New("socks5: server returned zero UDP relay port")
 	}
 	if bnd.Addr.IsValid() && !bnd.Addr.IsUnspecified() {
-		return &net.UDPAddr{IP: bnd.Addr.AsSlice(), Port: port}, nil
+		addr := bnd.Addr.Unmap()
+		if addr.IsMulticast() || addr == netip.MustParseAddr("255.255.255.255") {
+			return nil, errors.New("socks5: server returned invalid multicast/broadcast UDP relay address")
+		}
+		return &net.UDPAddr{IP: addr.AsSlice(), Port: port}, nil
 	}
 	// Use serverAddr first — correct for chained connections where
 	// ctrl.RemoteAddr() is the immediate TCP peer (e.g. a local relay),
@@ -823,8 +846,11 @@ type connState struct {
 }
 
 type socks5UDPPacketConn struct {
+	diagnostic               connectionDiagnosticState
+	controlDiagnostic        atomic.Pointer[ConnectionDiagnostic] // 故障当时的端点，重连后不可拿新端点冒充
 	state                    atomic.Pointer[connState] // swapped atomically during reconnect
 	destination              M.Socksaddr
+	proxyServer              M.Socksaddr // 仅用于 UDP 超时诊断，重连仍归原关联所有
 	closeOnce                sync.Once
 	closed                   atomic.Bool // set by Close() to suppress monitor log
 	remoteClosed             atomic.Bool // set when reconnect fails permanently
@@ -918,6 +944,7 @@ func (c *socks5UDPPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 		if attempt == 0 && c.reconnecting.Load() {
 			continue
 		}
+		c.diagnostic.record("udp_write", err)
 		logger.Debug("SOCKS5 UDP write failed: relay=%s err=%v", st.relayAddr, err)
 		return 0, err
 	}
@@ -949,11 +976,12 @@ func (c *socks5UDPPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 				c.waitReconnect()
 				continue
 			}
+			c.diagnostic.record("udp_read", err)
 			if !isTimeoutError(err) {
 				logger.Debug("SOCKS5 UDP read failed: relay=%s err=%v",
 					st.relayAddr, err)
 			}
-			return 0, nil, err
+			return 0, nil, socks5RelayReadError(c.proxyServer, st.relayAddr, err)
 		}
 		if n < 3 {
 			continue

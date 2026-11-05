@@ -56,6 +56,7 @@ const (
 	ProxyModePassthrough = "passthrough"
 	ProxyModeRakNet      = "raknet"
 	ProxyModeRawUDP      = "raw_udp"
+	ProxyModeAuto        = "auto"
 	ProxyModeMITM        = "mitm"
 	ProxyModeNetherNet   = "nethernet"
 )
@@ -78,7 +79,7 @@ func normalizeServerProxyMode(protocol, mode string) string {
 	switch normalizedMode {
 	case "", ProxyModeTransparent:
 		return ""
-	case ProxyModePassthrough, ProxyModeRakNet, ProxyModeRawUDP, ProxyModeMITM, ProxyModeNetherNet:
+	case ProxyModePassthrough, ProxyModeRakNet, ProxyModeRawUDP, ProxyModeAuto, ProxyModeMITM, ProxyModeNetherNet:
 		return normalizedMode
 	default:
 		return ""
@@ -323,6 +324,15 @@ func (sc *ServerConfig) GetProxyMode() string {
 		return ProxyModeTransparent
 	}
 	return mode
+}
+
+// UsesRawUDPTransport 表示复用旧 RakNet UDP 转发器，不包含双端 NetherNet 模式。
+func (sc *ServerConfig) UsesRawUDPTransport() bool {
+	return sc.GetProxyMode() == ProxyModeRawUDP || sc.GetProxyMode() == ProxyModeAuto
+}
+
+func (sc *ServerConfig) SupportsNetherNetRelay() bool {
+	return sc.GetProxyMode() == ProxyModeAuto
 }
 
 func (sc *ServerConfig) Normalize() {
@@ -661,6 +671,8 @@ type ServerConfigDTO struct {
 	ActiveSessions             int                    `json:"active_sessions"`
 	ActiveProxyClients         int                    `json:"active_proxy_clients"`
 	RawUDPClients              []RawUDPClientStatsDTO `json:"raw_udp_clients,omitempty"`
+	NetherNetRelayStatus       string                 `json:"nethernet_relay_status,omitempty"`
+	EffectiveProxyMode         string                 `json:"effective_proxy_mode,omitempty"`
 	// Load balancing ping interval
 	AutoPingEnabled               bool   `json:"auto_ping_enabled"`
 	AutoPingIntervalMinutes       int    `json:"auto_ping_interval_minutes"` // Per-server ping interval

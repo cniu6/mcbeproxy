@@ -35,7 +35,7 @@ const (
 	ProtocolSudoku      = "sudoku"
 	ProtocolMasque      = "masque"
 	ProtocolTrustTunnel = "trusttunnel"
-	ProtocolChain        = "chain"
+	ProtocolChain       = "chain"
 )
 
 // Supported Shadowsocks encryption methods
@@ -64,12 +64,13 @@ type proxyOutboundRuntime struct {
 
 // ProxyOutbound represents a proxy outbound node configuration.
 type ProxyOutbound struct {
-	Name    string `json:"name"`            // Node name, unique identifier
-	Type    string `json:"type"`            // Protocol type: shadowsocks, vmess, trojan, vless, hysteria2
-	Server  string `json:"server"`          // Server address
-	Port    int    `json:"port"`            // Server port
-	Enabled bool   `json:"enabled"`         // Whether enabled
-	Group   string `json:"group,omitempty"` // Node group for organization
+	SecureUpstream *SecureUpstream `json:"secure_upstream,omitempty"`
+	Name           string          `json:"name"`            // Node name, unique identifier
+	Type           string          `json:"type"`            // Protocol type: shadowsocks, vmess, trojan, vless, hysteria2
+	Server         string          `json:"server"`          // Server address
+	Port           int             `json:"port"`            // Server port
+	Enabled        bool            `json:"enabled"`         // Whether enabled
+	Group          string          `json:"group,omitempty"` // Node group for organization
 
 	SubscriptionID     string `json:"subscription_id,omitempty"`      // Source subscription ID if managed by a subscription
 	SubscriptionName   string `json:"subscription_name,omitempty"`    // Source subscription display name
@@ -302,6 +303,14 @@ func (p *ProxyOutbound) validateTransport() error {
 }
 
 func (p *ProxyOutbound) validateHysteria2() error {
+	if p.SecureUpstream != nil {
+		u := p.SecureUpstream
+		if u.Type != p.Type || u.Server != p.Server || u.Port != p.Port || u.Username != p.Username || u.Password != p.Password || p.Insecure {
+			return errors.New("可信上游与节点字段不一致，不能跳过验证")
+		}
+		_, err := u.ClientTLS()
+		return err
+	}
 	if p.Password == "" {
 		return errors.New("missing required field: password (required for hysteria2)")
 	}
@@ -450,6 +459,10 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		HTTPLatencyMs:            p.HTTPLatencyMs,
 		UDPLatencyMs:             p.UDPLatencyMs,
 		runtime:                  p.runtimeState(),
+	}
+	if p.SecureUpstream != nil {
+		u := *p.SecureUpstream
+		clone.SecureUpstream = &u
 	}
 	if len(p.Chain) > 0 {
 		clone.Chain = make([]string, len(p.Chain))

@@ -67,8 +67,8 @@ func TestNetherNetRelayCompatOpaqueIDAndSuccessAnswer(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer media.Close()
-			offer := "v=0\r\na=identity:client-identity-fixture\r\n"
-			answer := fmt.Sprintf("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=ice-ufrag:compat\r\na=ice-pwd:unchanged-fixture\r\na=identity:target-identity-fixture\r\na=fingerprint:sha-256 AA:BB\r\na=candidate:1 1 udp 1 127.0.0.1 %d typ host\r\n", media.LocalAddr().(*net.UDPAddr).Port)
+			offer := string(iceTestSDP("client", "client-password")) + "a=identity:client-identity-fixture\r\n"
+			answer := string(iceTestSDP("compat", "unchanged-fixture")) + fmt.Sprintf("a=identity:target-identity-fixture\r\na=fingerprint:sha-256 AA:BB\r\na=candidate:1 1 udp 1 127.0.0.1 %d typ host\r\n", media.LocalAddr().(*net.UDPAddr).Port)
 			seen := make(chan string, 1)
 			r := compatRelay(t, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				if req.Method == http.MethodGet {
@@ -170,6 +170,8 @@ func TestNetherNetRelayCompatSameIPMediaStaysOpaque(t *testing.T) {
 		if _, err := r.bridge(context.Background(), req, answer); err != nil {
 			t.Fatal(err)
 		}
+		value, _ := r.sessions.Load(ufrag)
+		value.(*netherNetSession).binding = netherNetICEBinding{clientUfrag: "client", serverUfrag: ufrag, serverPassword: "password"}
 	}
 	if r.count.Load() != 2 {
 		t.Fatalf("sessions=%d, want 2", r.count.Load())
@@ -178,7 +180,7 @@ func TestNetherNetRelayCompatSameIPMediaStaysOpaque(t *testing.T) {
 		for i, p := range peers {
 			var payload []byte
 			if round == 0 {
-				payload = stunRequest(p.ufrag + ":client")
+				payload = authenticatedSTUN(t, p.ufrag+":client", "password")
 			} else {
 				// 加密记录样式的任意二进制数据，不是能被代理解析的游戏包。
 				payload = []byte{0x16, 0xfe, 0xfd, byte(i), 0x00, 0xff, 0x80, 0x00}

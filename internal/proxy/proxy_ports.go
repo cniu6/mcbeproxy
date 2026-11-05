@@ -20,8 +20,8 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
-	"mcpeserverproxy/internal/singboxcore"
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/singboxcore"
 )
 
 const (
@@ -45,6 +45,7 @@ type ProxyPortManager struct {
 	listeners      map[string]*proxyPortListener
 	dialerPool     *proxyPortDialerPool
 	stats          *proxyPortStatsRegistry
+	identities     *SecureIdentityStore
 }
 
 func NewProxyPortManager(configMgr *config.ProxyPortConfigManager, outboundMgr OutboundManager) *ProxyPortManager {
@@ -64,6 +65,7 @@ func NewProxyPortManagerWithSingboxFactory(configMgr *config.ProxyPortConfigMana
 		listeners:      make(map[string]*proxyPortListener),
 		dialerPool:     newProxyPortDialerPool(chainFactory),
 		stats:          newProxyPortStatsRegistry(),
+		identities:     NewSecureIdentityStore(configMgr.IdentityDataDir()),
 	}
 }
 
@@ -95,6 +97,7 @@ func (m *ProxyPortManager) Start(enabled bool) error {
 		}
 		listener := newProxyPortListener(cfg, m.outboundMgr, m.dialerPool)
 		listener.stats = m.stats
+		listener.identities = m.identities
 		if err := listener.Start(); err != nil {
 			logger.Error("ProxyPort: failed to start %s (%s): %v", cfg.ID, cfg.ListenAddr, err)
 			if firstErr == nil {
@@ -133,9 +136,22 @@ func (m *ProxyPortManager) Reload(enabled bool) error {
 	}
 
 	m.mu.Lock()
+	// 先检查所有需替换的安全入口，避免遍历顺序导致其他监听先被关闭。
+	for id, listener := range m.listeners {
+		if next, ok := desired[id]; ok && listener.secure != nil && !proxyPortRuntimeConfigEqual(listener.cfg, next) && listener.ActiveConnections() > 0 {
+			m.mu.Unlock()
+			return ErrSecureProxyBusy
+		}
+	}
 	for id, listener := range m.listeners {
 		cfg, ok := desired[id]
 		if !ok || !proxyPortRuntimeConfigEqual(listener.cfg, cfg) {
+			if listener.secure != nil && ok {
+				if err := listener.secure.freezeIfIdle(); err != nil {
+					m.mu.Unlock()
+					return err
+				}
+			}
 			listener.StopWithWait(false)
 			delete(m.listeners, id)
 			continue
@@ -157,6 +173,9 @@ func proxyPortRuntimeConfigEqual(a, b *config.ProxyPortConfig) bool {
 	}
 	ac := a.Clone()
 	bc := b.Clone()
+	if ac.IsSecure() || bc.IsSecure() {
+		return ac.ID == bc.ID && ac.ListenAddr == bc.ListenAddr && ac.Type == bc.Type && ac.Enabled == bc.Enabled && ac.Username == bc.Username && ac.Password == bc.Password && ac.ProxyOutbound == bc.ProxyOutbound && ac.LoadBalance == bc.LoadBalance && ac.LoadBalanceSort == bc.LoadBalanceSort && ac.IgnoreRouteRules == bc.IgnoreRouteRules && reflect.DeepEqual(ac.AllowList, bc.AllowList) && reflect.DeepEqual(ac.Users, bc.Users) && reflect.DeepEqual(ac.Secure, bc.Secure)
+	}
 	ac.ApplyDefaults()
 	bc.ApplyDefaults()
 	return ac.ID == bc.ID &&
@@ -259,7 +278,11 @@ func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
 	if cfg == nil {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%d|%d|%d|%d|%s|%t|%s|%t|%s|%t|%s|%s|%s|%s|%s|%s|%s|%s",
+	trustKey := ""
+	if cfg.SecureUpstream != nil {
+		trustKey = cfg.SecureUpstream.ServerName + "|" + cfg.SecureUpstream.TrustedCertPEM + "|" + cfg.SecureUpstream.CertSHA256
+	}
+	return trustKey + fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%d|%d|%d|%d|%s|%t|%s|%t|%s|%t|%s|%s|%s|%s|%s|%s|%s|%s",
 		cfg.Name,
 		cfg.Type,
 		cfg.Server,
@@ -299,6 +322,8 @@ func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
 }
 
 type proxyPortListener struct {
+	secure         *securePortRuntime
+	identities     *SecureIdentityStore
 	cfg            *config.ProxyPortConfig
 	outboundMgr    OutboundManager
 	dialerPool     *proxyPortDialerPool
@@ -328,6 +353,9 @@ func (l *proxyPortListener) ActiveConnections() int {
 	if l == nil {
 		return 0
 	}
+	if l.secure != nil {
+		return l.secure.ActiveConnections()
+	}
 	return int(l.activeConns.Load())
 }
 
@@ -344,6 +372,15 @@ func (l *proxyPortListener) Start() error {
 		return err
 	}
 
+	if l.cfg.IsSecure() {
+		l.ctx, l.cancel = context.WithCancel(context.Background())
+		l.secure = &securePortRuntime{owner: l, identities: l.identities}
+		if err := l.secure.Start(); err != nil {
+			l.cancel()
+			return err
+		}
+		return nil
+	}
 	ln, err := net.Listen("tcp", l.cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -360,6 +397,13 @@ func (l *proxyPortListener) Start() error {
 }
 
 func (l *proxyPortListener) StopWithWait(wait bool) {
+	if l.secure != nil {
+		if l.cancel != nil {
+			l.cancel()
+		}
+		l.secure.Stop(wait)
+		return
+	}
 	if l.cancel != nil {
 		l.cancel()
 	}
@@ -1000,19 +1044,37 @@ func (l *proxyPortListener) dialRoute(ctx context.Context, route proxyPortRoute,
 			exclude = append(exclude, DirectNodeName)
 			continue
 		}
+		// 连接保护必须包含代理端口 TCP，且拨号中的连接也算占用；
+		// selected 的 Clone 共享节点运行时，配置换代后旧连接仍能正常减计数。
+		selected.IncrConnCount()
 		dialer, err := l.dialerPool.Get(selected)
 		if err != nil {
+			selected.DecrConnCount()
 			exclude = append(exclude, selected.Name)
 			continue
 		}
 		conn, err := dialer.DialContext(ctx, "tcp", address)
 		if err != nil {
+			selected.DecrConnCount()
 			exclude = append(exclude, selected.Name)
 			continue
 		}
-		return conn, selected.Name, nil
+		return &countedProxyPortConn{Conn: conn, cfg: selected}, selected.Name, nil
 	}
 	return nil, "", fmt.Errorf("all proxy outbounds failed")
+}
+
+// Close 可能被转发循环与监听器清理同时调用，节点计数只能释放一次。
+type countedProxyPortConn struct {
+	net.Conn
+	cfg  *config.ProxyOutbound
+	once sync.Once
+}
+
+func (c *countedProxyPortConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.cfg.DecrConnCount)
+	return err
 }
 
 func (l *proxyPortListener) isAllowed(addr net.Addr) bool {
@@ -1151,11 +1213,11 @@ type sharedUDPRelay struct {
 	activeIPs   map[string]int // net.IP.String() -> reference count of active TCP control conns
 	// idents maps "ip:port" (when the ASSOCIATE request named the client's
 	// UDP port) or "ip" to the identity whose route the datagrams follow.
-	idents map[string]*proxyPortIdentity
-	wg          sync.WaitGroup
-	stopCh      chan struct{}
-	closeOnce   sync.Once
-	cfgID       string
+	idents    map[string]*proxyPortIdentity
+	wg        sync.WaitGroup
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	cfgID     string
 }
 
 // udpClientEntry holds per-client upstream connections.

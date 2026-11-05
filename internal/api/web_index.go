@@ -103,26 +103,10 @@ func (a *APIServer) buildWebIndexResponse(ctx context.Context) []byte {
 	servers := a.proxyController.GetAllServerStatuses()
 
 	// Build active sessions snapshot (filtered - no UUID/XUID)
-	sessions := a.sessionMgr.GetAllSessions()
-	type publicSessionDTO struct {
-		ServerID    string `json:"server_id"`
-		DisplayName string `json:"display_name"`
-		ClientAddr  string `json:"client_addr"`
-		BytesUp     int64  `json:"bytes_up"`
-		BytesDown   int64  `json:"bytes_down"`
-		Duration    int64  `json:"duration_seconds"`
-	}
+	sessions := a.buildActiveSessionDTOs(servers)
 	sessionDTOs := make([]publicSessionDTO, 0, len(sessions))
-	for _, sess := range sessions {
-		dto := sess.ToDTO()
-		sessionDTOs = append(sessionDTOs, publicSessionDTO{
-			ServerID:    dto.ServerID,
-			DisplayName: dto.DisplayName,
-			ClientAddr:  dto.ClientAddr,
-			BytesUp:     dto.BytesUp,
-			BytesDown:   dto.BytesDown,
-			Duration:    dto.Duration,
-		})
+	for _, dto := range sessions {
+		sessionDTOs = append(sessionDTOs, toPublicSessionDTO(dto))
 	}
 
 	// Fetch pings concurrently
@@ -352,15 +336,16 @@ func (a *APIServer) fetchSessionHistory(limit, page int) ([]map[string]interface
 	dtos := make([]map[string]interface{}, 0, len(records))
 	for _, r := range records {
 		dtos = append(dtos, map[string]interface{}{
-			"display_name":  r.DisplayName,
-			"server_id":     r.ServerID,
-			"client_addr":   r.ClientAddr,
-			"start_time":    r.StartTime,
-			"end_time":      r.EndTime,
-			"bytes_up":      r.BytesUp,
-			"bytes_down":    r.BytesDown,
-			"status":        r.Status,
-			"status_reason": r.StatusReason,
+			"display_name":    r.DisplayName,
+			"server_id":       r.ServerID,
+			"client_addr":     r.ClientAddr,
+			"start_time":      r.StartTime,
+			"end_time":        r.EndTime,
+			"bytes_up":        r.BytesUp,
+			"bytes_down":      r.BytesDown,
+			"status":          r.Status,
+			"status_reason":   r.StatusReason,
+			"connection_info": sessionHistoryConnectionInfo(r.Metadata),
 		})
 	}
 	return dtos, total
@@ -473,4 +458,3 @@ func (a *APIServer) getWebProxyOutboundLatencyHistory(c *gin.Context) {
 		"metrics": a.proxyOutboundHandler.getProxyOutboundLatencyHistoryMetrics(name, fromMs, toMs, limit),
 	})
 }
-

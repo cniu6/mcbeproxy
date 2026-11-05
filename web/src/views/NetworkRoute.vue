@@ -112,7 +112,7 @@
     </n-card>
 
     <!-- 规则编辑 -->
-    <n-modal size="small" :show="!!editing" preset="card" :title="editingIndex < 0 ? '添加规则' : '编辑规则'" style="width: 640px; max-width: 95vw" @update:show="v => { if (!v) editing = null }">
+    <n-modal size="small" :show="!!editing" preset="card" :title="editingIndex < 0 ? '添加规则' : '编辑规则'" style="width: min(640px, 98vw); max-width: 98vw" @update:show="v => { if (!v) editing = null }">
       <n-form v-if="editing" label-placement="left" label-width="90" size="small">
         <n-form-item label="名称">
           <n-input size="small" v-model:value="editing.name" placeholder="便于识别, 如: 内网直连" />
@@ -133,6 +133,7 @@
           </n-radio-group>
         </n-form-item>
         <template v-if="editing.action === 'proxy'">
+          <NodeFilters v-model="nodeFilter" :nodes="outbounds" />
           <n-form-item label="线路">
             <n-select size="small"
               :value="outboundSelection"
@@ -174,6 +175,8 @@
 </template>
 
 <script setup>
+import NodeFilters from '../components/NodeFilters.vue'
+import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
 import { ref, computed, h, onMounted } from 'vue'
 import { useMessage, useDialog, NTag, NSwitch, NButton, NSpace, NText } from 'naive-ui'
 import { api } from '../api'
@@ -199,6 +202,7 @@ const probeOptions = [
   { label: 'TCP 实测 (建连)', value: 'tcp' }
 ]
 const outbounds = ref([])
+const nodeFilter=ref(emptyNodeFilter())
 const groups = ref([])
 
 const actionOptions = [
@@ -334,8 +338,8 @@ const removeRule = (i) => {
 
 // Outbound picker: several nodes = "a,b" (load balanced), one group = "@g".
 const outboundOptions = computed(() => [
-  { type: 'group', label: '分组', key: 'groups', children: groups.value.map(g => ({ label: `@${g.name} (${g.total_count ?? g.count ?? ''})`, value: '@' + g.name })) },
-  { type: 'group', label: '节点', key: 'nodes', children: outbounds.value.map(o => ({ label: `${o.name}${o.group ? ' · ' + o.group : ''}`, value: o.name })) },
+  { type: 'group', label: '分组', key: 'groups', children: groups.value.map(g => ({ label: `@${g.name || '(未分类)'} (${g.total_count ?? g.count ?? ''})`, value: '@' + g.name })) },
+  { type: 'group', label: '节点', key: 'nodes', children: filterNodes(outbounds.value,nodeFilter.value).map(o => ({ label: `${o.name}${o.group ? ' · ' + o.group : ''}`, value: o.name })) },
   { label: '直连 (direct)', value: 'direct' }
 ])
 const outboundSelection = computed(() => {
@@ -355,7 +359,7 @@ const needsLB = computed(() => {
 const loadOutbounds = async () => {
   const [o, g] = await Promise.all([api('/api/proxy-outbounds'), api('/api/proxy-outbounds/groups')])
   if (o?.success) outbounds.value = o.data || []
-  if (g?.success) groups.value = (g.data || []).filter(x => x.name)
+  if (g?.success) groups.value = g.data || []
 }
 
 const load = async () => {

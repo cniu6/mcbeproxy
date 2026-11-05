@@ -171,12 +171,12 @@ func TestNetherNetRelayCapsSessionAddrs(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &netherNetSession{ufrag: "capU", upstream: up, mediaAddr: up.LocalAddr(), created: time.Now(),
-		writeCh: make(chan *netherNetPacket, netherNetRelayWriteQueue), done: make(chan struct{})}
+		writeCh: make(chan *netherNetPacket, netherNetRelayWriteQueue), done: make(chan struct{}), binding: netherNetICEBinding{clientUfrag: "cli", serverUfrag: "capU", serverPassword: "password"}}
 	r.sessions.Store("capU", s)
 	r.count.Add(1)
 	for i := 0; i < 40; i++ {
 		from := netip.AddrPortFrom(netip.MustParseAddr("10.0.0.1"), uint16(40000+i))
-		r.handleDatagram(stunRequest("capU:cli"), from)
+		r.handleDatagram(authenticatedSTUN(t, "capU:cli", "password"), from)
 	}
 	s.addrsMu.Lock()
 	n := len(s.addrs)

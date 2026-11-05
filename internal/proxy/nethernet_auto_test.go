@@ -13,7 +13,7 @@ import (
 	"mcpeserverproxy/internal/session"
 )
 
-// 透明UDP入口自动兼容，热更新复用原信令监听与活跃会话。
+// 显式 auto 入口自动兼容，热更新复用原信令监听与活跃会话。
 func TestRawUDPNetherNetAutoStartsAndSurvivesUpdate(t *testing.T) {
 	metadata := `{"name":"target","protocol":9999,"version":"target-defined"}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -21,7 +21,7 @@ func TestRawUDPNetherNetAutoStartsAndSurvivesUpdate(t *testing.T) {
 		_, _ = io.WriteString(w, metadata)
 	}))
 	defer upstream.Close()
-	cfg := &config.ServerConfig{ID: "raw-auto", Protocol: "raknet", ProxyMode: "raw_udp", Target: "127.0.0.1", Port: 1, ListenAddr: "127.0.0.1:0", IdleTimeout: 300, NetherNetUpstream: upstream.URL}
+	cfg := &config.ServerConfig{ID: "raw-auto", Protocol: "raknet", ProxyMode: "auto", Target: "127.0.0.1", Port: 1, ListenAddr: "127.0.0.1:0", IdleTimeout: 300, NetherNetUpstream: upstream.URL}
 	p := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestRawUDPNetherNetAutoTCPConflictKeepsUDP(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tcp.Close()
-	cfg := &config.ServerConfig{ID: "raw-auto-conflict", Protocol: "raknet", ProxyMode: "raw_udp", Target: "127.0.0.1", Port: 1, ListenAddr: tcp.Addr().String(), IdleTimeout: 300}
+	cfg := &config.ServerConfig{ID: "raw-auto-conflict", Protocol: "raknet", ProxyMode: "auto", Target: "127.0.0.1", Port: 1, ListenAddr: tcp.Addr().String(), IdleTimeout: 300}
 	p := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
 	if err := p.Start(); err != nil {
 		t.Fatalf("TCP conflict stopped old UDP path: %v", err)
@@ -97,7 +97,7 @@ func TestRawUDPNetherNetAutoKeepsLegacyUDP(t *testing.T) {
 		}
 	}()
 	defer func() { _ = target.Close(); <-echoDone }()
-	cfg := &config.ServerConfig{ID: "raw-auto-legacy", Protocol: "raknet", ProxyMode: "raw_udp", Target: "127.0.0.1", Port: target.LocalAddr().(*net.UDPAddr).Port, ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
+	cfg := &config.ServerConfig{ID: "raw-auto-legacy", Protocol: "raknet", ProxyMode: "auto", Target: "127.0.0.1", Port: target.LocalAddr().(*net.UDPAddr).Port, ListenAddr: "127.0.0.1:0", IdleTimeout: 300}
 	p := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
 	if err := p.Start(); err != nil {
 		t.Fatal(err)

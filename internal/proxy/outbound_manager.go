@@ -2268,9 +2268,14 @@ func (m *outboundManagerImpl) ListGroups() []*GroupStats {
 		groupNames[outbound.Group] = true
 	}
 
-	// Calculate stats for each group
-	var result []*GroupStats
+	// 空名称代表未分类；统一排序保证所有管理页面刷新后仍将它排在首位。
+	names := make([]string, 0, len(groupNames))
 	for groupName := range groupNames {
+		names = append(names, groupName)
+	}
+	sort.Strings(names)
+	var result []*GroupStats
+	for _, groupName := range names {
 		stats := m.calculateGroupStats(groupName)
 		if stats != nil {
 			result = append(result, stats)

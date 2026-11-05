@@ -126,7 +126,7 @@ func TestSchedulerRunOnceSkipsWhenSessionsActive(t *testing.T) {
 
 	updater := &fakeSubscriptionUpdater{}
 	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
-	scheduler := NewScheduler(mgr, updater, func() int { return 2 })
+	scheduler := NewScheduler(mgr, updater, func(_ *config.ProxySubscription) int { return 2 })
 	scheduler.now = func() time.Time { return now }
 
 	scheduler.runOnce(context.Background())
@@ -153,7 +153,7 @@ func TestSchedulerRunOncePersistsAttemptAndError(t *testing.T) {
 
 	updater := &fakeSubscriptionUpdater{err: errors.New("boom")}
 	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
-	scheduler := NewScheduler(mgr, updater, func() int { return 0 })
+	scheduler := NewScheduler(mgr, updater, func(_ *config.ProxySubscription) int { return 0 })
 	scheduler.now = func() time.Time { return now }
 
 	scheduler.runOnce(context.Background())
@@ -190,7 +190,7 @@ func TestSchedulerRunOnceRetriesAfterFailureBackoff(t *testing.T) {
 
 	updater := &fakeSubscriptionUpdater{err: errors.New("temporary failure")}
 	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
-	scheduler := NewScheduler(mgr, updater, func() int { return 0 })
+	scheduler := NewScheduler(mgr, updater, func(_ *config.ProxySubscription) int { return 0 })
 	scheduler.now = func() time.Time { return now }
 
 	scheduler.runOnce(context.Background())
@@ -228,7 +228,7 @@ func TestSchedulerRunOnceInvokesAfterUpdateHook(t *testing.T) {
 
 	updater := &fakeSubscriptionUpdater{}
 	now := time.Date(2026, 4, 18, 4, 30, 0, 0, time.Local)
-	scheduler := NewScheduler(mgr, updater, func() int { return 0 })
+	scheduler := NewScheduler(mgr, updater, func(_ *config.ProxySubscription) int { return 0 })
 	scheduler.now = func() time.Time { return now }
 
 	var hookCalls int

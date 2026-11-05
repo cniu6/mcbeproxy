@@ -87,7 +87,7 @@
         :show="!!newPortDraft"
         preset="card"
         title="新增代理端口"
-        style="width: 760px; max-width: 95vw"
+        style="width: min(760px, 98vw); max-width: 98vw"
         @update:show="(v) => { if (!v) newPortDraft = null }"
 >
         <PortEditForm
@@ -117,15 +117,16 @@
         :show="!!usersModal"
         preset="card"
         :title="usersModal ? `用户管理 · ${usersModal.port.name || usersModal.port.id} (${usersModal.port.listen_addr})` : ''"
-        style="width: 820px; max-width: 95vw"
+        style="width: min(820px, 98vw); max-width: 98vw"
         @update:show="(v) => { if (!v) usersModal = null }"
 >
         <template v-if="usersModal">
           <n-alert size="small" type="info" :show-icon="false" style="margin-bottom: 10px; font-size: 12px">
             同一个端口, 客户端用不同的用户名/密码登录, 就走不同的线路; 线路留空则继承端口线路
-            ({{ getProxyOutboundDisplay(usersModal.port.proxy_outbound) || '直连' }})。保存后立即生效, 已连接的客户端不会被断开。
+            ({{ getProxyOutboundDisplay(usersModal.port.proxy_outbound) || '直连' }})。安全入口遇活动连接会拒绝变更，需空闲或显式停用；原 HTTP/SOCKS 用户更新保留现有连接。
           </n-alert>
           <PortUsersEditor
+            :secure="['hysteria2', 'mieru'].includes(usersModal.port.type)"
             :users="usersModal.users"
             :stats="usersModal.port.user_stats || []"
             :is-mobile="isMobile"
@@ -148,7 +149,12 @@
       </n-modal>
     </n-space>
 
-    <n-modal size="small" v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: 520px; max-width: 95vw">
+    <n-modal :show="!!securePort" preset="card" title="安全入口配置与导出" style="width:min(780px,98vw)" @update:show="v => { if (!v) securePort = null }">
+      <PortEditForm v-if="securePort" saved-secure :port="securePort" :is-mobile="isMobile" :proxy-type-options="proxyTypeOptions" :load-balance-options="loadBalanceOptions" :load-balance-sort-options="loadBalanceSortOptions" :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions" :needs-load-balance="needsLoadBalance" :get-proxy-outbound-display="getProxyOutboundDisplay" @open-proxy-selector="openFormProxySelector(securePort)" @clear-proxy="clearProxySelection(securePort)" @pick-user-outbound="u => openFormProxySelector(u)" />
+      <template #footer><n-space justify="end"><n-button size="small" @click="securePort = null">关闭</n-button><n-button size="small" type="primary" :loading="securePort?._saving" @click="saveSecurePort">保存</n-button></n-space></template>
+    </n-modal>
+
+    <n-modal size="small" v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: min(520px, 98vw); max-width: 98vw">
       <n-space vertical size="small">
         <n-alert size="small" v-if="batchProxyAssignment === 'shared'" type="info" :show-icon="false">
           将为选中的 <b>{{ selectedPortIds.length }}</b> 个代理端口一次性应用相同的代理选择（分组/单节点/多节点均可）。
@@ -182,7 +188,7 @@
       </template>
     </n-modal>
 
-    <n-modal size="small" v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: 1200px; max-width: 95vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showFormProxySelector" preset="card" title="选择代理节点" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-spin size="small" :show="formProxySelectorLoading">
         <n-space style="margin-bottom: 16px" align="center">
           <n-radio-group v-model:value="formProxyMode" size="small">
@@ -326,7 +332,7 @@
       </template>
     </n-modal>
 
-    <n-modal size="small" v-model:show="showBulkCreate" preset="card" title="批量新增代理端口" style="width: 1100px; max-width: 95vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showBulkCreate" preset="card" title="批量新增代理端口" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical size="small">
         <n-alert size="small" type="info" :show-icon="false">
           支持端口列表与范围，例如 `1080, 1081, 2000-2005`。可为整批端口复用同一代理选择，或将多节点按端口轮换分配。
@@ -365,7 +371,8 @@
             </n-gi>
             <n-gi>
               <n-form-item label="代理类型">
-                <n-select size="small" v-model:value="bulkForm.type" :options="proxyTypeOptions" />
+                <n-select size="small" v-model:value="bulkForm.type" :options="proxyTypeOptions.filter(p => !['hysteria2','mieru'].includes(p.value))" />
+                <n-text depth="3">HY2 / Mieru 请逐条新增，单独管理密码、身份和资源限制。</n-text>
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -563,9 +570,9 @@ const editableFields = [
   'proxy_outbound', 'load_balance', 'load_balance_sort',
   'auto_ping_enabled', 'auto_ping_interval_minutes', 'auto_ping_top_candidates',
   'auto_ping_full_scan_mode', 'auto_ping_full_scan_time', 'auto_ping_full_scan_interval_hours',
-  'allow_list', 'ignore_route_rules', 'users'
+  'allow_list', 'ignore_route_rules', 'users', 'secure'
 ]
-const cloneField = (v) => (Array.isArray(v) ? JSON.parse(JSON.stringify(v)) : v)
+const cloneField = (v) => (v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v)
 const isEditingPort = (row) => editingRowIds.value.includes(row.id)
 const startEditPort = (port) => {
   if (!port || isEditingPort(port)) return
@@ -592,6 +599,8 @@ const saveEditPort = async (port) => {
 // 新增端口时的草稿: 显示在表格下方的 dashed-border 卡片内,
 // 不污染 ports 数组, 取消不留痕迹, 保存后才追加到 ports.
 const newPortDraft = ref(null)
+const securePort = ref(null)
+const saveSecurePort = async () => { if (await savePort(securePort.value)) securePort.value = null }
 
 const showBatchProxyModal = ref(false)
 const batchProxyAssignment = ref('shared')
@@ -650,7 +659,9 @@ const filterTypeOptions = [
   { label: 'SOCKS5', value: 'socks5' },
   { label: 'SOCKS4', value: 'socks4' },
   { label: 'HTTP', value: 'http' },
-  { label: '混合', value: 'mixed' }
+  { label: '混合', value: 'mixed' },
+  { label: 'HY2 · UDP 主力', value: 'hysteria2' },
+  { label: 'Mieru · TCP 兼容', value: 'mieru' }
 ]
 const filterEnabledOptions = [
   { label: '已启用', value: true },
@@ -667,7 +678,9 @@ const proxyTypeOptions = [
   { label: 'HTTP', value: 'http' },
   { label: 'SOCKS5', value: 'socks5' },
   { label: 'SOCKS4', value: 'socks4' },
-  { label: '混合', value: 'mixed' }
+  { label: '混合', value: 'mixed' },
+  { label: 'HY2 · UDP 主力', value: 'hysteria2' },
+  { label: 'Mieru · TCP 兼容', value: 'mieru' }
 ]
 
 const loadBalanceOptions = [
@@ -767,6 +780,7 @@ const portRuntimeFieldDefaults = {
 
 const applyPortRuntimeSnapshot = (port, snapshot = {}) => {
   if (!port) return
+  port.running = !!snapshot.running
   port.active_connections = snapshot.active_connections || 0
   port.current_node = snapshot.current_node || ''
   port.has_node = !!snapshot.has_node
@@ -825,6 +839,8 @@ const normalizePort = (port) => {
     allow_list: Array.isArray(port.allow_list) && port.allow_list.length > 0 ? [...port.allow_list] : ['0.0.0.0/0'],
     ignore_route_rules: !!port.ignore_route_rules,
     users: (port.users || []).map(normalizePortUser),
+    secure: port.secure ? JSON.parse(JSON.stringify(port.secure)) : undefined,
+    running: !!port.running,
     ...portRuntimeFieldDefaults
   }
   applyLoadBalanceDefaults(normalized)
@@ -1167,7 +1183,7 @@ const renderAuthCell = (row) => {
     return h(NTag, { size: 'small', type: 'default', bordered: false }, () => '无')
   }
   const userLabel = row.username ? row.username : '(匿名)'
-  const pwdHint = row.password ? ' · 已设密码' : ''
+  const pwdHint = row.password || ['hysteria2','mieru'].includes(row.type) ? ' · 已设密码' : ''
   return h('span', { style: 'font-size: 12px; color: var(--n-text-color-2)' },
     `${userLabel}${pwdHint}`)
 }
@@ -1331,7 +1347,7 @@ const portTableColumns = computed(() => [
     width: 116,
     render: row => isEditingPort(row)
       ? h(NSelect, { value: row.type, size: 'small', options: proxyTypeOptions, consistentMenuWidth: false, onUpdateValue: v => { row.type = v } })
-      : h(NTag, { size: 'small', type: 'info', bordered: false }, () => (row.type || '').toUpperCase() || '-')
+      : h(NTag, { size: 'small', type: 'info', bordered: false }, () => row.type === 'hysteria2' ? 'HY2 / UDP' : row.type === 'mieru' ? 'Mieru / TCP' : (row.type || '').toUpperCase() || '-')
   },
   {
     title: '认证',
@@ -1372,7 +1388,7 @@ const portTableColumns = computed(() => [
       ? h(NSwitch, { value: !!row.enabled, size: 'small', onUpdateValue: v => { row.enabled = v } })
       : h('span', {}, [
           h('span', { class: ['status-dot', row.enabled ? 'status-on' : 'status-off'] }),
-          h('span', { style: 'margin-left: 6px; font-size: 12px' }, row.enabled ? '启用' : '停用')
+          h('span', { style: 'margin-left: 6px; font-size: 12px' }, row.running ? '监听中' : row.enabled ? '已启用 / 未监听' : '停用')
         ])
   },
   {
@@ -1384,7 +1400,7 @@ const portTableColumns = computed(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 220,
+    width: 270,
     fixed: 'right',
     render: row => isEditingPort(row)
       ? h(NSpace, { size: 'small' }, () => [
@@ -1399,6 +1415,7 @@ const portTableColumns = computed(() => [
             loading: testResults[row.id]?.status === 'running',
             onClick: () => runSinglePortTest(row)
           }, () => '测试'),
+          ['hysteria2', 'mieru'].includes(row.type) ? h(NButton, { size: 'tiny', onClick: () => { securePort.value = JSON.parse(JSON.stringify(row)) } }, () => '导出') : null,
           h(NButton, {
             size: 'tiny',
             onClick: () => togglePortEnabled(row)
@@ -1406,7 +1423,7 @@ const portTableColumns = computed(() => [
           h(NButton, {
             size: 'tiny',
             type: 'primary',
-            onClick: () => startEditPort(row)
+            onClick: () => ['hysteria2', 'mieru'].includes(row.type) ? (securePort.value = JSON.parse(JSON.stringify(row))) : startEditPort(row)
           }, () => '编辑'),
           h(NButton, {
             size: 'tiny',
@@ -1425,6 +1442,7 @@ const portTableColumns = computed(() => [
 // - 失败但拿到了 status_code: 黄色 "HTTP xxx"
 // - 失败且无响应: 红色 "失败" + tooltip 里放具体错误信息
 const renderTestResultCell = (row) => {
+  if (['hysteria2','mieru'].includes(row.type)) return h('span', {style:'font-size:12px'}, '导出可信配置后由客户端测试')
   const r = testResults[row.id]
   if (!r) {
     return h('span', { style: 'color: var(--n-text-color-3); font-size: 12px' }, '未测试')
@@ -1488,7 +1506,8 @@ const buildPortPayload = (port) => {
     auto_ping_full_scan_interval_hours: port.auto_ping_full_scan_interval_hours || autoPingDefaults.full_scan_interval_hours,
     allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean),
     ignore_route_rules: !!port.ignore_route_rules,
-    users: buildUsersPayload(port.users)
+    users: buildUsersPayload(port.users),
+    secure: ['hysteria2', 'mieru'].includes(port.type) ? (port.secure || { limits: {} }) : undefined
   }
 }
 
@@ -1599,6 +1618,7 @@ const batchSetEnabled = async (enabled) => {
 }
 
 const batchSetType = async (key) => {
+  if (selectedPorts.value.some(p => ['hysteria2','mieru'].includes(p.type))) {message.warning('安全入口的协议不可批量变更，请逐条管理或新建入口');return}
   const targets = selectedPorts.value
   if (targets.length === 0) return
   batchActionRunning.value = true
@@ -1623,6 +1643,7 @@ const batchSetType = async (key) => {
 // 这里前端把 success 和 error 的组合统一归为 'ok' / 'fail' 两态.
 const runSinglePortTest = async (port) => {
   if (!port || !port.id) return
+  if (['hysteria2','mieru'].includes(port.type)) { message.info('安全协议请导出可信配置，在客户端验证 TCP/UDP，不能按 SOCKS 测试'); return }
   testResults[port.id] = { status: 'running' }
   try {
     const body = (testUrl.value || '').trim() ? { url: testUrl.value.trim() } : {}

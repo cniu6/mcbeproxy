@@ -38,7 +38,7 @@
     </n-space>
 
     <!-- 订阅管理入口：从顶部常驻面板挪到按钮弹窗，节省垂直空间让节点列表更高 -->
-    <n-modal size="small" v-model:show="showSubscriptionsModal" preset="card" title="订阅管理" style="width: 1280px; max-width: 96vw">
+    <n-modal size="small" v-model:show="showSubscriptionsModal" preset="card" title="订阅管理" style="width: min(1920px, 98vw); max-width: 98vw">
       <ProxySubscriptionsPanel
         v-if="showSubscriptionsModal"
         :outbounds="outbounds"
@@ -46,13 +46,13 @@
         @focus-subscription="onSubscriptionsPanelFocus"
       />
     </n-modal>
-    
+
     <!-- 分组卡片 -->
     <div class="group-cards-container" v-if="groupStatsData.length > 0">
       <!-- 全部节点卡片 -->
-      <n-card 
+      <n-card
         size="small"
-        class="group-card-wrapper" 
+        class="group-card-wrapper"
         :class="{ selected: selectedGroup === null }"
         @click="selectedGroup = null"
         hoverable
@@ -76,9 +76,9 @@
       </n-card>
 
       <!-- 分组卡片 -->
-      <n-card 
-        v-for="group in groupStatsData" 
-        :key="group.name || '_ungrouped'" 
+      <n-card
+        v-for="group in groupStatsData"
+        :key="group.name || '_ungrouped'"
         size="small"
         class="group-card-wrapper"
         :class="{ selected: selectedGroup === (group.name || '') }"
@@ -87,8 +87,8 @@
       >
         <div class="group-card-header">
           <span class="group-name">{{ group.name || '未分组' }}</span>
-          <span 
-            class="health-indicator" 
+          <span
+            class="health-indicator"
             :class="getGroupHealthClass(group)"
           ></span>
         </div>
@@ -210,7 +210,7 @@
       </n-space>
     </n-card>
 
-    <n-modal size="small" v-model:show="showLatencyOverviewModal" preset="card" title="代理节点延迟历史总表" style="width: 1460px; max-width: 97vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showLatencyOverviewModal" preset="card" title="代理节点延迟历史总表" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical :size="12">
         <n-alert size="small" type="info">
           总表固定展示最近 1 小时三类延迟小图，点击任意小图即可展开查看完整历史、时间范围和下方滑块缩放。
@@ -228,7 +228,7 @@
       </n-space>
     </n-modal>
 
-    <n-modal size="small" v-model:show="showLatencyHistoryModal" preset="card" :title="proxyHistoryModalTitle" style="width: 1180px; max-width: 96vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showLatencyHistoryModal" preset="card" :title="proxyHistoryModalTitle" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical :size="12">
         <n-alert size="small" type="info">
           上方控制后端请求时间范围；下方滑块会在已加载的时间段内继续滚动 / 缩放查看。
@@ -355,10 +355,10 @@
     </n-modal>
 
     <!-- 编辑 Modal -->
-    <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" :style="{ width: form.type === 'chain' ? '1000px' : '700px', maxWidth: '96vw' }">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showEditModal" preset="card" :title="editingName ? '编辑代理节点' : '添加代理节点'" :style="{ width: form.type === 'chain' ? 'min(1600px, 98vw)' : 'min(900px, 98vw)', maxWidth: '98vw' }">
       <n-form size="small" :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
-          <n-gi><n-form-item label="节点名称" required><n-input size="small" v-model:value="form.name" :disabled="!!editingName" placeholder="唯一标识（建议英文）" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="节点名称" required><n-input size="small" v-model:value="form.name" placeholder="自定义节点名称（不可重复）" /></n-form-item></n-gi>
           <n-gi><n-form-item label="协议类型" required><n-select size="small" v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
 
           <!-- 代理链条：内嵌链路编辑器 -->
@@ -387,7 +387,7 @@
 
                 <div class="chain-inline-body">
                   <div class="chain-inline-pool">
-                    <n-input v-model:value="chainInlinePoolSearch" size="small" placeholder="搜索节点..." clearable style="margin-bottom: 6px" />
+                    <NodeFilters v-model="chainInlineFilter" :nodes="chainVisualizerPoolNodes" />
                     <div class="chain-inline-pool-list">
                       <div
                         v-for="node in chainInlineFilteredPool"
@@ -480,21 +480,21 @@
                 <template #feedback>经此节点的 UDP 收发缓冲（字节）。0=跟随服务器设置（默认自动 1MB，推荐），-1=系统默认，正数=指定字节数，如 2097152=2MB。</template>
               </n-form-item>
             </n-gi>
-            <n-gi><n-form-item label="TLS"><n-switch size="small" v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
-          
+            <n-gi v-if="form.type !== 'mieru'"><n-form-item label="TLS"><n-switch size="small" v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
+
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
             <n-gi><n-form-item label="加密方式"><n-select size="small" v-model:value="form.method" :options="ssMethodOptions" /></n-form-item></n-gi>
             <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
           </template>
-          
+
           <!-- VMess 字段 -->
           <template v-if="form.type === 'vmess'">
             <n-gi><n-form-item label="UUID"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="AlterID"><n-input-number size="small" v-model:value="form.alter_id" :min="0" style="width: 100%" /></n-form-item></n-gi>
             <n-gi><n-form-item label="加密方式"><n-select size="small" v-model:value="form.security" :options="vmessSecurityOptions" /></n-form-item></n-gi>
           </template>
-          
+
           <!-- Trojan 字段 -->
           <template v-if="form.type === 'trojan'">
             <n-gi :span="2"><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" /></n-form-item></n-gi>
@@ -506,6 +506,12 @@
             <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password', '可选')" /></n-form-item></n-gi>
           </template>
 
+          <template v-if="form.type === 'mieru'">
+            <n-gi><n-form-item label="用户名" required><n-input size="small" v-model:value="form.username" placeholder="服务端认证用户名" /></n-form-item></n-gi>
+            <n-gi><n-form-item label="密码" required><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password', '服务端认证密码')" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-alert size="small" type="info">Mieru 外层只使用 TCP，无需证书；支持业务 TCP+UDP，UDP over TCP 存在队头阻塞。出口仍需具备访问目标 UDP 的能力。</n-alert></n-gi>
+          </template>
+
           <!-- AnyTLS 字段 -->
           <template v-if="form.type === 'anytls'">
             <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
@@ -514,13 +520,13 @@
             <n-gi><n-form-item label="空闲超时(s)"><n-input-number size="small" v-model:value="form.idle_session_timeout" :min="0" style="width: 100%" /></n-form-item></n-gi>
             <n-gi><n-form-item label="最小空闲会话"><n-input-number size="small" v-model:value="form.min_idle_session" :min="0" style="width: 100%" /></n-form-item></n-gi>
           </template>
-          
+
           <!-- VLESS 字段 -->
           <template v-if="form.type === 'vless'">
             <n-gi><n-form-item label="UUID"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
             <n-gi><n-form-item label="Flow"><n-select size="small" v-model:value="form.flow" :options="vlessFlowOptions" clearable /></n-form-item></n-gi>
           </template>
-          
+
           <!-- Hysteria v1 / v2 字段 -->
           <template v-if="['hysteria', 'hysteria2'].includes(form.type)">
             <n-gi><n-form-item label="密码"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
@@ -544,7 +550,7 @@
             <n-gi :span="2"><n-form-item label="PSK"><n-input size="small" v-model:value="form.password" type="password" show-password-on="click" :placeholder="sensitiveFieldPlaceholder('password')" /></n-form-item></n-gi>
             <n-gi :span="2"><n-alert size="small" type="info">Snell 默认 v4 并开启 UDP，适合 MCPE；高级版本/混淆参数请通过订阅导入。</n-alert></n-gi>
           </template>
-          
+
           <!-- TUIC 字段 -->
           <template v-if="form.type === 'tuic'">
             <n-gi><n-form-item label="UUID / Token"><n-input size="small" v-model:value="form.uuid" :placeholder="sensitiveFieldPlaceholder('uuid')" /></n-form-item></n-gi>
@@ -627,7 +633,7 @@
       <template #footer><n-space justify="end"><n-button size="small" @click="showEditModal = false">取消</n-button><n-button size="small" type="primary" @click="saveOutbound">保存</n-button></n-space></template>
     </n-modal>
 
-    <n-modal size="small" v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: 560px; max-width: 96vw">
+    <n-modal size="small" v-model:show="showAutoSelectBlockModal" preset="card" :title="autoSelectBlockModalTitle" style="width: min(560px, 98vw); max-width: 98vw">
       <n-space vertical>
         <n-alert size="small" type="warning">封禁后该节点不会再被负载均衡和自动候选池选中，但你手动指定单节点时仍可使用。</n-alert>
         <n-form size="small" :model="autoSelectBlockForm" label-placement="left" label-width="96">
@@ -662,10 +668,10 @@
     </n-modal>
 
     <!-- 导入 Modal -->
-    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: 700px">
+    <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: min(700px, 98vw); max-width: 98vw">
       <n-alert size="small" type="info" style="margin-bottom: 12px">
         支持以下格式：vmess://、ss://、trojan://、vless://、anytls://、tuic://、hysteria://、hysteria2://、hy2://，也支持 Clash/Mihomo YAML 订阅<br/>
-        每行一个链接，支持批量导入，支持 Base64 编码的订阅内容
+        每行一个链接，支持批量导入，支持 Base64 编码的订阅内容；也可粘贴本产品导出的 HY2 / Mieru 可信连接 JSON（含密码，请妥善保管）
       </n-alert>
       <n-form-item label="导入分组" style="margin-bottom: 12px">
         <n-auto-complete size="small"
@@ -702,7 +708,7 @@
     </n-modal>
 
     <!-- 订阅代理选择器 Modal -->
-    <n-modal size="small" v-model:show="showSubProxySelectorModal" preset="card" title="选择获取订阅使用的代理" style="width: 1100px; max-width: 95vw">
+    <n-modal class="app-modal-workspace" size="small" v-model:show="showSubProxySelectorModal" preset="card" title="选择获取订阅使用的代理" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical :size="8">
         <n-space align="center" :size="8" wrap>
           <n-input v-model:value="subProxySearch" size="small" placeholder="搜索节点..." clearable style="width: 200px" />
@@ -726,7 +732,7 @@
     </n-modal>
 
     <!-- 测试选项 Modal -->
-    <n-modal size="small" v-model:show="showTestOptionsModal" preset="card" title="连接测试" style="width: 600px">
+    <n-modal size="small" v-model:show="showTestOptionsModal" preset="card" title="连接测试" style="width: min(600px, 98vw); max-width: 98vw">
       <n-form size="small" label-placement="left" label-width="100">
         <n-form-item label="HTTP测试目标">
           <n-checkbox-group size="small" v-model:value="selectedTargets">
@@ -782,13 +788,13 @@
     </n-modal>
 
     <!-- 测试结果 Modal -->
-    <n-modal size="small" v-model:show="showTestResultModal" preset="card" title="测试结果" style="width: 900px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showTestResultModal" preset="card" title="测试结果" style="width: min(900px, 98vw); max-width: 98vw">
       <template v-if="testResultData">
         <n-alert size="small" :type="testResultData.success ? 'success' : 'warning'" style="margin-bottom: 16px">
           {{ testResultData.success ? '所有测试通过' : '部分测试失败' }}
           <template v-if="testResultData.error"> - {{ testResultData.error }}</template>
         </n-alert>
-        
+
         <!-- Ping 测试 -->
         <template v-if="testResultData.ping_test">
           <div class="detail-section-title">
@@ -844,7 +850,7 @@
             <n-descriptions-item v-if="testResultData.udp_test.error" label="错误" :span="2">{{ testResultData.udp_test.error }}</n-descriptions-item>
           </n-descriptions>
         </template>
-        
+
         <!-- HTTP 测试 -->
         <template v-if="testResultData.http_tests && testResultData.http_tests.length > 0">
           <n-h4>HTTP 测试 (通过代理)</n-h4>
@@ -880,13 +886,13 @@
             <n-descriptions-item label="Content-Length">{{ formatBytes(testResultData.custom_http.content_length) }}</n-descriptions-item>
             <n-descriptions-item v-if="testResultData.custom_http.error" label="错误" :span="2">{{ testResultData.custom_http.error }}</n-descriptions-item>
           </n-descriptions>
-          
+
           <n-collapse v-if="testResultData.custom_http.headers && Object.keys(testResultData.custom_http.headers).length > 0">
             <n-collapse-item title="响应头" name="headers">
               <n-code :code="formatHeaders(testResultData.custom_http.headers)" language="http" />
             </n-collapse-item>
           </n-collapse>
-          
+
           <template v-if="testResultData.custom_http.body">
             <n-space style="margin: 12px 0">
               <n-button size="small" @click="httpViewMode = 'text'" :type="httpViewMode === 'text' ? 'primary' : 'default'">文本</n-button>
@@ -905,7 +911,7 @@
     </n-modal>
 
     <!-- MCBE UDP 测试结果 Modal -->
-    <n-modal size="small" v-model:show="showMcbeResultModal" preset="card" title="UDP 测试 (MCBE 服务器)" style="width: 500px; max-width: 95vw">
+    <n-modal size="small" v-model:show="showMcbeResultModal" preset="card" title="UDP 测试 (MCBE 服务器)" style="width: min(500px, 98vw); max-width: 98vw">
       <n-form-item label="测试地址" style="margin-bottom: 16px">
         <n-input size="small" v-model:value="mcbeTestAddress" placeholder="mco.cubecraft.net:19132" />
       </n-form-item>
@@ -936,7 +942,7 @@
     </n-modal>
 
     <!-- 批量测试配置 Modal (HTTP/UDP/ALL) -->
-    <n-modal size="small" v-model:show="showBatchTestModal" preset="card" :title="batchTestModalTitle" style="width: 500px">
+    <n-modal size="small" v-model:show="showBatchTestModal" preset="card" :title="batchTestModalTitle" style="width: min(500px, 98vw); max-width: 98vw">
       <n-form size="small" label-placement="left" label-width="100">
         <n-form-item label="节点数量">
           <n-tag size="small" type="info">{{ checkedRowKeys.length }} 个节点</n-tag>
@@ -977,8 +983,10 @@
 import { ref, reactive, computed, onMounted, onBeforeUnmount, h, watch, nextTick } from 'vue'
 import { NTag, NButton, NSpace, NPopconfirm, NIcon, useMessage } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
+import NodeFilters from '../components/NodeFilters.vue'
+import { emptyNodeFilter, filterNodes, nodeGroupOptions } from '../composables/nodeFilters.js'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
-import { createAdaptivePoll } from '../composables/useAdaptivePoll'
+import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
 import LatencySparkline from '../components/LatencySparkline.vue'
 import ProxySubscriptionsPanel from '../components/ProxySubscriptionsPanel.vue'
 import { useDragSelect } from '../composables/useDragSelect'
@@ -1108,7 +1116,7 @@ const proxyHistoryDetailMetrics = ref({ tcp: [], http: [], udp: [] })
 const proxyHistoryViewportPercent = ref([0, 100])
 let proxyHistoryOverviewFetchToken = 0
 let proxyHistoryDetailFetchToken = 0
-const managedDataPoller = createAdaptivePoll(() => refreshManagedData(), { interval: 30000 })
+const managedDataPoller = createPageRefreshPoll(() => refreshManagedData())
 let refreshManagedDataPromise = null
 const proxyHistoryMetricOrder = ['tcp', 'http', 'udp']
 const proxyHistoryMetricLabels = { tcp: 'TCP', http: 'HTTP', udp: 'UDP' }
@@ -1284,13 +1292,9 @@ const formatLatency = (latency) => {
 }
 
 // 分组选项（从数据中动态生成）
-const groupOptions = computed(() => {
-  const groups = new Set()
-  outbounds.value.forEach(o => {
-    if (o.group) groups.add(o.group)
-  })
-  return Array.from(groups).sort().map(g => ({ label: g, value: g }))
-})
+const groupOptions = computed(() => nodeGroupOptions(outbounds.value).map(option => ({
+  ...option, value: option.value === '__ungrouped__' ? '' : option.value
+})))
 
 // 分组自动完成选项（用于编辑表单）
 const groupAutoCompleteOptions = computed(() => {
@@ -1313,7 +1317,7 @@ const chainVisualizerPoolNodes = computed(() => {
   return outbounds.value
     .filter(o => o.name !== editingName.value)
     .map(o => ({
-      name: o.name, type: o.type, server: o.server, port: o.port, chain: o.chain,
+      name: o.name, type: o.type, server: o.server, port: o.port, chain: o.chain, enabled: o.enabled,
       tcp_latency_ms: o.tcp_latency_ms || 0,
       udp_latency_ms: o.udp_latency_ms || 0,
       udp_available: o.udp_available,
@@ -1322,7 +1326,7 @@ const chainVisualizerPoolNodes = computed(() => {
 })
 
 // ---- 内嵌链路编辑器 (type=chain) ----
-const chainInlinePoolSearch = ref('')
+const chainInlineFilter = ref(emptyNodeFilter())
 const chainInlineHopTesting = ref(false)
 const chainInlineUDPTesting = ref(false)
 const chainInlineHopResults = ref({})
@@ -1340,18 +1344,7 @@ const chainInlineTargetLabel = computed(() => {
   return 'MCBE 目标服务器'
 })
 
-const chainInlineFilteredPool = computed(() => {
-  const search = chainInlinePoolSearch.value.toLowerCase().trim()
-  let pool = chainVisualizerPoolNodes.value
-  if (search) {
-    pool = pool.filter(n =>
-      n.name.toLowerCase().includes(search) ||
-      n.type.toLowerCase().includes(search) ||
-      (n.server || '').toLowerCase().includes(search)
-    )
-  }
-  return pool
-})
+const chainInlineFilteredPool = computed(() => filterNodes(chainVisualizerPoolNodes.value, chainInlineFilter.value))
 
 const chainInlineIsInChain = (name) => (form.value.chain || []).includes(name)
 
@@ -1480,7 +1473,7 @@ async function testChainInlineTarget() {
 // Reset inline chain test state when modal opens
 watch(() => showEditModal.value, (val) => {
   if (val) {
-    chainInlinePoolSearch.value = ''
+    chainInlineFilter.value = emptyNodeFilter()
     chainInlineHopResults.value = {}
     chainInlineUDPResult.value = null
     chainInlineTestAddr.value = 'mco.cubecraft.net:19132'
@@ -1561,6 +1554,7 @@ const protocolFilterOptions = [
   { label: 'HTTP', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' },
+  { label: 'Mieru TCP · TCP+UDP', value: 'mieru' },
   { label: 'Hysteria (v1)', value: 'hysteria' },
   { label: 'Snell', value: 'snell' },
   { label: 'TUIC', value: 'tuic' },
@@ -1599,7 +1593,7 @@ const getQualitySortValue = (row, metric) => {
 // 筛选后的数据
 const filteredOutbounds = computed(() => {
   let result = [...outbounds.value]
-  
+
   // 分组筛选 - 支持空字符串表示未分组
   if (selectedGroup.value !== null) {
     if (selectedGroup.value === '') {
@@ -1609,12 +1603,12 @@ const filteredOutbounds = computed(() => {
       result = result.filter(o => o.group === selectedGroup.value)
     }
   }
-  
+
   // 协议筛选
   if (selectedProtocol.value) {
     result = result.filter(o => o.type === selectedProtocol.value)
   }
-  
+
   // 状态筛选
   if (selectedStatus.value) {
     switch (selectedStatus.value) {
@@ -1639,19 +1633,19 @@ const filteredOutbounds = computed(() => {
   if (showRuntimeOnly.value) {
     result = result.filter(o => hasRuntimeActivity(o))
   }
-  
+
   // 关键词搜索
   if (searchKeyword.value) {
     const kw = searchKeyword.value.toLowerCase()
-    result = result.filter(o => 
-      o.name.toLowerCase().includes(kw) || 
+    result = result.filter(o =>
+      o.name.toLowerCase().includes(kw) ||
       o.server.toLowerCase().includes(kw) ||
       (o.group && o.group.toLowerCase().includes(kw)) ||
       (o.subscription_name && o.subscription_name.toLowerCase().includes(kw)) ||
       (o.auto_select_block_reason && o.auto_select_block_reason.toLowerCase().includes(kw))
     )
   }
-  
+
   // 排序：高亮节点在最前，然后按分组（无分组在前），再按名称
   return result.sort((a, b) => {
     // 高亮节点排在最前面
@@ -1785,6 +1779,7 @@ const protocolOptions = [
   { label: 'HTTP Proxy', value: 'http' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' },
+  { label: 'Mieru TCP · TCP+UDP', value: 'mieru' },
   { label: 'Hysteria (v1)', value: 'hysteria' },
   { label: 'Snell', value: 'snell' },
   { label: 'TUIC', value: 'tuic' },
@@ -2925,7 +2920,7 @@ const onProtocolChange = () => {
     form.value.grpc_service_name = ''
     form.value.grpc_authority = ''
   }
-  if (!['socks5', 'http'].includes(form.value.type)) {
+  if (!['socks5', 'http', 'mieru'].includes(form.value.type)) {
     form.value.username = ''
   }
   if (form.value.type !== 'anytls') {
@@ -2957,8 +2952,17 @@ const saveOutbound = async () => {
     message.warning('请填写服务器地址和端口')
     return
   }
+  if (form.value.type === 'mieru' && (!form.value.username || (!form.value.password && !form.value.has_password))) {
+    message.warning('Mieru TCP 需要用户名和密码')
+    return
+  }
   const url = editingName.value ? '/api/proxy-outbounds/update' : '/api/proxy-outbounds'
   const payload = { ...form.value }
+  if (editingName.value) payload.original_name = editingName.value
+  if (payload.type === 'mieru') {
+    payload.tls = false
+    payload.provider_options = { ...(payload.provider_options || {}), core: 'mihomo', transport: 'TCP', multiplexing: 'MULTIPLEXING_OFF', udp: true }
+  }
   delete payload.has_password
   delete payload.has_uuid
   delete payload.has_obfs_password
@@ -3171,27 +3175,27 @@ const startBatchTest = async () => {
   // 过滤掉已删除的节点（只保留当前存在的节点）
   const existingNames = new Set(outbounds.value.map(o => o.name))
   const names = checkedRowKeys.value.filter(name => existingNames.has(name))
-  
+
   if (names.length === 0) {
     message.warning('没有可测试的节点')
     return
   }
-  
+
   // 清理已删除的选中项
   if (names.length !== checkedRowKeys.value.length) {
     checkedRowKeys.value = names
   }
-  
+
   batchTesting.value = true
-  
+
   const type = batchTestType.value
-  
+
   // 一键测试全部：依次执行 TCP、HTTP、UDP
   if (type === 'all') {
     const totalTests = names.length * 3
     batchTestProgress.value = { current: 0, total: totalTests, success: 0, failed: 0 }
     message.info(`开始一键测试 ${names.length} 个节点 (TCP+HTTP+UDP)...`)
-    
+
     // TCP 测试
     await runBatchTestType(names, 'tcp')
     // HTTP 测试
@@ -3199,18 +3203,18 @@ const startBatchTest = async () => {
     // UDP 测试
     await runBatchTestType(names, 'udp')
     await refreshProxyHistoryViews()
-    
+
     batchTesting.value = false
     message.success(`一键测试完成: ${batchTestProgress.value.success} 成功, ${batchTestProgress.value.failed} 失败`)
     return
   }
-  
+
   batchTestProgress.value = { current: 0, total: names.length, success: 0, failed: 0 }
   message.info(`开始 ${type.toUpperCase()} 测试 ${names.length} 个节点...`)
-  
+
   await runBatchTestType(names, type)
   await refreshProxyHistoryViews()
-  
+
   batchTesting.value = false
   message.success(`${type.toUpperCase()} 测试完成: ${batchTestProgress.value.success} 成功, ${batchTestProgress.value.failed} 失败`)
 }
@@ -3224,7 +3228,7 @@ const runBatchTestType = async (names, type) => {
         res = await api('/api/proxy-outbounds/test', 'POST', { name })
         handleTestResult(name, res, 'tcp')
       } else if (type === 'http') {
-        const target = batchHttpTarget.value === 'custom' 
+        const target = batchHttpTarget.value === 'custom'
           ? { custom_http: { url: batchHttpCustomUrl.value, method: 'GET' } }
           : { targets: [batchHttpTarget.value] }
         res = await api('/api/proxy-outbounds/detailed-test', 'POST', { name, include_ping: false, ...target })
@@ -3243,7 +3247,7 @@ const runBatchTestType = async (names, type) => {
 // 处理单个测试结果
 const handleTestResult = (name, res, type) => {
   batchTestProgress.value.current++
-  
+
   if (type === 'tcp') {
     if (res?.success && res.data?.success) {
       batchTestProgress.value.success++
@@ -3283,12 +3287,12 @@ const testMCBE = async (name) => {
   mcbeTestLoading.value = true
   mcbeTestResult.value = null
   showMcbeResultModal.value = true
-  
-  const res = await api('/api/proxy-outbounds/test-mcbe', 'POST', { 
-    name, 
-    address: mcbeTestAddress.value 
+
+  const res = await api('/api/proxy-outbounds/test-mcbe', 'POST', {
+    name,
+    address: mcbeTestAddress.value
   })
-  
+
   mcbeTestLoading.value = false
   if (res.success) {
     mcbeTestResult.value = res.data
@@ -3331,14 +3335,14 @@ const runDetailedTest = async () => {
   showTestOptionsModal.value = false
   testResultData.value = null
   httpViewMode.value = 'text'
-  
+
   let loadingText = '正在测试 Ping'
   if (enableDetailedUdp.value) loadingText += '、UDP'
   if (selectedTargets.value.length > 0) loadingText += '、HTTP'
   if (enableCustomHttp.value) loadingText += '、自定义HTTP'
   testLoading.value = loadingText + '...'
   showTestResultModal.value = true
-  
+
   const requestBody = {
     name: testingName.value,
     include_ping: true,
@@ -3346,7 +3350,7 @@ const runDetailedTest = async () => {
     udp_address: enableDetailedUdp.value ? mcbeTestAddress.value : '',
     targets: selectedTargets.value
   }
-  
+
   // 添加自定义 HTTP 测试配置
   if (enableCustomHttp.value && customHttpConfig.value.url) {
     requestBody.custom_http = {
@@ -3357,9 +3361,9 @@ const runDetailedTest = async () => {
       direct_test: customHttpConfig.value.directTest
     }
   }
-  
+
   const res = await api('/api/proxy-outbounds/detailed-test', 'POST', requestBody)
-  
+
   if (res.success) {
     testResultData.value = res.data
     // 更新表格数据
@@ -3588,13 +3592,7 @@ const showSubProxySelectorModal = ref(false)
 const subProxySearch = ref('')
 const subProxyGroup = ref(null)
 
-const subProxyGroupOptions = computed(() => {
-  const groups = new Set()
-  outbounds.value.forEach(o => {
-    if (o.group && o.enabled) groups.add(o.group)
-  })
-  return Array.from(groups).sort().map(g => ({ label: g, value: g }))
-})
+const subProxyGroupOptions = computed(() => nodeGroupOptions(outbounds.value.filter(o => o.enabled)))
 
 const subProxyColumns = [
   { title: '名称', key: 'name', width: 160, ellipsis: { tooltip: true }, sorter: (a, b) => a.name.localeCompare(b.name) },
@@ -3656,10 +3654,7 @@ const subProxyTest = async (name, type) => {
 }
 
 const filteredSubProxyList = computed(() => {
-  let list = outbounds.value.filter(o => o.enabled)
-   if (subProxyGroup.value) {
-     list = list.filter(o => o.group === subProxyGroup.value)
-   }
+  let list = filterNodes(outbounds.value.filter(o => o.enabled), { group: subProxyGroup.value })
    const q = subProxySearch.value.trim().toLowerCase()
   if (q) {
     list = list.filter(o => o.name.toLowerCase().includes(q) || (o.group || '').toLowerCase().includes(q) || (o.server || '').toLowerCase().includes(q))
@@ -3708,7 +3703,7 @@ const fetchSubscription = async () => {
     } catch {
       importText.value = text
     }
-    
+
     const lines = importText.value.split('\n').filter(l => l.trim())
     const proxyInfo = res.data.proxy_used ? ` (通过 ${res.data.proxy_used})` : ' (直连)'
     const summary = formatSubscriptionFetchSummary(res.data)
@@ -3901,14 +3896,14 @@ const parseShadowsocks = (link) => {
       url = parts[0]
       originalName = decodeURIComponent(parts[1] || '')
     }
-    
+
     // 移除查询参数 (如 ?plugin=xxx)
     if (url.includes('?')) {
       url = url.split('?')[0]
     }
-    
+
     let method, password, server, port
-    
+
     if (url.includes('@')) {
       const [encoded, hostPort] = url.split('@')
       const decoded = decodeBase64UTF8(encoded)
@@ -3930,9 +3925,9 @@ const parseShadowsocks = (link) => {
         port = parseInt(match[4])
       }
     }
-    
+
     if (!server || !port) return null
-    
+
     return {
       name: originalName || `${server}:${port}`,
       type: 'shadowsocks',
@@ -4042,7 +4037,7 @@ const parseVless = (link) => {
     const security = (params.get('security') || '').toLowerCase()
     const isReality = security === 'reality'
     const isTls = security === 'tls' || isReality
-    
+
     const result = {
       name: originalName,
       type: 'vless',
@@ -4061,7 +4056,7 @@ const parseVless = (link) => {
     if (!result.server || !result.uuid) {
       return null
     }
-    
+
     // Reality 参数
     if (isReality) {
       result.reality = true
@@ -4069,7 +4064,7 @@ const parseVless = (link) => {
       result.reality_short_id = params.get('sid') || ''
       result.insecure = true // Reality 不验证证书
     }
-    
+
     // WebSocket 传输
     const transport = (params.get('type') || 'tcp').toLowerCase()
     if (transport === 'ws') {
@@ -4093,7 +4088,7 @@ const parseVless = (link) => {
       result.grpc_service_name = params.get('serviceName') || params.get('service_name') || params.get('grpc_service_name') || ''
       result.grpc_authority = params.get('authority') || params.get('grpc_authority') || ''
     }
-    
+
     return result
   } catch (e) {
     console.error('VLESS parse error:', e)
@@ -4143,14 +4138,14 @@ const parseHysteria2 = (link) => {
 const parseLink = (link) => {
   link = link.trim()
   if (!link) return null
-  
+
   if (link.startsWith('vmess://')) return parseVmess(link)
   if (link.startsWith('ss://')) return parseShadowsocks(link)
   if (link.startsWith('trojan://')) return parseTrojan(link)
   if (link.startsWith('anytls://')) return parseAnyTLS(link)
   if (link.startsWith('vless://')) return parseVless(link)
   if (link.startsWith('hysteria2://') || link.startsWith('hy2://') || link.startsWith('hysteria://')) return parseHysteria2(link.replace('hy2://', 'hysteria2://').replace('hysteria://', 'hysteria2://'))
-  
+
   return null
 }
 
@@ -4161,7 +4156,7 @@ const importNodes = async () => {
     message.warning('请输入要导入的链接')
     return
   }
-  
+
   const groupName = importGroupName.value.trim()
   let parsedItems = []
   let ignored = 0
@@ -4181,16 +4176,16 @@ const importNodes = async () => {
     message.warning('未找到可导入的节点')
     return
   }
-  
+
   let success = 0
   const failedReasons = []
   for (const rawConfig of parsedItems) {
     const config = { ...rawConfig }
-    
+
     if (groupName) {
       config.group = groupName
     }
-    
+
     try {
       const res = await api('/api/proxy-outbounds', 'POST', config)
       if (res && res.success) {
@@ -4208,7 +4203,7 @@ const importNodes = async () => {
       })
     }
   }
-  
+
   const failed = failedReasons.length
   const groupSuffix = groupName ? ` (分组: ${groupName})` : ''
 
@@ -4276,7 +4271,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  managedDataPoller.stop()
+  managedDataPoller.dispose()
 })
 
 // 监听 initialSearch 和 initialHighlight 变化

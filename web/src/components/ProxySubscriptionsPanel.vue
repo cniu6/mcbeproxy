@@ -9,7 +9,7 @@
           </n-text>
         </n-space>
         <n-space>
-          <n-button size="small" @click="loadSubscriptions" :loading="loading">刷新列表</n-button>
+          <n-button size="small" @click="loadSubscriptions()" :loading="loading">刷新列表</n-button>
           <n-button size="small"
             type="info"
             secondary
@@ -87,7 +87,7 @@
         :checked-row-keys="checkedSubscriptionIds"
         @update:checked-row-keys="onCheckedKeysChange"
         :bordered="false"
-        :scroll-x="1680"
+        :scroll-x="1860"
         :pagination="false"
         :loading="loading"
       />
@@ -99,7 +99,7 @@
     traces, server HTML bodies) out of the table cell and gives users a
     copyable block to share.
   -->
-  <n-modal size="small" v-model:show="showErrorDetailModal" preset="card" title="订阅错误详情" style="width: 640px; max-width: 92vw">
+  <n-modal size="small" v-model:show="showErrorDetailModal" preset="card" title="订阅错误详情" style="width: min(640px, 98vw); max-width: 98vw">
     <n-space vertical :size="12">
       <div>
         <n-text depth="3" style="font-size: 12px">订阅名称</n-text>
@@ -127,9 +127,9 @@
     </template>
   </n-modal>
 
-  <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingId ? '编辑订阅' : '新增订阅'" style="width: 760px; max-width: 95vw">
+  <n-modal size="small" v-model:show="showEditModal" preset="card" :title="editingId ? '编辑订阅' : '新增订阅'" style="width: min(760px, 98vw); max-width: 98vw">
     <n-form size="small" :model="form" label-placement="left" label-width="110">
-      <n-grid :cols="2" :x-gap="16">
+      <n-grid responsive="self" cols="1 640:2" :x-gap="12">
         <n-gi>
           <n-form-item label="订阅名称" required>
             <n-input size="small" v-model:value="form.name" placeholder="例如：机场 A / HK 专线" />
@@ -140,7 +140,7 @@
             <n-switch size="small" v-model:value="form.enabled" />
           </n-form-item>
         </n-gi>
-        <n-gi :span="2">
+        <n-gi span="1 640:2">
           <n-form-item label="订阅地址" required>
             <n-input size="small" v-model:value="form.url" type="textarea" :autosize="{ minRows: 2, maxRows: 4 }" placeholder="https://example.com/subscription" />
           </n-form-item>
@@ -151,6 +151,7 @@
           </n-form-item>
         </n-gi>
         <n-gi>
+          <NodeFilters v-model="nodeFilter" :nodes="outbounds" />
           <n-form-item label="更新走代理">
             <n-select size="small"
               v-model:value="form.proxy_name"
@@ -161,7 +162,7 @@
             />
           </n-form-item>
         </n-gi>
-        <n-gi :span="2">
+        <n-gi span="1 640:2">
           <n-form-item label="User-Agent">
             <n-input size="small" v-model:value="form.user_agent" placeholder="默认 Mozilla/5.0" />
           </n-form-item>
@@ -190,9 +191,9 @@
             <n-input-number size="small" v-model:value="form.auto_update_interval_days" :min="1" style="width: 100%" />
           </n-form-item>
         </n-gi>
-        <n-gi v-if="form.auto_update_enabled" :span="2">
+        <n-gi v-if="form.auto_update_enabled" span="1 640:2">
           <n-alert size="small" type="info" :show-icon="false">
-            仅在无人连接时自动执行。如果到点还有玩家在线，会顺延到连接清空后再补更新。
+            按服务器时区执行（{{ scheduleTimezone }}），每分钟检查；本订阅节点（含链式引用）的游戏／代理连接清空后补更新，不强制断开连接，其他订阅不受影响。保存设置不代表已经更新，失败后每 15 分钟重试。
           </n-alert>
         </n-gi>
       </n-grid>
@@ -210,9 +211,12 @@
 </template>
 
 <script setup>
-import { computed, h, onMounted, ref } from 'vue'
+import NodeFilters from './NodeFilters.vue'
+import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
+import { computed, h, onMounted, onUnmounted, ref } from 'vue'
 import { NButton, NPopconfirm, NTag, NSpace, NText, useMessage } from 'naive-ui'
 import { api, formatBytes } from '../api'
+import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
 
 const props = defineProps({
   outbounds: { type: Array, default: () => [] }
@@ -294,10 +298,11 @@ const autoUpdateModeOptions = [
   { label: '每隔一段时间(天)', value: 'interval' }
 ]
 
+const nodeFilter=ref(emptyNodeFilter())
 const proxyOptions = computed(() => {
   const options = [{ label: '直连 (不使用代理)', value: null }]
   const seen = new Set()
-  ;(props.outbounds || []).forEach(item => {
+  ;filterNodes(props.outbounds || [],nodeFilter.value).forEach(item => {
     if (!item?.enabled || !item?.name || seen.has(item.name)) return
     seen.add(item.name)
     const parts = [item.name]
@@ -314,7 +319,7 @@ const updateProxyOptions = computed(() => {
     { label: '全部直连更新', value: '__direct__' }
   ]
   const seen = new Set()
-  ;(props.outbounds || []).forEach(item => {
+  ;filterNodes(props.outbounds || [],nodeFilter.value).forEach(item => {
     if (!item?.enabled || !item?.name || seen.has(item.name)) return
     seen.add(item.name)
     const parts = [item.name]
@@ -409,17 +414,23 @@ const getExpireTagType = (value) => {
   return 'success'
 }
 
-const loadSubscriptions = async () => {
-  loading.value = true
+// 这里只 GET 列表状态，不拉取订阅、不修改节点；真正的定时更新在后端调度器执行。
+const scheduleTimezone = computed(() => subscriptions.value[0]?.auto_update_timezone || '以服务器本地时间为准')
+const loadSubscriptions = async (silent = false) => {
+  if (!silent) loading.value = true
   try {
     const res = await api('/api/proxy-subscriptions')
     if (res.success) {
       subscriptions.value = res.data || []
     } else {
-      message.error(res.msg || '加载订阅列表失败')
+      if (!silent) message.error(res.msg || '加载订阅列表失败')
+      return false
     }
+  } catch (error) {
+    if (!silent) message.error(error?.message || '加载订阅列表失败')
+    return false
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -685,10 +696,16 @@ const subscriptionColumns = [
   {
     title: '自动更新',
     key: 'auto_update',
-    width: 170,
-    render: (row) => h(NSpace, { vertical: true, size: 4 }, () => [
+    width: 250,
+    render: (row) => h(NSpace, { vertical: true, size: 2 }, () => [
       h(NTag, { type: row.auto_update_enabled === false ? 'default' : 'success', size: 'small', bordered: false }, () => row.auto_update_enabled === false ? '已关闭' : '已开启'),
-      h(NText, { depth: 3, style: 'font-size: 12px' }, () => `${formatAutoUpdatePlan(row)} / 无人连接时执行`)
+      h(NText, { depth: 3 }, () => `${formatAutoUpdatePlan(row)} · ${row.auto_update_timezone || '服务器时间'}`),
+      row.auto_update_enabled !== false && row.enabled && row.auto_update_next_at
+        ? h(NText, { depth: 3 }, () => new Date(row.auto_update_next_at).getTime() <= Date.now()
+          ? '已到期，等待空闲／下轮检查'
+          : `下次：${formatDateTime(row.auto_update_next_at)}`)
+        : null,
+      row.auto_update_last_attempt_at ? h(NText, { depth: 3 }, () => `调度基准：${formatDateTime(row.auto_update_last_attempt_at)}`) : null
     ])
   },
   {
@@ -781,7 +798,10 @@ const subscriptionColumns = [
   }
 ]
 
+const statusPoll = createPageRefreshPoll(() => loadSubscriptions(true))
 onMounted(() => {
   loadSubscriptions()
+  statusPoll.start()
 })
+onUnmounted(() => statusPoll.dispose())
 </script>

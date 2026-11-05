@@ -163,6 +163,7 @@
 
 <script setup>
 import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { getSessionDisplayName, getSessionIdentityLabel } from '../composables/sessionPresentation'
 import {
   NBadge,
   NButton,
@@ -299,14 +300,14 @@ const serverColumns = [
 ]
 
 const sessionColumns = [
-  { title: '玩家', key: 'display_name', render: (row) => stack(line(row.display_name || '-'), line(row.server_id, 3)) },
+  { title: '玩家', key: 'display_name', render: (row) => stack(line(getSessionDisplayName(row)), line(getSessionIdentityLabel(row), 3), line(row.server_id, 3)) },
   { title: '地址', key: 'client_addr' },
   { title: '流量', key: 'traffic', render: trafficLines },
   { title: '时长', key: 'duration_seconds', render: (row) => duration(row.duration_seconds) }
 ]
 
 const historyColumns = [
-  { title: '玩家', key: 'display_name', render: (row) => stack(line(row.display_name || '-'), line(row.server_id, 3)) },
+  { title: '玩家', key: 'display_name', render: (row) => stack(line(getSessionDisplayName(row)), line(getSessionIdentityLabel(row), 3), line(row.server_id, 3)) },
   {
     title: '状态',
     key: 'status',

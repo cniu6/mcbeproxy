@@ -11,7 +11,17 @@ import (
 )
 
 // Session represents a client connection session with statistics.
+type ConnectionInfo struct {
+	Transport            string `json:"transport,omitempty"`
+	IdentitySource       string `json:"identity_source,omitempty"`
+	IdentityVerification string `json:"identity_verification,omitempty"`
+	IdentityReason       string `json:"identity_reason,omitempty"`
+	LoginObserved        bool   `json:"login_observed"`
+	ConnectionPhase      string `json:"connection_phase,omitempty"`
+}
+
 type Session struct {
+	ConnectionInfo
 	ID          string       `json:"id"`
 	ClientAddr  string       `json:"client_addr"`
 	RemoteConn  *net.UDPConn `json:"-"` // Excluded from JSON serialization
@@ -39,6 +49,7 @@ type Session struct {
 
 // SessionSnapshot provides a consistent view of session fields.
 type SessionSnapshot struct {
+	ConnectionInfo
 	ID               string
 	ClientAddr       string
 	ServerID         string
@@ -58,6 +69,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return SessionSnapshot{
+		ConnectionInfo:   s.ConnectionInfo,
 		ID:               s.ID,
 		ClientAddr:       s.ClientAddr,
 		ServerID:         s.ServerID,
@@ -200,6 +212,9 @@ func (s *Session) SetPlayerInfo(uuid, displayName string) {
 	s.UUID = uuid
 	s.DisplayName = displayName
 	s.LoginExtracted = true
+	s.IdentitySource = "login"
+	s.LoginObserved = true
+	s.ConnectionPhase = "login_observed"
 }
 
 // SetPlayerInfoWithXUID sets the player UUID, display name, and XUID.
@@ -219,6 +234,38 @@ func (s *Session) SetPlayerInfoWithXUID(uuid, displayName, xuid string) {
 	s.DisplayName = displayName
 	s.XUID = xuid
 	s.LoginExtracted = true
+	s.IdentitySource = "login"
+	s.LoginObserved = true
+	s.ConnectionPhase = "login_observed"
+}
+
+// SetSignalingIdentity 只保存已验证的信令摘要，不触发玩家登录日志或 Login 标记。
+func (s *Session) SetSignalingIdentity(name, xuid, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.DisplayName, s.XUID, s.UUID = name, xuid, id
+}
+
+func (s *Session) SetConnectionInfo(info ConnectionInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ConnectionInfo = info
+}
+
+// ApplyRelaySnapshot 接收累计值；重复或迟到快照不得回退计数和活动时间。
+func (s *Session) ApplyRelaySnapshot(addr string, up, down int64, lastSeen time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if up > s.BytesUp {
+		s.BytesUp = up
+	}
+	if down > s.BytesDown {
+		s.BytesDown = down
+	}
+	if !lastSeen.Before(s.LastSeen) {
+		s.ClientAddr = addr
+		s.LastSeen = lastSeen
+	}
 }
 
 // GetXUID returns the player's Xbox User ID.
@@ -326,23 +373,25 @@ func (s *Session) ToDTO() SessionDTO {
 		idle = 0
 	}
 	return SessionDTO{
-		ID:          s.ID,
-		ClientAddr:  s.ClientAddr,
-		ServerID:    s.ServerID,
-		UUID:        s.UUID,
-		DisplayName: s.DisplayName,
-		XUID:        s.XUID,
-		BytesUp:     s.BytesUp,
-		BytesDown:   s.BytesDown,
-		StartTime:   s.StartTime,
-		LastSeen:    s.LastSeen,
-		Duration:    duration,
-		IdleSeconds: idle,
+		ConnectionInfo: s.ConnectionInfo,
+		ID:             s.ID,
+		ClientAddr:     s.ClientAddr,
+		ServerID:       s.ServerID,
+		UUID:           s.UUID,
+		DisplayName:    s.DisplayName,
+		XUID:           s.XUID,
+		BytesUp:        s.BytesUp,
+		BytesDown:      s.BytesDown,
+		StartTime:      s.StartTime,
+		LastSeen:       s.LastSeen,
+		Duration:       duration,
+		IdleSeconds:    idle,
 	}
 }
 
 // SessionDTO is the data transfer object for session API responses.
 type SessionDTO struct {
+	ConnectionInfo
 	ID          string    `json:"id"`
 	ClientAddr  string    `json:"client_addr"`
 	ServerID    string    `json:"server_id"`

@@ -1,16 +1,18 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { createAdaptivePoll } from './useAdaptivePoll'
+import { getPageRefreshSeconds, setPageRefreshSeconds, subscribePageRefresh } from './pageRefreshSettings'
 
 // 仪表盘与服务状态页共用的「自动刷新 + 倒计时」逻辑：
 // 挂载时立即加载一次并启动自适应轮询，卸载时清理定时器。
-export function useAutoRefresh(load, defaultSeconds) {
-  const refreshInterval = ref(defaultSeconds)
+export function useAutoRefresh(load) {
+  const refreshInterval = ref(getPageRefreshSeconds())
   const now = ref(Date.now())
   const nextAt = ref(0)
   const poller = createAdaptivePoll(() => load(), { interval: 30000, onSchedule: (at) => { nextAt.value = at } })
   let ticker = null
 
-  const setup = (val) => {
+  const apply = (val) => {
+    refreshInterval.value = val
     poller.stop()
     const seconds = Number(val) || 0
     if (seconds > 0) {
@@ -19,9 +21,11 @@ export function useAutoRefresh(load, defaultSeconds) {
     }
   }
 
+  const setup = (val) => setPageRefreshSeconds(val)
+  const unsubscribe = subscribePageRefresh(apply)
   const manualRefresh = () => {
     load()
-    setup(refreshInterval.value)
+    apply(refreshInterval.value)
   }
 
   const countdownText = computed(() => {
@@ -33,10 +37,11 @@ export function useAutoRefresh(load, defaultSeconds) {
 
   onMounted(() => {
     load()
-    setup(refreshInterval.value)
+    apply(getPageRefreshSeconds())
     ticker = setInterval(() => { now.value = Date.now() }, 1000)
   })
   onUnmounted(() => {
+    unsubscribe()
     poller.stop()
     if (ticker) clearInterval(ticker)
   })

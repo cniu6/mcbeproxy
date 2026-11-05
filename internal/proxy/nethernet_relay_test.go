@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/binary"
 	"net"
 	"net/http"
@@ -127,7 +130,7 @@ func lanIPv4(t *testing.T) netip.Addr {
 // go-nethernet client through the proxy: signaling over the TCP twin of the
 // listen port, WebRTC media over the same UDP port as RakNet.
 func TestNetherNetRelay_EndToEnd(t *testing.T) {
-	for _, mode := range []string{"plain_udp", "raw_udp"} {
+	for _, mode := range []string{"plain_udp", "auto"} {
 		t.Run(mode, func(t *testing.T) { testNetherNetRelayEndToEnd(t, mode) })
 	}
 }
@@ -162,12 +165,24 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 		ListenAddr:  "0.0.0.0:0",
 		IdleTimeout: 300}
 	var p relayHost
+	var clientIdentity *nethernet.Identity
+	var identityObserver *netherNetInteropObserver
 	var relay func() *netherNetRelay
 	var udp func() *net.UDPConn
-	if mode == "raw_udp" {
+	if mode == "auto" {
 		cfg.Protocol = config.ProxyModeRakNet
-		cfg.ProxyMode = config.ProxyModeRawUDP
+		cfg.ProxyMode = config.ProxyModeAuto
 		raw := NewRawUDPProxy(cfg.ID, cfg, nil, session.NewSessionManager(time.Hour))
+		key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clientIdentity, err = nethernet.GenerateServerIdentity(key, "local-interop")
+		if err != nil {
+			t.Fatal(err)
+		}
+		identityObserver = &netherNetInteropObserver{key: &key.PublicKey, result: make(chan error, 1)}
+		raw.SetNetherNetIdentityVerifier(identityObserver)
 		p, relay, udp = raw, func() *netherNetRelay { return raw.nnRelay.Load() }, func() *net.UDPConn { return raw.listener }
 	} else {
 		plain := NewPlainUDPProxy(cfg.ID, cfg)
@@ -192,7 +207,7 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 		}
 	}()
 
-	client, err := (nethernet.Dialer{DisableTrickleICE: true}).DialContext(ctx,
+	client, err := (nethernet.Dialer{DisableTrickleICE: true, Identity: clientIdentity}).DialContext(ctx,
 		"http://"+net.JoinHostPort(lan.String(), strconv.Itoa(proxyPort)), endpoint.NewClient())
 	if err != nil {
 		t.Fatalf("dial through relay: %v", err)
@@ -232,6 +247,16 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 	})
 	if up == 0 || down == 0 {
 		t.Fatalf("media bypassed the relay: up=%d down=%d", up, down)
+	}
+	if identityObserver != nil {
+		select {
+		case err := <-identityObserver.result:
+			if err != nil {
+				t.Fatalf("go-nethernet signed offer interoperability: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("identity observer not invoked")
+		}
 	}
 }
 

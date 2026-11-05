@@ -6,7 +6,7 @@ export const proxyModeLabel = (server) => {
   const protocol = String(server?.protocol || '').trim().toLowerCase()
   if (protocol && protocol !== 'raknet') return 'Plain'
   const mode = String(server?.proxy_mode || '').trim().toLowerCase()
-  const map = { raw_udp: 'Raw UDP', passthrough: 'Pass', transparent: 'Trans', raknet: 'RakNet', mitm: 'MITM', nethernet: 'NetherNet' }
+  const map = { auto: 'Auto', raw_udp: 'Raw UDP', passthrough: 'Pass', transparent: 'Trans', raknet: 'RakNet', mitm: 'MITM', nethernet: 'NetherNet' }
   return map[mode] || server?.proxy_mode || 'Trans'
 }
 
@@ -14,7 +14,7 @@ export const proxyModeType = (server) => {
   const protocol = String(server?.protocol || '').trim().toLowerCase()
   if (protocol && protocol !== 'raknet') return 'default'
   const mode = String(server?.proxy_mode || '').trim().toLowerCase()
-  const map = { raw_udp: 'success', passthrough: 'info', transparent: 'warning', raknet: 'default', mitm: 'error', nethernet: 'warning' }
+  const map = { auto: 'info', raw_udp: 'success', passthrough: 'info', transparent: 'warning', raknet: 'default', mitm: 'error', nethernet: 'warning' }
   return map[mode] || 'default'
 }
 

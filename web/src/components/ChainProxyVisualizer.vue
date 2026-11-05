@@ -1,10 +1,10 @@
 <template>
-  <n-modal size="small"
+  <n-modal class="app-modal-workspace" size="small"
     :show="show"
     @update:show="$emit('update:show', $event)"
     preset="card"
     title="链式代理可视化编辑器"
-    style="width: 1100px; max-width: 96vw"
+    style="width: min(1800px, 98vw); max-width: 98vw"
     :bordered="false"
 >
     <div class="chain-viz-container">
@@ -36,17 +36,15 @@
         </n-space>
       </div>
 
+      <n-alert v-if="chainNodes.length > 0" type="warning" :show-icon="false">
+        后跳 HY2（包括其中的 TCP 业务）需要前一跳允许 UDP 转发；能连接 HY2 不代表该账户允许代理 UDP。Mieru TCP 后跳需要前一跳提供 TCP。协议按顺序封装，不会把所有节点改成 HY2；UDP over TCP 可用但有队头阻塞。实际承载失败会报错，不绕过前跳直连；链式 HY2 请使用固定端口。
+      </n-alert>
+
       <div class="chain-viz-body">
         <!-- Left: Available nodes pool -->
         <div class="chain-viz-pool">
           <div class="chain-viz-pool-header">
-            <n-input
-              v-model:value="poolSearch"
-              size="small"
-              placeholder="搜索可用节点..."
-              clearable
-              class="pool-search"
-            />
+            <NodeFilters v-model="poolFilter" :nodes="poolNodes" />
           </div>
           <div class="chain-viz-pool-list">
             <div
@@ -223,8 +221,10 @@
 
 <script setup>
 import { ref, computed, watch, h } from 'vue'
+import NodeFilters from './NodeFilters.vue'
+import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
 import {
-  NModal, NButton, NSpace, NTag, NInput, NIcon,
+  NModal, NButton, NSpace, NTag, NInput, NIcon, NAlert,
 } from 'naive-ui'
 import { api } from '../api'
 
@@ -292,7 +292,7 @@ const props = defineProps({
 
 const emit = defineEmits(['update:show', 'save'])
 
-const poolSearch = ref('')
+const poolFilter = ref(emptyNodeFilter())
 const chainNodes = ref([])
 const draggingIndex = ref(-1)
 const dropTargetIndex = ref(-1)
@@ -308,7 +308,7 @@ const udpTestResult = ref(null) // { success, latency_ms, server_name, players }
 // Reset chain when modal opens
 watch(() => props.show, (val) => {
   if (val) {
-    poolSearch.value = ''
+    poolFilter.value = emptyNodeFilter()
     draggingIndex.value = -1
     dropTargetIndex.value = -1
     isDraggingFromPool.value = false
@@ -323,15 +323,7 @@ watch(() => props.show, (val) => {
   }
 })
 
-const filteredPoolNodes = computed(() => {
-  const search = poolSearch.value.toLowerCase().trim()
-  if (!search) return props.poolNodes
-  return props.poolNodes.filter(n =>
-    n.name.toLowerCase().includes(search) ||
-    n.type.toLowerCase().includes(search) ||
-    n.server.toLowerCase().includes(search)
-  )
-})
+const filteredPoolNodes = computed(() => filterNodes(props.poolNodes, poolFilter.value))
 
 function isInChain(name) {
   return chainNodes.value.some(n => n.name === name)

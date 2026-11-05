@@ -80,6 +80,7 @@ import { NIcon } from 'naive-ui'
 
 // 全局紧凑：只收紧统计数字与小卡片内边距，配色仍用 naive-ui 默认深色。
 const themeOverrides = {
+  common: { fontFamily: '"Twemoji Country Flags", ' + darkTheme.common.fontFamily },
   Card: { paddingSmall: '8px 10px' },
   Statistic: { valueFontSize: '18px', labelFontSize: '12px' },
   Table: { fontSizeSmall: '12px', tdPaddingSmall: '4px 8px', thPaddingSmall: '4px 8px' },
