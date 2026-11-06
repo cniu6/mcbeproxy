@@ -23,11 +23,11 @@
         </n-popconfirm>
       </n-space>
     </n-space>
-    
+
     <n-card size="small">
       <n-input size="small" v-model:value="filter" placeholder="过滤关键词..." style="margin-bottom: 12px" clearable />
       <div ref="logContainer" v-if="logContent" style="height: calc(100vh - 280px); min-height: 400px; overflow: auto; background: #1a1a1a; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all;">
-        <div v-for="(line, idx) in filteredLines" :key="idx" :style="getLineStyle(line)">{{ line }}</div>
+        <div v-for="(item, idx) in styledLines" :key="idx" :style="item.style">{{ item.line }}</div>
       </div>
       <n-empty size="small" v-else description="请选择日志文件" />
     </n-card>
@@ -39,6 +39,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api } from '../api'
 import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
+import { logLineStyles } from '../composables/logLineStyle'
 
 const message = useMessage()
 const logFiles = ref([])
@@ -54,21 +55,15 @@ onUnmounted(() => logPoller.dispose())
 
 const logFileOptions = computed(() => logFiles.value.map(f => ({ label: f, value: f })))
 
-const filteredLines = computed(() => {
+// 先按原始行序定好每行颜色（无级别前缀的续行沿用上一行），再套关键词过滤；
+// 这样正文里出现 error / write_target_errors=0 的统计行不会被误判成错误。
+const styledLines = computed(() => {
   const allLines = logContent.value.split('\n')
-  if (!filter.value) return allLines
-  const keyword = filter.value.toLowerCase()
-  return allLines.filter(line => line.toLowerCase().includes(keyword))
+  const styles = logLineStyles(allLines)
+  const keyword = filter.value.trim().toLowerCase()
+  const items = allLines.map((line, index) => ({ line, style: styles[index] }))
+  return keyword ? items.filter(item => item.line.toLowerCase().includes(keyword)) : items
 })
-
-const getLineStyle = (line) => {
-  const lower = line.toLowerCase()
-  if (lower.includes('error') || lower.includes('fatal')) return { color: '#f56c6c' }
-  if (lower.includes('warn')) return { color: '#e6a23c' }
-  if (lower.includes('info')) return { color: '#67c23a' }
-  if (lower.includes('debug')) return { color: '#909399' }
-  return { color: '#ddd' }
-}
 
 // 滚动到底部
 const scrollToBottom = () => {

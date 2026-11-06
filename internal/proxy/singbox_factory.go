@@ -399,6 +399,44 @@ type hy2PortHoppingConnFactory struct {
 	portEnd     int
 	hopInterval time.Duration
 	obfs        *hy2ObfsConfig
+
+	// HY2 的数据面在 QUIC 流上，唯一能被内核调优的是本工厂建出的真实 UDP
+	// socket。上层调优请求落在 QUIC 流上时先记在 pendingBuffers，等 socket
+	// 建好或重连时用项目统一的 configureUDPConnBuffers 生效（一个大小、
+	// 读写双向同时生效，与其它链路语义一致）。
+	mu             sync.Mutex
+	pendingBuffers int
+	activeSocket   net.PacketConn
+}
+
+// requestBufferSize 记录一次调优请求；若本机 socket 已存在则立即套用。
+// 链式模式下没有本机 socket，请求继续保留，不算错误。
+func (f *hy2PortHoppingConnFactory) requestBufferSize(bytes int) {
+	if f == nil || bytes <= 0 {
+		return
+	}
+	f.mu.Lock()
+	f.pendingBuffers = bytes
+	socket := f.activeSocket
+	f.mu.Unlock()
+	if setter, ok := socket.(udpSocketBufferConfigurer); ok {
+		_ = configureUDPConnBuffers(setter, bytes)
+	}
+}
+
+// adoptUDPSocket 接管新建的本机 socket：记为当前生效 socket 并套用已记录
+// 的调优请求。调用点必须在混淆/端口跳跃包装之前，确保调到真实 UDP socket。
+func (f *hy2PortHoppingConnFactory) adoptUDPSocket(conn net.PacketConn) {
+	if f == nil || conn == nil {
+		return
+	}
+	f.mu.Lock()
+	f.activeSocket = conn
+	pending := f.pendingBuffers
+	f.mu.Unlock()
+	if setter, ok := conn.(udpSocketBufferConfigurer); ok && pending > 0 {
+		_ = configureUDPConnBuffers(setter, pending)
+	}
 }
 
 // New creates a new port-hopping UDP connection.
@@ -422,6 +460,9 @@ func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 新 socket 建好后先套用已记录的调优请求；链式模式没有本机 socket，
+	// 请求继续保留。放在混淆/端口跳跃包装之前，调到真实 UDP socket。
+	f.adoptUDPSocket(conn)
 
 	// Wrap with obfuscation if configured
 	var baseConn net.PacketConn = conn
@@ -3297,6 +3338,31 @@ func (c *hysteria2PacketConn) Close() error {
 
 	if c.conn != nil {
 		return c.conn.Close()
+	}
+	return nil
+}
+
+// SetReadBuffer 把上层调优请求转交给共享 QUIC 客户端的底层 socket。本层
+// 只有一条 QUIC 流、没有自己的内核缓冲区，转发后返回 nil——传输层能力
+// 差异不应被上报成错误（此前就是这里把每次调优打成 WARN）。
+func (c *hysteria2PacketConn) SetReadBuffer(bytes int) error {
+	return c.forwardBufferRequest(bytes)
+}
+
+// SetWriteBuffer 同 SetReadBuffer：工厂语义是一个大小、双向同时生效。
+func (c *hysteria2PacketConn) SetWriteBuffer(bytes int) error {
+	return c.forwardBufferRequest(bytes)
+}
+
+func (c *hysteria2PacketConn) forwardBufferRequest(bytes int) error {
+	if c == nil || c.outbound == nil {
+		return nil
+	}
+	c.outbound.hy2Mu.Lock()
+	factory := c.outbound.hy2ConnFactory
+	c.outbound.hy2Mu.Unlock()
+	if factory != nil {
+		factory.requestBufferSize(bytes)
 	}
 	return nil
 }
