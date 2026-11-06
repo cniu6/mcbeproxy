@@ -284,6 +284,7 @@ func (a *APIServer) setupRoutes() {
 		api.GET("/servers/latency-overview", a.getServerLatencyOverview)
 		serverAdminGroup := api.Group("/servers")
 		serverAdminGroup.Use(a.requireAdminMiddleware())
+		serverAdminGroup.GET("/disconnect-reports", a.getDisconnectReports)
 		serverAdminGroup.GET("/:id/last-disconnect", a.getLastDisconnectReport)
 		serverAdminGroup.POST("", a.createServer)
 		serverAdminGroup.PUT("/:id", a.updateServer)

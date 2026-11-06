@@ -95,6 +95,7 @@ const Players = defineAsyncComponent(() => import('./views/Players.vue'))
 const Blacklist = defineAsyncComponent(() => import('./views/Blacklist.vue'))
 const Whitelist = defineAsyncComponent(() => import('./views/Whitelist.vue'))
 const Sessions = defineAsyncComponent(() => import('./views/Sessions.vue'))
+const Disconnects = defineAsyncComponent(() => import('./views/Disconnects.vue'))
 const Logs = defineAsyncComponent(() => import('./views/Logs.vue'))
 const Settings = defineAsyncComponent(() => import('./views/Settings.vue'))
 const ProxyOutbounds = defineAsyncComponent(() => import('./views/ProxyOutbounds.vue'))
@@ -150,7 +151,8 @@ const menuOptions = [
       { label: '玩家', key: 'players', icon: renderIcon(PeopleOutline) },
       { label: '黑名单', key: 'blacklist', icon: renderIcon(BanOutline) },
       { label: '白名单', key: 'whitelist', icon: renderIcon(CheckmarkCircleOutline) },
-      { label: '连接记录', key: 'sessions', icon: renderIcon(TimeOutline) }
+      { label: '连接记录', key: 'sessions', icon: renderIcon(TimeOutline) },
+      { label: '断线记录', key: 'disconnects', icon: renderIcon(BugOutline) }
     ]
   },
   {
@@ -184,6 +186,7 @@ const pageComponentMap = {
   'blacklist': Blacklist,
   'whitelist': Whitelist,
   'sessions': Sessions,
+  'disconnects': Disconnects,
   'logs': Logs,
   'debug': Debug,
   'settings': Settings
@@ -197,6 +200,7 @@ const currentViewProps = computed(() => {
       return { initialSearch: searchParam.value, initialHighlight: highlightParam.value }
     case 'players':
     case 'sessions':
+    case 'disconnects':
       return { initialSearch: searchParam.value }
     default:
       return {}
@@ -205,7 +209,7 @@ const currentViewProps = computed(() => {
 
 const currentViewKey = computed(() => {
   // 仅对依赖搜索参数的页面附加 searchKey，避免无关页面被销毁重建
-  if (['proxy-outbounds', 'players', 'sessions'].includes(currentPage.value)) {
+  if (['proxy-outbounds', 'players', 'sessions', 'disconnects'].includes(currentPage.value)) {
     return `${currentPage.value}-${searchKey.value}`
   }
   return currentPage.value

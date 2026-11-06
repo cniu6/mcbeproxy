@@ -141,7 +141,12 @@ type relayHost interface {
 	Stop() error
 }
 
-func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
+// 本机以127.0.0.1进行HTTP信令，仍必须通过真实ICE媒体检查和双向数据验证。
+func TestNetherNetRelay_LoopbackSignalingEndToEnd(t *testing.T) {
+	testNetherNetRelayEndToEnd(t, "auto", "127.0.0.1")
+}
+
+func testNetherNetRelayEndToEnd(t *testing.T, mode string, signalingHosts ...string) {
 	lan := lanIPv4(t)
 
 	handler := endpoint.NewHandler()
@@ -194,7 +199,11 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 	if relay() == nil {
 		t.Fatal("relay not started")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	timeout := 45 * time.Second
+	if len(signalingHosts) > 0 {
+		timeout = 12 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	go func() { _ = p.Listen(ctx) }()
 	defer p.Stop()
@@ -207,8 +216,12 @@ func testNetherNetRelayEndToEnd(t *testing.T, mode string) {
 		}
 	}()
 
+	signalingHost := lan.String()
+	if len(signalingHosts) > 0 {
+		signalingHost = signalingHosts[0]
+	}
 	client, err := (nethernet.Dialer{DisableTrickleICE: true, Identity: clientIdentity}).DialContext(ctx,
-		"http://"+net.JoinHostPort(lan.String(), strconv.Itoa(proxyPort)), endpoint.NewClient())
+		"http://"+net.JoinHostPort(signalingHost, strconv.Itoa(proxyPort)), endpoint.NewClient())
 	if err != nil {
 		t.Fatalf("dial through relay: %v", err)
 	}

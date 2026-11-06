@@ -730,7 +730,48 @@ func (r *netherNetRelay) advertisedAddr(ctx context.Context, req *http.Request) 
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("resolve advertised host %q: %w", host, err)
 	}
+	// HTTP 能经回环访问，不代表 ICE 会在回环接口收集可配对的候选。
+	// 自动、全接口监听时改用真正的本机网卡地址；仅本机可用，绝不把它
+	// 作为远程公网地址猜测，也不覆盖用户明确指定的映射或仅回环监听。
+	if r.conf().NetherNetPublicAddr == "" && ip.IsLoopback() && r.udp != nil {
+		if local, ok := r.udp.LocalAddr().(*net.UDPAddr); ok && local.IP.IsUnspecified() {
+			ip, err = r.localMediaIPv4(ctx)
+			if err != nil {
+				return netip.AddrPort{}, err
+			}
+		}
+	}
 	return netip.AddrPortFrom(ip, port), nil
+}
+
+// 优先沿用到目标的路由网卡，UDP connect 只查询系统路由，不发送报文。
+// 目标本身在回环（本机中继链/测试）时复用现有接口缓存，不查询公网IP服务。
+func (r *netherNetRelay) localMediaIPv4(ctx context.Context) (netip.Addr, error) {
+	if target := r.upstreamIP(ctx); target.IsValid() && target.Is4() && !target.IsLoopback() {
+		conn, err := netroute.DialUDP(net.UDPAddrFromAddrPort(netip.AddrPortFrom(target, 1)))
+		if err == nil {
+			local, _ := netip.AddrFromSlice(conn.LocalAddr().(*net.UDPAddr).IP)
+			_ = conn.Close()
+			if local = local.Unmap(); local.IsGlobalUnicast() && local.Is4() {
+				return local, nil
+			}
+		}
+	}
+	interfaces, _, err := netroute.ListInterfaces(false)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("enumerate local media interfaces: %w", err)
+	}
+	for _, iface := range interfaces {
+		if !iface.Up || iface.Loopback {
+			continue
+		}
+		for _, address := range iface.IPv4 {
+			if local, err := netip.ParseAddr(address); err == nil && local.IsGlobalUnicast() {
+				return local, nil
+			}
+		}
+	}
+	return netip.Addr{}, errors.New("no non-loopback IPv4 interface for local NetherNet media")
 }
 
 func resolveNetherNetHost(ctx context.Context, host string) (netip.Addr, error) {

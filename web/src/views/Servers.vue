@@ -2675,6 +2675,7 @@ const renderServerLatencyHistoryCell = (server) => {
     samples: getServerLatencyHistorySamples(server.id),
     loading: serverOverviewLoading.value,
     label: `${server.name || server.id} 延迟历史`,
+    emptyText: '尚无实测样本',
     width: 138,
     height: 34,
     showLabel: false,

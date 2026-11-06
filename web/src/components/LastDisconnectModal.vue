@@ -12,9 +12,13 @@
       <n-spin size="small" :show="loading">
         <n-space v-if="report" vertical :size="8">
           <n-tag size="tiny" type="warning">{{ disconnectReasonLabel(report.end_reason) }}</n-tag>
-          <n-descriptions size="small" label-placement="top" :column="2" bordered>
-            <n-descriptions-item v-for="item in summary" :key="item.label" :label="item.label">{{ item.value }}</n-descriptions-item>
-          </n-descriptions>
+          <n-grid cols="1 m:2" responsive="screen" :x-gap="6" :y-gap="6">
+            <n-gi v-for="item in summary" :key="item.label">
+              <n-descriptions size="small" label-placement="top" :column="1" bordered>
+                <n-descriptions-item :label="item.label"><n-text style="overflow-wrap: anywhere">{{ item.value }}</n-text></n-descriptions-item>
+              </n-descriptions>
+            </n-gi>
+          </n-grid>
           <n-card v-for="(transport, index) in report.transport || []" :key="`${transport.id}-${index}`" size="small" :title="`传输层 ${index + 1} · ${transport.layer || '未知'} · ${transport.id || '-'}`">
             <n-descriptions size="small" label-placement="top" :column="1">
               <n-descriptions-item label="代理 / 目标">{{ transport.proxy || '-' }} → {{ transport.destination || '-' }}</n-descriptions-item>
@@ -38,7 +42,7 @@ import { useMessage } from 'naive-ui'
 import { api, formatBytes } from '../api'
 import { loadDisconnectDiagnostic, disconnectReasonLabel } from '../composables/disconnectDiagnostic.js'
 
-const props = defineProps({ show: Boolean, server: { type: Object, default: null } })
+const props = defineProps({ show: Boolean, server: { type: Object, default: null }, snapshot: { type: Object, default: null } })
 const emit = defineEmits(['update:show'])
 const message = useMessage()
 const report = ref(null)
@@ -90,11 +94,12 @@ async function copyReport() {
   try { await navigator.clipboard.writeText(JSON.stringify(report.value, null, 2)); message.success('已复制断线详情') }
   catch { message.error('复制失败，浏览器未允许访问剪贴板') }
 }
-watch(() => [props.show, props.server?.id], ([show]) => {
+watch(() => [props.show, props.server?.id, props.snapshot], ([show]) => {
   sequence++
   loading.value = false
   report.value = null
   notice.value = ''
-  if (show) load()
+  if (show && props.snapshot) report.value = props.snapshot
+  else if (show) load()
 }, { immediate: true })
 </script>

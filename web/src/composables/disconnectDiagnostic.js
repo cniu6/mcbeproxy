@@ -5,6 +5,22 @@ export async function loadDisconnectDiagnostic(api, serverID) {
   return { report: result.data || null, message: result.data ? '' : '尚未捕获断线记录' }
 }
 
+// 汇总接口一次读取，避免按服务器逐个请求；权限失败与真正空列表分开处理。
+export async function loadDisconnectReports(api) {
+  const result = await api('/api/servers/disconnect-reports')
+  if (!result?.success) throw new Error(result?.msg || result?.message || '读取断线快照失败，请确认管理员权限')
+  if (!Array.isArray(result.data)) throw new Error('断线快照响应格式错误')
+  return result.data.filter(entry => entry?.server_id && entry?.report)
+}
+
+export function filterDisconnectReports(entries, keyword) {
+  const query = String(keyword || '').trim().toLowerCase()
+  return entries.filter(entry => !query || [entry.server_id, entry.server_name, entry.report?.client,
+    entry.report?.route, entry.report?.target, entry.report?.end_reason,
+    disconnectReasonLabel(entry.report?.end_reason), entry.report?.last_io?.error]
+    .some(value => String(value || '').toLowerCase().includes(query)))
+}
+
 const endReasons = {
   upstream_read_error: '读取上游失败', upstream_eof: '上游流结束',
   upstream_write_error: '写入上游失败', upstream_write_timeouts: '连续上游写超时',

@@ -22,15 +22,17 @@ type ServerLatencyHistorySample struct {
 }
 
 type serverLatencyHistoryStore struct {
-	config *config.GlobalConfig
-	mu     sync.RWMutex
-	series map[string][]ServerLatencyHistorySample
+	config      *config.GlobalConfig
+	mu          sync.RWMutex
+	series      map[string][]ServerLatencyHistorySample
+	windowStart map[string]int64 // 合并窗口起点不随最新样本后移，避免高频采样永远只有一个点
 }
 
 func newServerLatencyHistoryStore(globalConfig *config.GlobalConfig) *serverLatencyHistoryStore {
 	return &serverLatencyHistoryStore{
-		config: globalConfig,
-		series: make(map[string][]ServerLatencyHistorySample),
+		config:      globalConfig,
+		series:      make(map[string][]ServerLatencyHistorySample),
+		windowStart: make(map[string]int64),
 	}
 }
 
@@ -76,6 +78,7 @@ func (s *serverLatencyHistoryStore) Delete(serverID string) {
 	}
 	s.mu.Lock()
 	delete(s.series, serverID)
+	delete(s.windowStart, serverID)
 	s.mu.Unlock()
 }
 
@@ -109,15 +112,19 @@ func (s *serverLatencyHistoryStore) Record(serverID string, sample ServerLatency
 	series := s.trimExpiredLocked(serverID, cutoff)
 	if len(series) == 0 {
 		s.series[serverID] = []ServerLatencyHistorySample{sample}
+		s.windowStart[serverID] = sample.Timestamp
 		return
 	}
 
 	lastIndex := len(series) - 1
-	last := series[lastIndex]
-	if sample.Timestamp-last.Timestamp < minGap {
+	if sample.Timestamp < series[lastIndex].Timestamp {
+		return // 迟到测量不能覆盖更新的值或打乱时间顺序
+	}
+	if sample.Timestamp-s.windowStart[serverID] < minGap {
 		series[lastIndex] = sample
 	} else {
 		series = append(series, sample)
+		s.windowStart[serverID] = sample.Timestamp
 	}
 	storageLimit := s.storageLimit()
 	if storageLimit > 0 && len(series) > storageLimit {
@@ -180,6 +187,7 @@ func (s *serverLatencyHistoryStore) trimExpiredLocked(serverID string, cutoff in
 	}
 	if start >= len(series) {
 		delete(s.series, serverID)
+		delete(s.windowStart, serverID)
 		return nil
 	}
 	if start > 0 {
@@ -263,6 +271,16 @@ const serverPingConcurrency = 16
 
 func (a *APIServer) buildServerLatencyOverview(servers []config.ServerConfigDTO, historyLimit int) map[string]interface{} {
 	pings := a.collectCachedServerPings(servers, serverLatencyOverviewRunning)
+	// 被动调度尚未执行时，允许已有有效缓存初始化一个点；之后概览只读，
+	// 不把每次页面刷新冒充新测量，也不为 cache_miss 制造离线点。
+	for id, info := range pings {
+		latency, _ := int64Value(info["latency"])
+		if boolValue(info["online"]) && latency > 0 && stringValue(info["source"]) == "proxy" {
+			if _, exists := a.lastServerLatencySample(id); !exists {
+				a.recordServerLatencyInfo(info)
+			}
+		}
+	}
 	serverIDs := make([]string, 0, len(servers))
 	for _, server := range servers {
 		if !serverLatencyOverviewRunning(server) {
