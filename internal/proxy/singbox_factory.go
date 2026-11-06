@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mcpeserverproxy/internal/config"
@@ -72,6 +73,7 @@ type SingboxOutbound struct {
 	ssKeyLen        int                                   // Key/salt length
 	ssCipher        func(key []byte) (cipher.AEAD, error) // Cipher constructor
 	hy2Client       hy2.Client
+	hy2ConnFactory  *hy2PortHoppingConnFactory
 	hy2Mu           sync.Mutex // 只保护 client 指针与拨号门，不在锁内等待网络。
 	hy2DialGate     chan struct{}
 	anytlsClient    *anytls.Client
@@ -390,7 +392,8 @@ func parsePortRange(portRange string) (start, end int, err error) {
 // hy2PortHoppingConnFactory implements port hopping for Hysteria2.
 // It creates UDP connections that hop between ports at specified intervals.
 type hy2PortHoppingConnFactory struct {
-	dialer      N.Dialer // 非直连时，QUIC必须使用前跳提供的UDP关联。
+	transport   atomic.Pointer[chainTransportPacket] // 当前QUIC底层队列；UDP建流时捕获到会话，不在诊断时查最新连接
+	dialer      N.Dialer                             // 非直连时，QUIC必须使用前跳提供的UDP关联。
 	serverIP    net.IP
 	portStart   int
 	portEnd     int
@@ -408,7 +411,10 @@ func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 		defer cancel()
 		conn, err = f.dialer.ListenPacket(ctx, M.SocksaddrFromNet(addr))
 		if err == nil {
-			conn = newChainTransportPacket(conn)
+			transport := newChainTransportPacket(conn)
+			transport.destination = addr.String()
+			f.transport.Store(transport)
+			conn = transport
 		}
 	} else {
 		conn, err = netroute.ListenUDP(addrString(addr))
@@ -739,6 +745,7 @@ func (s *SingboxOutbound) initHysteria2(cfg *config.ProxyOutbound) error {
 	}
 
 	s.hy2Client = hy2Client
+	s.hy2ConnFactory = connFactory
 	return nil
 }
 
@@ -1929,7 +1936,7 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 		return nil, fmt.Errorf("hysteria2 UDP cancelled: %w", err)
 	}
 	s.hy2Mu.Lock()
-	client := s.hy2Client
+	client, factory := s.hy2Client, s.hy2ConnFactory
 	s.hy2Mu.Unlock()
 	if client == nil {
 		<-gate
@@ -1937,8 +1944,9 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 	}
 
 	type result struct {
-		conn hy2.HyUDPConn
-		err  error
+		conn      hy2.HyUDPConn
+		err       error
+		transport *chainTransportPacket
 	}
 	ready := make(chan result)
 	go func() {
@@ -1964,8 +1972,14 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 				break
 			}
 		}
+		// UDP拨号门仍由本协程持有；在下一次可能重连前捕获当前底层队列。
+		// 旧玩家保留自己的传输引用，后续重连不能替换其断线证据。
+		var transport *chainTransportPacket
+		if err == nil && factory != nil {
+			transport = factory.transport.Load()
+		}
 		select {
-		case ready <- result{conn: conn, err: err}:
+		case ready <- result{conn: conn, err: err, transport: transport}:
 		case <-ctx.Done():
 			// 取消后晚到的 session 没有玩家接管，只关闭它自己的关联。
 			if conn != nil {
@@ -1990,7 +2004,7 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 			}
 			return nil, fmt.Errorf("hysteria2 UDP failed: %w", r.err)
 		}
-		return &hysteria2PacketConn{conn: r.conn, destination: dest, destStr: dest.String(), outbound: s}, nil
+		return &hysteria2PacketConn{conn: r.conn, destination: dest, destStr: dest.String(), outbound: s, transport: r.transport}, nil
 	}
 }
 
@@ -3074,6 +3088,7 @@ func (d *SingboxDialer) dialAnyTLSTCP(ctx context.Context, _, dest M.Socksaddr) 
 
 // hysteria2PacketConn wraps a Hysteria2 UDP connection.
 type hysteria2PacketConn struct {
+	transport    *chainTransportPacket // 对应创建该UDP会话时的共享QUIC传输
 	conn         hy2.HyUDPConn
 	destination  M.Socksaddr
 	destStr      string // destination.String(), computed once instead of per packet

@@ -54,12 +54,19 @@ func (r *PlayerRepository) GetByDisplayName(displayName string) (*PlayerRecord, 
 
 // List retrieves player records with pagination.
 func (r *PlayerRepository) List(limit, offset int) ([]*PlayerRecord, error) {
+	return r.Search("", limit, offset)
+}
+
+// Search 在分页之前匹配身份字段，不能只过滤最近100条而漏掉旧玩家。
+func (r *PlayerRepository) Search(keyword string, limit, offset int) ([]*PlayerRecord, error) {
 	query := `
 		SELECT display_name, uuid, xuid, first_seen, last_seen, total_bytes, total_playtime, metadata
-		FROM players ORDER BY last_seen DESC LIMIT ? OFFSET ?
+		FROM players
+		WHERE instr(lower(display_name), lower(?)) > 0 OR instr(lower(coalesce(uuid, '')), lower(?)) > 0 OR instr(lower(coalesce(xuid, '')), lower(?)) > 0
+		ORDER BY last_seen DESC LIMIT ? OFFSET ?
 	`
 
-	rows, err := r.db.DB().Query(query, limit, offset)
+	rows, err := r.db.DB().Query(query, keyword, keyword, keyword, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list players: %w", err)
 	}

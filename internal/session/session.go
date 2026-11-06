@@ -71,7 +71,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	return SessionSnapshot{
 		ConnectionInfo:   s.ConnectionInfo,
 		ID:               s.ID,
-		ClientAddr:       s.ClientAddr,
+		ClientAddr:       NormalizeClientAddress(s.ClientAddr),
 		ServerID:         s.ServerID,
 		UUID:             s.UUID,
 		DisplayName:      s.DisplayName,
@@ -263,7 +263,7 @@ func (s *Session) ApplyRelaySnapshot(addr string, up, down int64, lastSeen time.
 		s.BytesDown = down
 	}
 	if !lastSeen.Before(s.LastSeen) {
-		s.ClientAddr = addr
+		s.ClientAddr = NormalizeClientAddress(addr)
 		s.LastSeen = lastSeen
 	}
 }
@@ -375,7 +375,7 @@ func (s *Session) ToDTO() SessionDTO {
 	return SessionDTO{
 		ConnectionInfo: s.ConnectionInfo,
 		ID:             s.ID,
-		ClientAddr:     s.ClientAddr,
+		ClientAddr:     NormalizeClientAddress(s.ClientAddr),
 		ServerID:       s.ServerID,
 		UUID:           s.UUID,
 		DisplayName:    s.DisplayName,

@@ -2307,79 +2307,50 @@ const getRawUDPClientStats = (row) => {
   return list.filter(Boolean)
 }
 
-const getRawUDPPrimaryStats = (row) => {
-  const list = getRawUDPClientStats(row)
-  return list.find(item => item?.stall_reason) || list[0] || null
-}
-
-const getRawUDPErrorCount = (stats) => {
-  if (!stats) return 0
-  return Number(stats.write_target_errors || 0) + Number(stats.write_client_errors || 0) + Number(stats.write_target_timeouts || 0) + Number(stats.write_client_timeouts || 0) + Number(stats.read_target_timeouts || 0)
-}
-
-const renderRawUDPStatsTooltip = (stats, clients = []) => {
-  if (!stats) return null
-  const errorCount = getRawUDPErrorCount(stats)
-  const otherClients = clients.filter(item => item && item !== stats).slice(0, 4)
+const renderRawUDPStatsTooltip = (stats) => {
+  const relay = stats.transport === 'nethernet'
   const lines = [
-    `客户端数: ${clients.length || 1}`,
-    `主客户端: ${stats.client || '-'}`,
-    `线路: ${stats.route || '-'}`,
-    `目标: ${stats.target || '-'}`,
+    `玩家: ${stats.player_name || '身份未提供'} · ${relay ? 'NetherNet' : 'RakNet'}`,
+    `客户端: ${stats.client_addr || stats.client || '-'}`,
+    `线路: ${stats.route || '-'} → ${stats.target || '-'}`,
+    `连接时长: ${formatLiveSessionDuration(stats.duration_seconds)}`,
     `上行: ${stats.up_packets || 0} 包 / ${formatLiveSessionBytes(stats.up_bytes)} (${formatRawUDPRate(stats.up_bytes_per_second)})`,
     `下行: ${stats.down_packets || 0} 包 / ${formatLiveSessionBytes(stats.down_bytes)} (${formatRawUDPRate(stats.down_bytes_per_second)})`,
-    `距客户端包: ${formatRawUDPDurationMs(stats.since_client_ms)}`,
-    `距目标包: ${formatRawUDPDurationMs(stats.since_target_ms)}`,
-    `写目标耗时: ${formatRawUDPWriteMs(stats.last_write_target_ms, stats.max_write_target_ms, stats.slow_write_target_count)}`,
-    `写客户端耗时: ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`,
+    `距客户端包: ${formatRawUDPDurationMs(stats.since_client_ms)} · 距目标包: ${formatRawUDPDurationMs(stats.since_target_ms)}`,
+    `写目标: ${formatRawUDPWriteMs(stats.last_write_target_ms, stats.max_write_target_ms, stats.slow_write_target_count)}`,
+    `写客户端: ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`,
     `包间隔峰值: 客户端 ${formatRawUDPDurationMs(stats.max_client_packet_gap_ms)} / 目标 ${formatRawUDPDurationMs(stats.max_target_packet_gap_ms)}`,
-    `窗口写入峰值: 目标 ${formatRawUDPDurationMs(stats.recent_max_write_target_ms)} / 客户端 ${formatRawUDPDurationMs(stats.recent_max_write_client_ms)}`,
-    `包间隔峰值: 客户端 ${formatRawUDPDurationMs(stats.max_client_packet_gap_ms)} / 目标 ${formatRawUDPDurationMs(stats.max_target_packet_gap_ms)}`,
-    `窗口写入峰值: 目标 ${formatRawUDPDurationMs(stats.recent_max_write_target_ms)} / 客户端 ${formatRawUDPDurationMs(stats.recent_max_write_client_ms)}`,
     `上行队列: ${formatRawUDPQueue(stats)}`,
-    `Login解析: ${formatRawUDPParseState(stats)}`,
+    relay ? `信令身份: ${stats.identity_verification === 'verified_signaling' ? '验证通过' : '未验证'}；加密媒体连接，未观察游戏 Login` : `Login解析: ${formatRawUDPParseState(stats)}`,
     `写目标超时/错误: ${stats.write_target_timeouts || 0}/${stats.write_target_errors || 0}`,
     `写客户端超时/错误: ${stats.write_client_timeouts || 0}/${stats.write_client_errors || 0}`,
-    `读目标超时: ${stats.read_target_timeouts || 0}`,
-    `异常合计: ${errorCount}`,
-    ...(stats.client_rtt_ms || stats.target_rtt_ms ? [`延迟(RTT): 客户端 ${stats.client_rtt_ms || 0}ms${stats.target_rtt_ms ? ` / 目标 ${stats.target_rtt_ms}ms` : ''}`] : []),
+    `读等待超时: ${stats.read_target_timeouts || 0}（不等于链路断开）`,
+    ...(!relay && (stats.client_rtt_ms || stats.target_rtt_ms) ? [`延迟(RTT): 客户端 ${stats.client_rtt_ms || 0}ms / 目标 ${stats.target_rtt_ms || 0}ms`] : []),
     ...(stats.downstream_pending_bytes ? [`下行限速排队: ${formatLiveSessionBytes(stats.downstream_pending_bytes)}`] : [])
   ]
-  const children = lines.map(line => h('div', null, line))
-  if (otherClients.length > 0) {
-    children.push(h('div', { class: 'raw-udp-tooltip-section' }, '其他客户端'))
-    otherClients.forEach(item => {
-      children.push(h('div', { class: 'raw-udp-tooltip-muted' }, `${formatRawUDPStallReason(item.stall_reason)} · ${item.client || '-'} · ↑${item.up_packets || 0} ↓${item.down_packets || 0} · ↓${formatRawUDPRate(item.down_bytes_per_second)} · 写客 ${formatRawUDPWriteMs(item.last_write_client_ms, item.max_write_client_ms, item.slow_write_client_count)}`))
-    })
-    const hiddenCount = clients.length - otherClients.length - 1
-    if (hiddenCount > 0) {
-      children.push(h('div', { class: 'raw-udp-tooltip-muted' }, `另有 ${hiddenCount} 个客户端未展开`))
-    }
-  }
-  return h('div', { class: 'raw-udp-tooltip' }, children)
+  return h(NSpace, { vertical: true, size: 2 }, () => lines.map(line => h('div', null, line)))
 }
 
 const renderRawUDPStatsCell = (row) => {
   const clients = getRawUDPClientStats(row)
-  const stats = getRawUDPPrimaryStats(row)
-  if (!stats) return null
-  const errorCount = getRawUDPErrorCount(stats)
-  const stalled = !!stats.stall_reason
-  const slowClientWrites = Number(stats.slow_write_client_count || 0) > 0
-  const queueDrops = Number(stats.upstream_queue_drops || 0) > 0
-  const tagType = stalled ? 'error' : errorCount > 0 || slowClientWrites || queueDrops ? 'warning' : 'success'
-  const loginReady = !!stats.login_parsed && !!String(stats.player_name || '').trim()
-  const label = stalled ? formatRawUDPStallReason(stats.stall_reason) : slowClientWrites ? '写客户端慢' : queueDrops ? '队列丢包' : !loginReady ? '握手中/未认证' : 'RawUDP 链路正常'
-  const packetLine = clients.length > 1 ? `${clients.length}客户端 · ↑${stats.up_packets || 0} ↓${stats.down_packets || 0}` : `↑${stats.up_packets || 0} ↓${stats.down_packets || 0}`
-  return h(NTooltip, { trigger: 'hover', placement: 'top' }, {
-    trigger: () => h('div', { class: 'raw-udp-summary' }, [
-      h(NTag, { size: 'small', type: tagType, bordered: false }, () => label),
-      h('div', { class: 'raw-udp-mini' }, packetLine),
-      h('div', { class: 'raw-udp-mini' }, `↓ ${formatRawUDPRate(stats.down_bytes_per_second)} · 写客 ${formatRawUDPWriteMs(stats.last_write_client_ms, stats.max_write_client_ms, stats.slow_write_client_count)}`),
-      h('div', { class: stalled ? 'raw-udp-stall-line' : 'raw-udp-mini' }, `客 ${formatRawUDPDurationMs(stats.since_client_ms)} · 目 ${formatRawUDPDurationMs(stats.since_target_ms)} · 队 ${formatRawUDPQueue(stats)}`)
-    ]),
-    default: () => renderRawUDPStatsTooltip(stats, clients)
-  })
+  if (!clients.length) return null
+  // 不再只展开主客户端或截取四人；每个玩家有自己的状态及完整悬浮详情。
+  return h(NSpace, { vertical: true, size: 4 }, () => clients.map(stats => {
+    const relay = stats.transport === 'nethernet'
+    const stalled = !!stats.stall_reason
+    const errors = Number(stats.write_target_errors || 0) + Number(stats.write_client_errors || 0) + Number(stats.write_target_timeouts || 0) + Number(stats.write_client_timeouts || 0)
+    const drops = Number(stats.upstream_queue_drops || 0) > 0
+    const slow = Number(stats.slow_write_client_count || 0) > 0
+    const type = stalled ? 'error' : errors || drops || slow ? 'warning' : 'success'
+    const state = stalled ? formatRawUDPStallReason(stats.stall_reason) : drops ? '队列丢包' : slow ? '写客户端慢' : relay ? '媒体链路正常' : stats.login_parsed ? '链路正常' : '握手中/未认证'
+    return h(NTooltip, { key: stats.session_key || stats.client, trigger: 'hover', placement: 'top' }, {
+      trigger: () => h(NSpace, { vertical: true, size: 0 }, () => [
+        h(NTag, { size: 'small', type, bordered: false }, () => `${stats.player_name || stats.client_addr || stats.client} · ${relay ? 'NetherNet' : 'RakNet'} · ${state}`),
+        h('small', null, `↑${stats.up_packets || 0} ↓${stats.down_packets || 0} · ↓${formatRawUDPRate(stats.down_bytes_per_second)}`)
+      ]),
+      default: () => renderRawUDPStatsTooltip(stats)
+    })
+  }))
 }
 
 const getServerPing = (serverId) => serverPingMap.value?.[serverId] || null

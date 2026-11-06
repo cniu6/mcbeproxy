@@ -1077,8 +1077,9 @@ func (st *rakConnStats) dto(now time.Time) config.RawUDPClientStatsDTO {
 	}
 	addr := st.client.RemoteAddr().String()
 	d := config.RawUDPClientStatsDTO{
-		Client:                 addr,
-		ClientAddr:             addr,
+		Client:                 session.NormalizeClientAddress(addr),
+		ClientAddr:             session.NormalizeClientAddress(addr),
+		Transport:              "raknet",
 		SessionKey:             addr,
 		ConnectedAt:            st.start,
 		DurationSeconds:        int64(now.Sub(st.start).Seconds()),

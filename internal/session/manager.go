@@ -77,7 +77,7 @@ func (sm *SessionManager) GetOrCreate(clientAddr string, serverID string) (*Sess
 	now := time.Now()
 	session := &Session{
 		ID:         uuid.New().String(),
-		ClientAddr: clientAddr,
+		ClientAddr: NormalizeClientAddress(clientAddr),
 		ServerID:   serverID,
 		StartTime:  now,
 		LastSeen:   now,
@@ -96,7 +96,7 @@ func (sm *SessionManager) GetOrCreateWithKey(ownerKey, clientAddr, serverID stri
 		return s, false
 	}
 	now := time.Now()
-	s := &Session{ID: uuid.NewString(), ClientAddr: clientAddr, ServerID: serverID, StartTime: now, LastSeen: now}
+	s := &Session{ID: uuid.NewString(), ClientAddr: NormalizeClientAddress(clientAddr), ServerID: serverID, StartTime: now, LastSeen: now}
 	sm.sessions[key] = s
 	return s, true
 }

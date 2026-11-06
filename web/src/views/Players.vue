@@ -1,25 +1,29 @@
 <template>
   <div class="page-container">
     <n-h3>玩家列表</n-h3>
-    <n-card size="small">
-      <template #header-extra>
+    <n-space vertical :size="8">
+      <n-space justify="space-between" align="center" :size="6" wrap>
         <n-space>
-          <n-input size="small" v-model:value="search" placeholder="搜索玩家名" style="width: 200px" clearable @keyup.enter="filterPlayers" />
-          <n-button size="small" @click="filterPlayers">搜索</n-button>
+          <n-input size="small" v-model:value="search" placeholder="搜索玩家名 / UUID / XUID" style="width: 200px" clearable @keyup.enter="load" />
+          <n-button size="small" @click="load">搜索</n-button>
           <n-button size="small" @click="clearSearch">清除</n-button>
         </n-space>
-      </template>
+      </n-space>
+      <n-alert type="info" :show-icon="false">NetherNet 名字来自已验证信令，不代表已观察游戏 Login。UUID 未提供时不推测；当前信令连接仅合并展示，不伪造登录历史。</n-alert>
+      <n-card size="small">
       <div class="table-wrapper">
         <n-data-table size="small" :columns="columns" :data="displayPlayers" :bordered="false" :pagination="pagination" :scroll-x="1200" @update:page="p => pagination.page = p" @update:page-size="s => { pagination.pageSize = s; pagination.page = 1 }" />
       </div>
     </n-card>
+    </n-space>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, h } from 'vue'
+import { ref, onMounted, watch, h } from 'vue'
 import { NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
 import { api, formatTime, formatDuration, formatBytes } from '../api'
+import SessionIdentity from '../components/SessionIdentity.vue'
 
 const props = defineProps({ initialSearch: { type: String, default: '' } })
 const message = useMessage()
@@ -50,13 +54,14 @@ const filterPlayers = () => {
   displayPlayers.value = players.value.filter(p => {
     const name = (p.display_name || '').toLowerCase()
     const uuid = (p.uuid || '').toLowerCase()
-    return name.includes(s) || uuid.includes(s)
+    return name.includes(s) || uuid.includes(s) || String(p.xuid || '').toLowerCase().includes(s)
   })
 }
 
 const clearSearch = () => {
   search.value = ''
-  displayPlayers.value = players.value
+  pagination.value.page = 1
+  load()
 }
 
 const quickBan = async (name) => {
@@ -93,8 +98,8 @@ const toTimestamp = (val) => {
 const compareStr = (a, b) => String(a ?? '').localeCompare(String(b ?? ''), 'zh-CN')
 
 const columns = [
-  { title: '玩家名', key: 'display_name', width: 120, sorter: (a, b) => compareStr(a.display_name, b.display_name) },
-  { title: 'UUID', key: 'uuid', ellipsis: { tooltip: true }, width: 260, sorter: (a, b) => compareStr(a.uuid, b.uuid) },
+  { title: '玩家 / 通信方案', key: 'display_name', width: 300, sorter: (a, b) => compareStr(a.display_name, b.display_name), render: r => h(SessionIdentity, { record: r }) },
+  { title: 'UUID', key: 'uuid', ellipsis: { tooltip: true }, width: 260, sorter: (a, b) => compareStr(a.uuid, b.uuid), render: r => r.uuid || '未提供' },
   { title: 'XUID', key: 'xuid', width: 150, sorter: (a, b) => compareStr(a.xuid, b.xuid) },
   { title: '首次登录', key: 'first_seen', render: r => formatTime(r.first_seen), width: 150, sorter: (a, b) => toTimestamp(a.first_seen) - toTimestamp(b.first_seen) },
   { title: '最后登录', key: 'last_seen', render: r => formatTime(r.last_seen), width: 150, defaultSortOrder: 'descend', sorter: (a, b) => toTimestamp(a.last_seen) - toTimestamp(b.last_seen) },
@@ -114,14 +119,19 @@ const columns = [
   }
 ]
 
+let loadSequence = 0
 const load = async () => {
-  const res = await api('/api/players')
+  const sequence = ++loadSequence
+  const keyword = search.value.trim()
+  const res = await api(`/api/players${keyword ? `?q=${encodeURIComponent(keyword)}` : ''}`)
+  if (sequence !== loadSequence) return
   if (res.success) {
     players.value = res.data || []
+    pagination.value.page = 1
     filterPlayers()
-  }
+  } else { players.value = []; displayPlayers.value = []; message.error(res.msg || '读取玩家失败') }
 }
-
+watch(() => props.initialSearch, value => { search.value = getSearchString(value); load() })
 onMounted(load)
 </script>
 

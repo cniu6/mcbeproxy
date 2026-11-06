@@ -41,12 +41,7 @@
               <tbody>
                 <tr v-for="sess in sessionsOf(s)" :key="sess.id">
                   <td>
-                    <template v-if="hasName(sess)">
-                      <n-button size="small" v-if="actions && canManageSessionAsPlayer(sess)" text type="primary" @click="emit('player', sess.display_name)">{{ sess.display_name }}</n-button>
-                      <span v-else>{{ sess.display_name }}</span>
-                    </template>
-                    <n-tag v-else size="tiny" type="warning" :bordered="false">{{ getSessionDisplayName(sess) }}</n-tag>
-                    <n-text v-if="getSessionIdentityLabel(sess)" depth="3"> {{ getSessionIdentityLabel(sess) }}</n-text>
+                    <SessionIdentity :record="sess" :navigable="actions" @player="emit('player', $event)" />
                   </td>
                   <td>{{ sess.client_addr }}</td>
                   <td>{{ onlineDuration(sess) }}</td>
@@ -80,7 +75,8 @@
 
 <script setup>
 import { ref, computed, watch } from 'vue'
-import { getSessionDisplayName, getSessionIdentityLabel, canManageSessionAsPlayer, canCloseRelaySession } from '../composables/sessionPresentation'
+import SessionIdentity from './SessionIdentity.vue'
+import { canManageSessionAsPlayer, canCloseRelaySession } from '../composables/sessionPresentation'
 import { formatBytes, formatDuration } from '../api'
 import LatencySparkline from './LatencySparkline.vue'
 import ServerLatencyHistoryModal from './ServerLatencyHistoryModal.vue'
@@ -108,7 +104,6 @@ const historyServer = ref(null)
 
 const sessionsOf = (server) => props.activeSessions[server.id] || []
 const historyOf = (id) => (Array.isArray(props.latencyHistory[id]) ? props.latencyHistory[id] : [])
-const hasName = (sess) => String(sess?.display_name || '').trim() !== ''
 
 // 有玩家的服务器默认展开；用玩家分布做 key，避免每次轮询都重置用户手动折叠
 const withPlayers = computed(() => props.servers.filter((s) => sessionsOf(s).length).map((s) => s.id).join(','))

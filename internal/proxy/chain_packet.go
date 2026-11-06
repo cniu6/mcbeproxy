@@ -11,18 +11,28 @@ import (
 
 // 后跳QUIC依赖更新期限立即唤醒ReadFrom。部分UDP-over-TCP库只在
 // 开始读取时检查期限，因此由传输边界管理等待，不能把期限转给内部帧解析器。
-// 单个读取泵保留报文边界；慢消费者仅丢当前报文，不创建额外协程或重建前跳。
+// 单个读取泵保留报文边界；队列同时按包数和字节限额，超限只丢新包并计数。
+// 256包与当前QUIC内核的单连接待处理队列同级，字节上限避免大UDP报文放大内存。
+const chainTransportPacketLimit = 256
+const chainTransportByteLimit = 1 << 20
+
 type chainTransportPacket struct {
 	net.PacketConn
-	mu       sync.Mutex
-	deadline time.Time
-	changed  chan struct{}
-	done     chan struct{}
-	terminal chan struct{}
-	err      error
-	packets  chan chainTransportDatagram
-	once     sync.Once
-	writeMu  sync.Mutex
+	mu          sync.Mutex
+	deadline    time.Time
+	changed     chan struct{}
+	done        chan struct{}
+	terminal    chan struct{}
+	err         error
+	closed      bool
+	ready       chan struct{}
+	queue       [chainTransportPacketLimit]chainTransportDatagram
+	head        int
+	buffer      PacketBufferDiagnostic // 与队列一起由mu保护，快照不保存报文内容
+	diagnostic  connectionDiagnosticState
+	destination string // 构造时设置，只表示下一跳网络端点
+	once        sync.Once
+	writeMu     sync.Mutex
 }
 type chainTransportDatagram struct {
 	data    []byte
@@ -30,7 +40,9 @@ type chainTransportDatagram struct {
 }
 
 func newChainTransportPacket(pc net.PacketConn) *chainTransportPacket {
-	c := &chainTransportPacket{PacketConn: pc, changed: make(chan struct{}), done: make(chan struct{}), terminal: make(chan struct{}), packets: make(chan chainTransportDatagram, 16)}
+	c := &chainTransportPacket{PacketConn: pc, changed: make(chan struct{}), done: make(chan struct{}), terminal: make(chan struct{}), ready: make(chan struct{}, 1)}
+	c.buffer.PacketLimit, c.buffer.ByteLimit = chainTransportPacketLimit, chainTransportByteLimit
+	c.diagnostic.initialize()
 	go func() {
 		defer close(c.terminal)
 		buf := make([]byte, 65535)
@@ -47,25 +59,96 @@ func newChainTransportPacket(pc net.PacketConn) *chainTransportPacket {
 					}
 				}
 				c.mu.Lock()
-				c.err = err
+				if !c.closed {
+					c.err = err
+					c.diagnostic.record("transport_read", err)
+				}
 				c.mu.Unlock()
 				return
 			}
-			p := chainTransportDatagram{data: append([]byte(nil), buf[:n]...), address: a}
-			select {
-			case <-c.done:
+			c.mu.Lock()
+			if c.closed {
+				c.mu.Unlock()
 				return
-			case c.packets <- p:
-			default:
 			}
+			c.buffer.ReceivedPackets++
+			c.buffer.ReceivedBytes += int64(n)
+			if c.buffer.QueuePackets == chainTransportPacketLimit || c.buffer.QueueBytes+n > chainTransportByteLimit {
+				c.noteDropLocked(n, "queue_limit")
+				c.mu.Unlock()
+				continue
+			}
+			tail := (c.head + c.buffer.QueuePackets) % chainTransportPacketLimit
+			c.queue[tail] = chainTransportDatagram{data: append([]byte(nil), buf[:n]...), address: a}
+			c.buffer.QueuePackets++
+			c.buffer.QueueBytes += n
+			c.buffer.PeakPackets = max(c.buffer.PeakPackets, c.buffer.QueuePackets)
+			c.buffer.PeakBytes = max(c.buffer.PeakBytes, c.buffer.QueueBytes)
+			c.notifyReadyLocked()
+			c.mu.Unlock()
 		}
 	}()
 	return c
 }
+func (c *chainTransportPacket) notifyReadyLocked() {
+	select {
+	case c.ready <- struct{}{}:
+	default:
+	}
+}
+
+func (c *chainTransportPacket) noteDropLocked(size int, reason string) {
+	c.buffer.DroppedPackets++
+	c.buffer.DroppedBytes += int64(size)
+	c.buffer.LastDropAt = time.Now()
+	c.buffer.LastDropReason = reason
+}
+
+func (c *chainTransportPacket) ConnectionDiagnostics() []ConnectionDiagnostic {
+	c.mu.Lock()
+	buffer, closed := c.buffer, c.closed
+	c.mu.Unlock()
+	id, created, last, _ := c.diagnostic.snapshot()
+	record := ConnectionDiagnostic{ID: id, Layer: "chain_udp_buffer", CreatedAt: created, Destination: c.destination, UDPLocal: rawUDPAddrString(c.LocalAddr()), LastError: last, LocallyClosed: closed, CauseScope: "shared_transport", PacketBuffer: &buffer}
+	return append([]ConnectionDiagnostic{record}, packetConnectionDiagnostics(c.PacketConn)...)
+}
+
 func (c *chainTransportPacket) ReadFrom(b []byte) (int, net.Addr, error) {
 	for {
 		c.mu.Lock()
 		deadline, changed := c.deadline, c.changed
+		if c.closed {
+			c.mu.Unlock()
+			return 0, nil, net.ErrClosed
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			c.mu.Unlock()
+			return 0, nil, os.ErrDeadlineExceeded
+		}
+		if c.buffer.QueuePackets > 0 {
+			p := c.queue[c.head]
+			c.queue[c.head] = chainTransportDatagram{}
+			c.head = (c.head + 1) % chainTransportPacketLimit
+			c.buffer.QueuePackets--
+			c.buffer.QueueBytes -= len(p.data)
+			if c.buffer.QueuePackets > 0 {
+				c.notifyReadyLocked()
+			}
+			if len(p.data) > len(b) {
+				c.noteDropLocked(len(p.data), "short_read_buffer")
+				c.mu.Unlock()
+				return 0, p.address, io.ErrShortBuffer
+			}
+			c.buffer.DeliveredPackets++
+			c.buffer.DeliveredBytes += int64(len(p.data))
+			c.mu.Unlock()
+			return copy(b, p.data), p.address, nil
+		}
+		if c.err != nil {
+			err := c.err
+			c.mu.Unlock()
+			return 0, nil, err
+		}
 		c.mu.Unlock()
 		var timer *time.Timer
 		var timeout <-chan time.Time
@@ -93,18 +176,11 @@ func (c *chainTransportPacket) ReadFrom(b []byte) (int, net.Addr, error) {
 			if timer != nil {
 				timer.Stop()
 			}
-			c.mu.Lock()
-			err := c.err
-			c.mu.Unlock()
-			return 0, nil, err
-		case p := <-c.packets:
+			// 底层结束前已接收的队列先交付，下一轮再返回终止错误。
+		case <-c.ready:
 			if timer != nil {
 				timer.Stop()
 			}
-			if len(p.data) > len(b) {
-				return 0, p.address, io.ErrShortBuffer
-			}
-			return copy(b, p.data), p.address, nil
 		}
 	}
 }
@@ -126,6 +202,14 @@ func (c *chainTransportPacket) WriteTo(b []byte, a net.Addr) (int, error) {
 }
 func (c *chainTransportPacket) Close() error {
 	var err error
-	c.once.Do(func() { close(c.done); err = c.PacketConn.Close() })
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		close(c.done)
+		clear(c.queue[:])
+		c.buffer.QueuePackets, c.buffer.QueueBytes = 0, 0
+		c.mu.Unlock()
+		err = c.PacketConn.Close()
+	})
 	return err
 }

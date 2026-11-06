@@ -25,4 +25,17 @@ export const canManageSessionAsPlayer = (value) => {
   const s = readSessionConnectionInfo(value)
   return !isRelay(s) && s.login_observed !== false && !!String(s.display_name || '').trim()
 }
+// 导航只查看已观察身份，不授予游戏踢出/ACL操作权限。
+export const canNavigateSessionPlayer = (value) => {
+  const s = readSessionConnectionInfo(value)
+  return !!String(s.display_name || '').trim() && (!isRelay(s) || s.identity_verification === 'verified_signaling')
+}
+export const getSessionTransportLabel = (value) => isRelay(value) ? 'NetherNet' : 'RakNet'
+export const sessionStatusMap = {
+  connected: { label: '连接中', type: 'success' }, disconnected: { label: '已断开', type: 'default' },
+  ended: { label: '已结束', type: 'default' }, idle: { label: '空闲超时', type: 'warning' },
+  blacklist: { label: '黑名单拒绝', type: 'error' }, whitelist: { label: '白名单拒绝', type: 'warning' },
+  auth_failed: { label: '验证失败', type: 'error' }, kicked: { label: '被踢出', type: 'warning' }
+}
+export const getSessionStatus = (status) => sessionStatusMap[status || 'disconnected'] || { label: '其他结束状态', type: 'default' }
 export const canCloseRelaySession = (s) => isRelay(s) && !!s?.id && !!s?.server_id

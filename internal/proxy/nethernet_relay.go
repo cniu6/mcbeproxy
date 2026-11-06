@@ -118,24 +118,32 @@ type netherNetRelay struct {
 }
 
 type netherNetSession struct {
-	id                  string
-	identity            netherNetIdentityObservation
-	binding             netherNetICEBinding
-	ingressMu           sync.Mutex // 单会话入队与关停互斥，防止 drain 后仍归还不了缓冲
-	syncMu              sync.Mutex // 保护统一会话注册、累计同步与关闭，不能复活已关闭的会话
-	activeSession       *session.Session
-	closed              bool
-	closeReason         string
-	workers             sync.WaitGroup
-	bindingTransactions map[[12]byte]netip.AddrPort // 在 lifeMu 下限制已认证 STUN 跨地址重放
-	bindingOrder        [][12]byte
-	ufrag               string
-	upstream            net.PacketConn
-	mediaAddr           net.Addr
-	created             time.Time
-	lastActive          atomic.Int64
-	client              atomic.Pointer[netip.AddrPort]
-	bound               atomic.Bool
+	id                                                               string
+	identity                                                         netherNetIdentityObservation
+	route                                                            string // 会话创建时选定的出口，不随配置热更新改写
+	lastClientPacket, lastTargetPacket                               atomic.Int64
+	maxClientGap, maxTargetGap                                       atomic.Int64
+	lastWriteTarget, maxWriteTarget, slowWriteTarget                 atomic.Int64
+	lastWriteClient, maxWriteClient, slowWriteClient                 atomic.Int64
+	clientWriteErrors, clientWriteTimeouts, readTimeouts, queueDrops atomic.Int64
+	rateAt                                                           time.Time // 以下速率快照由 syncMu 保护，只在管理读取时计算
+	rateUp, rateDown, upRate, downRate                               int64
+	binding                                                          netherNetICEBinding
+	ingressMu                                                        sync.Mutex // 单会话入队与关停互斥，防止 drain 后仍归还不了缓冲
+	syncMu                                                           sync.Mutex // 保护统一会话注册、累计同步与关闭，不能复活已关闭的会话
+	activeSession                                                    *session.Session
+	closed                                                           bool
+	closeReason                                                      string
+	workers                                                          sync.WaitGroup
+	bindingTransactions                                              map[[12]byte]netip.AddrPort // 在 lifeMu 下限制已认证 STUN 跨地址重放
+	bindingOrder                                                     [][12]byte
+	ufrag                                                            string
+	upstream                                                         net.PacketConn
+	mediaAddr                                                        net.Addr
+	created                                                          time.Time
+	lastActive                                                       atomic.Int64
+	client                                                           atomic.Pointer[netip.AddrPort]
+	bound                                                            atomic.Bool
 
 	addrsMu sync.Mutex
 	addrs   []netip.AddrPort
@@ -256,6 +264,9 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 	if r == nil || r.count.Load() == 0 {
 		return false
 	}
+	// 在接收边界统一端点表示，使会话键、日志、NAT重绑定与API保持一致。
+	// Unmap只去除IPv4映射前缀，不改变真正的IPv6地址。
+	from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 	ufrag, isBinding := stunRequestServerUfrag(pkt)
 	if v, ok := r.byAddr.Load(from); ok && !isBinding {
 		s := v.(*netherNetSession)
@@ -344,7 +355,9 @@ func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
 		return
 	default:
 	}
-	s.lastActive.Store(time.Now().UnixNano())
+	now := time.Now()
+	s.lastActive.Store(now.UnixNano())
+	rawUDPRecordPacketGap(&s.lastClientPacket, &s.maxClientGap, now)
 	if cur := s.client.Load(); cur == nil || *cur != from {
 		addr := from
 		s.client.Store(&addr)
@@ -358,6 +371,7 @@ func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
 	select {
 	case s.writeCh <- &netherNetPacket{buf: buf, n: n}:
 	default:
+		s.queueDrops.Add(1)
 		netherNetPacketPool.Put(buf) // UDP semantics: drop under congestion rather than stall the listener
 	}
 }
@@ -391,7 +405,10 @@ func (r *netherNetRelay) forwardUpstream(s *netherNetSession) {
 				writeDeadlineAt = now.Add(250 * time.Millisecond)
 				_ = s.upstream.SetWriteDeadline(writeDeadlineAt)
 			}
-			if _, err := writePacketConn(s.upstream, (*p.buf)[:p.n], s.mediaAddr); err == nil {
+			started := time.Now()
+			_, err := writePacketConn(s.upstream, (*p.buf)[:p.n], s.mediaAddr)
+			rawUDPRecordWriteLatency(&s.lastWriteTarget, &s.maxWriteTarget, &s.slowWriteTarget, time.Since(started))
+			if err == nil {
 				s.packetsUp.Add(1)
 				s.bytesUp.Add(int64(p.n))
 			} else if isTimeoutError(err) {
@@ -421,18 +438,28 @@ func (r *netherNetRelay) forwardDownstream(s *netherNetSession) {
 			default:
 			}
 			if isTimeoutError(err) || isRecoverableConnError(err) {
+				s.readTimeouts.Add(1)
 				continue
 			}
 			return
 		}
-		s.lastActive.Store(time.Now().UnixNano())
+		now := time.Now()
+		s.lastActive.Store(now.UnixNano())
+		rawUDPRecordPacketGap(&s.lastTargetPacket, &s.maxTargetGap, now)
 		dst := s.client.Load()
 		if dst == nil {
 			continue // client has not reached us yet; ICE will retransmit
 		}
-		if _, err := r.udp.WriteToUDPAddrPort(buf[:n], *dst); err == nil {
+		started := time.Now()
+		_, err = r.udp.WriteToUDPAddrPort(buf[:n], *dst)
+		rawUDPRecordWriteLatency(&s.lastWriteClient, &s.maxWriteClient, &s.slowWriteClient, time.Since(started))
+		if err == nil {
 			s.packetsDown.Add(1)
 			s.bytesDown.Add(int64(n))
+		} else if isTimeoutError(err) {
+			s.clientWriteTimeouts.Add(1)
+		} else {
+			s.clientWriteErrors.Add(1)
 		}
 	}
 }
@@ -651,6 +678,7 @@ func (r *netherNetRelay) bridge(ctx context.Context, req *http.Request, answer s
 	s := &netherNetSession{
 		id:        uuid.NewString(),
 		identity:  identity,
+		route:     r.routeName(),
 		binding:   binding,
 		ufrag:     ufrag,
 		upstream:  upstream,

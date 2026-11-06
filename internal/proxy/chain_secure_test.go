@@ -68,6 +68,12 @@ func TestChainSecureTransports(t *testing.T) {
 					t.Fatalf("UDP size=%d n=%d err=%v", size, n, err)
 				}
 			}
+			if kinds[len(kinds)-1] == "hysteria2" {
+				snapshot := chainBufferSnapshot(t, pc)
+				if snapshot["received_packets"].(float64) == 0 {
+					t.Fatal("真实链式HY2数据没有对应底层队列诊断")
+				}
+			}
 			var upload, download int64
 			for _, st := range first.UserStats("fixture") {
 				if st.Username == "no-udp" {

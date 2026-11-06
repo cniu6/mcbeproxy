@@ -199,7 +199,7 @@ const MaxSplitPacketBytes = 1024 * 1024
 
 // rawUDPClientInfo stores information about a connected client
 type rawUDPClientInfo struct {
-	diagnostic rawUDPDiagnosticState
+	diagnostic             rawUDPDiagnosticState
 	clientAddr             *net.UDPAddr
 	targetConn             net.PacketConn // Can be *net.UDPConn or proxy PacketConn
 	targetAddr             net.Addr       // Target address for WriteTo
@@ -683,8 +683,9 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 			pacedBytes, clientRTT = clientInfo.pacer.stats()
 		}
 		stats = append(stats, config.RawUDPClientStatsDTO{
-			Client:                 clientKey,
-			ClientAddr:             clientAddr,
+			Client:                 session.NormalizeClientAddress(clientKey),
+			ClientAddr:             session.NormalizeClientAddress(clientAddr),
+			Transport:              "raknet",
 			SessionKey:             clientInfo.sessionKey,
 			PlayerName:             playerName,
 			PlayerUUID:             playerUUID,
@@ -729,6 +730,9 @@ func (p *RawUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
 		})
 		return true
 	})
+	if relay := p.nnRelay.Load(); relay != nil {
+		stats = append(stats, relay.linkStats()...)
+	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].Client < stats[j].Client })
 	return stats
 }
@@ -1027,7 +1031,7 @@ type bannedIPInfo struct {
 // RawUDPProxy implements a raw UDP forwarding proxy.
 // It forwards UDP packets directly without any RakNet protocol processing.
 type RawUDPProxy struct {
-	lastDisconnect atomic.Pointer[RawUDPDisconnectReport]
+	lastDisconnect    atomic.Pointer[RawUDPDisconnectReport]
 	serverID          string
 	cfgPtr            atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
 	configMgr         *config.ConfigManager
@@ -2636,8 +2640,12 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 	if clientInfo.kicked.Load() {
 		p.recentlyKicked.Store(clientKey, p.snapshotKickReplay(clientInfo, p.kickMessageOf(clientInfo)))
 	}
-	if p.closed.Load() { clientInfo.markEnd("proxy_stopped") }
-	if clientInfo.kicked.Load() { clientInfo.markEnd("proxy_kick") }
+	if p.closed.Load() {
+		clientInfo.markEnd("proxy_stopped")
+	}
+	if clientInfo.kicked.Load() {
+		clientInfo.markEnd("proxy_kick")
+	}
 	// 主动关闭上游前先抓取，避免清理产生的closed覆盖原始故障。
 	p.reportDisconnect(clientKey, clientInfo)
 	clientInfo.stopUpstreamWriter()

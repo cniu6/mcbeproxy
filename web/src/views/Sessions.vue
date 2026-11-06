@@ -56,7 +56,8 @@
 import { ref, onMounted, h } from 'vue'
 import { NButton, NPopconfirm, NTag, NTooltip, useMessage } from 'naive-ui'
 import { api, formatTime, formatBytes, formatDuration } from '../api'
-import { getSessionDisplayName, getSessionIdentityLabel } from '../composables/sessionPresentation'
+import { getSessionStatus, sessionStatusMap } from '../composables/sessionPresentation'
+import SessionIdentity from '../components/SessionIdentity.vue'
 
 const props = defineProps({ initialSearch: { type: String, default: '' } })
 const message = useMessage()
@@ -80,17 +81,11 @@ const getSearchString = (val) => {
 }
 const search = ref(getSearchString(props.initialSearch))
 
-const statusMap = {
-  'disconnected': { label: '正常断开', type: 'success' },
-  'blacklist': { label: '黑名单', type: 'error' },
-  'whitelist': { label: '白名单拒绝', type: 'warning' },
-  'auth_failed': { label: '验证失败', type: 'error' },
-  'kicked': { label: '被踢出', type: 'warning' },
-}
+const statusMap = sessionStatusMap
 
 const renderStatus = (r) => {
   const status = r.status || 'disconnected'
-  const info = statusMap[status] || { label: status, type: 'default' }
+  const info = getSessionStatus(status)
   const reason = r.status_reason || ''
   const tag = h(NTag, { size: 'small', type: info.type, round: true }, () => info.label)
   if (reason) {
@@ -103,7 +98,7 @@ const renderStatus = (r) => {
 }
 
 const columns = [
-  { title: '身份 / 来源', key: 'display_name', width: 190, render: r => h('div', [h('div', getSessionDisplayName(r)), h('small', getSessionIdentityLabel(r))]) },
+  { title: '身份 / 来源', key: 'display_name', width: 190, render: r => h(SessionIdentity, { record: r, navigable: true, onPlayer: name => window.dispatchEvent(new CustomEvent('navigate', { detail: { page: 'players', search: name } })) }) },
   { title: '服务器', key: 'server_id', width: 90 },
   { title: '连接状态', key: 'status', width: 110, render: renderStatus,
     filterOptions: Object.entries(statusMap).map(([k, v]) => ({ label: v.label, value: k })),

@@ -1068,7 +1068,7 @@ func applyRawUDPClientStatsToSessionDTO(dto session.SessionDTO, raw config.RawUD
 		dto.ConnectionPhase = "login_observed"
 	}
 	if clientAddr := strings.TrimSpace(raw.ClientAddr); clientAddr != "" {
-		dto.ClientAddr = clientAddr
+		dto.ClientAddr = session.NormalizeClientAddress(clientAddr)
 	}
 	if playerName := strings.TrimSpace(raw.PlayerName); playerName != "" {
 		dto.DisplayName = playerName
@@ -1115,7 +1115,7 @@ func rawUDPClientStatsToSessionDTO(serverID string, raw config.RawUDPClientStats
 	return session.SessionDTO{
 		ConnectionInfo: session.ConnectionInfo{Transport: "raknet", IdentitySource: "login", LoginObserved: raw.LoginParsed, ConnectionPhase: "login_observed"},
 		ID:             key,
-		ClientAddr:     strings.TrimSpace(raw.ClientAddr),
+		ClientAddr:     session.NormalizeClientAddress(strings.TrimSpace(raw.ClientAddr)),
 		ServerID:       serverID,
 		UUID:           strings.TrimSpace(raw.PlayerUUID),
 		DisplayName:    strings.TrimSpace(raw.PlayerName),
@@ -1137,6 +1137,11 @@ func (a *APIServer) indexRawUDPClients(servers []config.ServerConfigDTO) (map[st
 	}
 	for _, server := range servers {
 		for _, raw := range server.RawUDPClients {
+			// 媒体会话由自身owner注册；它共用链路视图，但不能按地址合并进
+			// RakNet会话，否则同端口重用时会把信令身份误标为游戏Login。
+			if raw.Transport == "nethernet" {
+				continue
+			}
 			key := rawUDPClientIdentityKey(raw)
 			if key != "" {
 				byKey[key] = raw
@@ -1261,15 +1266,53 @@ func (a *APIServer) getPlayers(c *gin.Context) {
 	limit := 100
 	offset := 0
 
-	players, err := a.playerRepo.List(limit, offset)
+	keyword := strings.TrimSpace(c.Query("q"))
+	players, err := a.playerRepo.Search(keyword, limit, offset)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "Failed to get players", err.Error())
 		return
 	}
 
-	dtos := make([]db.PlayerDTO, 0, len(players))
+	// 可信信令身份可供查看与搜索，但不写成游戏Login或累计玩家游戏时长。
+	type playerView struct {
+		db.PlayerDTO
+		session.ConnectionInfo
+	}
+	dtos := make([]playerView, 0, len(players))
+	byName := make(map[string]int)
 	for _, player := range players {
-		dtos = append(dtos, player.ToDTO())
+		byName[player.DisplayName] = len(dtos)
+		dtos = append(dtos, playerView{PlayerDTO: player.ToDTO()})
+	}
+	if a.sessionMgr != nil {
+		for _, active := range a.sessionMgr.GetAllSessions() {
+			snap := active.Snapshot()
+			if snap.DisplayName == "" || (snap.Transport == "nethernet" && snap.IdentityVerification != "verified_signaling") {
+				continue
+			}
+			q := strings.ToLower(keyword)
+			if q != "" && !strings.Contains(strings.ToLower(snap.DisplayName), q) && !strings.Contains(strings.ToLower(snap.UUID), q) && !strings.Contains(strings.ToLower(snap.XUID), q) {
+				continue
+			}
+			index, exists := byName[snap.DisplayName]
+			if !exists {
+				index = len(dtos)
+				byName[snap.DisplayName] = index
+				dtos = append(dtos, playerView{PlayerDTO: db.PlayerDTO{DisplayName: snap.DisplayName, FirstSeen: snap.StartTime, LastSeen: snap.LastSeen}})
+			}
+			dto := &dtos[index]
+			// 多连接只合并身份，不重复累计已有持久化统计。
+			if snap.LastSeen.After(dto.LastSeen) {
+				dto.LastSeen = snap.LastSeen
+			}
+			if snap.UUID != "" {
+				dto.UUID = snap.UUID
+			}
+			if snap.XUID != "" {
+				dto.XUID = snap.XUID
+			}
+			dto.ConnectionInfo = snap.ConnectionInfo
+		}
 	}
 	respondSuccess(c, dtos)
 }

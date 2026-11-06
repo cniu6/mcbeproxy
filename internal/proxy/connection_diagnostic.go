@@ -88,7 +88,9 @@ func (c *socks5UDPPacketConn) recordControlDiagnostic(state *connState, err erro
 			fault.ControlLocal = rawUDPAddrString(state.ctrlConn.LocalAddr())
 			fault.ControlRemote = rawUDPAddrString(state.ctrlConn.RemoteAddr())
 		}
-		if state.udpConn != nil { fault.UDPLocal = rawUDPAddrString(state.udpConn.LocalAddr()) }
+		if state.udpConn != nil {
+			fault.UDPLocal = rawUDPAddrString(state.udpConn.LocalAddr())
+		}
 		fault.Relay = rawUDPAddrString(state.relayAddr)
 	}
 	c.controlDiagnostic.Store(fault)
@@ -130,6 +132,14 @@ func (c *socks5UDPPacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
 		records = records[:8]
 	}
 	return records
+}
+
+// HY2会话和链/计数包装层只透传原始队列的诊断；不从当前outbound取新连接。
+func (c *hysteria2PacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
+	if c.transport == nil {
+		return nil
+	}
+	return c.transport.ConnectionDiagnostics()
 }
 
 func (c *trackedPacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {

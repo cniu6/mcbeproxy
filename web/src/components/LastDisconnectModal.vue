@@ -24,6 +24,14 @@
               <n-descriptions-item label="代理 / 目标">{{ transport.proxy || '-' }} → {{ transport.destination || '-' }}</n-descriptions-item>
               <n-descriptions-item label="TCP控制连接">{{ transport.control_local || '-' }} → {{ transport.control_remote || '-' }}</n-descriptions-item>
               <n-descriptions-item label="UDP本地 / 中继">{{ transport.udp_local || '-' }} → {{ transport.relay || '-' }}</n-descriptions-item>
+              <template v-if="transport.packet_buffer">
+                <n-descriptions-item label="链内接收队列 / 内存">{{ transport.packet_buffer.queue_packets }} / {{ transport.packet_buffer.packet_limit }} 包 · {{ formatBytes(transport.packet_buffer.queue_bytes) }} / {{ formatBytes(transport.packet_buffer.byte_limit) }}</n-descriptions-item>
+                <n-descriptions-item label="队列峰值">{{ transport.packet_buffer.peak_packets }} 包 · {{ formatBytes(transport.packet_buffer.peak_bytes) }}</n-descriptions-item>
+                <n-descriptions-item label="下层收到 / 向后跳交付">{{ transport.packet_buffer.received_packets }} / {{ transport.packet_buffer.delivered_packets }} 包 · {{ formatBytes(transport.packet_buffer.received_bytes) }} / {{ formatBytes(transport.packet_buffer.delivered_bytes) }}</n-descriptions-item>
+                <n-descriptions-item label="链内丢弃">{{ transport.packet_buffer.dropped_packets }} 包 · {{ formatBytes(transport.packet_buffer.dropped_bytes) }}</n-descriptions-item>
+                <n-descriptions-item label="最后丢弃时间 / 原因">{{ transport.packet_buffer.dropped_packets ? when(transport.packet_buffer.last_drop_at) : '未发生' }} · {{ bufferDropReason(transport.packet_buffer.last_drop_reason) }}</n-descriptions-item>
+                <n-descriptions-item label="统计范围">共享传输连接生命周期累计，可能包含其他玩家；不是本玩家丢包率，也不同于上行转发队列。</n-descriptions-item>
+              </template>
               <n-descriptions-item label="最后原始错误">{{ errorText(transport.last_error) }}</n-descriptions-item>
               <n-descriptions-item v-if="transport.latest_io_error" label="后续IO错误">{{ errorText(transport.latest_io_error) }}</n-descriptions-item>
               <n-descriptions-item label="快照状态">远端关闭 {{ yesNo(transport.remote_closed) }} · 重连中 {{ yesNo(transport.reconnecting) }} · 本地主动关闭 {{ yesNo(transport.locally_closed) }}</n-descriptions-item>
@@ -51,6 +59,7 @@ const loading = ref(false)
 let sequence = 0
 const when = value => value ? new Date(value).toLocaleString() : '-'
 const yesNo = value => value ? '是' : '否'
+const bufferDropReason = reason => ({ queue_limit: '队列包数或字节达到上限', short_read_buffer: '读取缓冲不足，未交付截断报文' })[reason] || (reason ? '其他原因' : '无')
 const ms = value => `${Number(value) || 0} ms`
 const errorText = error => error?.operation
   ? `${when(error.at)} · ${error.operation} · ${error.error || '-'} · 超时${yesNo(error.timeout)} · 重复${error.repeat || 1}次`
@@ -66,7 +75,7 @@ const summary = computed(() => {
     { label: '距最后客户端 / 目标包', value: `${ms(r.since_client_ms)} / ${ms(r.since_target_ms)}` },
     { label: '上传 / 下载', value: `${formatBytes(r.bytes_up)} (${r.packets_up || 0}包) / ${formatBytes(r.bytes_down)} (${r.packets_down || 0}包)` },
     { label: '读超时 / 上游写错 / 客户端写错', value: `${r.read_timeouts || 0} / ${r.write_target_errors || 0} / ${r.write_client_errors || 0}` },
-    { label: '队列 / 丢弃', value: `${r.queue_len || 0}/${r.queue_cap || 0} · ${r.queue_drops || 0}` },
+    { label: '上行转发队列 / 丢弃', value: `${r.queue_len || 0}/${r.queue_cap || 0} · ${r.queue_drops || 0}` },
     { label: '最后IO错误', value: errorText(r.last_io) },
     { label: 'Login已解析 / 数据已加密', value: `${yesNo(r.login_parsed)} / ${yesNo(r.encrypted)}` },
     { label: '丢包摘要', value: r.loss || '-' }

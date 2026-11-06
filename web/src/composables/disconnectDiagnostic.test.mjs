@@ -49,6 +49,18 @@ test('统一断线页有导航、复用快照详情，小组件响应式布局�
   assert.doesNotMatch(page, /setInterval|createAdaptivePoll|<style/)
 })
 
+test('断线详情区分链内接收溢出和上行队列，保留时间与共享统计范围', () => {
+  const modal = readFileSync(new URL('../components/LastDisconnectModal.vue', import.meta.url), 'utf8')
+  for (const field of ['queue_packets', 'queue_bytes', 'packet_limit', 'byte_limit', 'peak_packets', 'peak_bytes', 'received_packets', 'delivered_packets', 'dropped_packets', 'dropped_bytes', 'last_drop_at', 'last_drop_reason']) {
+    assert.ok(modal.includes(`transport.packet_buffer.${field}`), `missing ${field}`)
+  }
+  assert.match(modal, /v-if="transport.packet_buffer"/)
+  assert.match(modal, /共享传输连接生命周期累计/)
+  assert.match(modal, /不是本玩家丢包率/)
+  assert.match(modal, /上行转发队列 \/ 丢弃/)
+  assert.doesNotMatch(modal, /setInterval|<style/)
+})
+
 test('服务器操作栏接入小号诊断窗口，手动读取且抑制迟到响应', () => {
   const servers = readFileSync(new URL('../views/Servers.vue', import.meta.url), 'utf8')
   const modal = readFileSync(new URL('../components/LastDisconnectModal.vue', import.meta.url), 'utf8')

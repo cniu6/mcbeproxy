@@ -821,6 +821,14 @@ func plainUDPClientDuration(client *plainUDPClient) time.Duration {
 // packets: the client kept sending but not a single datagram came back. The
 // usual cause is a dead SOCKS5 UDP association; tearing the client down lets
 // its next packet dial a fresh one.
+// Plain UDP 的自动模式也复用同一媒体链路视图，不把普通UDP流量伪装为RakNet玩家。
+func (p *PlainUDPProxy) GetRawUDPClientStats() []config.RawUDPClientStatsDTO {
+	if relay := p.nnRelay.Load(); relay != nil {
+		return relay.linkStats()
+	}
+	return nil
+}
+
 func (p *PlainUDPProxy) isClientBlackholed(clientInfo *plainUDPClient, now time.Time) bool {
 	return clientInfo.packetsDown.Load() == 0 &&
 		clientInfo.packetsUp.Load() >= int64(RawUDPBlackholeMinUpPackets) &&

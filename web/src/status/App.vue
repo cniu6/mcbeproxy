@@ -163,7 +163,9 @@
 
 <script setup>
 import { computed, h, onMounted, onUnmounted, ref } from 'vue'
-import { getSessionDisplayName, getSessionIdentityLabel } from '../composables/sessionPresentation'
+import { getSessionStatus } from '../composables/sessionPresentation'
+import { latencyTrendValues, latencySparkline } from '../composables/latencyTrend'
+import SessionIdentity from '../components/SessionIdentity.vue'
 import {
   NBadge,
   NButton,
@@ -273,12 +275,30 @@ const statusTag = (row) => {
   if (row.status !== 'running') return h(NTag, { size: 'tiny', type: 'default', bordered: false }, () => '已停止')
   return h(NTag, { size: 'tiny', type: row.online ? 'success' : 'error', bordered: false }, () => (row.online ? '在线' : '离线'))
 }
-const trendText = (row) => {
-  const samples = latencyHistory.value?.[row.id]
-  if (!Array.isArray(samples) || samples.length === 0) return '暂无'
-  const values = samples.filter((s) => s.ok && Number(s.latency_ms) > 0).map((s) => Number(s.latency_ms))
-  if (!values.length) return '暂无'
-  return `${Math.min(...values)}–${Math.max(...values)} ms`
+// 现场样本字段是 online + latency_ms；旧实现读不存在的 ok，导致趋势恒为“暂无”。
+const latencyTrend = (row) => latencyTrendValues(latencyHistory.value?.[row.id], 60)
+const latencyRangeText = (values) => `${Math.min(...values)}–${Math.max(...values)} ms`
+const latencyTrendCell = (row) => {
+  const values = latencyTrend(row)
+  if (!values.length) return line('暂无趋势', 3)
+  const geometry = latencySparkline(values, { width: 72, height: 18 })
+  const polyline = geometry
+    ? h('polyline', {
+        points: geometry.points.map(([x, y]) => `${x},${y}`).join(' '),
+        fill: 'none',
+        stroke: '#63e2b7',
+        'stroke-width': 1.5,
+        'stroke-linejoin': 'round',
+        'stroke-linecap': 'round'
+      })
+    : null
+  // 上下两行，宽度只取决于折线本身，小屏不会把延迟列撑宽。
+  return h(NSpace, { vertical: true, size: 0 }, () => [
+    polyline
+      ? h('svg', { width: 72, height: 18, viewBox: '0 0 72 18', role: 'img', 'aria-label': `延迟趋势 ${latencyRangeText(values)}` }, [polyline])
+      : null,
+    line(latencyRangeText(values), 3)
+  ])
 }
 
 // 不设固定列宽、不用省略号，并把相关信息合并为「上下两行」的单元格：
@@ -296,22 +316,22 @@ const trafficLines = (row) => stack(line(`↑ ${bytes(row.bytes_up)}`), line(`�
 const serverColumns = [
   { title: '服务器', key: 'id', render: (row) => stack(line(row.id), line(row.server_name || '-', 3)) },
   { title: '状态', key: 'status', render: statusTag },
-  { title: '延迟', key: 'latency', render: (row) => stack(line(Number(row.latency) > 0 ? `${row.latency} ms` : '-'), line(trendText(row), 3)) }
+  { title: '延迟 / 趋势', key: 'latency', render: (row) => stack(line(Number(row.latency) > 0 ? `${row.latency} ms` : '-'), latencyTrendCell(row)) }
 ]
 
 const sessionColumns = [
-  { title: '玩家', key: 'display_name', render: (row) => stack(line(getSessionDisplayName(row)), line(getSessionIdentityLabel(row), 3), line(row.server_id, 3)) },
+  { title: '玩家', key: 'display_name', render: (row) => stack(h(SessionIdentity, { record: row }), line(row.server_id, 3)) },
   { title: '地址', key: 'client_addr' },
   { title: '流量', key: 'traffic', render: trafficLines },
   { title: '时长', key: 'duration_seconds', render: (row) => duration(row.duration_seconds) }
 ]
 
 const historyColumns = [
-  { title: '玩家', key: 'display_name', render: (row) => stack(line(getSessionDisplayName(row)), line(getSessionIdentityLabel(row), 3), line(row.server_id, 3)) },
+  { title: '玩家', key: 'display_name', render: (row) => stack(h(SessionIdentity, { record: row }), line(row.server_id, 3)) },
   {
     title: '状态',
     key: 'status',
-    render: (row) => h(NTag, { size: 'tiny', bordered: false, type: row.status === 'ended' ? 'default' : 'info' }, () => row.status_reason || row.status || '-')
+    render: (row) => h(NTag, { size: 'small', bordered: false, type: getSessionStatus(row.status).type }, () => getSessionStatus(row.status).label)
   },
   { title: '时间', key: 'start_time', render: (row) => dateLines(row.start_time) },
   { title: '流量', key: 'traffic', render: trafficLines }
