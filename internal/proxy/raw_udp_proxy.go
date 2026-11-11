@@ -1313,6 +1313,10 @@ func (p *RawUDPProxy) Start() error {
 		logger.Info("raw_udp serves RakNet only; select auto explicitly for NetherNet: server=%s", p.serverID)
 	}
 
+	// 卡顿监控只在后台读取计数，前后窗口有界，异常才异步写入现有日志。
+	p.wg.Add(1)
+	go p.monitorLinkStalls(p.ctx)
+
 	// Initialize cached latency state
 	p.latencyMu.Lock()
 	p.cachedLatency = -1
