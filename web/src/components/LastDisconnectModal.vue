@@ -9,6 +9,10 @@
         </n-space>
       </n-space>
       <n-alert type="info" :show-icon="false">这里是代理本机观察到的故障，不等于目标服已说明内部原因。EOF只能证明该控制流结束。</n-alert>
+      <n-space v-if="manualCopy" vertical :size="6">
+        <n-alert type="warning" :show-icon="false">浏览器限制了自动复制，请在下方文本框中全选并复制（电脑可按 Ctrl+A、Ctrl+C，手机可长按选择）。</n-alert>
+        <n-input size="small" type="textarea" :value="reportText" readonly :rows="6" aria-label="断线详情，供手动复制" />
+      </n-space>
       <n-spin size="small" :show="loading">
         <n-space v-if="report" vertical :size="8">
           <n-tag size="tiny" type="warning">{{ disconnectReasonLabel(report.end_reason) }}</n-tag>
@@ -49,6 +53,7 @@ import { computed, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api, formatBytes } from '../api'
 import { loadDisconnectDiagnostic, disconnectReasonLabel } from '../composables/disconnectDiagnostic.js'
+import { copyShareLink } from '../composables/secureShare.js'
 
 const props = defineProps({ show: Boolean, server: { type: Object, default: null }, snapshot: { type: Object, default: null } })
 const emit = defineEmits(['update:show'])
@@ -56,6 +61,8 @@ const message = useMessage()
 const report = ref(null)
 const notice = ref('')
 const loading = ref(false)
+const manualCopy = ref(false)
+const reportText = computed(() => report.value ? JSON.stringify(report.value, null, 2) : '')
 let sequence = 0
 const when = value => value ? new Date(value).toLocaleString() : '-'
 const yesNo = value => value ? '是' : '否'
@@ -99,15 +106,23 @@ async function load() {
     if (token === sequence) loading.value = false
   }
 }
-async function copyReport() {
-  try { await navigator.clipboard.writeText(JSON.stringify(report.value, null, 2)); message.success('已复制断线详情') }
-  catch { message.error('复制失败，浏览器未允许访问剪贴板') }
+async function copyReport(event) {
+  if (!report.value) return
+  const token = sequence
+  // 回退输入框留在当前模态框内，避免焦点被模态框约束抢回。
+  const container = event?.currentTarget?.parentElement
+  const copied = await copyShareLink(reportText.value, container)
+  if (token !== sequence) return
+  manualCopy.value = !copied
+  if (copied) message.success('已复制断线详情')
+  else message.warning('自动复制受限，已显示可手动复制的详情')
 }
 watch(() => [props.show, props.server?.id, props.snapshot], ([show]) => {
   sequence++
   loading.value = false
   report.value = null
   notice.value = ''
+  manualCopy.value = false
   if (show && props.snapshot) report.value = props.snapshot
   else if (show) load()
 }, { immediate: true })
