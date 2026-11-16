@@ -246,20 +246,98 @@ func TestRawUDPPacerLetsGoOfSilentClient(t *testing.T) {
 	}
 }
 
+// TestRawUDPPacerHoldsBurstToRate: 队列上界是时延口径（rate × 200ms，且不少于
+// 4 个满包），只约束纯不可靠数据报；超界的既不排队也不代 ACK。可靠帧另见
+// TestRawUDPPacerKeepsReliableFramesPastQueueBound。
 func TestRawUDPPacerHoldsBurstToRate(t *testing.T) {
-	r, toClient, _, _ := newTestRawUDPPacer(80) // 10KB/s, 3000-byte bucket
+	r, toClient, toTarget, _ := newTestRawUDPPacer(80) // 10KB/s, 3000-byte bucket
 	now := time.Now()
 	payload := make([]byte, 1000)
+	size := len(testRakDatagram(0, testRakFrame(0, 0, payload)))
+	wantBound := max(int(r.rate*rawUDPPacerMaxQueueDelay.Seconds()), rawUDPPacerMinQueued)
+	if r.maxQueued != wantBound {
+		t.Fatalf("queue bound = %d bytes, want %d (%v at %.0f B/s)", r.maxQueued, wantBound, rawUDPPacerMaxQueueDelay, r.rate)
+	}
 	for i := uint32(0); i < 10; i++ {
+		r.fromTarget(testRakDatagram(i, testRakFrame(0, i, payload)), now)
+		if queued, _ := r.stats(); queued > r.maxQueued {
+			t.Fatalf("datagram %d: queued %d bytes exceeds the %v bound", i, queued, rawUDPPacerMaxQueueDelay)
+		}
+	}
+	if r.overflow == 0 {
+		t.Fatal("the burst never hit the queue bound: the drop path went untested")
+	}
+	kept := 10 - int(r.overflow)
+	queued, _ := r.stats()
+	if sent := len(*toClient); sent+queued/size != kept {
+		t.Fatalf("sent %d + queued %d/%d bytes = %d, want %d (overflow=%d)", sent, queued, size, sent+queued/size, kept, r.overflow)
+	}
+	// 被丢弃的包不得出现在代 ACK 里：服务器收不到 ACK 才会自己重发。
+	r.tick(now)
+	if len(*toTarget) != 1 {
+		t.Fatalf("to server: %d datagrams, want 1", len(*toTarget))
+	}
+	if _, acked := testDecodeRakAck(t, (*toTarget)[0]); len(acked) != kept {
+		t.Fatalf("ACKed %d datagrams, want %d (overflow=%d)", len(acked), kept, r.overflow)
+	}
+	// 令牌桶每 tick 只补到 burst 上限（300ms 的量）：多发几次才能清空队列。
+	for i := 1; i <= 6; i++ {
+		r.tick(now.Add(time.Duration(i) * 100 * time.Millisecond))
+	}
+	if got := len(*toClient); got != kept {
+		t.Fatalf("after 600ms of ticks: sent %d, want %d", got, kept)
+	}
+}
+
+// TestRawUDPPacerKeepsReliableFramesPastQueueBound: 时延上界只适用于不可靠帧。
+// 可靠帧一旦代 ACK，服务器就不会再重发，丢一帧就是客户端永远等不到的空洞。
+func TestRawUDPPacerKeepsReliableFramesPastQueueBound(t *testing.T) {
+	r, _, toTarget, _ := newTestRawUDPPacer(80) // 上界 6000 字节
+	now := time.Now()
+	payload := make([]byte, 1000)
+	const frames = 9 // 3 发 + 6 排队 ≫ 上界
+	for i := uint32(0); i < frames; i++ {
 		r.fromTarget(testRakDatagram(i, testRakFrame(3, i, payload)), now)
 	}
-	size := len(testRakDatagram(0, testRakFrame(3, 0, payload)))
-	if queued, _ := r.stats(); len(*toClient) != 3 || queued != 7*size {
-		t.Fatalf("burst: sent %d, queued %d bytes; want 3 sent, %d queued", len(*toClient), queued, 7*size)
+	queued, _ := r.stats()
+	if queued <= r.maxQueued {
+		t.Fatalf("queue %d bytes never passed the %d-byte bound: the reliable-frame path went untested", queued, r.maxQueued)
 	}
-	r.tick(now.Add(500 * time.Millisecond)) // earns 5000 bytes, the bucket holds 3000
-	if len(*toClient) != 6 {
-		t.Fatalf("after 500ms: sent %d, want 6", len(*toClient))
+	if r.overflow != 0 {
+		t.Fatalf("reliable frames were dropped: overflow=%d", r.overflow)
+	}
+	r.tick(now)
+	if _, acked := testDecodeRakAck(t, (*toTarget)[0]); len(acked) != frames {
+		t.Fatalf("ACKed %d datagrams, want all %d", len(acked), frames)
+	}
+}
+
+// TestRawUDPPacerResetOnlyAfterDataPhase: 握手阶段重传的 OCR1 不是新连接。
+// reset() 清掉已代 ACK 的帧后服务器不会重发它们，客户端就永久缺一块；
+// 只有进入数据阶段之后重新握手的客户端（resetPacerOnHandshake）才清空。
+func TestRawUDPPacerResetOnlyAfterDataPhase(t *testing.T) {
+	r, _, _, _ := newTestRawUDPPacer(80) // 10KB/s：3 个满包就超过令牌桶，必然积压
+	now := time.Now()
+	for i := uint32(0); i < 4; i++ {
+		r.fromTarget(testRakDatagram(i, testRakFrame(3, i, make([]byte, 1000))), now)
+	}
+	queued, _ := r.stats()
+	if queued == 0 {
+		t.Fatal("no backlog to protect: the test set up nothing")
+	}
+	c := &rawUDPClientInfo{pacer: r}
+	c.resetPacerOnHandshake(raknetOpenConnectionReq1) // 握手阶段重传
+	if got, _ := r.stats(); got != queued || r.resets != 0 {
+		t.Fatalf("handshake retransmission dropped %d queued bytes (resets=%d)", queued-got, r.resets)
+	}
+	c.resetPacerOnHandshake(0x84) // 普通数据包
+	if r.resets != 0 {
+		t.Fatal("a data packet reset the pacer")
+	}
+	c.dataPhase.Store(true)
+	c.resetPacerOnHandshake(raknetOpenConnectionReq1) // 数据阶段之后重新握手 = 新连接
+	if got, _ := r.stats(); got != 0 || r.resets != 1 {
+		t.Fatalf("new connection left %d queued bytes (resets=%d)", got, r.resets)
 	}
 }
 

@@ -178,11 +178,20 @@ func TestNetherNetRelayCapsSessionAddrs(t *testing.T) {
 		from := netip.AddrPortFrom(netip.MustParseAddr("10.0.0.1"), uint16(40000+i))
 		r.handleDatagram(authenticatedSTUN(t, "capU:cli", "password"), from)
 	}
-	s.addrsMu.Lock()
-	n := len(s.addrs)
-	s.addrsMu.Unlock()
-	if n != netherNetRelayMaxAddrsPerSession {
+	if n := s.pathCount(); n != netherNetRelayMaxAddrsPerSession {
 		t.Fatalf("session bound %d addresses, want cap %d", n, netherNetRelayMaxAddrsPerSession)
+	}
+	// 表满后腾掉的是最久没有认证的路径：它在 byAddr 里也要一并释放，
+	// 否则那个地址的后续报文会被当成本会话的。
+	bound := 0
+	r.byAddr.Range(func(_, owner any) bool {
+		if owner == s {
+			bound++
+		}
+		return true
+	})
+	if bound != netherNetRelayMaxAddrsPerSession {
+		t.Fatalf("byAddr holds %d addresses for the session, want %d", bound, netherNetRelayMaxAddrsPerSession)
 	}
 }
 

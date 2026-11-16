@@ -1373,6 +1373,7 @@ func (p *PassthroughProxy) extractIdentityFromOIDCToken(token string) (displayNa
 	}
 	displayName, _ = claims["xname"].(string)
 	xuid, _ = claims["xid"].(string)
+	uuid = session.UUIDFromXUID(xuid)
 	return
 }
 

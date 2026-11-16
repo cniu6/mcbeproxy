@@ -51,7 +51,7 @@ func (r *SessionRepository) Create(sr *session.SessionRecord) error {
 
 	_, err := r.db.DB().Exec(query,
 		sr.ID,
-		session.NormalizeClientAddress(sr.ClientAddr),
+		session.DisplayClientAddress(sr.ClientAddr),
 		sr.ServerID,
 		sr.UUID,
 		sr.XUID,
@@ -254,7 +254,7 @@ func (r *SessionRepository) scanSessionRecord(row *sql.Row) (*session.SessionRec
 		sr.StatusReason = statusReason.String
 	}
 
-	sr.ClientAddr = session.NormalizeClientAddress(sr.ClientAddr)
+	sr.ClientAddr = session.DisplayClientAddress(sr.ClientAddr)
 	return &sr, nil
 }
 
@@ -308,7 +308,7 @@ func (r *SessionRepository) scanSessionRecords(rows *sql.Rows) ([]*session.Sessi
 			sr.StatusReason = statusReason.String
 		}
 
-		sr.ClientAddr = session.NormalizeClientAddress(sr.ClientAddr)
+		sr.ClientAddr = session.DisplayClientAddress(sr.ClientAddr)
 		records = append(records, &sr)
 	}
 
@@ -334,6 +334,6 @@ func SessionRecordFromJSON(data string) (*session.SessionRecord, error) {
 	if err := json.Unmarshal([]byte(data), &sr); err != nil {
 		return nil, fmt.Errorf("failed to deserialize session record: %w", err)
 	}
-	sr.ClientAddr = session.NormalizeClientAddress(sr.ClientAddr)
+	sr.ClientAddr = session.DisplayClientAddress(sr.ClientAddr)
 	return &sr, nil
 }

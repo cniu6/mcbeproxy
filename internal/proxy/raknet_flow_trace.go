@@ -132,6 +132,11 @@ func (s rakLossSnapshot) String() string {
 // where the chunk/resource burst happens.
 const rawUDPFlowTraceWindow = 3 * time.Minute
 
+// rawUDPFlowTraceExtend is how long the trace keeps running past the window
+// once a stall or a new downstream queue peak shows up. A player's freeze
+// happens minutes into a session, where the fixed window never looks.
+const rawUDPFlowTraceExtend = time.Minute
+
 // traceRakFlow logs one debug line per second for a new connection: packets
 // and bytes per direction, per-leg loss deltas, and how long each side has
 // been silent. It lets a freeze be placed on a leg and a second.
@@ -140,6 +145,8 @@ func (p *RawUDPProxy) traceRakFlow(clientKey string, c *rawUDPClientInfo, done <
 	defer ticker.Stop()
 	var prevUpP, prevDownP, prevUpB, prevDownB int64
 	var prev rakLossSnapshot
+	deadline := c.startTime.Add(rawUDPFlowTraceWindow)
+	var peakSeen int
 	for {
 		select {
 		case <-done:
@@ -148,8 +155,17 @@ func (p *RawUDPProxy) traceRakFlow(clientKey string, c *rawUDPClientInfo, done <
 			return
 		case now := <-ticker.C:
 			elapsed := now.Sub(c.startTime)
-			if elapsed > rawUDPFlowTraceWindow {
-				return
+			if now.After(deadline) {
+				// 开局窗口外只在有卡顿迹象时继续：某条腿静默，或下行队列刷新
+				// 峰值（积压还在增长）。两者都没有就停，避免长期刷日志。
+				peak, _ := c.pacer.queuePeak()
+				stalled := rawUDPStallReason(c,
+					rawUDPStatAgeMsOrSince(c.lastClientPacket.Load(), c.startTime, now),
+					rawUDPStatAgeMsOrSince(c.lastTargetPacket.Load(), c.startTime, now)) != ""
+				if !stalled && peak <= peakSeen {
+					return
+				}
+				deadline = now.Add(rawUDPFlowTraceExtend)
 			}
 			upP, downP := c.packetsUp.Load(), c.packetsDown.Load()
 			upB, downB := c.bytesUp.Load(), c.bytesDown.Load()
@@ -160,6 +176,9 @@ func (p *RawUDPProxy) traceRakFlow(clientKey string, c *rawUDPClientInfo, done <
 				cur.c2pLost-prev.c2pLost, cur.t2pLost-prev.t2pLost,
 				cur.clientNacked-prev.clientNacked, cur.targetNacked-prev.targetNacked,
 				rawUDPStatAge(c.lastClientPacket.Load(), now), rawUDPStatAge(c.lastTargetPacket.Load(), now))
+			if peak, _ := c.pacer.queuePeak(); peak > peakSeen {
+				peakSeen = peak
+			}
 			prevUpP, prevDownP, prevUpB, prevDownB, prev = upP, downP, upB, downB, cur
 		}
 	}

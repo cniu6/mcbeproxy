@@ -3,6 +3,8 @@ package db
 
 import (
 	"time"
+
+	"mcpeserverproxy/internal/session"
 )
 
 // PlayerRecord represents a player record in the database.
@@ -33,7 +35,7 @@ type PlayerDTO struct {
 func (pr *PlayerRecord) ToDTO() PlayerDTO {
 	return PlayerDTO{
 		DisplayName:   pr.DisplayName,
-		UUID:          pr.UUID,
+		UUID:          playerUUID(pr.UUID, pr.XUID),
 		XUID:          pr.XUID,
 		FirstSeen:     pr.FirstSeen,
 		LastSeen:      pr.LastSeen,
@@ -49,4 +51,12 @@ type APIKey struct {
 	CreatedAt time.Time `json:"created_at"`
 	LastUsed  time.Time `json:"last_used,omitempty"`
 	IsAdmin   bool      `json:"is_admin"`
+}
+
+// 新版客户端登录不带 identity，旧记录 UUID 为空；按 XUID 补出，与旧记录同一算法。
+func playerUUID(uuid, xuid string) string {
+	if uuid != "" {
+		return uuid
+	}
+	return session.UUIDFromXUID(xuid)
 }

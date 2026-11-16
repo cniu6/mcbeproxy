@@ -107,6 +107,10 @@ const (
 	RawUDPBlackholeMinUpPackets = 3
 )
 
+// 已进入数据阶段的 RakNet 客户端每秒都有包（连接 ping、ACK）；静默这么久即已断开，
+// 不必等 idle_timeout。
+const rawUDPEstablishedSilence = 20 * time.Second
+
 var (
 	errRawUDPUpstreamQueueClosed = errors.New("raw udp upstream writer closed")
 	errRawUDPUpstreamQueueFull   = errors.New("raw udp upstream write queue full")
@@ -240,9 +244,12 @@ type rawUDPClientInfo struct {
 	slowWriteClientCount   atomic.Int64
 	maxClientPacketGapMs   atomic.Int64
 	maxTargetPacketGapMs   atomic.Int64
+	windowClientGapMs      atomic.Int64 // 上次卡顿采样以来结束的最大包间隔（link_stall_monitor.go）
+	windowTargetGapMs      atomic.Int64
 	upLeg                  rakLegStats  // RakNet seq/NACK accounting for packets from the client
 	downLeg                rakLegStats  // ... and for packets from the target
 	pacer                  *rawUDPPacer // downstream_limit_kbps (raw_udp_pacer.go); nil when off
+	dataPhase              atomic.Bool  // 客户端已进入可靠数据阶段：此后再来 OCR1 才是新连接
 	writeMetricWindowAt    atomic.Int64
 	recentMaxWriteTargetMs atomic.Int64
 	recentMaxWriteClientMs atomic.Int64
@@ -1530,14 +1537,16 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 				p.replayKickResponse(clientInfo, buffer[:n])
 				continue
 			}
-			if clientInfo.pacer != nil && n > 0 && buffer[0] == raknetOpenConnectionReq1 {
-				clientInfo.pacer.reset() // a new RakNet connection from the same address
+			// 只有数据阶段之后的重新握手才是新连接；握手阶段重传的 OCR1 不动 pacer，
+			// 否则已代 ACK 的帧被丢弃后服务器不会重发，客户端永久缺一块。
+			if clientInfo.pacer != nil && n > 0 {
+				clientInfo.resetPacerOnHandshake(buffer[0])
 			}
 
 			// Update stats (lock-free)
 			now := time.Now().UnixNano()
 			clientInfo.lastSeen.Store(now)
-			rawUDPRecordPacketGap(&clientInfo.lastClientPacket, &clientInfo.maxClientPacketGapMs, time.Unix(0, now))
+			rawUDPRecordPacketGapWindow(&clientInfo.lastClientPacket, &clientInfo.maxClientPacketGapMs, &clientInfo.windowClientGapMs, time.Unix(0, now))
 			clientInfo.bytesUp.Add(int64(n))
 			clientInfo.packetsUp.Add(1)
 			clientInfo.packetCount.Add(1)
@@ -1548,6 +1557,7 @@ func (p *RawUDPProxy) Listen(ctx context.Context) error {
 			// players with split/encrypted/unknown-compression Login packets still
 			// appear online and retain traffic/playtime statistics.
 			if buffer[0] >= raknetFrameReliable && buffer[0] <= raknetFrameReliable|0x0f {
+				clientInfo.dataPhase.Store(true)
 				p.ensureSession(clientInfo)
 			}
 
@@ -2509,7 +2519,7 @@ func (p *RawUDPProxy) forwardResponses(clientAddr *net.UDPAddr, clientInfo *rawU
 			clientInfo.downLeg.observe(buffer[:n])
 			downAt := time.Now()
 			clientInfo.lastSeen.Store(downAt.UnixNano())
-			rawUDPRecordPacketGap(&clientInfo.lastTargetPacket, &clientInfo.maxTargetPacketGapMs, downAt)
+			rawUDPRecordPacketGapWindow(&clientInfo.lastTargetPacket, &clientInfo.maxTargetPacketGapMs, &clientInfo.windowTargetGapMs, downAt)
 			p.debugRawUDPPacket(clientInfo, "target_to_client", buffer[:n], downAt)
 
 			p.updateRakNetSendStateFromDatagram(buffer[:n], clientInfo)
@@ -2670,6 +2680,11 @@ func (p *RawUDPProxy) finalizeClientRemoval(clientKey string, clientInfo *rawUDP
 
 	startTime := clientInfo.startTime
 	lastSeenNano := clientInfo.lastSeen.Load()
+	// 计时和流量以客户端最后一个包为准：目标服在玩家断开后还会发包，
+	// 以 lastSeen 收尾会把静默期算进游戏时长。
+	if lc := clientInfo.lastClientPacket.Load(); lc > 0 && lc < lastSeenNano {
+		lastSeenNano = lc
+	}
 	endTime := time.Unix(0, lastSeenNano)
 	if lastSeenNano == 0 || endTime.Before(startTime) {
 		endTime = time.Now()
@@ -2813,7 +2828,8 @@ func (p *RawUDPProxy) sweepInactiveClients(now time.Time, effectiveClientTimeout
 			removed++
 			logger.Info("RawUDP session closed (pre-login timeout %v): server=%s client=%s active_proxy_clients=%d",
 				now.Sub(clientInfo.startTime).Round(time.Second), p.serverID, key.(string), p.GetActiveClientCount())
-		} else if isUDPPeerGone(lastClientPktNano, clientInfo.lastTargetPacket.Load(), now) {
+		} else if isUDPPeerGone(lastClientPktNano, clientInfo.lastTargetPacket.Load(), now) ||
+			(effectiveClientTimeout > 0 && clientInfo.dataPhase.Load() && lastClientPktNano > 0 && now.Sub(time.Unix(0, lastClientPktNano)) > rawUDPEstablishedSilence) {
 			clientInfo.markEnd("client_stopped_answering")
 			p.removeClient(key.(string))
 			removed++
@@ -3886,7 +3902,7 @@ func (p *RawUDPProxy) extractIdentityFromOIDCToken(token string) (playerName, pl
 	}
 	name, _ := claims["xname"].(string)
 	xuid, _ := claims["xid"].(string)
-	return name, "", xuid
+	return name, session.UUIDFromXUID(xuid), xuid
 }
 
 func (p *RawUDPProxy) extractIdentityFromClientDataToken(token string) (playerName, playerUUID, playerXUID string) {
