@@ -362,3 +362,18 @@ func TestLinkStallCaptureWritesExistingLog(t *testing.T) {
 		}
 	}
 }
+
+// 传输层交付量随采样更新：静默时交付为 0 才说明传输层也停了。
+func TestLinkStallMonitorTransportDeliveredDelta(t *testing.T) {
+	m := newLinkStallMonitor("fixture", func(linkStallCapture) {})
+	base := time.Unix(1700000000, 0)
+	o := healthyLinkObservation(base)
+	o.Sample.Transport = []linkTransportSample{{ID: "t", Delivered: 100}}
+	m.observe(o)
+	o = healthyLinkObservation(base.Add(time.Second))
+	o.Sample.Transport = []linkTransportSample{{ID: "t", Delivered: 130}}
+	m.observe(o)
+	if got := m.states["fixture"].last.TransportDelivered; got != 30 {
+		t.Fatalf("transport delivered delta = %d, want 30", got)
+	}
+}

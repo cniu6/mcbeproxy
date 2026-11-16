@@ -71,6 +71,10 @@ type linkSample struct {
 	PathSwitches int64                 `json:"path_switches,omitempty"`
 	BackupChecks int64                 `json:"backup_checks,omitempty"`
 	Transport    []linkTransportSample `json:"transport,omitempty"`
+	// 上一采样以来，本会话所用传输层交付的包数（共享计数，可能含其他玩家）。
+	// 与静默配合判断：传输层仍在交付而本会话静默，说明问题在分发或目标侧；
+	// 传输层也停了，才指向链路。
+	TransportDelivered int64 `json:"transport_delivered_delta,omitempty"`
 }
 
 type linkObservation struct {
@@ -191,6 +195,14 @@ func linkAnomalies(previous, current, baseline linkSample) []string {
 	return reasons
 }
 
+func deliveredTotal(ts []linkTransportSample) int64 {
+	var n int64
+	for _, t := range ts {
+		n += t.Delivered
+	}
+	return n
+}
+
 func (m *linkStallMonitor) observe(o linkObservation) {
 	s := o.Sample
 	// 历史窗口拥有自己的副本，诊断提供者复用切片也不能改写先前证据。
@@ -203,6 +215,9 @@ func (m *linkStallMonitor) observe(o linkObservation) {
 		}
 		h = &linkHistory{}
 		m.states[o.ID] = h
+	}
+	if !h.last.At.IsZero() {
+		s.TransportDelivered = deliveredTotal(s.Transport) - deliveredTotal(h.last.Transport)
 	}
 	h.seen = s.At
 	if !h.last.At.IsZero() {

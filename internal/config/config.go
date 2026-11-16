@@ -1258,9 +1258,19 @@ func (cm *ConfigManager) resolveTargets(ctx context.Context, servers []*ServerCo
 			defer wg.Done()
 			ip, err := cm.resolver.ResolveContext(ctx, host)
 			if err != nil {
-				logger.Warn("DNS resolve failed for server %s (%s): %v — set target_ip to pin an address", server.ID, host, err)
+				// 解析失败时沿用上一次成功的地址：目标 IP 没有变化的概率远高于解析器瞬时失败，
+				// 不能因为一次公共 DNS 返回被过滤的假地址就让服务器失效。
+				// 告警按域名每 10 分钟最多一次，避免每分钟刷屏。
+				if server.GetResolvedIP() == "" {
+					logger.Warn("DNS resolve failed for server %s (%s): %v — set target_ip to pin an address", server.ID, host, err)
+				} else if warnDNSFailureDue(host) {
+					logger.Warn("DNS resolve still failing for server %s (%s), keeping last good IP %s: %v", server.ID, host, server.GetResolvedIP(), err)
+				}
 				return
 			}
+			dnsWarnMu.Lock()
+			delete(dnsWarnAt, host)
+			dnsWarnMu.Unlock()
 			server.SetResolvedIP(ip)
 		}(server, host)
 	}
@@ -1930,4 +1940,21 @@ func (cm *ConfigManager) closeWatcher() {
 		cm.watcher.Close()
 		cm.watcher = nil
 	}
+}
+
+var (
+	dnsWarnMu sync.Mutex
+	dnsWarnAt = map[string]time.Time{}
+)
+
+// warnDNSFailureDue 对同一域名每 10 分钟只允许一条告警。
+func warnDNSFailureDue(host string) bool {
+	dnsWarnMu.Lock()
+	defer dnsWarnMu.Unlock()
+	now := time.Now()
+	if last, ok := dnsWarnAt[host]; ok && now.Sub(last) < 10*time.Minute {
+		return false
+	}
+	dnsWarnAt[host] = now
+	return true
 }
