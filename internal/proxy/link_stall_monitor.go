@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"mcpeserverproxy/internal/logger"
@@ -36,31 +37,40 @@ type linkTransportSample struct {
 }
 
 type linkSample struct {
-	At                  time.Time             `json:"at"`
-	SampleGapMs         int64                 `json:"sample_gap_ms"`
-	UpPackets           int64                 `json:"up_packets"`
-	DownPackets         int64                 `json:"down_packets"`
-	UpBytes             int64                 `json:"up_bytes"`
-	DownBytes           int64                 `json:"down_bytes"`
-	SinceClientMs       int64                 `json:"since_client_ms"`
-	SinceTargetMs       int64                 `json:"since_target_ms"`
-	MaxClientGapMs      int64                 `json:"max_client_gap_ms"`
-	MaxTargetGapMs      int64                 `json:"max_target_gap_ms"`
-	WriteTargetMs       int64                 `json:"write_target_ms"`
-	WriteClientMs       int64                 `json:"write_client_ms"`
-	MaxWriteTargetMs    int64                 `json:"max_write_target_ms"`
-	MaxWriteClientMs    int64                 `json:"max_write_client_ms"`
-	WriteTargetErrors   int64                 `json:"write_target_errors"`
-	WriteClientErrors   int64                 `json:"write_client_errors"`
-	WriteTargetTimeouts int64                 `json:"write_target_timeouts"`
-	WriteClientTimeouts int64                 `json:"write_client_timeouts"`
-	ReadTimeouts        int64                 `json:"read_timeouts"`
-	SlowWriteTarget     int64                 `json:"slow_write_target"`
-	SlowWriteClient     int64                 `json:"slow_write_client"`
-	Queue               int                   `json:"queue"`
-	QueueCap            int                   `json:"queue_cap"`
-	QueueDrops          int64                 `json:"queue_drops"`
-	Transport           []linkTransportSample `json:"transport,omitempty"`
+	At            time.Time `json:"at"`
+	SampleGapMs   int64     `json:"sample_gap_ms"`
+	UpPackets     int64     `json:"up_packets"`
+	DownPackets   int64     `json:"down_packets"`
+	UpBytes       int64     `json:"up_bytes"`
+	DownBytes     int64     `json:"down_bytes"`
+	SinceClientMs int64     `json:"since_client_ms"`
+	SinceTargetMs int64     `json:"since_target_ms"`
+	// 本采样周期内结束的最大包间隔。max_*_gap_ms 是会话累计最大值，只在被刷新
+	// 时变化；每次都一样长的周期性卡顿要看这两个值。
+	ClientGapMs         int64 `json:"client_gap_ms"`
+	TargetGapMs         int64 `json:"target_gap_ms"`
+	MaxClientGapMs      int64 `json:"max_client_gap_ms"`
+	MaxTargetGapMs      int64 `json:"max_target_gap_ms"`
+	WriteTargetMs       int64 `json:"write_target_ms"`
+	WriteClientMs       int64 `json:"write_client_ms"`
+	MaxWriteTargetMs    int64 `json:"max_write_target_ms"`
+	MaxWriteClientMs    int64 `json:"max_write_client_ms"`
+	WriteTargetErrors   int64 `json:"write_target_errors"`
+	WriteClientErrors   int64 `json:"write_client_errors"`
+	WriteTargetTimeouts int64 `json:"write_target_timeouts"`
+	WriteClientTimeouts int64 `json:"write_client_timeouts"`
+	ReadTimeouts        int64 `json:"read_timeouts"`
+	SlowWriteTarget     int64 `json:"slow_write_target"`
+	SlowWriteClient     int64 `json:"slow_write_client"`
+	Queue               int   `json:"queue"`
+	QueueCap            int   `json:"queue_cap"`
+	QueueDrops          int64 `json:"queue_drops"`
+	// NetherNet 中继的客户端路径（nethernet_relay_paths.go）：通过认证的地址数、
+	// 媒体开始后的换路次数、没有打断媒体的备用对保活次数。
+	ClientPaths  int                   `json:"client_paths,omitempty"`
+	PathSwitches int64                 `json:"path_switches,omitempty"`
+	BackupChecks int64                 `json:"backup_checks,omitempty"`
+	Transport    []linkTransportSample `json:"transport,omitempty"`
 }
 
 type linkObservation struct {
@@ -112,7 +122,15 @@ func linkTrafficRecent(s linkSample) bool {
 	return s.UpPackets > 0 && s.DownPackets > 0 && s.SinceClientMs < 1000 && s.SinceTargetMs < 1000
 }
 
-func linkAnomalies(previous, current linkSample) []string {
+// linkFlowActive 判断 baseline 到 current 之间该方向是否原本有流量（平均至少
+// 2 包/秒）。只剩 ICE 保活的空闲会话包间隔本来就有 2.5s，不是卡顿。
+func linkFlowActive(baseline, current linkSample, packets func(linkSample) int64) bool {
+	span := current.At.Sub(baseline.At).Seconds()
+	return span > 0 && float64(packets(current)-packets(baseline)) >= 2*span
+}
+
+// baseline 是前窗口里最早的样本，用来判断间隔出现前该方向是否有流量。
+func linkAnomalies(previous, current, baseline linkSample) []string {
 	var reasons []string
 	limit := linkSilenceLimit.Milliseconds()
 	switch {
@@ -123,11 +141,18 @@ func linkAnomalies(previous, current linkSample) []string {
 	case current.SinceClientMs >= limit:
 		reasons = append(reasons, "client_silent")
 	}
-	if current.MaxClientGapMs > previous.MaxClientGapMs && current.MaxClientGapMs >= limit {
+	// 累计最大值被刷新只说明“出现过更长的间隔”；本周期的间隔让等长的重复卡顿
+	// 每次都能触发。
+	clientGap := current.ClientGapMs >= limit && linkFlowActive(baseline, current, func(s linkSample) int64 { return s.UpPackets })
+	if clientGap || (current.MaxClientGapMs > previous.MaxClientGapMs && current.MaxClientGapMs >= limit) {
 		reasons = append(reasons, "client_gap_observed")
 	}
-	if current.MaxTargetGapMs > previous.MaxTargetGapMs && current.MaxTargetGapMs >= limit {
+	targetGap := current.TargetGapMs >= limit && linkFlowActive(baseline, current, func(s linkSample) int64 { return s.DownPackets })
+	if targetGap || (current.MaxTargetGapMs > previous.MaxTargetGapMs && current.MaxTargetGapMs >= limit) {
 		reasons = append(reasons, "target_gap_observed")
+	}
+	if current.PathSwitches > previous.PathSwitches {
+		reasons = append(reasons, "client_path_switched")
 	}
 	if current.SampleGapMs >= limit {
 		reasons = append(reasons, "monitor_delayed")
@@ -193,7 +218,11 @@ func (m *linkStallMonitor) observe(o linkObservation) {
 			m.finish(h, outcome)
 		}
 	} else if h.armed && !s.At.Before(h.cooldown) {
-		if reasons := linkAnomalies(h.last, s); len(reasons) > 0 {
+		baseline := h.last
+		if h.count > 0 {
+			baseline = h.before[(h.next-h.count+linkBeforeSamples)%linkBeforeSamples]
+		}
+		if reasons := linkAnomalies(h.last, s, baseline); len(reasons) > 0 {
 			capture := linkStallCapture{
 				Event: fmt.Sprintf("%s-%d", o.ID, s.At.UnixNano()), Server: m.server,
 				ID: o.ID, Protocol: o.Protocol, Client: o.Client, Route: o.Route, Target: o.Target,
@@ -273,6 +302,18 @@ func writeLinkStallCapture(c linkStallCapture) {
 	}
 }
 
+// rawUDPRecordPacketGapWindow 在 rawUDPRecordPacketGap 之外，另记一个由采样协程
+// 每秒取走并清零的最大间隔。累计最大值只会被更长的间隔刷新，周期性出现的等长
+// 卡顿只触发第一次；按采样周期看才能每次都抓到。
+func rawUDPRecordPacketGapWindow(last, maxGap, windowGap *atomic.Int64, now time.Time) {
+	previous := last.Swap(now.UnixNano())
+	if previous > 0 {
+		gap := rawUDPDurationMs(now.Sub(time.Unix(0, previous)))
+		atomicMaxInt64(maxGap, gap)
+		atomicMaxInt64(windowGap, gap)
+	}
+}
+
 func monitorText(s string, limit int) string {
 	if len(s) > limit {
 		return s[:limit]
@@ -314,6 +355,7 @@ func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
 		}
 		s := linkSample{At: now, UpPackets: c.packetsUp.Load(), DownPackets: c.packetsDown.Load(), UpBytes: c.bytesUp.Load(), DownBytes: c.bytesDown.Load(),
 			SinceClientMs: rawUDPStatAgeMsOrSince(c.lastClientPacket.Load(), c.startTime, now), SinceTargetMs: rawUDPStatAgeMsOrSince(c.lastTargetPacket.Load(), c.startTime, now),
+			ClientGapMs: c.windowClientGapMs.Swap(0), TargetGapMs: c.windowTargetGapMs.Swap(0),
 			MaxClientGapMs: c.maxClientPacketGapMs.Load(), MaxTargetGapMs: c.maxTargetPacketGapMs.Load(),
 			WriteTargetMs: c.lastWriteTargetMs.Load(), WriteClientMs: c.lastWriteClientMs.Load(), MaxWriteTargetMs: c.maxWriteTargetMs.Load(), MaxWriteClientMs: c.maxWriteClientMs.Load(),
 			WriteTargetErrors: c.writeTargetErrors.Load(), WriteClientErrors: c.writeClientErrors.Load(), WriteTargetTimeouts: c.writeTargetTimeouts.Load(), WriteClientTimeouts: c.writeClientTimeouts.Load(), ReadTimeouts: c.readTargetTimeouts.Load(), QueueDrops: c.upstreamQueueDrops.Load(),
@@ -346,6 +388,8 @@ func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
 			}
 			s := linkSample{At: now, UpPackets: c.packetsUp.Load(), DownPackets: c.packetsDown.Load(), UpBytes: c.bytesUp.Load(), DownBytes: c.bytesDown.Load(),
 				SinceClientMs: rawUDPStatAgeMsOrSince(c.lastClientPacket.Load(), c.created, now), SinceTargetMs: rawUDPStatAgeMsOrSince(c.lastTargetPacket.Load(), c.created, now),
+				ClientGapMs: c.windowClientGap.Swap(0), TargetGapMs: c.windowTargetGap.Swap(0),
+				ClientPaths: c.pathCount(), PathSwitches: c.pathSwitches.Load(), BackupChecks: c.secondaryChecks.Load(),
 				MaxClientGapMs: c.maxClientGap.Load(), MaxTargetGapMs: c.maxTargetGap.Load(), WriteTargetMs: c.lastWriteTarget.Load(), WriteClientMs: c.lastWriteClient.Load(),
 				MaxWriteTargetMs: c.maxWriteTarget.Load(), MaxWriteClientMs: c.maxWriteClient.Load(), WriteTargetErrors: c.writeErrors.Load(), WriteClientErrors: c.clientWriteErrors.Load(),
 				WriteTargetTimeouts: c.writeTimeouts.Load(), WriteClientTimeouts: c.clientWriteTimeouts.Load(), ReadTimeouts: c.readTimeouts.Load(), Queue: len(c.writeCh), QueueCap: cap(c.writeCh), QueueDrops: c.queueDrops.Load(),

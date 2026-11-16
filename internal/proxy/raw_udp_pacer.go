@@ -39,9 +39,16 @@ import (
 
 const (
 	rawUDPPacerTick = 5 * time.Millisecond
-	// rawUDPPacerMaxQueued bounds what is held for one client. Past it a
-	// server datagram is dropped unACKed, so the server sends it again later.
-	rawUDPPacerMaxQueued = 16 << 20
+	// rawUDPPacerMaxQueued is the hard byte ceiling for one client, whatever
+	// the rate. rawUDPPacerMaxQueueDelay is the real bound: what waits longer
+	// than that at the configured rate reaches the player as a freeze, then as
+	// every entity jumping at once when the queue finally drains. Past either
+	// bound a server datagram is dropped unACKed, so the server sends it again.
+	rawUDPPacerMaxQueued     = 16 << 20
+	rawUDPPacerMaxQueueDelay = 200 * time.Millisecond
+	// rawUDPPacerMinQueued keeps a few full datagrams admissible at low
+	// rates, so the delay bound never turns into a near-total drop.
+	rawUDPPacerMinQueued = 4 * 1500
 	// rawUDPPacerIPOverhead is the IPv4+UDP header a policer counts as well.
 	rawUDPPacerIPOverhead = 28
 	rawUDPPacerMaxRTO     = 3 * time.Second
@@ -118,14 +125,15 @@ type rawUDPPacer struct {
 	seq           uint32 // next sequence number towards the client
 	resend, fresh rawUDPPacerQueue
 	queued        int // bytes waiting in resend and fresh
+	maxQueued     int // queued bound: rawUDPPacerMaxQueueDelay at this rate
 	inflight      map[uint32]*rawUDPPacerDatagram
 	expired       []*rawUDPPacerDatagram
 	srtt, rttvar  time.Duration
 
 	sent, nackResent, rtoResent, dupFrames, gapNacked, overflow int64
 	peakQueued                                                  int
-	// resets 记录 reset() 次数：每次收到 OCR1 都会清空队列与序号，
-	// 若它出现在数据流中途，已代 ACK 的帧会被丢弃且不会重发。
+	// resets 记录 reset() 次数：只有进入数据阶段后重新握手的客户端才清空
+	// 队列与序号（重置），握手阶段重传的 OCR1 不算。
 	resets int64
 }
 
@@ -169,6 +177,7 @@ func newRawUDPPacer(kbps int, toClient, toTarget func([]byte), seqOut *atomic.Ui
 		rate:       rate,
 		burst:      math.Max(rate/100, 2*1500), // ~10ms
 		last:       time.Now(),
+		maxQueued:  min(max(int(rate*rawUDPPacerMaxQueueDelay.Seconds()), rawUDPPacerMinQueued), rawUDPPacerMaxQueued),
 		inflight:   make(map[uint32]*rawUDPPacerDatagram),
 	}
 	r.tokens = r.burst
@@ -209,8 +218,28 @@ func (r *rawUDPPacer) close() {
 	}
 }
 
+// resetPacerOnHandshake handles an OCR1 from a client that already has a
+// pacer. RakNet restarts only at OCR1, so a client that already reached the
+// data phase and sends one again is a new connection: both sequences restart
+// at 0 and the old queue is dead weight.
+//
+// During the handshake an OCR1 is a retransmission of the live connection
+// (its reply1 was lost): the server has already been ACKed for every queued
+// frame and never sends it again, so the queue must stay. srvNext must not
+// restart either, or the next server datagram reads as a gap of tens of
+// thousands and triggers a NACK storm for frames the client already has.
+func (c *rawUDPClientInfo) resetPacerOnHandshake(packetID byte) {
+	if c.pacer == nil || packetID != raknetOpenConnectionReq1 || !c.dataPhase.Load() {
+		return
+	}
+	c.pacer.reset()
+}
+
 // reset starts over for a new RakNet connection from the same client address:
-// both sequences restart at 0.
+// both sequences restart at 0 and what the old connection left is dropped.
+// Only resetPacerOnHandshake may call this: an OCR1 inside the handshake must
+// not drop frames the server was already ACKed for - it never sends an ACKed
+// frame again, so the client would wait for a hole that never fills.
 func (r *rawUDPPacer) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -262,7 +291,6 @@ func (r *rawUDPPacer) fromTarget(b []byte, now time.Time) {
 		r.overflow++ // left unACKed: the server sends it again later
 		return
 	}
-	r.acks = append(r.acks, seq)
 	d := rawUDPPacerDatagramPool.Get().(*rawUDPPacerDatagram)
 	var dups int
 	d.b, d.reliable, dups = appendRawUDPFrames(d.b[:0], b, &r.held)
@@ -271,6 +299,15 @@ func (r *rawUDPPacer) fromTarget(b []byte, now time.Time) {
 		putRawUDPPacerDatagram(d)
 		return
 	}
+	// 纯不可靠数据报（PvP 里的位置/动作更新）超过时延上界就丢弃：它们已经
+	// 过时，排队只会让玩家看到一个几秒前的世界再整体快进。可靠帧不能走
+	// 这条路径——服务器收到代发的 ACK 后不再重发，丢一帧就是永久空洞。
+	if !d.reliable && r.queued+len(d.b) > r.maxQueued {
+		r.overflow++
+		putRawUDPPacerDatagram(d)
+		return
+	}
+	r.acks = append(r.acks, seq)
 	r.fresh.push(d)
 	r.queued += len(d.b)
 	r.peakQueued = max(r.peakQueued, r.queued)
@@ -492,6 +529,17 @@ func (r *rawUDPPacer) stats() (queued int, rtt time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.queued, r.srtt
+}
+
+// queuePeak reports the highest and the current queue depth. A nil pacer
+// (downstream_limit_kbps off) reports zero.
+func (r *rawUDPPacer) queuePeak() (peak, queued int) {
+	if r == nil {
+		return 0, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peakQueued, r.queued
 }
 
 func (r *rawUDPPacer) String() string {

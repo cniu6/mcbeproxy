@@ -386,7 +386,7 @@ flowchart TD
 | `acl_server_id` | string | ⚪ | 该服务器使用的 ACL 分组 ID（默认同 `id`） |
 | `auto_select_blocked_nodes` | object | ⚪ | 服务器级节点拉黑（由 API 维护） |
 | `udp_speeder` | object | ⚪ | UDPspeeder sidecar 配置（见[延迟优化](#延迟优化-latency_mode-与-udp_speeder)） |
-| `downstream_limit_kbps` | int | ⚪ | 下行限速（kbps，`raknet` / `raw_udp` 模式），0=不限。只给进服突发大、不会自己降速的服务器用（目前仅 Venity=3200，见 [docs/2026-09-28-venity-raw-udp-downstream-limit.md](docs/2026-09-28-venity-raw-udp-downstream-limit.md)） |
+| `downstream_limit_kbps` | int | ⚪ | 下行限速（kbps，`raknet` / `raw_udp` 模式），0=不限。只给进服突发大、不会自己降速**且出口真的被限速**的服务器用。raw_udp 下队列按此速率换算的 200ms 时延上限截断（不得低于 4 个满包），超出的数据报不代 ACK、由服务器重传，避免积压变成数秒卡顿后实体瞬移。当前无服务器启用（Venity 出口已是 200M 级，无需限速，见 [docs/2026-09-28-venity-raw-udp-downstream-limit.md](docs/2026-09-28-venity-raw-udp-downstream-limit.md)） |
 
 ---
 
@@ -806,6 +806,13 @@ flowchart TD
 3. 看 `session created`：说明目标 SDP 成功并建立了媒体转发关联；`client bound` 说明客户端 STUN 已到达代理。只有 HTTP 2xx 不代表 ICE/DTLS、登录或进世界成功。
 4. 看 `session closed` 的 `up_packets/down_packets`、写超时与错误计数，区分客户端到代理、代理到目标两段是否有回包。日志只作阶段定位，不把 ufrag、网络 ID 或 HTTP 成功当成可信玩家身份。
 5. `Terracotta / InitialConnection-149` 不是本项目已确认的单一根因映射，需结合上述阶段和实际目标日志；不靠替换游戏协议号或关闭认证来解决。
+
+**多路径客户端（周期性卡顿的排查）：** 玩家设备常常不止一条路能到代理——手机同时开着 Wi-Fi 和流量、电脑有多块网卡或 VPN 虚拟网卡、客户端带 TURN——每条路是一对 ICE 候选，从不同的源地址到达。游戏只在其中一条上传数据，其余每 25 秒发一次 STUN 保活。中继把同一会话里每个通过校验的地址都记为一条路径：任一路径来的报文都转发，STUN 应答按事务号回到发起的路径，其余下行跟随玩家实际传数据的那条。
+
+- `additional client path ... paths=2 downstream=<主路径>`：这个玩家是多路径的，保活不会再打断数据。
+- `client path switched ... reason=media_moved | current_path_silent`：玩家真的换了路（换网、NAT 重绑定），属正常；频繁出现才需要看玩家网络。
+- `session closed ... paths=N path_switches=N backup_checks=N`：`backup_checks` 是备用路径保活的次数。旧版本里每一次都会让游戏卡约 2 秒（表现为每 25 秒左右卡一下、进服慢），与上游节点、HY2 或加速器无关。
+- `UDP stall_capture` 样本里的 `client_gap_ms` / `target_gap_ms` 是该秒内结束的最大包间隔；`max_*_gap_ms` 是会话累计最大值，只在出现更长的间隔时才变。
 
 本地已覆盖目标元数据透传、不透明 ID、非 200 的 2xx SDP answer、中继响应大小限制、初探竞态、同 IP 两会话的双向字节一致性，以及 `raw_udp` / `udp` 上真实 go-nethernet 客户端的媒体往返。**这不等于已经完成 Windows GDK 1.26.60 实机登录验收**，也不代表所有上游节点、NAT 或目标 candidate 组合都已验证。
 

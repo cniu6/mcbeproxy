@@ -124,6 +124,97 @@ func TestLinkStallMonitorTriggersOnlyOnNewEvidence(t *testing.T) {
 	}
 }
 
+// 会话累计最大间隔只会被更长的间隔刷新：周期性出现、每次一样长的卡顿
+// （NetherNet 备用对保活造成的每 25 秒约 2 秒）只有第一次能刷新它。
+// 采样周期内的间隔必须让每一次都触发。
+func TestLinkStallMonitorCatchesRepeatedEqualGaps(t *testing.T) {
+	var captures []linkStallCapture
+	m := newLinkStallMonitor("fixture", func(c linkStallCapture) { captures = append(captures, c) })
+	base := time.Unix(1700000000, 0)
+	for second := 0; second < 120; second++ {
+		o := healthyLinkObservation(base.Add(time.Duration(second) * time.Second))
+		o.Sample.UpPackets += int64(50 * second) // 游戏内上行约 50 包/秒
+		o.Sample.MaxClientGapMs = 2076           // 更早的一次同长卡顿已把累计最大值占住
+		if second == 10 || second == 50 || second == 90 {
+			o.Sample.ClientGapMs = 2050
+		}
+		m.observe(o)
+		m.endTick(o.Sample.At)
+	}
+	var triggered []time.Duration
+	for _, c := range captures {
+		if c.Phase != "before" {
+			continue
+		}
+		if strings.Join(c.Reasons, ",") != "client_gap_observed" {
+			t.Fatalf("触发原因错误: %v", c.Reasons)
+		}
+		triggered = append(triggered, c.TriggeredAt.Sub(base))
+	}
+	if len(triggered) != 3 || triggered[0] != 10*time.Second || triggered[1] != 50*time.Second || triggered[2] != 90*time.Second {
+		t.Fatalf("等长的重复卡顿没有逐次捕获: %v", triggered)
+	}
+
+	// 只剩 ICE 保活的空闲会话：每 2.5s 一个包是常态，不能每个冷却周期报一次。
+	captures = nil
+	idle := newLinkStallMonitor("fixture", func(c linkStallCapture) { captures = append(captures, c) })
+	for second := 0; second < 120; second++ {
+		o := healthyLinkObservation(base.Add(time.Duration(second) * time.Second))
+		o.Sample.UpPackets += int64(second * 2 / 5)
+		if second%5 == 0 {
+			o.Sample.ClientGapMs = 2500
+		}
+		idle.observe(o)
+		idle.endTick(o.Sample.At)
+	}
+	if len(captures) != 0 {
+		t.Fatalf("空闲会话的保活间隔被当成卡顿: %+v", captures[0].Reasons)
+	}
+}
+
+// 采样周期内的间隔只报告一次；NetherNet 会话同时带出客户端路径计数，
+// 换路本身也是一次值得保留前后窗口的事件。
+func TestLinkStallMonitorSamplesWindowGapAndClientPaths(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	p := NewRawUDPProxy("fixture", &config.ServerConfig{}, nil, nil)
+	nn := &netherNetSession{id: "paths-fixture", route: "fixture-chain", created: base, upstream: &linkFixturePacketConn{},
+		mediaAddr: &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 20132}, done: make(chan struct{}), writeCh: make(chan *netherNetPacket, 128)}
+	addr := netip.MustParseAddrPort("192.0.2.3:1234")
+	nn.client.Store(&addr)
+	nn.bound.Store(true)
+	nn.paths = []netherNetClientPath{{addr: addr}, {addr: netip.MustParseAddrPort("198.51.100.7:4321")}}
+	nn.packetsUp.Store(30)
+	nn.packetsDown.Store(40)
+	nn.secondaryChecks.Store(3)
+	r := &netherNetRelay{}
+	r.sessions.Store(nn.id, nn)
+	p.nnRelay.Store(r)
+	var captures []linkStallCapture
+	m := newLinkStallMonitor(p.serverID, func(c linkStallCapture) { captures = append(captures, c) })
+	sampled := func() linkSample { return m.states["nethernet-"+nn.id].last }
+
+	// 一次 2050ms 的上行间隔在第一次采样前结束。
+	rawUDPRecordPacketGapWindow(&nn.lastClientPacket, &nn.maxClientGap, &nn.windowClientGap, base.Add(-2050*time.Millisecond))
+	rawUDPRecordPacketGapWindow(&nn.lastClientPacket, &nn.maxClientGap, &nn.windowClientGap, base)
+	nn.lastTargetPacket.Store(base.UnixNano())
+	p.collectLinkSamples(m, base)
+	if s := sampled(); s.ClientGapMs != 2050 || s.MaxClientGapMs != 2050 || s.ClientPaths != 2 || s.BackupChecks != 3 || s.PathSwitches != 0 {
+		t.Fatalf("首次采样缺少间隔或路径计数: %+v", s)
+	}
+
+	next := base.Add(time.Second)
+	nn.lastClientPacket.Store(next.UnixNano())
+	nn.lastTargetPacket.Store(next.UnixNano())
+	nn.pathSwitches.Store(1)
+	p.collectLinkSamples(m, next)
+	if s := sampled(); s.ClientGapMs != 0 || s.MaxClientGapMs != 2050 || s.PathSwitches != 1 {
+		t.Fatalf("同一次间隔被重复报告，或换路计数丢失: %+v", s)
+	}
+	if len(captures) != 1 || strings.Join(captures[0].Reasons, ",") != "client_path_switched" {
+		t.Fatalf("换路没有触发捕获: %+v", captures)
+	}
+}
+
 func TestLinkStallMonitorPartialWindowAndBounds(t *testing.T) {
 	for _, outcome := range []string{"session_ended", "listener_stopped"} {
 		t.Run(outcome, func(t *testing.T) {

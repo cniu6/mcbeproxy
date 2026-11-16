@@ -135,18 +135,29 @@ type netherNetSession struct {
 	closed                                                           bool
 	closeReason                                                      string
 	workers                                                          sync.WaitGroup
-	bindingTransactions                                              map[[12]byte]netip.AddrPort // 在 lifeMu 下限制已认证 STUN 跨地址重放
-	bindingOrder                                                     [][12]byte
 	ufrag                                                            string
 	upstream                                                         net.PacketConn
 	mediaAddr                                                        net.Addr
 	created                                                          time.Time
 	lastActive                                                       atomic.Int64
-	client                                                           atomic.Pointer[netip.AddrPort]
+	client                                                           atomic.Pointer[netip.AddrPort] // 下行目的地址：客户端媒体所在的路径
 	bound                                                            atomic.Bool
 
-	addrsMu sync.Mutex
-	addrs   []netip.AddrPort
+	// 客户端路径（nethernet_relay_paths.go）。pathMu 保护路径表与检查事务；
+	// 当前路径的两个时钟由热路径无锁刷新。
+	pathMu           sync.Mutex
+	paths            []netherNetClientPath
+	transactions     map[[12]byte]netip.AddrPort
+	transactionRing  [netherNetRelayTransactions][12]byte
+	transactionNext  int
+	currentMedia     atomic.Int64 // 当前路径最后一个媒体（非 STUN）包，UnixNano
+	currentCheck     atomic.Int64 // 当前路径最后一个 STUN 包，UnixNano
+	pathCarriedMedia atomic.Bool  // 当前路径被选中后承载过媒体
+	pathSwitches     atomic.Int64 // 媒体开始后的换路次数
+	secondaryChecks  atomic.Int64 // 非当前路径的已认证检查，下行未动（备用对保活）
+	secondaryPackets atomic.Int64 // 非当前路径来的其它报文，已转发
+	// 上次采样以来结束的最大包间隔；累计最大值只动一次，等长的重复卡顿靠它发现。
+	windowClientGap, windowTargetGap atomic.Int64
 
 	writeCh   chan *netherNetPacket
 	done      chan struct{}
@@ -268,17 +279,16 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 	// Unmap只去除IPv4映射前缀，不改变真正的IPv6地址。
 	from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 	ufrag, isBinding := stunRequestServerUfrag(pkt)
-	if v, ok := r.byAddr.Load(from); ok && !isBinding {
+	if !isBinding {
+		v, ok := r.byAddr.Load(from)
+		if !ok {
+			return false
+		}
 		s := v.(*netherNetSession)
-		// 旧候选地址不能用任意密文抢回 NAT 重绑定后的下行目的地址。
-		if current := s.client.Load(); current != nil && *current == from {
-			s.fromClient(pkt, from)
+		if event := s.fromClientDatagram(pkt, from); event.switched {
+			r.logPathSwitch(s, from, event)
 		}
 		return true
-	}
-	ok := isBinding
-	if !ok {
-		return false
 	}
 	v, ok := r.sessions.Load(ufrag)
 	if !ok {
@@ -301,53 +311,55 @@ func (r *netherNetRelay) handleDatagram(pkt []byte, from netip.AddrPort) bool {
 	if owner, occupied := r.byAddr.Load(from); occupied && owner != s {
 		return true
 	}
-	var transaction [12]byte
-	copy(transaction[:], pkt[8:20])
-	if s.bindingTransactions == nil {
-		s.bindingTransactions = make(map[[12]byte]netip.AddrPort)
+	now := time.Now()
+	// 每个通过认证的地址是客户端的一条路径（每对 ICE 候选一条，外加 NAT 重绑定）；
+	// 哪条路径接收下行由 authenticatedCheck 决定，不是“最后发检查的那条”。
+	event := s.authenticatedCheck(pkt, from, now)
+	if !event.forward {
+		return true // 跨地址重放的事务：是本会话的，丢弃
 	}
-	if previous, exists := s.bindingTransactions[transaction]; exists {
-		current := s.client.Load()
-		if previous != from || (current != nil && *current != from) {
-			return true
-		}
-	} else {
-		if len(s.bindingOrder) == 64 {
-			delete(s.bindingTransactions, s.bindingOrder[0])
-			s.bindingOrder = s.bindingOrder[1:]
-		}
-		s.bindingOrder = append(s.bindingOrder, transaction)
-		s.bindingTransactions[transaction] = from
+	if event.evicted.IsValid() {
+		r.byAddr.CompareAndDelete(event.evicted, s)
 	}
-	// A client binds a handful of addresses (one per ICE candidate, plus NAT
-	// rebinding); cap it so nobody can grow a session's address list.
-	s.addrsMu.Lock()
-	currentAddr, alreadyBound := r.byAddr.Load(from)
-	if len(s.addrs) >= netherNetRelayMaxAddrsPerSession && (!alreadyBound || currentAddr != s) {
-		s.addrsMu.Unlock()
-		return true // ours, but not bound: drop
-	}
-	known := false
-	for _, addr := range s.addrs {
-		if addr == from {
-			known = true
-			break
-		}
-	}
-	if !known {
-		s.addrs = append(s.addrs, from)
-	}
-	s.addrsMu.Unlock()
 	r.byAddr.Store(from, s)
-	if s.bound.CompareAndSwap(false, true) {
+	switch {
+	case s.bound.CompareAndSwap(false, true):
 		logger.Info("NetherNet relay: client bound server=%s client=%s ufrag=%s media=%s", r.serverID, from, ufrag, s.mediaAddr)
+	case event.added:
+		// 多路径客户端的直接证据：同一会话从第二个地址通过了认证。
+		logger.Info("NetherNet relay: additional client path server=%s session=%s path=%s paths=%d downstream=%s",
+			r.serverID, s.id, from, s.pathCount(), netherNetAddrText(s.client.Load()))
 	}
-	s.fromClient(pkt, from)
+	if event.switched {
+		r.logPathSwitch(s, from, event)
+	}
+	s.enqueueUpstream(pkt, now)
 	r.registerMediaSession(s, from)
 	return true
 }
 
-func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
+func netherNetAddrText(addr *netip.AddrPort) string {
+	if addr == nil {
+		return "-"
+	}
+	return addr.String()
+}
+
+// logPathSwitch 只记录媒体开始后的换路；检查阶段的选路每个多网卡客户端都会有。
+func (r *netherNetRelay) logPathSwitch(s *netherNetSession, to netip.AddrPort, event netherNetPathEvent) {
+	if !event.handover {
+		return
+	}
+	// 换路本应罕见；万一某个客户端来回切，日志量仍有上限。
+	if n := s.pathSwitches.Load(); n > 16 && n%64 != 0 {
+		return
+	}
+	logger.Info("NetherNet relay: client path switched server=%s session=%s from=%s to=%s reason=%s switches=%d",
+		r.serverID, s.id, event.previous, to, event.reason, s.pathSwitches.Load())
+}
+
+// enqueueUpstream 把客户端报文排入上行队列；选路已由调用方完成。
+func (s *netherNetSession) enqueueUpstream(pkt []byte, now time.Time) {
 	s.ingressMu.Lock()
 	defer s.ingressMu.Unlock()
 	select {
@@ -355,13 +367,8 @@ func (s *netherNetSession) fromClient(pkt []byte, from netip.AddrPort) {
 		return
 	default:
 	}
-	now := time.Now()
 	s.lastActive.Store(now.UnixNano())
-	rawUDPRecordPacketGap(&s.lastClientPacket, &s.maxClientGap, now)
-	if cur := s.client.Load(); cur == nil || *cur != from {
-		addr := from
-		s.client.Store(&addr)
-	}
+	rawUDPRecordPacketGapWindow(&s.lastClientPacket, &s.maxClientGap, &s.windowClientGap, now)
 	buf := netherNetPacketPool.Get().(*[]byte)
 	if len(pkt) > len(*buf) {
 		netherNetPacketPool.Put(buf)
@@ -445,13 +452,19 @@ func (r *netherNetRelay) forwardDownstream(s *netherNetSession) {
 		}
 		now := time.Now()
 		s.lastActive.Store(now.UnixNano())
-		rawUDPRecordPacketGap(&s.lastTargetPacket, &s.maxTargetGap, now)
+		rawUDPRecordPacketGapWindow(&s.lastTargetPacket, &s.maxTargetGap, &s.windowTargetGap, now)
 		dst := s.client.Load()
 		if dst == nil {
 			continue // client has not reached us yet; ICE will retransmit
 		}
+		to := *dst
+		// 检查的应答只对发起它的候选对有意义：送到别的路径会被客户端按未知
+		// 事务丢弃，那条路径随后就被判为不可写。
+		if path, ok := s.bindingResponsePath(buf[:n]); ok {
+			to = path
+		}
 		started := time.Now()
-		_, err = r.udp.WriteToUDPAddrPort(buf[:n], *dst)
+		_, err = r.udp.WriteToUDPAddrPort(buf[:n], to)
 		rawUDPRecordWriteLatency(&s.lastWriteClient, &s.maxWriteClient, &s.slowWriteClient, time.Since(started))
 		if err == nil {
 			s.packetsDown.Add(1)
@@ -499,22 +512,20 @@ func (r *netherNetRelay) closeSession(s *netherNetSession, reason string) {
 		_ = s.upstream.Close()
 		r.lifeMu.Lock()
 		r.sessions.CompareAndDelete(s.ufrag, s)
-		s.addrsMu.Lock()
-		for _, a := range s.addrs {
-			r.byAddr.CompareAndDelete(a, s)
+		s.pathMu.Lock()
+		paths := len(s.paths)
+		for _, p := range s.paths {
+			r.byAddr.CompareAndDelete(p.addr, s)
 		}
-		s.addrsMu.Unlock()
+		s.pathMu.Unlock()
 		r.count.Add(-1)
 		r.lifeMu.Unlock()
 		// 最终快照由发布时已注册的回收器等待双向转发退出后写入。
-		client := "-"
-		if c := s.client.Load(); c != nil {
-			client = c.String()
-		}
-		logger.Info("NetherNet relay: session closed server=%s client=%s reason=%s duration=%v up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d up_write_timeouts=%d up_write_errors=%d",
-			r.serverID, client, reason, time.Since(s.created).Round(time.Second),
+		// paths>1 即多路径客户端；backup_checks 是没有再打断媒体的备用对保活次数。
+		logger.Info("NetherNet relay: session closed server=%s client=%s reason=%s duration=%v up_packets=%d down_packets=%d up_bytes=%d down_bytes=%d up_write_timeouts=%d up_write_errors=%d paths=%d path_switches=%d backup_checks=%d",
+			r.serverID, netherNetAddrText(s.client.Load()), reason, time.Since(s.created).Round(time.Second),
 			s.packetsUp.Load(), s.packetsDown.Load(), s.bytesUp.Load(), s.bytesDown.Load(),
-			s.writeTimeouts.Load(), s.writeErrors.Load())
+			s.writeTimeouts.Load(), s.writeErrors.Load(), paths, s.pathSwitches.Load(), s.secondaryChecks.Load())
 	})
 }
 

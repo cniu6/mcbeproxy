@@ -33,9 +33,26 @@ type chainTransportPacket struct {
 	destination string // 构造时设置，只表示下一跳网络端点
 	once        sync.Once
 	writeMu     sync.Mutex
+	readTimer   *time.Timer // 只由读端使用，复用避免每次读新建计时器
 }
+
+// 队列里的报文从池里取，交付或丢弃后归还：这是每个下行包都走的路径。
+var chainTransportBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 2048); return &b }}
+
+func chainTransportBuf(p []byte) *[]byte {
+	b := chainTransportBufPool.Get().(*[]byte)
+	*b = append((*b)[:0], p...)
+	return b
+}
+
+func putChainTransportBuf(b *[]byte) {
+	if b != nil && cap(*b) <= 64<<10 {
+		chainTransportBufPool.Put(b)
+	}
+}
+
 type chainTransportDatagram struct {
-	data    []byte
+	data    *[]byte
 	address net.Addr
 }
 
@@ -79,7 +96,7 @@ func newChainTransportPacket(pc net.PacketConn) *chainTransportPacket {
 				continue
 			}
 			tail := (c.head + c.buffer.QueuePackets) % chainTransportPacketLimit
-			c.queue[tail] = chainTransportDatagram{data: append([]byte(nil), buf[:n]...), address: a}
+			c.queue[tail] = chainTransportDatagram{data: chainTransportBuf(buf[:n]), address: a}
 			c.buffer.QueuePackets++
 			c.buffer.QueueBytes += n
 			c.buffer.PeakPackets = max(c.buffer.PeakPackets, c.buffer.QueuePackets)
@@ -130,19 +147,23 @@ func (c *chainTransportPacket) ReadFrom(b []byte) (int, net.Addr, error) {
 			c.queue[c.head] = chainTransportDatagram{}
 			c.head = (c.head + 1) % chainTransportPacketLimit
 			c.buffer.QueuePackets--
-			c.buffer.QueueBytes -= len(p.data)
+			size := len(*p.data)
+			c.buffer.QueueBytes -= size
 			if c.buffer.QueuePackets > 0 {
 				c.notifyReadyLocked()
 			}
-			if len(p.data) > len(b) {
-				c.noteDropLocked(len(p.data), "short_read_buffer")
+			if size > len(b) {
+				c.noteDropLocked(size, "short_read_buffer")
 				c.mu.Unlock()
+				putChainTransportBuf(p.data)
 				return 0, p.address, io.ErrShortBuffer
 			}
 			c.buffer.DeliveredPackets++
-			c.buffer.DeliveredBytes += int64(len(p.data))
+			c.buffer.DeliveredBytes += int64(size)
 			c.mu.Unlock()
-			return copy(b, p.data), p.address, nil
+			n := copy(b, *p.data)
+			putChainTransportBuf(p.data)
+			return n, p.address, nil
 		}
 		if c.err != nil {
 			err := c.err
@@ -156,30 +177,35 @@ func (c *chainTransportPacket) ReadFrom(b []byte) (int, net.Addr, error) {
 			if !time.Now().Before(deadline) {
 				return 0, nil, os.ErrDeadlineExceeded
 			}
-			timer = time.NewTimer(time.Until(deadline))
+			if c.readTimer == nil {
+				c.readTimer = time.NewTimer(time.Until(deadline))
+			} else {
+				c.readTimer.Reset(time.Until(deadline))
+			}
+			timer = c.readTimer
 			timeout = timer.C
 		}
 		select {
 		case <-c.done:
 			if timer != nil {
-				timer.Stop()
+				stopHY2ReadTimer(timer)
 			}
 			return 0, nil, net.ErrClosed
 		case <-changed:
 			if timer != nil {
-				timer.Stop()
+				stopHY2ReadTimer(timer)
 			}
 			continue
 		case <-timeout:
-			return 0, nil, os.ErrDeadlineExceeded
+			return 0, nil, os.ErrDeadlineExceeded // 已从通道取走，计时器可直接 Reset
 		case <-c.terminal:
 			if timer != nil {
-				timer.Stop()
+				stopHY2ReadTimer(timer)
 			}
 			// 底层结束前已接收的队列先交付，下一轮再返回终止错误。
 		case <-c.ready:
 			if timer != nil {
-				timer.Stop()
+				stopHY2ReadTimer(timer)
 			}
 		}
 	}
@@ -206,6 +232,9 @@ func (c *chainTransportPacket) Close() error {
 		c.mu.Lock()
 		c.closed = true
 		close(c.done)
+		for i := range c.queue {
+			putChainTransportBuf(c.queue[i].data)
+		}
 		clear(c.queue[:])
 		c.buffer.QueuePackets, c.buffer.QueueBytes = 0, 0
 		c.mu.Unlock()

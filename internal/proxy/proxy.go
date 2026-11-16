@@ -571,7 +571,7 @@ func persistSession(sess *session.Session, sessionRepo *db.SessionRepository, pl
 
 	record := &session.SessionRecord{
 		ID:           snap.ID,
-		ClientAddr:   snap.ClientAddr,
+		ClientAddr:   session.DisplayClientAddress(snap.ClientAddr),
 		ServerID:     snap.ServerID,
 		UUID:         snap.UUID,
 		XUID:         snap.XUID,
