@@ -3561,33 +3561,15 @@ const proxyDetailGroupColumns = computed(() => [
 
 // 筛选后的多节点列表
 const filteredProxyDetailNodes = computed(() => {
-  let list = [...proxyDetailNodesData.value]
-  if (proxyDetailFilter.value.search) {
-    const kw = proxyDetailFilter.value.search.toLowerCase()
-    list = list.filter(o => o.name?.toLowerCase().includes(kw) || o.server?.toLowerCase().includes(kw))
-  }
-  if (proxyDetailFilter.value.protocol) {
-    list = list.filter(o => o.type === proxyDetailFilter.value.protocol)
-  }
-  if (proxyDetailFilter.value.udpOnly) {
-    list = list.filter(o => o.udp_available === true)
-  }
-  return list
+  // 与其它节点选择器共用 filterNodes：协议与「仅UDP可用」（未探测的节点保留，只排除明确不支持 UDP 的）
+  return filterNodes(proxyDetailNodesData.value, proxyDetailFilter.value)
 })
 
 // 筛选后的分组节点列表
 const filteredGroupNodes = computed(() => {
   if (!proxyDetailGroupData.value) return []
   const groupName = proxyDetailGroupData.value.name || ''
-  let list = allProxyOutbounds.value.filter(o => (o.group || '') === groupName)
-  if (proxyDetailFilter.value.search) {
-    const kw = proxyDetailFilter.value.search.toLowerCase()
-    list = list.filter(o => o.name?.toLowerCase().includes(kw) || o.server?.toLowerCase().includes(kw))
-  }
-  if (proxyDetailFilter.value.udpOnly) {
-    list = list.filter(o => o.udp_available === true)
-  }
-  return list
+  return filterNodes(allProxyOutbounds.value.filter(o => (o.group || '') === groupName), proxyDetailFilter.value)
 })
 
 // 快速切换弹窗的代理列表列（带操作）
