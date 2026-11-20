@@ -1209,6 +1209,7 @@
 import NodeFilters from '../components/NodeFilters.vue'
 import LastDisconnectModal from '../components/LastDisconnectModal.vue'
 import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
+import { serverLoadBalanceOptions as loadBalanceOptions, serverLoadBalanceSortOptions as loadBalanceSortOptions, autoPingFullScanModeOptions, proxyProtocolOptions } from '../composables/selectOptions.js'
  import { ref, reactive, computed, onMounted, onUnmounted, h, nextTick, watch } from 'vue'
  import { NTag, NButton, NSpace, NPopconfirm, useMessage, NRadioGroup, NRadioButton, NDropdown, NTooltip, NSwitch } from 'naive-ui'
  import { api, apiStream } from '../api'
@@ -1458,26 +1459,8 @@ const buildServerPayload = (server) => {
 }
 
 // Load balance strategy options
-const loadBalanceOptions = [
-  { label: '最低延迟 (默认)', value: '' },
-  { label: '最低延迟', value: 'least-latency' },
-  { label: '轮询', value: 'round-robin' },
-  { label: '随机', value: 'random' },
-  { label: '最少连接', value: 'least-connections' }
-]
 
-// Load balance sort options
-const loadBalanceSortOptions = [
-  { label: 'UDP延迟 (MCBE默认)', value: 'udp' },
-  { label: 'TCP延迟', value: 'tcp' },
-  { label: 'HTTP延迟', value: 'http' }
-]
 
-const autoPingFullScanModeOptions = [
-  { label: '关闭', value: '' },
-  { label: '每日定时全量扫描', value: 'daily' },
-  { label: '按间隔全量扫描', value: 'interval' }
-]
 
 const latencySortOrderOptions = [
   { label: '从小到大', value: 'asc' },
@@ -1768,16 +1751,6 @@ const proxyColumns = [
 ]
 
 // 协议筛选选项
-const proxyProtocolOptions = [
-  { label: 'Shadowsocks', value: 'shadowsocks' },
-  { label: 'VMess', value: 'vmess' },
-  { label: 'Trojan', value: 'trojan' },
-  { label: 'VLESS', value: 'vless' },
-  { label: 'SOCKS5', value: 'socks5' },
-  { label: 'HTTP', value: 'http' },
-  { label: 'AnyTLS', value: 'anytls' },
-  { label: 'Hysteria2', value: 'hysteria2' }
-]
 
 // 获取代理类型标签（点击打开详情弹窗）
 const getProxyTypeTags = (proxyName, serverId) => {
@@ -3396,36 +3369,8 @@ const mergeServerNodeLatency = (outbound) => {
 }
 
 const formFilteredProxyOutbounds = computed(() => {
-  let list = allProxyOutbounds.value.map(mergeServerNodeLatency)
-  
-  // 按分组过滤（支持未分组）
-  if (formProxyFilter.value.group) {
-    if (formProxyFilter.value.group === '_ungrouped') {
-      list = list.filter(o => !o.group)
-    } else {
-      list = list.filter(o => o.group === formProxyFilter.value.group)
-    }
-  }
-  
-  // 按协议过滤
-  if (formProxyFilter.value.protocol) {
-    list = list.filter(o => o.type === formProxyFilter.value.protocol)
-  }
-  
-  // 只显示支持UDP的
-  if (formProxyFilter.value.udpOnly) {
-    list = list.filter(o => o.udp_available !== false)
-  }
-  
-  // 搜索过滤
-  if (formProxyFilter.value.search) {
-    const kw = formProxyFilter.value.search.toLowerCase()
-    list = list.filter(o => 
-      o.name.toLowerCase().includes(kw) || 
-      o.server.toLowerCase().includes(kw)
-    )
-  }
-  
+  let list = filterNodes(allProxyOutbounds.value.map(mergeServerNodeLatency), formProxyFilter.value)
+
   // 获取当前服务器已选中的节点
   const server = servers.value.find(s => s.id === selectedServerId.value)
   const currentProxy = server?.proxy_outbound || ''
@@ -4009,38 +3954,9 @@ const proxyGroups = computed(() => {
 
 // 过滤后的代理列表
 const filteredProxyOutbounds = computed(() => {
-  let list = [...allProxyOutbounds.value]
-  
-  // 按分组过滤（支持未分组）
-  if (proxyFilter.value.group) {
-    if (proxyFilter.value.group === '_ungrouped') {
-      list = list.filter(o => !o.group)
-    } else {
-      list = list.filter(o => o.group === proxyFilter.value.group)
-    }
-  }
-  
-  // 按协议过滤
-  if (proxyFilter.value.protocol) {
-    list = list.filter(o => o.type === proxyFilter.value.protocol)
-  }
-  
-  // 只显示支持UDP的
-  if (proxyFilter.value.udpOnly) {
-    list = list.filter(o => o.udp_available !== false)
-  }
-  
-  // 搜索过滤
- if (proxyFilter.value.search) {
-   const kw = proxyFilter.value.search.toLowerCase()
-   list = list.filter(o => 
-     o.name.toLowerCase().includes(kw) || 
-     o.server.toLowerCase().includes(kw) ||
-     (o.group && o.group.toLowerCase().includes(kw))
-   )
- }
- 
- // 获取当前服务器已选中的节点
+  let list = filterNodes(allProxyOutbounds.value, proxyFilter.value)
+
+// 获取当前服务器已选中的节点
  const server = servers.value.find(s => s.id === selectedServerId.value)
  const currentProxy = server?.proxy_outbound || ''
  let selectedNodes = []

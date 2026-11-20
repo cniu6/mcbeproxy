@@ -471,6 +471,8 @@ import PortEditForm from './components/PortEditForm.vue'
 import PortUsersEditor from './components/PortUsersEditor.vue'
 import ListenAddrInput from '../components/ListenAddrInput.vue'
 import { useNetworkInterfaces } from '../composables/useNetworkInterfaces'
+import { loadBalanceOptions, loadBalanceSortOptions, autoPingFullScanModeOptions, proxyProtocolOptions } from '../composables/selectOptions.js'
+import { filterNodes } from '../composables/nodeFilters.js'
 
 const message = useMessage()
 const { listenHostOptions, loadInterfaces, loading: ifaceLoading } = useNetworkInterfaces()
@@ -683,35 +685,9 @@ const proxyTypeOptions = [
   { label: 'Mieru · TCP 兼容', value: 'mieru' }
 ]
 
-const loadBalanceOptions = [
-  { label: '最低延迟', value: 'least-latency' },
-  { label: '轮询', value: 'round-robin' },
-  { label: '随机', value: 'random' },
-  { label: '最少连接', value: 'least-connections' }
-]
 
-const loadBalanceSortOptions = [
-  { label: 'TCP', value: 'tcp' },
-  { label: 'HTTP', value: 'http' },
-  { label: 'UDP', value: 'udp' }
-]
 
-const autoPingFullScanModeOptions = [
-  { label: '关闭', value: '' },
-  { label: '每天定时', value: 'daily' },
-  { label: '固定间隔', value: 'interval' }
-]
 
-const proxyProtocolOptions = [
-  { label: 'Shadowsocks', value: 'shadowsocks' },
-  { label: 'VMess', value: 'vmess' },
-  { label: 'Trojan', value: 'trojan' },
-  { label: 'VLESS', value: 'vless' },
-  { label: 'SOCKS5', value: 'socks5' },
-  { label: 'HTTP', value: 'http' },
-  { label: 'AnyTLS', value: 'anytls' },
-  { label: 'Hysteria2', value: 'hysteria2' }
-]
 
 const batchTestOptions = [
   { label: '一键测试全部 (TCP+HTTP+UDP)', key: 'all' },
@@ -2110,24 +2086,7 @@ const proxyGroups = computed(() => {
 })
 
 const formFilteredProxyOutbounds = computed(() => {
-  let list = [...allProxyOutbounds.value]
-  if (formProxyFilter.value.group) {
-    if (formProxyFilter.value.group === '_ungrouped') {
-      list = list.filter(o => !o.group)
-    } else {
-      list = list.filter(o => o.group === formProxyFilter.value.group)
-    }
-  }
-  if (formProxyFilter.value.protocol) {
-    list = list.filter(o => o.type === formProxyFilter.value.protocol)
-  }
-  if (formProxyFilter.value.udpOnly) {
-    list = list.filter(o => o.udp_available !== false)
-  }
-  if (formProxyFilter.value.search) {
-    const kw = formProxyFilter.value.search.toLowerCase()
-    list = list.filter(o => o.name.toLowerCase().includes(kw) || o.server.toLowerCase().includes(kw))
-  }
+  let list = filterNodes(allProxyOutbounds.value, formProxyFilter.value)
   const selected = formSelectedNodes.value || []
   return list.sort((a, b) => {
     const aSelected = selected.includes(a.name)

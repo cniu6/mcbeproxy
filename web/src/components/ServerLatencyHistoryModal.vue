@@ -155,6 +155,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { api } from '../api'
 import LatencySparkline from './LatencySparkline.vue'
+import { serverLoadBalanceSortOptions as loadBalanceSortOptions } from '../composables/selectOptions.js'
 
 const props = defineProps({
   show: { type: Boolean, default: false },
@@ -191,11 +192,6 @@ const rangeOptions = [
   { label: '自定义', value: 'custom' }
 ]
 
-const loadBalanceSortOptions = [
-  { label: 'UDP延迟 (MCBE默认)', value: 'udp' },
-  { label: 'TCP延迟', value: 'tcp' },
-  { label: 'HTTP延迟', value: 'http' }
-]
 
 const currentServerId = computed(() => String(props.server?.id || '').trim())
 

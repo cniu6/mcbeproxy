@@ -130,6 +130,7 @@
 import { ref, reactive, computed, onMounted, h } from 'vue'
 import { NButton, NPopconfirm, NSwitch, useMessage } from 'naive-ui'
 import { api, formatTime } from '../api'
+import { expiryOptions } from '../composables/selectOptions.js'
 
 const message = useMessage()
 const whitelist = ref([])
@@ -152,15 +153,6 @@ const aclSettings = reactive({
 })
 const entryToggleLoading = reactive({})
 const reasonOptions = ['临时放行', '活动服豁免', '测试账号', '管理成员', '可信玩家']
-const expiryOptions = [
-  { label: '永久', value: 'permanent' },
-  { label: '12 小时', value: '12h' },
-  { label: '1 天', value: '1d' },
-  { label: '5 天', value: '5d' },
-  { label: '15 天', value: '15d' },
-  { label: '30 天', value: '30d' },
-  { label: '自定义', value: 'custom' }
-]
 const expiryDurationMs = {
   '12h': 12 * 60 * 60 * 1000,
   '1d': 24 * 60 * 60 * 1000,

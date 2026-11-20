@@ -985,6 +985,7 @@ import { NTag, NButton, NSpace, NPopconfirm, NIcon, useMessage } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 import NodeFilters from '../components/NodeFilters.vue'
 import { emptyNodeFilter, filterNodes, nodeGroupOptions } from '../composables/nodeFilters.js'
+import { proxyProtocolOptions as protocolFilterOptions } from '../composables/selectOptions.js'
 import { api, formatBytes, formatDuration, formatTime } from '../api'
 import { createPageRefreshPoll } from '../composables/createPageRefreshPoll'
 import LatencySparkline from '../components/LatencySparkline.vue'
@@ -1543,27 +1544,6 @@ function chainInlineDragEnd() {
   chainInlineDragIdx.value = -1
   chainInlineDragging.value = false
 }
-
-// 协议筛选选项
-const protocolFilterOptions = [
-  { label: 'Shadowsocks', value: 'shadowsocks' },
-  { label: 'VMess', value: 'vmess' },
-  { label: 'Trojan', value: 'trojan' },
-  { label: 'VLESS', value: 'vless' },
-  { label: 'SOCKS5', value: 'socks5' },
-  { label: 'HTTP', value: 'http' },
-  { label: 'AnyTLS', value: 'anytls' },
-  { label: 'Hysteria2', value: 'hysteria2' },
-  { label: 'Mieru TCP · TCP+UDP', value: 'mieru' },
-  { label: 'Hysteria (v1)', value: 'hysteria' },
-  { label: 'Snell', value: 'snell' },
-  { label: 'TUIC', value: 'tuic' },
-  { label: 'Mieru', value: 'mieru' },
-  { label: 'ShadowQUIC', value: 'shadowquic' },
-  { label: 'Sudoku', value: 'sudoku' },
-  { label: 'Masque', value: 'masque' },
-  { label: 'TrustTunnel', value: 'trusttunnel' }
-]
 
 // 状态筛选选项
 const statusFilterOptions = [

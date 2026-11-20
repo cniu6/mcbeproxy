@@ -300,6 +300,7 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useMessage, useDialog } from 'naive-ui'
 import { api, getApiKey, setApiKey, hasApiKey } from '../api'
+import { autoPingFullScanModeOptions } from '../composables/selectOptions.js'
 import { pageRefreshOptions, getPageRefreshSeconds, setPageRefreshSeconds, subscribePageRefresh } from '../composables/pageRefreshSettings'
 
 const message = useMessage()
@@ -368,11 +369,6 @@ const aclSettings = reactive({
 })
 const savingACL = ref(false)
 
-const autoPingFullScanModeOptions = [
-  { label: '关闭', value: '' },
-  { label: '每天定时', value: 'daily' },
-  { label: '固定间隔', value: 'interval' }
-]
 
 const config = reactive({
   api_port: 8080,

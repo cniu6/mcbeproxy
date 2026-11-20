@@ -10,3 +10,8 @@ test('分类包含未分类，分组、协议、状态和搜索共同过滤且�
   assert.equal(filterNodes(nodes,emptyNodeFilter()).length,3)
   assert.equal(nodes.length,3)
 })
+test('节点选择器统一支持 udpOnly（仅排除明确不支持 UDP 的节点）与历史未分组取值 _ungrouped', () => {
+  const udp = [{name:'a',type:'vmess',group:'',server:'x',udp_available:false},{name:'b',type:'vmess',group:'',server:'x',udp_available:true},{name:'c',type:'vmess',group:'',server:'x'}]
+  assert.deepEqual(filterNodes(udp,{udpOnly:true}).map(n=>n.name),['b','c'])
+  assert.equal(filterNodes(udp,{group:'_ungrouped'}).length,3)
+})

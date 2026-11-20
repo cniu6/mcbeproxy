@@ -177,6 +177,7 @@
 <script setup>
 import NodeFilters from '../components/NodeFilters.vue'
 import { emptyNodeFilter, filterNodes } from '../composables/nodeFilters.js'
+import { loadBalanceOptions as lbOptions, loadBalanceSortOptions as lbSortOptions } from '../composables/selectOptions.js'
 import { ref, computed, h, onMounted } from 'vue'
 import { useMessage, useDialog, NTag, NSwitch, NButton, NSpace, NText } from 'naive-ui'
 import { api } from '../api'
@@ -213,17 +214,6 @@ const actionOptions = [
 ]
 const actionLabel = (a) => ({ default: '默认线路', direct: '直连', proxy: '走代理', block: '阻止' }[a] || a)
 const actionTag = (a) => ({ direct: 'success', proxy: 'info', block: 'error' }[a] || 'default')
-const lbOptions = [
-  { label: '最低延迟', value: 'least-latency' },
-  { label: '轮询', value: 'round-robin' },
-  { label: '随机', value: 'random' },
-  { label: '最少连接', value: 'least-connections' }
-]
-const lbSortOptions = [
-  { label: 'TCP', value: 'tcp' },
-  { label: 'HTTP', value: 'http' },
-  { label: 'UDP', value: 'udp' }
-]
 
 const markDirty = () => { dirty.value = true }
 
