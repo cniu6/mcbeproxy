@@ -2253,60 +2253,139 @@ flowchart LR
 
 ### 9.1 REST API 端点完整列表
 
+认证列含义：`无` 为公开接口；`认证` 需要 `X-API-Key`（未配置任何 Key 时仅允许本机访问）；`管理员` 需要管理员权限（未配置 Key 时同本机规则）。
+
 | 方法 | 路径 | 描述 | 认证 |
 |-----|------|------|-----|
-| **服务器管理** |
-| GET | /api/servers | 获取所有服务器状态 | 可选 |
-| GET | /api/servers/:id | 获取单个服务器详情 | 可选 |
-| POST | /api/servers/:id/start | 启动服务器代理 | 必需 |
-| POST | /api/servers/:id/stop | 停止服务器代理 | 必需 |
-| POST | /api/servers/:id/reload | 重载服务器配置 | 必需 |
-| GET | /api/servers/:id/sessions | 获取服务器活跃会话 | 必需 |
-| POST | /api/servers/:id/kick | 踢出服务器玩家 | 必需 |
-| **会话管理** |
-| GET | /api/sessions | 获取所有活跃会话 | 必需 |
-| GET | /api/sessions/history | 获取历史会话记录 | 必需 |
-| **玩家管理** |
-| GET | /api/players | 获取玩家列表 | 必需 |
-| GET | /api/players/:name | 获取玩家详情 | 必需 |
-| GET | /api/players/:name/sessions | 获取玩家会话历史 | 必需 |
+| **公开接口** |
+| GET | /api/public/status | 公开状态页数据 | 无 |
+| GET | /api/public/version | 版本信息 | 无 |
+| GET | /api/web/index | 公开状态页首页数据 | 无 |
+| GET | /api/web/index-api | 公开状态页数据（API） | 无 |
+| GET | /api/web/servers/:id/latency-history | 公开状态页延迟历史 | 无 |
+| **服务器** |
+| GET | /api/servers | 服务器列表与运行状态 | 认证 |
+| GET | /api/servers/latency-overview | 服务器延迟总览 | 认证 |
+| POST | /api/servers | 创建服务器 | 管理员 |
+| PUT | /api/servers/:id | 更新服务器 | 管理员 |
+| DELETE | /api/servers/:id | 删除服务器 | 管理员 |
+| POST | /api/servers/:id/start | 启动服务器代理 | 管理员 |
+| POST | /api/servers/:id/stop | 停止服务器代理 | 管理员 |
+| POST | /api/servers/:id/reload | 重载服务器配置 | 管理员 |
+| POST | /api/servers/:id/hide | 公开状态页隐藏（`/disable` 为兼容别名） | 管理员 |
+| POST | /api/servers/:id/show | 公开状态页显示（`/enable` 为兼容别名） | 管理员 |
+| GET | /api/servers/:id/latency | 服务器延迟 | 认证 |
+| GET | /api/servers/:id/latency-history | 服务器延迟历史 | 认证 |
+| GET | /api/servers/:id/node-latency | 各节点延迟 | 认证 |
+| GET | /api/servers/:id/node-latency-history | 各节点延迟历史 | 认证 |
+| GET | /api/servers/:id/current-node | 当前使用节点 | 认证 |
+| GET | /api/servers/:id/blocked-nodes | 被拉黑节点列表 | 认证 |
+| POST | /api/servers/:id/switch-node | 切换节点 | 管理员 |
+| POST | /api/servers/:id/block-node | 拉黑节点 | 管理员 |
+| POST | /api/servers/:id/unblock-node | 解除节点拉黑 | 管理员 |
+| GET | /api/servers/disconnect-reports | 断线报告列表 | 管理员 |
+| GET | /api/servers/:id/last-disconnect | 最近一次断线诊断 | 管理员 |
+| POST | /api/servers/:id/sessions/:sessionID/close | 关闭指定会话 | 管理员 |
+| **会话** |
+| GET | /api/sessions | 在线会话 | 认证 |
+| GET | /api/sessions/history | 历史会话 | 认证 |
+| DELETE | /api/sessions/:id | 踢出会话 | 管理员 |
+| DELETE | /api/sessions/history | 清空历史会话 | 管理员 |
+| DELETE | /api/sessions/history/:id | 删除单条历史会话 | 管理员 |
+| **玩家** |
+| GET | /api/players | 玩家列表 | 认证 |
+| GET | /api/players/:name | 玩家详情 | 认证 |
+| POST | /api/players/:name/kick | 踢出玩家 | 管理员 |
+| DELETE | /api/players/:name | 删除玩家记录 | 管理员 |
 | **上游节点** |
-| GET | /api/proxy-outbounds | 获取所有上游节点 | 必需 |
-| GET | /api/proxy-outbounds/:name | 获取节点详情 | 必需 |
-| POST | /api/proxy-outbounds | 创建节点 | 必需 |
-| PUT | /api/proxy-outbounds/:name | 更新节点 | 必需 |
-| DELETE | /api/proxy-outbounds/:name | 删除节点 | 必需 |
-| POST | /api/proxy-outbounds/:name/test | 测试节点 | 必需 |
-| POST | /api/proxy-outbounds/test-all | 测试所有节点 | 必需 |
-| GET | /api/proxy-outbounds/groups | 获取组统计 | 必需 |
+| GET | /api/proxy-outbounds | 节点列表 | 认证 |
+| GET | /api/proxy-outbounds/:name | 节点详情 | 认证 |
+| POST | /api/proxy-outbounds | 创建节点 | 管理员 |
+| PUT | /api/proxy-outbounds/:name | 更新节点 | 管理员 |
+| DELETE | /api/proxy-outbounds/:name | 删除节点 | 管理员 |
+| POST | /api/proxy-outbounds/parse-import | 解析导入内容 | 管理员 |
+| POST | /api/proxy-outbounds/get | 按 body 中的 name 读取节点 | 认证 |
+| POST | /api/proxy-outbounds/update | 按 body 中的 name 更新节点 | 管理员 |
+| POST | /api/proxy-outbounds/delete | 按 body 中的 name 删除节点 | 管理员 |
+| POST | /api/proxy-outbounds/test | 测试单个节点 | 认证 |
+| POST | /api/proxy-outbounds/:name/test | 测试指定节点（路径内 name） | 认证 |
+| POST | /api/proxy-outbounds/batch-test | 批量测试节点 | 认证 |
+| POST | /api/proxy-outbounds/detailed-test | 详细测试节点 | 认证 |
+| POST | /api/proxy-outbounds/test-mcbe | MCBE UDP 连通性测试 | 认证 |
+| POST | /api/proxy-outbounds/health | 节点健康状态（body） | 认证 |
+| GET | /api/proxy-outbounds/:name/health | 节点健康状态（路径） | 认证 |
+| GET | /api/proxy-outbounds/:name/latency-history | 节点延迟历史 | 认证 |
+| GET | /api/proxy-outbounds/latency-overview | 节点延迟总览 | 认证 |
+| GET | /api/proxy-outbounds/groups | 分组统计 | 认证 |
+| GET | /api/proxy-outbounds/groups/:name | 分组详情 | 认证 |
+| POST | /api/proxy-outbounds/fetch-subscription | 抓取订阅内容 | 认证 |
+| POST | /api/proxy-outbounds/block-auto-select | 屏蔽节点自动选择 | 管理员 |
+| POST | /api/proxy-outbounds/block-auto-select/batch | 批量屏蔽自动选择 | 管理员 |
+| POST | /api/proxy-outbounds/unblock-auto-select | 解除自动选择屏蔽 | 管理员 |
+| POST | /api/proxy-outbounds/unblock-auto-select/batch | 批量解除自动选择屏蔽 | 管理员 |
+| **订阅** |
+| GET | /api/proxy-subscriptions | 订阅列表 | 认证 |
+| POST | /api/proxy-subscriptions | 新增订阅 | 管理员 |
+| PUT | /api/proxy-subscriptions/:id | 修改订阅 | 管理员 |
+| DELETE | /api/proxy-subscriptions/:id | 删除订阅 | 管理员 |
+| POST | /api/proxy-subscriptions/:id/update | 立即更新单个订阅 | 管理员 |
+| POST | /api/proxy-subscriptions/update-all | 更新全部订阅 | 管理员 |
 | **代理端口** |
-| GET | /api/proxy-ports | 获取代理端口列表 | 必需 |
-| POST | /api/proxy-ports | 创建代理端口 | 必需 |
-| PUT | /api/proxy-ports/:id | 更新代理端口 | 必需 |
-| DELETE | /api/proxy-ports/:id | 删除代理端口 | 必需 |
-| **ACL管理** |
-| GET | /api/acl/blacklist | 获取黑名单 | 必需 |
-| POST | /api/acl/blacklist | 添加到黑名单 | 必需 |
-| DELETE | /api/acl/blacklist/:name | 从黑名单移除 | 必需 |
-| GET | /api/acl/whitelist | 获取白名单 | 必需 |
-| POST | /api/acl/whitelist | 添加到白名单 | 必需 |
-| DELETE | /api/acl/whitelist/:name | 从白名单移除 | 必需 |
-| GET | /api/acl/settings/:server_id | 获取ACL设置 | 必需 |
-| PUT | /api/acl/settings/:server_id | 更新ACL设置 | 必需 |
-| **API密钥** |
-| GET | /api/api-keys | 获取API密钥列表 | 管理员 |
-| POST | /api/api-keys | 创建API密钥 | 管理员 |
-| DELETE | /api/api-keys/:key | 撤销API密钥 | 管理员 |
-| **监控与日志** |
-| GET | /api/metrics | Prometheus指标 | 无（本地）|
-| GET | /api/status | 服务状态 | 无 |
-| GET | /api/public/status | 公开状态（无认证）| 无 |
-| GET | /api/logs | 获取日志 | 管理员 |
-| GET | /api/debug/sessions | 调试会话 | 管理员 |
-| GET | /api/debug/goroutines | Goroutine列表 | 管理员 |
-| **Dashboard** |
-| GET | /mcpe-admin/ | Dashboard入口 | 可选 |
-| GET | /mcpe-admin/* | Dashboard资源 | 可选 |
+| GET | /api/proxy-ports | 代理端口列表 | 认证 |
+| GET | /api/proxy-ports/:id/runtime | 端口运行态 | 认证 |
+| POST | /api/proxy-ports/:id/test | 测试端口 | 认证 |
+| POST | /api/proxy-ports | 创建代理端口 | 管理员 |
+| POST | /api/proxy-ports/bulk | 批量创建代理端口 | 管理员 |
+| POST | /api/proxy-ports/identities | 创建安全身份 | 管理员 |
+| POST | /api/proxy-ports/profile/validate | 校验安全配置 | 管理员 |
+| POST | /api/proxy-ports/:id/export | 导出安全端口配置 | 管理员 |
+| PUT | /api/proxy-ports/:id | 更新代理端口 | 管理员 |
+| DELETE | /api/proxy-ports/:id | 删除代理端口 | 管理员 |
+| **网络路由** |
+| GET | /api/network | 网络路由配置 | 认证 |
+| GET | /api/network/interfaces | 网卡列表（`?refresh=1` 强制刷新） | 认证 |
+| POST | /api/network/test | 路由测试 | 认证 |
+| PUT | /api/network | 更新网络路由配置 | 管理员 |
+| **ACL** |
+| GET | /api/acl/blacklist | 黑名单 | 认证 |
+| POST | /api/acl/blacklist | 添加到黑名单 | 管理员 |
+| PUT | /api/acl/blacklist/:name/enabled | 启用/停用黑名单条目 | 管理员 |
+| DELETE | /api/acl/blacklist/:name | 从黑名单移除 | 管理员 |
+| GET | /api/acl/whitelist | 白名单 | 认证 |
+| POST | /api/acl/whitelist | 添加到白名单 | 管理员 |
+| PUT | /api/acl/whitelist/:name/enabled | 启用/停用白名单条目 | 管理员 |
+| DELETE | /api/acl/whitelist/:name | 从白名单移除 | 管理员 |
+| GET | /api/acl/settings | ACL 设置 | 认证 |
+| PUT | /api/acl/settings | 更新 ACL 设置 | 管理员 |
+| **日志** |
+| GET | /api/logs | 日志文件列表 | 认证 |
+| GET | /api/logs/:filename | 日志内容 | 认证 |
+| DELETE | /api/logs | 清空全部日志 | 管理员 |
+| DELETE | /api/logs/:filename | 删除单个日志文件 | 管理员 |
+| **API Key** |
+| POST | /api/keys | 创建 API Key | 管理员 |
+| DELETE | /api/keys/:key | 删除 API Key | 管理员 |
+| **配置与监控** |
+| GET | /api/config | 全局配置 | 认证 |
+| PUT | /api/config | 更新全局配置 | 管理员 |
+| PUT | /api/config/entry-path | 修改 Dashboard 入口路径 | 管理员 |
+| PUT | /api/config/max-session-records | 修改会话记录上限 | 管理员 |
+| GET | /api/stats/system | 系统资源统计 | 认证 |
+| GET | /api/metrics | Prometheus 指标 | 认证 |
+| GET | /api/ping/:address | 探测远程地址 | 认证 |
+| POST | /api/ping | 探测远程地址（body） | 认证 |
+| **调试** |
+| GET | /api/debug/goroutines | Goroutine 列表 | 管理员 |
+| GET | /api/debug/goroutines/stats | Goroutine 统计 | 管理员 |
+| GET | /api/debug/goroutines/pprof | Goroutine pprof | 管理员 |
+| GET | /api/debug/session-persister | 会话持久化统计 | 管理员 |
+| ANY | /api/debug/pprof/* | pprof 入口 | 管理员 |
+| POST | /api/debug/goroutines/cancel/:id | 取消指定协程 | 管理员 |
+| POST | /api/debug/goroutines/cancel-all | 取消全部协程 | 管理员 |
+| POST | /api/debug/goroutines/cancel-component/:component | 按组件取消协程 | 管理员 |
+| POST | /api/debug/gc | 强制 GC | 管理员 |
+| **Dashboard（不在 /api 下）** |
+| GET | /{api_entry_path}/ | Dashboard 入口，路径由 `api_entry_path` 配置，默认 `/mcpe-admin` | - |
 
 ### 9.2 API架构图
 

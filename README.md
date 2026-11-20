@@ -1088,6 +1088,11 @@ API 使用请求头 `X-API-Key`。
 - `GET /api/metrics`：Prometheus 指标
 - `GET /api/debug/*`：goroutine/pprof/GC（管理）
 - `GET /api/public/status`、`/api/web/index*`：公开状态页（无鉴权）
+- `GET /api/logs`、`GET /api/logs/:filename`：日志列表与内容；`DELETE /api/logs[/:filename]`：清理日志（管理）
+- `POST /api/keys`、`DELETE /api/keys/:key`：API Key 增删（管理）
+- `GET /api/ping/:address`、`POST /api/ping`：远程地址探测
+- `GET /api/stats/system`：系统资源统计
+- `GET /api/servers/disconnect-reports`、`GET /api/servers/:id/last-disconnect`：断线报告（管理）
 
 ## 监控与日志
 
