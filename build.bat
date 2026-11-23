@@ -101,6 +101,23 @@ set "FAIL_COUNT=0"
 :: Linux
 call :build_target linux amd64
 
+:: UPX 压壳：--lzma 压缩率最高；找不到 upx 就保留未压缩产物，不让构建失败。
+set "UPX_EXE="
+for /f "delims=" %%I in ('where upx 2^>nul') do if not defined UPX_EXE set "UPX_EXE=%%I"
+if not defined UPX_EXE if exist "%USERPROFILE%\bin\upx.exe" set "UPX_EXE=%USERPROFILE%\bin\upx.exe"
+if defined UPX_EXE (
+    echo.
+    echo [UPX] Compressing with --lzma...
+    for %%F in ("%BUILD_DIR%\%PROJECT_NAME%_*") do (
+        echo       %%~nxF
+        "%UPX_EXE%" --lzma -f "%%F" >nul
+        if errorlevel 1 echo       [WARN] UPX failed on %%~nxF, kept uncompressed
+    )
+) else (
+    echo.
+    echo [UPX] upx not found ^(PATH or %%USERPROFILE%%\bin\upx.exe^), skipped
+)
+
 echo ========================================
 echo   Build Complete
 echo   Success: %SUCCESS_COUNT%  Failed: %FAIL_COUNT%
