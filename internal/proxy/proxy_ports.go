@@ -46,6 +46,11 @@ type ProxyPortManager struct {
 	dialerPool     *proxyPortDialerPool
 	stats          *proxyPortStatsRegistry
 	identities     *SecureIdentityStore
+
+	recoveryMu     sync.Mutex
+	recoveryCancel context.CancelFunc
+	recoveryDone   chan struct{}
+	recoveryOn     bool
 }
 
 func NewProxyPortManager(configMgr *config.ProxyPortConfigManager, outboundMgr OutboundManager) *ProxyPortManager {
@@ -112,8 +117,94 @@ func (m *ProxyPortManager) Start(enabled bool) error {
 	return firstErr
 }
 
+// StartRecovery launches a background retry loop that re-attempts Start for
+// enabled proxy ports whose initial bind failed (e.g. the previous process was
+// still holding the socket at boot). It is a no-op if already running, and stops
+// on ctx cancel or StopRecovery. Recovery is inert while the feature is off.
+func (m *ProxyPortManager) StartRecovery(ctx context.Context, enabled func() bool) {
+	if m == nil || ctx == nil || enabled == nil {
+		return
+	}
+	m.recoveryMu.Lock()
+	if m.recoveryOn {
+		m.recoveryMu.Unlock()
+		return
+	}
+	recCtx, cancel := context.WithCancel(ctx)
+	m.recoveryCancel = cancel
+	m.recoveryDone = make(chan struct{})
+	m.recoveryOn = true
+	done := m.recoveryDone
+	m.recoveryMu.Unlock()
+
+	go func() {
+		defer close(done)
+		defer logger.CapturePanic("proxy-port-recovery")
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-recCtx.Done():
+				return
+			case <-ticker.C:
+				if !enabled() {
+					continue
+				}
+				m.recoverMissingListeners()
+			}
+		}
+	}()
+}
+
+// StopRecovery stops the retry loop if running. Safe to call multiple times.
+func (m *ProxyPortManager) StopRecovery() {
+	if m == nil {
+		return
+	}
+	m.recoveryMu.Lock()
+	cancel := m.recoveryCancel
+	done := m.recoveryDone
+	m.recoveryCancel = nil
+	m.recoveryDone = nil
+	m.recoveryOn = false
+	m.recoveryMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+// recoverMissingListeners retries binding only for enabled ports that are not
+// currently listening. Start() already skips IDs present in m.listeners, so a
+// port that came up (via reload or an earlier retry) is never double-bound.
+func (m *ProxyPortManager) recoverMissingListeners() {
+	if m == nil || m.configMgr == nil {
+		return
+	}
+	m.mu.Lock()
+	pending := 0
+	for _, cfg := range m.configMgr.GetAllPorts() {
+		if cfg == nil || !cfg.Enabled {
+			continue
+		}
+		if _, ok := m.listeners[cfg.ID]; !ok {
+			pending++
+		}
+	}
+	m.mu.Unlock()
+	if pending == 0 {
+		return
+	}
+	if err := m.Start(true); err != nil {
+		logger.Warn("ProxyPort: recovery retry incomplete: %v", err)
+	}
+}
+
 // Stop stops all proxy port listeners and waits for active connections to finish.
 func (m *ProxyPortManager) Stop() {
+	m.StopRecovery()
 	m.stopListeners(true, true)
 }
 

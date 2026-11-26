@@ -761,6 +761,12 @@ func (p *ProxyServer) Start() error {
 		if err := p.proxyPortManager.Start(p.config != nil && p.config.ProxyPortsEnabled); err != nil {
 			logger.Error("Failed to start proxy ports: %v", err)
 		}
+		// Unlike game listeners, proxy ports had no self-healing: a failed bind at
+		// boot (e.g. previous process still holding the socket) stayed down until a
+		// manual save. Retry like the game listeners do.
+		p.proxyPortManager.StartRecovery(p.ctx, func() bool {
+			return p.config != nil && p.config.ProxyPortsEnabled
+		})
 	}
 
 	logger.Info("Proxy server started with %d listeners", p.listenerCount())
