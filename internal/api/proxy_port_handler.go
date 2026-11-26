@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/netroute"
 	"mcpeserverproxy/internal/proxy"
 )
 
@@ -175,6 +177,10 @@ func (a *APIServer) createProxyPort(c *gin.Context) {
 		respondError(c, 400, err.Error(), "")
 		return
 	}
+	if err := prepareHTTPSProxyPort(&cfg, nil); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error(), "")
+		return
+	}
 	if err := a.proxyPortConfigMgr.AddPort(&cfg); err != nil {
 		respondError(c, http.StatusBadRequest, "Failed to create proxy port", err.Error())
 		return
@@ -215,6 +221,10 @@ func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
 		clone.ApplyDefaults()
 		if err := a.prepareSecurePort(clone); err != nil {
 			respondError(c, 400, err.Error(), "")
+			return
+		}
+		if err := prepareHTTPSProxyPort(clone, nil); err != nil {
+			respondError(c, http.StatusBadRequest, err.Error(), "")
 			return
 		}
 		prepared = append(prepared, clone)
@@ -272,6 +282,10 @@ func (a *APIServer) updateProxyPort(c *gin.Context) {
 		respondError(c, 400, err.Error(), "")
 		return
 	}
+	if err := prepareHTTPSProxyPort(&cfg, old); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error(), "")
+		return
+	}
 	if err := a.validateSecurePortChange(&cfg); err != nil {
 		respondError(c, 409, err.Error(), "")
 		return
@@ -319,6 +333,24 @@ func (a *APIServer) deleteProxyPort(c *gin.Context) {
 		}
 	}
 	respondSuccessWithMsg(c, "已删除", nil)
+}
+
+func prepareHTTPSProxyPort(cfg, old *config.ProxyPortConfig) error {
+	if cfg.Type != config.ProxyPortTypeHTTPS {
+		return nil
+	}
+	if cfg.TLS == nil && old != nil && old.Type == config.ProxyPortTypeHTTPS {
+		cfg.TLS = old.Clone().TLS
+	}
+	// Disabling a port remains possible even when its TLS files have gone away.
+	if !cfg.Enabled {
+		return nil
+	}
+	if _, err := cfg.TLS.ServerTLS(); err != nil {
+		return err
+	}
+	_, err := cfg.TLS.ClientTLS()
+	return err
 }
 
 func generateProxyPortID() string {
@@ -393,6 +425,19 @@ func (a *APIServer) testProxyPort(c *gin.Context) {
 	respondSuccess(c, result)
 }
 
+func proxyPortAllowsLoopback(allowList []string, loopback netip.Addr) bool {
+	for _, value := range allowList {
+		value = strings.TrimSpace(value)
+		if ip, err := netip.ParseAddr(value); err == nil && ip.Unmap() == loopback {
+			return true
+		}
+		if prefix, err := netip.ParsePrefix(value); err == nil && prefix.Contains(loopback) {
+			return true
+		}
+	}
+	return false
+}
+
 // runProxyPortConnectivityTest fills `out` in place. Split out for unit testing
 // against a hand-rolled local HTTP/SOCKS5 listener without requiring the full
 // APIServer wiring.
@@ -406,8 +451,15 @@ func runProxyPortConnectivityTest(ctx context.Context, port *config.ProxyPortCon
 		return
 	}
 	switch host {
-	case "", "0.0.0.0", "::":
+	case "", "0.0.0.0":
 		host = "127.0.0.1"
+	case "::":
+		// The IPv6 wildcard also accepts IPv4 on dual-stack listeners.
+		// Preserve the usual IPv4 loopback for the default IPv4 allow-list.
+		host = "127.0.0.1"
+		if proxyPortAllowsLoopback(port.AllowList, netip.IPv6Loopback()) && !proxyPortAllowsLoopback(port.AllowList, netip.AddrFrom4([4]byte{127, 0, 0, 1})) {
+			host = "::1"
+		}
 	}
 	dialTarget := net.JoinHostPort(host, portStr)
 
@@ -418,6 +470,8 @@ func runProxyPortConnectivityTest(ctx context.Context, port *config.ProxyPortCon
 	switch strings.ToLower(port.Type) {
 	case config.ProxyPortTypeHTTP:
 		scheme = "http"
+	case config.ProxyPortTypeHTTPS:
+		scheme = "https"
 	case config.ProxyPortTypeSocks5, config.ProxyPortTypeMixed:
 		scheme = "socks5"
 	case config.ProxyPortTypeSocks4, config.ProxyPortTypeSock:
@@ -445,6 +499,28 @@ func runProxyPortConnectivityTest(ctx context.Context, port *config.ProxyPortCon
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if scheme == "https" {
+		proxyTLS, err := port.TLS.ClientTLS()
+		if err != nil {
+			out.Error = err.Error()
+			return
+		}
+		// Verify TLS to the proxy independently. TLSClientConfig still
+		// controls the test target's TLS session inside the CONNECT tunnel.
+		dialer := tls.Dialer{
+			NetDialer: netroute.Dialer(transport.TLSHandshakeTimeout, dialTarget),
+			Config:    proxyTLS,
+		}
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, transport.TLSHandshakeTimeout)
+			defer cancel()
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("HTTPS proxy TLS: %w", err)
+			}
+			return conn, nil
+		}
 	}
 	defer transport.CloseIdleConnections()
 

@@ -466,7 +466,7 @@ flowchart TD
 | `method` | string | ⚪ | 加密方法（Shadowsocks 需要） |
 | `security` | string | ⚪ | 安全级别（VMess 需要） |
 | `tls` | bool | ⚪ | 是否启用 TLS |
-| `sni` | string | ⚪ | TLS SNI |
+| `sni` | string | ⚪ | TLS SNI。证书必须匹配 SNI（或服务器地址）；SNI 与服务器不同**不会**自动跳过验证，需要跳过时只能显式勾选 `insecure` |
 | `insecure` | bool | ⚪ | 是否跳过证书验证 |
 | `chain` | array | ⚪ | 链式代理跳板列表（如 `["node-A", "node-B"]`，流量依次经过） |
 | `provider_options` | object | ⚪ | 订阅导入保留的原始 Clash/Mihomo 字段（不手写） |
@@ -489,7 +489,7 @@ flowchart TD
 
 ### 代理端口配置 (proxy_ports.json)
 
-配置本地 HTTP/SOCKS 代理端口，用于将其他应用的流量通过上游节点转发。
+配置本地 HTTP/HTTPS/SOCKS 代理端口，用于将其他应用的流量通过上游节点转发。
 
 #### 完整配置示例
 
@@ -536,7 +536,8 @@ flowchart TD
 | `id` | string | ✅ | 代理端口唯一标识符 |
 | `name` | string | ✅ | 代理端口显示名称 |
 | `listen_addr` | string | ✅ | 监听地址（如 `0.0.0.0:1080`） |
-| `type` | string | ✅ | 代理类型（http/socks5/socks4/mixed） |
+| `type` | string | ✅ | 代理类型（http/https/socks5/socks4/mixed） |
+| `tls` | object | HTTPS | `cert_file`、`key_file`、`server_name`，以及测试私有 CA 时可选的 `ca_file` |
 | `enabled` | bool | ✅ | 是否启用此代理端口 |
 | `proxy_outbound` | string | ⚪ | 上游节点名称、组名或节点列表 |
 | `load_balance` | string | ⚪ | 负载均衡策略 |
@@ -968,7 +969,7 @@ flowchart TD
 
 | 字段 | 说明 |
 |------|------|
-| `url` | 订阅地址（http/https，Clash/Mihomo/URI 分享格式均可） |
+| `url` | 订阅地址（http/https，Clash/Mihomo/URI 分享格式均可）。https 地址必须通过证书验证，证书不受信任时拉取失败，不会跳过校验 |
 | `group` | 导入节点统一归入的组名 |
 | `proxy_name` | 拉取订阅时使用的本地上游节点名（空=直连） |
 | `auto_update_mode` | `daily`（每天 `auto_update_time`）或 `interval`（每 `auto_update_interval_days` 天） |
@@ -1033,6 +1034,21 @@ flowchart TD
   "mode": 0
 }
 ```
+
+### HTTPS 正向代理（TCP）
+
+在「代理端口」新增独立的 **HTTPS 代理**，保持现有 HTTP/SOCKS 端口不变。例如监听 `0.0.0.0:10821`，设置账号密码和需要的客户端 IP 白名单。填入服务器上的 PEM 证书链（certbot 等工具生成的 `fullchain.pem`，不要用只含叶子证书的 `cert.pem`）和私钥路径，以及证书覆盖的完整域名（例如 `proxy.example.com`）。文件路径以服务的工作目录为基准，建议使用绝对路径；私钥只放在服务器上；运行服务的系统用户（例如 Linux 上的 `www`）必须有权读取这两个文件。
+
+代理监听端口**不必是 443**；客户端连接 `https://proxy.example.com:10821`，防火墙放行对应 TCP 端口即可。不方便开放 80/443 时，可通过 DNS-01 为该域名签发证书。公共证书不必填 CA 文件；如果使用私有 CA，客户端须显式信任该 CA，面板的连通性测试可通过入口的 `tls.ca_file` 指定信任。证书续期时直接覆盖同一路径的文件即可：新连接在下一次握手时自动使用新证书，无需重启，正在使用的连接不受影响。新证书若与证书名不符或已过期，会保留上一份可用证书并记录警告。
+
+```bash
+curl --proxy https://proxy.example.com:10821 \
+  --proxy-user alice https://example.com/
+```
+
+使用私有 CA 的 curl 客户端再加 `--proxy-cacert proxy-ca.pem`。这验证的是**代理**的证书；目标网站的 TLS 仍由客户端验证。
+
+在「代理节点」选择 **HTTPS 代理**连接上游，填上游地址、端口和账号密码。程序保存为 `type: "http", tls: true`；例如连接一个 IP、验证证书为域名时，填入对应 **SNI**（不会自动跳过证书验证）。私有 CA 可通过节点的 `tls_ca_file` 配置，仅影响这个出站。入站和出站均使用 HTTP/1.1，支持 HTTP 转发、TCP CONNECT，不支持 UDP。
 
 ### SOCKS5 UDP ASSOCIATE 支持
 

@@ -149,8 +149,8 @@
       </n-modal>
     </n-space>
 
-    <n-modal :show="!!securePort" preset="card" title="安全入口配置与导出" style="width:min(780px,98vw)" @update:show="v => { if (!v) securePort = null }">
-      <PortEditForm v-if="securePort" saved-secure :port="securePort" :is-mobile="isMobile" :proxy-type-options="proxyTypeOptions" :load-balance-options="loadBalanceOptions" :load-balance-sort-options="loadBalanceSortOptions" :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions" :needs-load-balance="needsLoadBalance" :get-proxy-outbound-display="getProxyOutboundDisplay" @open-proxy-selector="openFormProxySelector(securePort)" @clear-proxy="clearProxySelection(securePort)" @pick-user-outbound="u => openFormProxySelector(u)" />
+    <n-modal :show="!!securePort" preset="card" :title="securePort && securePort.type === 'https' ? 'HTTPS 入口配置' : '安全入口配置与导出'" style="width:min(780px,98vw)" @update:show="v => { if (!v) securePort = null }">
+      <PortEditForm v-if="securePort" :saved-secure="proxyPortSecureTypes.includes(securePort.type)" :port="securePort" :is-mobile="isMobile" :proxy-type-options="proxyTypeOptions" :load-balance-options="loadBalanceOptions" :load-balance-sort-options="loadBalanceSortOptions" :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions" :needs-load-balance="needsLoadBalance" :get-proxy-outbound-display="getProxyOutboundDisplay" @open-proxy-selector="openFormProxySelector(securePort)" @clear-proxy="clearProxySelection(securePort)" @pick-user-outbound="u => openFormProxySelector(u)" />
       <template #footer><n-space justify="end"><n-button size="small" @click="securePort = null">关闭</n-button><n-button size="small" type="primary" :loading="securePort?._saving" @click="saveSecurePort">保存</n-button></n-space></template>
     </n-modal>
 
@@ -371,8 +371,8 @@
             </n-gi>
             <n-gi>
               <n-form-item label="代理类型">
-                <n-select size="small" v-model:value="bulkForm.type" :options="proxyTypeOptions.filter(p => !['hysteria2','mieru'].includes(p.value))" />
-                <n-text depth="3">HY2 / Mieru 请逐条新增，单独管理密码、身份和资源限制。</n-text>
+                <n-select size="small" v-model:value="bulkForm.type" :options="proxyTypeOptions.filter(p => proxyPortQuickTypeValues.includes(p.value))" />
+                <n-text depth="3">HTTPS 需逐条填写证书路径，HY2 / Mieru 需单独管理身份与资源限制，均不支持批量新增。</n-text>
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -471,7 +471,8 @@ import PortEditForm from './components/PortEditForm.vue'
 import PortUsersEditor from './components/PortUsersEditor.vue'
 import ListenAddrInput from '../components/ListenAddrInput.vue'
 import { useNetworkInterfaces } from '../composables/useNetworkInterfaces'
-import { loadBalanceOptions, loadBalanceSortOptions, autoPingFullScanModeOptions, proxyProtocolOptions } from '../composables/selectOptions.js'
+import { loadBalanceOptions, loadBalanceSortOptions, autoPingFullScanModeOptions, proxyProtocolOptions,
+  proxyPortTypeOptions, proxyPortSecureTypes, proxyPortQuickTypeValues } from '../composables/selectOptions.js'
 import { filterNodes } from '../composables/nodeFilters.js'
 
 const message = useMessage()
@@ -657,14 +658,7 @@ const portTablePagination = ref({
   prefix: ({ itemCount }) => `共 ${itemCount} 个端口`
 })
 
-const filterTypeOptions = [
-  { label: 'SOCKS5', value: 'socks5' },
-  { label: 'SOCKS4', value: 'socks4' },
-  { label: 'HTTP', value: 'http' },
-  { label: '混合', value: 'mixed' },
-  { label: 'HY2 · UDP 主力', value: 'hysteria2' },
-  { label: 'Mieru · TCP 兼容', value: 'mieru' }
-]
+const filterTypeOptions = proxyPortTypeOptions
 const filterEnabledOptions = [
   { label: '已启用', value: true },
   { label: '已停用', value: false }
@@ -676,14 +670,7 @@ const filterProxyModeOptions = [
   { label: '分组负载', value: 'group' }
 ]
 
-const proxyTypeOptions = [
-  { label: 'HTTP', value: 'http' },
-  { label: 'SOCKS5', value: 'socks5' },
-  { label: 'SOCKS4', value: 'socks4' },
-  { label: '混合', value: 'mixed' },
-  { label: 'HY2 · UDP 主力', value: 'hysteria2' },
-  { label: 'Mieru · TCP 兼容', value: 'mieru' }
-]
+const proxyTypeOptions = proxyPortTypeOptions
 
 
 
@@ -816,6 +803,7 @@ const normalizePort = (port) => {
     ignore_route_rules: !!port.ignore_route_rules,
     users: (port.users || []).map(normalizePortUser),
     secure: port.secure ? JSON.parse(JSON.stringify(port.secure)) : undefined,
+    tls: port.tls ? JSON.parse(JSON.stringify(port.tls)) : undefined,
     running: !!port.running,
     ...portRuntimeFieldDefaults
   }
@@ -1322,7 +1310,15 @@ const portTableColumns = computed(() => [
     key: 'type',
     width: 116,
     render: row => isEditingPort(row)
-      ? h(NSelect, { value: row.type, size: 'small', options: proxyTypeOptions, consistentMenuWidth: false, onUpdateValue: v => { row.type = v } })
+      ? h(NSelect, {
+          value: row.type, size: 'small', consistentMenuWidth: false,
+          // 行内快捷编辑没有证书输入：HTTPS 入口保留原类型，只能从完整表单改；
+          // 其他类型也不能快捷切到 HTTPS，避免创建出无证书的不可用入口。
+          options: row.type === 'https'
+            ? [{ label: 'HTTPS · TLS 代理（完整表单修改）', value: 'https', disabled: true }]
+            : proxyTypeOptions.filter(p => !proxyPortSecureTypes.includes(p.value) && p.value !== 'https'),
+          onUpdateValue: v => { if (v !== 'https') row.type = v }
+        })
       : h(NTag, { size: 'small', type: 'info', bordered: false }, () => row.type === 'hysteria2' ? 'HY2 / UDP' : row.type === 'mieru' ? 'Mieru / TCP' : (row.type || '').toUpperCase() || '-')
   },
   {
@@ -1399,7 +1395,8 @@ const portTableColumns = computed(() => [
           h(NButton, {
             size: 'tiny',
             type: 'primary',
-            onClick: () => ['hysteria2', 'mieru'].includes(row.type) ? (securePort.value = JSON.parse(JSON.stringify(row))) : startEditPort(row)
+            // HTTPS 与 HY2/Mieru 一样有独立配置块，走完整表单弹窗，避免行内快捷编辑丢证书。
+            onClick: () => [...proxyPortSecureTypes, 'https'].includes(row.type) ? (securePort.value = JSON.parse(JSON.stringify(row))) : startEditPort(row)
           }, () => '编辑'),
           h(NButton, {
             size: 'tiny',
@@ -1483,17 +1480,20 @@ const buildPortPayload = (port) => {
     allow_list: (port.allow_list || []).map(v => (v || '').trim()).filter(Boolean),
     ignore_route_rules: !!port.ignore_route_rules,
     users: buildUsersPayload(port.users),
-    secure: ['hysteria2', 'mieru'].includes(port.type) ? (port.secure || { limits: {} }) : undefined
+    secure: ['hysteria2', 'mieru'].includes(port.type) ? (port.secure || { limits: {} }) : undefined,
+    // TLS 只属于 HTTPS 入口；其他类型不回传，避免后端拒绝 tls 与类型不匹配。
+    // 批量启停/改代理保持 type=https 时，证书配置随 payload 原样保留。
+    tls: port.type === 'https' ? (port.tls || {}) : undefined
   }
 }
 
 // ----- 批量操作 -----
-const batchTypeOptions = [
-  { label: '改为 SOCKS5', key: 'socks5' },
-  { label: '改为 SOCKS4', key: 'socks4' },
-  { label: '改为 HTTP', key: 'http' },
-  { label: '改为 混合', key: 'mixed' }
-]
+// 批量改类型只提供无证书配置的快捷类型。HTTPS 需要完整证书表单，
+// 且从 HTTPS 切走会丢失 TLS 配置，因此不在批量菜单里出现。
+const batchTypeOptions = proxyPortQuickTypeValues.map(type => ({
+  label: `改为 ${type.toUpperCase()}`,
+  key: type
+}))
 
 const selectedPorts = computed(() => {
   const idSet = new Set(selectedPortIds.value)
@@ -1594,7 +1594,9 @@ const batchSetEnabled = async (enabled) => {
 }
 
 const batchSetType = async (key) => {
-  if (selectedPorts.value.some(p => ['hysteria2','mieru'].includes(p.type))) {message.warning('安全入口的协议不可批量变更，请逐条管理或新建入口');return}
+  if (selectedPorts.value.some(p => proxyPortSecureTypes.includes(p.type))) {message.warning('安全入口的协议不可批量变更，请逐条管理或新建入口');return}
+  // HTTPS 的证书路径无法在快捷切换中迁移，切走会丢失 TLS 配置；逐条用完整表单编辑。
+  if (selectedPorts.value.some(p => p.type === 'https')) {message.warning('HTTPS 入口请逐条通过完整表单修改类型，避免丢失证书配置');return}
   const targets = selectedPorts.value
   if (targets.length === 0) return
   batchActionRunning.value = true

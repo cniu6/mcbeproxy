@@ -60,6 +60,24 @@ export const proxyProtocolOptions = [
   { label: '代理链条', value: 'chain' }
 ]
 
+// 代理端口入口类型（唯一来源）。HTTPS 需要证书四项，只在完整表单里提供，
+// 快捷/批量切换与批量新增使用 proxyPortQuickTypeValues，避免丢 TLS 或降级。
+export const proxyPortTypeOptions = [
+  { label: 'HTTP', value: 'http' },
+  { label: 'HTTPS · TLS 代理', value: 'https' },
+  { label: 'SOCKS5', value: 'socks5' },
+  { label: 'SOCKS4', value: 'socks4' },
+  { label: '混合', value: 'mixed' },
+  { label: 'HY2 · UDP 主力', value: 'hysteria2' },
+  { label: 'Mieru · TCP 兼容', value: 'mieru' }
+]
+
+// 安全入口（独立身份/证书自动生成/快捷导入链接），与 HTTPS 入口互不混用
+export const proxyPortSecureTypes = ['hysteria2', 'mieru']
+
+// 没有证书输入控件的快捷路径：行内类型切换、批量改类型、批量新增
+export const proxyPortQuickTypeValues = ['http', 'socks5', 'socks4', 'mixed']
+
 // 黑/白名单的到期时长
 export const expiryOptions = [
   { label: '永久', value: 'permanent' },

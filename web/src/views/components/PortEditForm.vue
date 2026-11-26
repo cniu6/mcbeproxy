@@ -34,6 +34,7 @@
       <n-gi>
         <n-form-item label="代理类型">
           <n-select size="small" v-model:value="port.type" :options="proxyTypeOptions" :disabled="savedSecure" />
+          <n-text v-if="isHttps" depth="3" style="font-size: 12px">HTTPS 入口仅在本完整表单创建/修改，TLS 证书与密钥路径需一并填写。</n-text>
         </n-form-item>
       </n-gi>
       <n-gi>
@@ -53,6 +54,35 @@
         </n-form-item>
       </n-gi>
     </n-grid>
+
+    <n-space v-if="isHttps" vertical style="margin-bottom:12px">
+      <n-alert size="small" type="info" :show-icon="false">
+        HTTPS 入口用 TLS 保护客户端到代理这段，支持 HTTP/1.1 与 CONNECT；不解密目标站 TLS、不支持 UDP。证书/私钥只填写服务器上的文件路径，私钥正文不会进入页面或配置 API。证书文件更新后新连接自动使用新证书，无需重启；证书名不符或已过期的新文件会被拒绝，并保留上一份可用证书。
+      </n-alert>
+      <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
+        <n-gi>
+          <n-form-item label="证书链文件" required>
+            <n-input size="small" v-model:value="tlsConfig.cert_file" placeholder="/path/to/fullchain.pem" clearable />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="私钥文件" required>
+            <n-input size="small" v-model:value="tlsConfig.key_file" placeholder="/path/to/privkey.pem" clearable />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="证书名称" required>
+            <n-input size="small" v-model:value="tlsConfig.server_name" placeholder="proxy.example.com（本机探测与证书校验用）" clearable />
+          </n-form-item>
+        </n-gi>
+        <n-gi>
+          <n-form-item label="CA 文件">
+            <n-input size="small" v-model:value="tlsConfig.ca_file" placeholder="可选，自定义 CA 证书路径" clearable />
+          </n-form-item>
+        </n-gi>
+      </n-grid>
+      <n-text depth="3" style="font-size: 12px">证书名称用于本机连接测试时校验代理证书；客户端实际连接仍按自己信任的根证书验证该名称，监听 IP 与证书名不同属正常情况。</n-text>
+    </n-space>
 
     <n-space v-if="isSecure" vertical style="margin-bottom:12px">
       <n-text depth="3">{{ port.type === 'hysteria2' ? 'HY2 · TCP+UDP，认证与证书自动配置。' : 'Mieru TCP · TCP+UDP，无需证书。' }}</n-text>
@@ -254,7 +284,21 @@ const props = defineProps({
   runtimeRefreshing: { type: Boolean, default: false }
 })
 
+// 安全入口（HY2/Mieru，自动生成身份与导出链接）与 HTTPS 入口是两套独立能力，
+// 不能共用 isSecure：HTTPS 仍用 Basic 认证与端口测试，不显示快捷导入链接。
 const isSecure = computed(() => ['hysteria2', 'mieru'].includes(props.port.type))
+const isHttps = computed(() => props.port.type === 'https')
+
+// tlsConfig 直接落在 port.tls 上，父组件 buildPortPayload 原样回传；切换类型时
+// 不在这里清空证书路径，避免误删后端已保存的配置。
+const tlsConfig = computed({
+  get() {
+    if (!props.port.tls) props.port.tls = { cert_file: '', key_file: '', server_name: '', ca_file: '' }
+    return props.port.tls
+  },
+  set(value) { props.port.tls = value }
+})
+
 watch(() => props.port.type, () => {
   if (!isSecure.value) return
   if (!props.port.secure) props.port.secure = { limits: {} }

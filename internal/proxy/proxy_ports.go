@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -90,9 +92,11 @@ func (m *ProxyPortManager) Start(enabled bool) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startListenersLocked(m.configMgr.GetAllPorts(), nil)
+}
 
+func (m *ProxyPortManager) startListenersLocked(ports []*config.ProxyPortConfig, prepared map[string]*tls.Config) error {
 	var firstErr error
-	ports := m.configMgr.GetAllPorts()
 	for _, cfg := range ports {
 		if cfg == nil || !cfg.Enabled {
 			continue
@@ -103,7 +107,7 @@ func (m *ProxyPortManager) Start(enabled bool) error {
 		listener := newProxyPortListener(cfg, m.outboundMgr, m.dialerPool)
 		listener.stats = m.stats
 		listener.identities = m.identities
-		if err := listener.Start(); err != nil {
+		if err := listener.start(prepared[cfg.ID]); err != nil {
 			logger.Error("ProxyPort: failed to start %s (%s): %v", cfg.ID, cfg.ListenAddr, err)
 			if firstErr == nil {
 				firstErr = err
@@ -217,29 +221,42 @@ func (m *ProxyPortManager) Reload(enabled bool) error {
 		return nil
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	ports := m.configMgr.GetAllPorts()
 	desired := make(map[string]*config.ProxyPortConfig, len(ports))
 	for _, cfg := range ports {
-		if cfg == nil || !cfg.Enabled {
-			continue
+		if cfg != nil && cfg.Enabled {
+			desired[cfg.ID] = cfg
 		}
-		desired[cfg.ID] = cfg.Clone()
 	}
 
-	m.mu.Lock()
 	// 先检查所有需替换的安全入口，避免遍历顺序导致其他监听先被关闭。
 	for id, listener := range m.listeners {
 		if next, ok := desired[id]; ok && listener.secure != nil && !proxyPortRuntimeConfigEqual(listener.cfg, next) && listener.ActiveConnections() > 0 {
-			m.mu.Unlock()
 			return ErrSecureProxyBusy
 		}
 	}
+	var prepared map[string]*tls.Config
+	var reloadErr error
 	for id, listener := range m.listeners {
 		cfg, ok := desired[id]
 		if !ok || !proxyPortRuntimeConfigEqual(listener.cfg, cfg) {
+			if ok && cfg.Type == config.ProxyPortTypeHTTPS {
+				// A bad replacement certificate must not take down a live port.
+				tlsConfig, err := cfg.TLS.ServerTLS()
+				if err != nil {
+					reloadErr = errors.Join(reloadErr, fmt.Errorf("proxy port %s: %w", id, err))
+					continue
+				}
+				if prepared == nil {
+					prepared = make(map[string]*tls.Config)
+				}
+				prepared[id] = tlsConfig
+			}
 			if listener.secure != nil && ok {
 				if err := listener.secure.freezeIfIdle(); err != nil {
-					m.mu.Unlock()
 					return err
 				}
 			}
@@ -253,9 +270,7 @@ func (m *ProxyPortManager) Reload(enabled bool) error {
 			logger.Warn("ProxyPort: keeping previous users for %s: %v", id, err)
 		}
 	}
-	m.mu.Unlock()
-
-	return m.Start(enabled)
+	return errors.Join(reloadErr, m.startListenersLocked(ports, prepared))
 }
 
 func proxyPortRuntimeConfigEqual(a, b *config.ProxyPortConfig) bool {
@@ -278,6 +293,7 @@ func proxyPortRuntimeConfigEqual(a, b *config.ProxyPortConfig) bool {
 		ac.ProxyOutbound == bc.ProxyOutbound &&
 		ac.LoadBalance == bc.LoadBalance &&
 		ac.LoadBalanceSort == bc.LoadBalanceSort &&
+		reflect.DeepEqual(ac.TLS, bc.TLS) &&
 		reflect.DeepEqual(ac.AllowList, bc.AllowList)
 }
 
@@ -373,7 +389,7 @@ func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
 	if cfg.SecureUpstream != nil {
 		trustKey = cfg.SecureUpstream.ServerName + "|" + cfg.SecureUpstream.TrustedCertPEM + "|" + cfg.SecureUpstream.CertSHA256
 	}
-	return trustKey + fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%d|%d|%d|%d|%s|%t|%s|%t|%s|%t|%s|%s|%s|%s|%s|%s|%s|%s",
+	return trustKey + fmt.Sprintf("%s|%s|%s|%d|%s|%s|%s|%s|%s|%d|%s|%s|%s|%d|%d|%s|%s|%d|%d|%d|%d|%s|%t|%s|%t|%s|%s|%t|%s|%s|%s|%s|%s|%s|%s|%s",
 		cfg.Name,
 		cfg.Type,
 		cfg.Server,
@@ -400,6 +416,7 @@ func proxyOutboundDialerCacheKey(cfg *config.ProxyOutbound) string {
 		cfg.SNI,
 		cfg.Insecure,
 		cfg.Fingerprint,
+		cfg.TLSCAFile,
 		cfg.Reality,
 		cfg.RealityPublicKey,
 		cfg.RealityShortID,
@@ -451,6 +468,10 @@ func (l *proxyPortListener) ActiveConnections() int {
 }
 
 func (l *proxyPortListener) Start() error {
+	return l.start(nil)
+}
+
+func (l *proxyPortListener) start(tlsConfig *tls.Config) error {
 	if err := l.cfg.Validate(); err != nil {
 		return err
 	}
@@ -472,9 +493,18 @@ func (l *proxyPortListener) Start() error {
 		}
 		return nil
 	}
+	if l.cfg.Type == config.ProxyPortTypeHTTPS && tlsConfig == nil {
+		tlsConfig, err = l.cfg.TLS.ServerTLS()
+		if err != nil {
+			return err
+		}
+	}
 	ln, err := net.Listen("tcp", l.cfg.ListenAddr)
 	if err != nil {
 		return err
+	}
+	if tlsConfig != nil {
+		ln = tls.NewListener(ln, tlsConfig)
 	}
 	l.listener = ln
 	l.ctx, l.cancel = context.WithCancel(context.Background())
@@ -619,7 +649,7 @@ func (l *proxyPortListener) handleConn(conn net.Conn) {
 
 	reader := bufio.NewReader(conn)
 	switch l.cfg.Type {
-	case config.ProxyPortTypeHTTP:
+	case config.ProxyPortTypeHTTP, config.ProxyPortTypeHTTPS:
 		l.handleHTTP(conn, reader)
 	case config.ProxyPortTypeSocks5:
 		l.handleSocks5(conn, reader)
