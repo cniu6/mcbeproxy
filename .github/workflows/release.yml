@@ -39,7 +39,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24.9'
+          go-version-file: go.mod   # 与 go.mod 的 go/toolchain 指令保持一致，不再硬编码版本
 
       - name: Build release binaries
         run: |
