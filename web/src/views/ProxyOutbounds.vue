@@ -359,7 +359,7 @@
       <n-form size="small" :model="form" label-placement="left" label-width="100">
         <n-grid :cols="2" :x-gap="16">
           <n-gi><n-form-item label="节点名称" required><n-input size="small" v-model:value="form.name" placeholder="自定义节点名称（不可重复）" /></n-form-item></n-gi>
-          <n-gi><n-form-item label="协议类型" required><n-select size="small" v-model:value="form.type" :options="protocolOptions" @update:value="onProtocolChange" /></n-form-item></n-gi>
+          <n-gi><n-form-item label="协议类型" required><n-select size="small" :value="protocolChoice" :options="protocolOptions" @update:value="onProtocolChoiceChange" /></n-form-item></n-gi>
 
           <!-- 代理链条：内嵌链路编辑器 -->
           <template v-if="form.type === 'chain'">
@@ -480,7 +480,7 @@
                 <template #feedback>经此节点的 UDP 收发缓冲（字节）。0=跟随服务器设置（默认自动 1MB，推荐），-1=系统默认，正数=指定字节数，如 2097152=2MB。</template>
               </n-form-item>
             </n-gi>
-            <n-gi v-if="form.type !== 'mieru'"><n-form-item label="TLS"><n-switch size="small" v-model:value="form.tls" :disabled="form.type === 'anytls'" /></n-form-item></n-gi>
+            <n-gi v-if="form.type !== 'mieru'"><n-form-item label="TLS"><n-switch size="small" v-model:value="form.tls" :disabled="form.type === 'anytls' || protocolChoice === 'https'" /></n-form-item></n-gi>
 
           <!-- Shadowsocks 字段 -->
           <template v-if="form.type === 'shadowsocks'">
@@ -562,6 +562,7 @@
           <template v-if="form.tls || form.reality">
             <n-gi><n-form-item label="SNI"><n-input size="small" v-model:value="form.sni" placeholder="服务器名称指示" /></n-form-item></n-gi>
             <n-gi><n-form-item label="跳过验证"><n-switch size="small" v-model:value="form.insecure" /></n-form-item></n-gi>
+            <n-gi :span="2"><n-form-item label="CA 证书文件"><n-input size="small" v-model:value="form.tls_ca_file" placeholder="可选，本机文件路径；私有 CA 用它验证，无需安装到系统根证书" clearable /><template #feedback>留空则使用系统根证书；填写后按该文件信任服务端证书，仍按 SNI/服务器地址校验名称。</template></n-form-item></n-gi>
             <n-gi :span="2"><n-form-item label="TLS 指纹"><n-select size="small" v-model:value="form.fingerprint" :options="fingerprintOptions" clearable /></n-form-item></n-gi>
           </template>
 
@@ -1757,6 +1758,8 @@ const protocolOptions = [
   { label: 'VLESS', value: 'vless' },
   { label: 'SOCKS5', value: 'socks5' },
   { label: 'HTTP Proxy', value: 'http' },
+  // 仅 UI 选项：保存时归一为 type=http + tls=true，后端/订阅里的规范类型仍是 http。
+  { label: 'HTTPS 代理', value: 'https' },
   { label: 'AnyTLS', value: 'anytls' },
   { label: 'Hysteria2', value: 'hysteria2' },
   { label: 'Mieru TCP · TCP+UDP', value: 'mieru' },
@@ -1814,7 +1817,7 @@ const networkOptions = [
 const defaultForm = {
   name: '', type: 'shadowsocks', server: '', port: 443, enabled: true, group: '',
   username: '', method: 'aes-256-gcm', password: '', uuid: '', alter_id: 0, security: 'auto',
-  flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '',
+  flow: '', obfs: '', obfs_password: '', port_hopping: '', tls: false, sni: '', insecure: false, fingerprint: '', alpn: '', tls_ca_file: '',
   up_mbps: 0, down_mbps: 0,
   idle_session_check_interval: 0, idle_session_timeout: 0, min_idle_session: 0,
   udp_socket_buffer_size: 0,
@@ -2888,10 +2891,29 @@ const openEditModal = (o) => {
   showEditModal.value = true
 }
 
+// HTTPS 代理在 UI 里是可选项，但持久化的规范类型仍是 http + tls:true。
+// 编辑已有的 http+tls 节点时自动回到 HTTPS 选项，避免用户重复设置。
+const protocolChoice = computed(() => {
+  if (form.value.type === 'http' && form.value.tls) return 'https'
+  return form.value.type
+})
+const onProtocolChoiceChange = (value) => {
+  if (value === 'https') {
+    form.value.type = 'http'
+    form.value.tls = true
+  } else {
+    form.value.type = value
+    if (value === 'http') form.value.tls = false
+  }
+  onProtocolChange()
+}
+
 const onProtocolChange = () => {
   form.value.method = form.value.type === 'shadowsocks' ? 'aes-256-gcm' : ''
   form.value.security = form.value.type === 'vmess' ? 'auto' : ''
-  form.value.tls = ['trojan', 'vless', 'anytls', 'tuic'].includes(form.value.type)
+  // http+tls 即 HTTPS 出站，切换协议时保留已有 TLS 设置，不因选到 http 而丢失。
+  form.value.tls = ['trojan', 'vless', 'anytls', 'tuic'].includes(form.value.type) ||
+    (form.value.type === 'http' && !!form.value.tls)
   if (!['vmess', 'trojan', 'vless'].includes(form.value.type)) {
     form.value.network = ''
     form.value.ws_path = ''
@@ -2938,6 +2960,16 @@ const saveOutbound = async () => {
   }
   const url = editingName.value ? '/api/proxy-outbounds/update' : '/api/proxy-outbounds'
   const payload = { ...form.value }
+  // HTTPS 代理是 UI 预设：统一保存为规范类型 http + tls:true。
+  if (payload.type === 'https') {
+    payload.type = 'http'
+    payload.tls = true
+  }
+  if (payload.type !== 'http' || !payload.tls) delete payload.tls_ca_file
+  if (payload.tls_ca_file?.trim() && payload.insecure) {
+    message.warning('指定 CA 文件时不能跳过证书验证')
+    return
+  }
   if (editingName.value) payload.original_name = editingName.value
   if (payload.type === 'mieru') {
     payload.tls = false
@@ -3832,9 +3864,8 @@ const parseVmess = (link) => {
       tls: useTls,
       sni: json.sni || '',
       fingerprint: json.fp || '',
-      // 如果使用 TLS 且 SNI 与服务器不同，默认跳过验证
-      insecure: json.allowInsecure === true || json.allowInsecure === '1' || json.allowInsecure === 1 ||
-                (useTls && json.sni && json.sni !== (json.add || json.address)),
+      // 跳过验证只来自链接中明确的 allowInsecure；SNI 与服务器不同时仍校验证书
+      insecure: json.allowInsecure === true || json.allowInsecure === '1' || json.allowInsecure === 1,
       enabled: true
     }
     const transport = String(json.net || '').toLowerCase()
@@ -3940,10 +3971,9 @@ const parseTrojan = (link) => {
       tls: useTls,
       sni: useTls ? (sni || url.hostname) : '',
       fingerprint: url.searchParams.get('fp') || '',
-      // 如果 SNI 与服务器不同，默认跳过验证
+      // 跳过验证只来自链接中明确的 allowInsecure/insecure；SNI 与服务器不同时仍校验证书
       insecure: parseBoolQueryValue(url.searchParams.get('allowInsecure')) ||
-                parseBoolQueryValue(url.searchParams.get('insecure')) ||
-                (useTls && sni && sni !== url.hostname),
+                parseBoolQueryValue(url.searchParams.get('insecure')),
       enabled: true
     }
     const transport = (url.searchParams.get('type') || 'tcp').toLowerCase()

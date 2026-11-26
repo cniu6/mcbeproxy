@@ -195,7 +195,7 @@ func (d *SingboxDialer) dialHTTPTCP(ctx context.Context, serverAddr, dest M.Sock
 		return nil, fmt.Errorf("http proxy: failed to connect to proxy: %w", err)
 	}
 	if d.config.TLS {
-		tlsConn, terr := dialTLSWithFingerprint(ctx, conn, d.config)
+		tlsConn, terr := dialHTTPProxyTLS(ctx, conn, d.config)
 		if terr != nil {
 			conn.Close()
 			return nil, fmt.Errorf("http proxy: TLS handshake failed: %w", terr)

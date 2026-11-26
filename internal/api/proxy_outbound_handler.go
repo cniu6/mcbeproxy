@@ -203,6 +203,7 @@ type ProxyOutboundDTO struct {
 	SNI             string `json:"sni,omitempty"`
 	Insecure        bool   `json:"insecure,omitempty"`
 	Fingerprint     string `json:"fingerprint,omitempty"`
+	TLSCAFile       string `json:"tls_ca_file,omitempty"`
 
 	// Hysteria2 specific fields
 	PortHopping              string `json:"port_hopping,omitempty"`
@@ -260,6 +261,7 @@ func (h *ProxyOutboundHandler) toDTO(cfg *config.ProxyOutbound) ProxyOutboundDTO
 		SNI:             cfg.SNI,
 		Insecure:        cfg.Insecure,
 		Fingerprint:     cfg.Fingerprint,
+		TLSCAFile:       cfg.TLSCAFile,
 		// Hysteria2 specific
 		PortHopping:              cfg.PortHopping,
 		HopInterval:              cfg.HopInterval,
@@ -338,6 +340,7 @@ type CreateProxyOutboundRequest struct {
 	SNI            string                 `json:"sni,omitempty"`
 	Insecure       bool                   `json:"insecure,omitempty"`
 	Fingerprint    string                 `json:"fingerprint,omitempty"`
+	TLSCAFile      string                 `json:"tls_ca_file,omitempty"`
 
 	// Hysteria2 specific fields
 	PortHopping              string `json:"port_hopping,omitempty"`
@@ -397,6 +400,7 @@ func (r *CreateProxyOutboundRequest) toProxyOutbound() *config.ProxyOutbound {
 		SNI:            r.SNI,
 		Insecure:       r.Insecure,
 		Fingerprint:    r.Fingerprint,
+		TLSCAFile:      r.TLSCAFile,
 		// Hysteria2 specific
 		PortHopping:              r.PortHopping,
 		HopInterval:              r.HopInterval,
@@ -4434,22 +4438,19 @@ func (h *ProxyOutboundHandler) FetchSubscription(c *gin.Context) {
 			return
 		}
 		dialerToClose = dialer
+		// Verify the subscription host like any HTTPS endpoint; see subscription.Service.
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				DialContext: dialer.DialContext,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+				DialContext:     dialer.DialContext,
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		}
 	} else {
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		}
 	}

@@ -62,6 +62,12 @@ func supportsMihomo(cfg *config.ProxyOutbound) bool {
 	if cfg.SecureUpstream != nil {
 		return false
 	}
+	// A private CA is honoured by the native HTTP CONNECT path only; mihomo
+	// cannot carry the per-connection trust roots. Force native even if the
+	// node explicitly asked for the mihomo core.
+	if cfg.TLSCAFile != "" {
+		return false
+	}
 	switch outboundCorePreference(cfg) {
 	case "mihomo", "clash":
 		return mihomoSupportsProtocol(cfg.Type)

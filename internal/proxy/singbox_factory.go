@@ -1459,13 +1459,10 @@ func dialTLSWithFingerprint(ctx context.Context, conn net.Conn, cfg *config.Prox
 	}
 	alpn := effectiveTLSALPN(cfg)
 
-	// Auto-detect SNI mismatch: if SNI is set and differs from server hostname,
-	// the server certificate likely won't match the SNI, so skip verification.
+	// Verification follows the explicit Insecure flag only. An SNI that differs
+	// from the server address is checked against the SNI, never silently skipped
+	// (that silent skip let an untrusted certificate through for Trojan/VLESS).
 	insecure := cfg.Insecure
-	if !insecure && sni != "" && !strings.EqualFold(sni, cfg.Server) {
-		logger.Debug("TLS: SNI %q differs from server %q, auto-enabling insecure skip verify", sni, cfg.Server)
-		insecure = true
-	}
 
 	// If fingerprint is specified, use uTLS for better compatibility
 	if cfg.Fingerprint != "" {

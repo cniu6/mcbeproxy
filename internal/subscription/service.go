@@ -99,22 +99,20 @@ func (s *Service) FetchContent(ctx context.Context, sub *config.ProxySubscriptio
 			return nil, fmt.Errorf("failed to create proxy dialer: %w", err)
 		}
 		dialerToClose = dialer
+		// Subscription hosts are verified like any other HTTPS endpoint. The
+		// previous unconditional skip let a spoofed server feed us node lists.
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				DialContext: dialer.DialContext,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+				DialContext:     dialer.DialContext,
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		}
 	} else {
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		}
 	}
