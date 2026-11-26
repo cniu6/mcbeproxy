@@ -53,7 +53,7 @@ try {
     # 单引号 here-string：内部不做 PowerShell 展开；需要的值由 shell 变量在开头给出
     $setup = @'
 set -e
-W='${WORK}'
+W="$WORK"
 rm -rf "$W" && mkdir -p "$W" && cd "$W"
 cp "$BIN" ./mcpeserverproxy_linux_amd64 && chmod +x ./mcpeserverproxy_linux_amd64
 echo "HASH=$(sha256sum mcpeserverproxy_linux_amd64 | cut -d' ' -f1)"

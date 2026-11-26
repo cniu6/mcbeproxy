@@ -24,12 +24,35 @@ git diff --quiet --ignore-submodules=dirty --no-ext-diff --exit-code -- 2>nul
 if errorlevel 1 set "RELEASE_VERSION=%RELEASE_VERSION%-dirty"
 git diff --cached --quiet --ignore-submodules=dirty --no-ext-diff --exit-code -- 2>nul
 if errorlevel 1 set "RELEASE_VERSION=%RELEASE_VERSION%-dirty"
+:: 发布构建必须来自干净工作树：脏树会让版本号与二进制内容不一致（见 release-8c0a80d 事件）。
+:: 本地调试可设 ALLOW_DIRTY_BUILD=1 跳过，但产物版本号会带 -dirty，不应发布。
+if defined RELEASE_VERSION (
+    echo %RELEASE_VERSION% | findstr /c:"-dirty" >nul
+    if not errorlevel 1 (
+        if not "%ALLOW_DIRTY_BUILD%"=="1" (
+            echo [ERROR] 工作树有未提交的改动，拒绝打包发布版本。
+            echo         提交或撤销改动后重试；仅本地调试可设 ALLOW_DIRTY_BUILD=1。
+            set "DIRTY_REFUSED=1"
+            goto :dirty_refused
+        )
+        echo [WARN] ALLOW_DIRTY_BUILD=1：产物版本号带 -dirty，请勿用于发布。
+    )
+)
 set "BUILD_TIME="
 for /f "usebackq delims=" %%I in (`powershell -NoLogo -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'"`) do set "BUILD_TIME=%%I"
 if not defined BUILD_TIME set "BUILD_TIME=unknown"
 set "GIT_COMMIT="
 for /f "delims=" %%I in ('git rev-parse --short HEAD 2^>nul') do set "GIT_COMMIT=%%I"
 if not defined GIT_COMMIT set "GIT_COMMIT=unknown"
+:: 干净树正常路径：跳过中止块，只有上面的拒绝分支才会落到 :dirty_refused
+goto :after_dirty_guard
+
+:dirty_refused
+echo.
+echo [ABORT] 未构建任何产物。
+exit /b 1
+
+:after_dirty_guard
 
 :: 检查 Go 是否安装
 where go >nul 2>&1
