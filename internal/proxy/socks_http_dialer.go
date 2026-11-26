@@ -518,6 +518,7 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 		proxyServer:              serverAddr,
 		destAddr:                 resolvedDest.UDPAddr(),
 		stopCh:                   make(chan struct{}),
+		hop:                      s.hop,
 		disableReactiveReconnect: s.disableSOCKS5ReactiveReconnect,
 		reconnectFn: func() (net.Conn, net.PacketConn, net.Addr, error) {
 			reconnectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -528,9 +529,10 @@ func (s *SingboxOutbound) dialSOCKS5UDP(ctx context.Context, serverAddr, dest M.
 	}
 	s5pc.diagnostic.initialize()
 	s5pc.state.Store(&connState{
-		udpConn:   udpConn,
-		ctrlConn:  ctrl,
-		relayAddr: relayAddr,
+		udpConn:    udpConn,
+		ctrlConn:   ctrl,
+		relayAddr:  relayAddr,
+		generation: 1,
 	})
 
 	go func() {
@@ -662,9 +664,10 @@ func (c *socks5UDPPacketConn) doReactiveReconnect(st *connState, backoff *time.D
 		newCtrl, newUdp, newRelay, err := c.reconnectFn()
 		if err == nil {
 			newState := &connState{
-				udpConn:   newUdp,
-				ctrlConn:  newCtrl,
-				relayAddr: newRelay,
+				udpConn:    newUdp,
+				ctrlConn:   newCtrl,
+				relayAddr:  newRelay,
+				generation: st.generation + 1,
 			}
 			c.applyConfiguredBuffers(newState)
 			c.state.Store(newState)
@@ -840,15 +843,17 @@ var _ net.PacketConn = (*connectedPacketConn)(nil)
 // All datagrams are sent to a single baked destination, matching the contract of
 // the other UDP outbound PacketConns in this package.
 type connState struct {
-	udpConn   net.PacketConn
-	ctrlConn  net.Conn
-	relayAddr net.Addr
+	udpConn    net.PacketConn
+	ctrlConn   net.Conn
+	relayAddr  net.Addr
+	generation uint64 // 同一个 SOCKS5 包连接内的 UDP ASSOCIATE 代数
 }
 
 type socks5UDPPacketConn struct {
 	diagnostic               connectionDiagnosticState
+	hop                      routeHopIdentity                     // 冻结的跳身份；重连不会改写
 	controlDiagnostic        atomic.Pointer[ConnectionDiagnostic] // 故障当时的端点，重连后不可拿新端点冒充
-	state                    atomic.Pointer[connState] // swapped atomically during reconnect
+	state                    atomic.Pointer[connState]            // swapped atomically during reconnect
 	destination              M.Socksaddr
 	proxyServer              M.Socksaddr // 仅用于 UDP 超时诊断，重连仍归原关联所有
 	closeOnce                sync.Once

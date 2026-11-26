@@ -82,6 +82,8 @@ type SingboxOutbound struct {
 	// For chain UDP caching, SOCKS5 control-close must mark the cached
 	// association dead instead of reconnecting it in place.
 	disableSOCKS5ReactiveReconnect bool
+	// 单跳直出时由 manager 在建立连接前冻结身份；链式各跳由 CreateChainUDPOutbound 冻结。
+	hop routeHopIdentity
 	// Hysteria2 uses per-destination UDP connections
 	// Each destination gets its own HyUDPConn to avoid demultiplexing issues
 }
@@ -393,6 +395,7 @@ func parsePortRange(portRange string) (start, end int, err error) {
 // It creates UDP connections that hop between ports at specified intervals.
 type hy2PortHoppingConnFactory struct {
 	transport   atomic.Pointer[chainTransportPacket] // 当前QUIC底层队列；UDP建流时捕获到会话，不在诊断时查最新连接
+	hop         routeHopIdentity                     // 创建该QUIC载体的出站跳，捕获后不再变化
 	dialer      N.Dialer                             // 非直连时，QUIC必须使用前跳提供的UDP关联。
 	serverIP    net.IP
 	portStart   int
@@ -451,6 +454,7 @@ func (f *hy2PortHoppingConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 		if err == nil {
 			transport := newChainTransportPacket(conn)
 			transport.destination = addr.String()
+			transport.hop = f.hop
 			f.transport.Store(transport)
 			conn = transport
 		}
@@ -2045,7 +2049,9 @@ func (s *SingboxOutbound) dialHysteria2UDP(ctx context.Context, _, dest M.Socksa
 			}
 			return nil, fmt.Errorf("hysteria2 UDP failed: %w", r.err)
 		}
-		return &hysteria2PacketConn{conn: r.conn, destination: dest, destStr: dest.String(), outbound: s, transport: r.transport}, nil
+		packetConn := &hysteria2PacketConn{conn: r.conn, destination: dest, destStr: dest.String(), outbound: s, transport: r.transport, hop: s.hop}
+		packetConn.diagnostic.initialize()
+		return packetConn, nil
 	}
 }
 
@@ -3130,7 +3136,9 @@ func (d *SingboxDialer) dialAnyTLSTCP(ctx context.Context, _, dest M.Socksaddr) 
 // hysteria2PacketConn wraps a Hysteria2 UDP connection.
 type hysteria2PacketConn struct {
 	transport    *chainTransportPacket // 对应创建该UDP会话时的共享QUIC传输
+	hop          routeHopIdentity      // 冻结的跳身份；不为未捕获载体伪造ID
 	conn         hy2.HyUDPConn
+	diagnostic   connectionDiagnosticState // 仅错误时记录本UDP会话证据；不记包内容与认证材料
 	destination  M.Socksaddr
 	destStr      string // destination.String(), computed once instead of per packet
 	lastSrc      string // source address cache for ReadFrom (one peer per session)
@@ -3259,6 +3267,7 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			// 下次进来 Reset 前 channel 一定是空的，否则会读到陈旧的到期事件。
 			stopHY2ReadTimer(timer)
 			if r.err != nil {
+				c.diagnostic.record("hy2_session_read", r.err)
 				errStr := r.err.Error()
 				// EOF means the UDP session was closed
 				if errStr == "EOF" || strings.Contains(errStr, "EOF") {
@@ -3273,6 +3282,7 @@ func (c *hysteria2PacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			return n, c.sourceAddr(r.addr), nil
 
 		case <-timer.C:
+			c.diagnostic.record("hy2_session_read_timeout", os.ErrDeadlineExceeded)
 			logger.Debug("Hysteria2: read timeout for %s", c.destination.String())
 			return 0, nil, &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
 		}
@@ -3310,6 +3320,7 @@ func (c *hysteria2PacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
 	}
 	err = c.conn.Send(p, destStr)
 	if err != nil {
+		c.diagnostic.record("hy2_session_write", err)
 		logger.Debug("Hysteria2: send error to %s: %v", destStr, err)
 		return 0, err
 	}

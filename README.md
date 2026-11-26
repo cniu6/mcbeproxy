@@ -1101,6 +1101,14 @@ API 使用请求头 `X-API-Key`。
 - 调试：`/api/debug/*`（需要管理员权限）
   - goroutine 列表/统计、pprof、手动 GC 等
 
+### RawUDP 断线诊断
+
+管理员「断线记录」每个监听器显示最近一次快照；要对比多次断线，在轮转日志中查 `RawUDP disconnect_diagnostic` 和 `UDP stall_capture`。用游戏连接 `id` 拼接同一次断线的前后采样；用 `transport` 中的 `id` 和 `created_at` 查多个游戏连接是否经过同一个观测对象，SOCKS5 原地重连再看 `association_generation`。
+
+- `end_reason` / `end_trigger` 是代理结束会话的条件与来源，`flow_observation` 是结束时看到的流量方向，不是远端根因。双向已停包时，即使结束条件是客户端静默，也不等于客户端先故障。读超时后又收到上游包时，`traffic_after_last_io` 会标出来。
+- `route_hops` 按代理到目标的实际出站顺序列出；`observed=false` 表示没有该跳的运行时诊断。`shared_transport` 的报文可能是其他会话或保活；共享载体还有包，不证明这名玩家的游戏会话还通。
+- 不记录包正文。诊断文件日志沿用现有异步队列和轮转策略；高负载覆盖会记录 `overwritten`。`details_truncated` / `transport_truncated` 表示详情已限长。
+
 ## 开发与构建
 
 ### 一键构建（Windows）

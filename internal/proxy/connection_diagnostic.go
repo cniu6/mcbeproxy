@@ -71,6 +71,8 @@ func (d *connectionDiagnosticState) snapshot() (string, time.Time, ConnectionIOE
 
 type connectionDiagnosticProvider interface{ ConnectionDiagnostics() []ConnectionDiagnostic }
 
+type routeDiagnosticProvider interface{ routeDiagnosticHops() []routeHopIdentity }
+
 func packetConnectionDiagnostics(conn net.PacketConn) []ConnectionDiagnostic {
 	if provider, ok := conn.(connectionDiagnosticProvider); ok {
 		return provider.ConnectionDiagnostics()
@@ -78,12 +80,41 @@ func packetConnectionDiagnostics(conn net.PacketConn) []ConnectionDiagnostic {
 	return nil
 }
 
+// packetRouteDiagnosticHops 返回连接实际绑定的出站跳拓扑（单跳或链）。
+// records 必须与拓扑取自同一时刻的快照（断线报告使用 report.Transport），
+// 不在这里二次读取连接，避免SOCKS5重连造成同一报告内不一致。
+// 每次返回新切片，调用方可修改而不影响后续快照；Observed 只看传入的
+// 该连接自己的传输诊断，不查最新的全局连接。
+func packetRouteDiagnosticHops(conn net.PacketConn, records []ConnectionDiagnostic) []RouteDiagnosticHop {
+	var topology []routeHopIdentity
+	if provider, ok := conn.(routeDiagnosticProvider); ok {
+		topology = provider.routeDiagnosticHops()
+	}
+	if len(topology) == 0 {
+		return nil
+	}
+	hops := make([]RouteDiagnosticHop, 0, len(topology))
+	for _, hop := range topology {
+		entry := hop.routeHop()
+		for _, d := range records {
+			if d.HopIndex == hop.index && d.HopName == hop.name && d.HopProtocol == hop.protocol {
+				entry.Observed = true
+				break
+			}
+		}
+		hops = append(hops, entry)
+	}
+	return hops
+}
+
 func (c *socks5UDPPacketConn) recordControlDiagnostic(state *connState, err error) {
 	c.diagnostic.initialize()
 	c.diagnostic.record("control_read", err)
 	id, created, _, control := c.diagnostic.snapshot()
 	fault := &ConnectionDiagnostic{ID: id, CreatedAt: created, LastError: control}
+	c.hop.apply(fault)
 	if state != nil {
+		fault.ControlErrorGeneration = state.generation
 		if state.ctrlConn != nil {
 			fault.ControlLocal = rawUDPAddrString(state.ctrlConn.LocalAddr())
 			fault.ControlRemote = rawUDPAddrString(state.ctrlConn.RemoteAddr())
@@ -96,15 +127,24 @@ func (c *socks5UDPPacketConn) recordControlDiagnostic(state *connState, err erro
 	c.controlDiagnostic.Store(fault)
 }
 
+func (c *socks5UDPPacketConn) routeDiagnosticHops() []routeHopIdentity {
+	if c.hop.index == 0 {
+		return nil
+	}
+	return []routeHopIdentity{c.hop}
+}
+
 func (c *socks5UDPPacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
 	c.diagnostic.initialize()
 	id, created, last, control := c.diagnostic.snapshot()
 	record := ConnectionDiagnostic{ID: id, Layer: "socks5_udp", CreatedAt: created, Proxy: c.proxyServer.String(), Destination: c.destination.String(), LastError: last, RemoteClosed: c.remoteClosed.Load(), Reconnecting: c.reconnecting.Load(), LocallyClosed: c.closed.Load(), CauseScope: "local_observation_only"}
+	c.hop.apply(&record)
 	if control.Operation != "" {
 		record.ControlError = &control
 	}
 	var nested []ConnectionDiagnostic
 	if state := c.state.Load(); state != nil {
+		record.AssociationGeneration = state.generation
 		if state.ctrlConn != nil {
 			record.ControlLocal = rawUDPAddrString(state.ctrlConn.LocalAddr())
 			record.ControlRemote = rawUDPAddrString(state.ctrlConn.RemoteAddr())
@@ -119,31 +159,69 @@ func (c *socks5UDPPacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
 	if fault := c.controlDiagnostic.Load(); fault != nil {
 		record.ControlLocal, record.ControlRemote = fault.ControlLocal, fault.ControlRemote
 		record.UDPLocal, record.Relay = fault.UDPLocal, fault.Relay
+		record.ControlErrorGeneration = fault.ControlErrorGeneration
+		control = fault.LastError
+		record.ControlError = &control
 	}
 	// 对控制EOF优先展示原始原因，另行保留最近UDP错误。
 	if control.Operation != "" {
 		record.LastError = control
-		if last.Operation != "control_read" {
+		if last.Operation != "control_read" && last.At.After(control.At) {
 			record.LatestIOError = &last
 		}
 	}
 	records := append([]ConnectionDiagnostic{record}, nested...)
-	if len(records) > 8 {
-		records = records[:8]
+	// 多留一条让上层能分辨"超过上限"，不会截断成恰好等于上限的假完整快照。
+	if len(records) > rawUDPDiagnosticLimit+1 {
+		records = records[:rawUDPDiagnosticLimit+1]
 	}
 	return records
 }
 
 // HY2会话和链/计数包装层只透传原始队列的诊断；不从当前outbound取新连接。
+// 每个UDP会话单独记录自己的错误，共享载体错误仍留在transport记录中。
 func (c *hysteria2PacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
-	if c.transport == nil {
+	var records []ConnectionDiagnostic
+	if c.transport != nil {
+		records = c.transport.ConnectionDiagnostics()
+	}
+	id, created, last, _ := c.diagnostic.snapshot()
+	if id != "" {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		session := ConnectionDiagnostic{ID: id, Layer: "hy2_udp_session", CreatedAt: created, Destination: c.destStr, LastError: last, LocallyClosed: closed, CauseScope: "local_observation_only"}
+		c.hop.apply(&session)
+		records = append([]ConnectionDiagnostic{session}, records...)
+	}
+	// 多留一条让上层能分辨"超过上限"，不会截断成恰好等于上限的假完整快照。
+	if len(records) > rawUDPDiagnosticLimit+1 {
+		records = records[:rawUDPDiagnosticLimit+1]
+	}
+	return records
+}
+
+func (c *hysteria2PacketConn) routeDiagnosticHops() []routeHopIdentity {
+	if c.hop.index == 0 {
 		return nil
 	}
-	return c.transport.ConnectionDiagnostics()
+	return []routeHopIdentity{c.hop}
 }
 
 func (c *trackedPacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
 	return packetConnectionDiagnostics(c.PacketConn)
+}
+
+func (c *trackedPacketConn) routeDiagnosticHops() []routeHopIdentity {
+	if provider, ok := c.PacketConn.(routeDiagnosticProvider); ok {
+		if hops := provider.routeDiagnosticHops(); len(hops) > 0 {
+			return hops
+		}
+	}
+	if c.hop.index > 0 {
+		return []routeHopIdentity{c.hop}
+	}
+	return nil
 }
 
 func (w *chainConnWrapper) ConnectionDiagnostics() []ConnectionDiagnostic {
@@ -151,4 +229,14 @@ func (w *chainConnWrapper) ConnectionDiagnostics() []ConnectionDiagnostic {
 		return nil
 	}
 	return packetConnectionDiagnostics(w.cached.pc)
+}
+
+// chainConnWrapper 的跳序来自创建它的 outbound；旧会话不随全局重载改身份。
+func (w *chainConnWrapper) routeDiagnosticHops() []routeHopIdentity {
+	if w.parent == nil {
+		return nil
+	}
+	hops := make([]routeHopIdentity, len(w.parent.hopsIdentity))
+	copy(hops, w.parent.hopsIdentity)
+	return hops
 }

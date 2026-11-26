@@ -30,7 +30,8 @@ type chainTransportPacket struct {
 	head        int
 	buffer      PacketBufferDiagnostic // 与队列一起由mu保护，快照不保存报文内容
 	diagnostic  connectionDiagnosticState
-	destination string // 构造时设置，只表示下一跳网络端点
+	hop         routeHopIdentity // 创建该队列的出站跳；共享载体计数不冒充玩家丢包
+	destination string           // 构造时设置，只表示下一跳网络端点
 	once        sync.Once
 	writeMu     sync.Mutex
 	readTimer   *time.Timer // 只由读端使用，复用避免每次读新建计时器
@@ -90,6 +91,7 @@ func newChainTransportPacket(pc net.PacketConn) *chainTransportPacket {
 			}
 			c.buffer.ReceivedPackets++
 			c.buffer.ReceivedBytes += int64(n)
+			c.buffer.LastReceivedAt = time.Now()
 			if c.buffer.QueuePackets == chainTransportPacketLimit || c.buffer.QueueBytes+n > chainTransportByteLimit {
 				c.noteDropLocked(n, "queue_limit")
 				c.mu.Unlock()
@@ -127,7 +129,13 @@ func (c *chainTransportPacket) ConnectionDiagnostics() []ConnectionDiagnostic {
 	c.mu.Unlock()
 	id, created, last, _ := c.diagnostic.snapshot()
 	record := ConnectionDiagnostic{ID: id, Layer: "chain_udp_buffer", CreatedAt: created, Destination: c.destination, UDPLocal: rawUDPAddrString(c.LocalAddr()), LastError: last, LocallyClosed: closed, CauseScope: "shared_transport", PacketBuffer: &buffer}
-	return append([]ConnectionDiagnostic{record}, packetConnectionDiagnostics(c.PacketConn)...)
+	c.hop.apply(&record)
+	records := append([]ConnectionDiagnostic{record}, packetConnectionDiagnostics(c.PacketConn)...)
+	// 前跳的关联承载的是共享隧道，不是某个玩家独占的 UDP 会话。
+	for i := 1; i < len(records); i++ {
+		records[i].CauseScope = "shared_transport"
+	}
+	return records
 }
 
 func (c *chainTransportPacket) ReadFrom(b []byte) (int, net.Addr, error) {

@@ -16,8 +16,8 @@ import (
 	"golang.org/x/sync/singleflight"
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
-	"mcpeserverproxy/internal/singboxcore"
 	"mcpeserverproxy/internal/netroute"
+	"mcpeserverproxy/internal/singboxcore"
 )
 
 // Error definitions for OutboundManager operations.
@@ -1796,9 +1796,14 @@ success:
 		active.cfg.SetLastCheck(time.Now())
 	}
 
+	var hop routeHopIdentity
+	if active.cfg != nil && !active.cfg.IsChainProxy() {
+		hop = routeHopIdentity{index: 1, name: active.cfg.Name, protocol: string(active.cfg.Type)}
+	}
 	return &trackedPacketConn{
 		PacketConn: conn,
 		cfg:        active.cfg,
+		hop:        hop,
 		onClose: func() {
 			m.releaseSingboxOutbound(active)
 		},
@@ -1836,6 +1841,13 @@ func (m *outboundManagerImpl) getOrCreateSingboxOutbound(cfg *config.ProxyOutbou
 			singboxOutbound, createErr := m.singboxFactory.CreateUDPOutbound(context.Background(), cfgCopy)
 			if createErr != nil {
 				return nil, createErr
+			}
+			// 单跳出站：连接时冻结该节点的名称/协议，不从最新全局配置回查。
+			if out, ok := singboxOutbound.(*SingboxOutbound); ok {
+				out.hop = routeHopIdentity{index: 1, name: cfgCopy.Name, protocol: string(cfgCopy.Type)}
+				if out.hy2ConnFactory != nil {
+					out.hy2ConnFactory.hop = out.hop
+				}
 			}
 
 			m.mu.Lock()
@@ -1888,6 +1900,12 @@ func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*activeSingb
 			if createErr != nil {
 				return nil, createErr
 			}
+			if out, ok := singboxOutbound.(*SingboxOutbound); ok {
+				out.hop = routeHopIdentity{index: 1, name: cfgCopy.Name, protocol: string(cfgCopy.Type)}
+				if out.hy2ConnFactory != nil {
+					out.hy2ConnFactory.hop = out.hop
+				}
+			}
 
 			m.mu.Lock()
 			currentCfg, exists := m.outbounds[name]
@@ -1923,6 +1941,7 @@ func (m *outboundManagerImpl) recreateSingboxOutbound(name string) (*activeSingb
 // trackedPacketConn wraps a PacketConn to track when it's closed.
 type trackedPacketConn struct {
 	net.PacketConn
+	hop       routeHopIdentity // 不暴露运行时诊断的单跳仍保留路由身份
 	onClose   func()
 	closeOnce sync.Once
 	closeErr  error

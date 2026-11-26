@@ -61,6 +61,24 @@ func resetChainDNSCacheForTest(t *testing.T) {
 	})
 }
 
+func waitChainDNSWarmIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		dnsCacheMu.Lock()
+		idle := len(dnsCacheInFlight) == 0
+		dnsCacheMu.Unlock()
+		if idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Error("async DNS warm did not finish")
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestNormalizeCacheKeyDoesNotBlockOnDNSMiss(t *testing.T) {
 	resetChainDNSCacheForTest(t)
 	oldResolve := resolveChainCacheIP
@@ -77,6 +95,9 @@ func TestNormalizeCacheKeyDoesNotBlockOnDNSMiss(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		close(release)
+		// 预热协程放行后才写全局缓存并清除 in-flight；必须等它写完再还原，
+		// 否则迟到的写入会污染下一个测试，也会和下面对 resolveChainCacheIP 的还原竞争。
+		waitChainDNSWarmIdle(t)
 		resolveChainCacheIP = oldResolve
 	})
 

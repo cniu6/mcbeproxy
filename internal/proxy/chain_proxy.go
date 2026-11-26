@@ -244,6 +244,7 @@ var _ singboxcore.Dialer = (*chainDialer)(nil)
 type chainUDPOutbound struct {
 	dialers      []*chainNxDialer // UDP链的中间TCP/QUIC客户端也由链owner收尾。
 	hops         []*config.ProxyOutbound
+	hopsIdentity []routeHopIdentity // 冻结的跳序身份，与该outbound创建的连接共存亡
 	outbound     *SingboxOutbound   // the last hop's outbound (with chained dialer)
 	allOutbounds []*SingboxOutbound // all hop outbounds for resource cleanup (anytls/hy2 goroutines)
 	closed       bool
@@ -488,6 +489,13 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 		nxDialers = append(nxDialers, nxD)
 		prevDialer = nxD
 
+		// 跳号按实际创建顺序冻结；共享队列、SOCKS5关联和HY2 UDP会话都引用
+		// 自己创建时的对象，重载后不会被新链的身份覆盖。
+		outbound.hop = routeHopIdentity{index: i + 1, name: cfg.Name, protocol: string(cfg.Type)}
+		if outbound.hy2ConnFactory != nil {
+			outbound.hy2ConnFactory.hop = outbound.hop
+		}
+
 		if i == len(chainConfigs)-1 {
 			finalOutbound = outbound
 		}
@@ -497,10 +505,17 @@ func CreateChainUDPOutbound(chainConfigs []*config.ProxyOutbound) (singboxcore.U
 		return nil, fmt.Errorf("chain: failed to create final outbound")
 	}
 
+	// frozenHops 是实际创建顺序的跳身份副本；缓存的连接在重载后仍引用旧对象。
+	frozenHops := make([]routeHopIdentity, len(chainConfigs))
+	for i, cfg := range chainConfigs {
+		frozenHops[i] = routeHopIdentity{index: i + 1, name: cfg.Name, protocol: string(cfg.Type)}
+	}
+
 	complete = true
 	return &chainUDPOutbound{
 		dialers:      nxDialers,
 		hops:         chainConfigs,
+		hopsIdentity: frozenHops,
 		outbound:     finalOutbound,
 		allOutbounds: allOutbounds,
 		cache:        make(map[string]*cachedChainConn),

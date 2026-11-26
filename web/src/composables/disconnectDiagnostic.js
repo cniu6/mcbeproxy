@@ -26,10 +26,24 @@ const endReasons = {
   upstream_write_error: '写入上游失败', upstream_write_timeouts: '连续上游写超时',
   no_downstream_after_upstream: '已上传但始终无下行', bidirectional_stall: '双向传输停滞',
   client_write_error: '写入客户端失败', client_inactive_timeout: '客户端静默超时',
-  client_stopped_answering: '目标仍发送，客户端停止回应', pre_login_timeout: '登录前超时',
+  client_stopped_answering: '客户端侧静默（旧判定）', established_client_silence: '数据阶段客户端侧静默',
+  pre_login_timeout: '登录前超时',
   max_stale_timeout: '最长无活动超时', target_raknet_disconnect: '目标发送RakNet断开',
   client_raknet_disconnect: '客户端发送RakNet断开', proxy_stopped: '代理停止',
   proxy_kick: '代理主动踢出', dial_target_error: '建立上游连接失败',
   removed_without_observed_error: '连接被清理，未捕获明确错误'
 }
+const endTriggers = {
+  cleanup_sweep: '清理扫描', upstream_read_deadline: '上游读取期限', upstream_read: '上游读取',
+  upstream_write: '上游写入', client_write: '客户端方向写入', target_dial: '建立上游连接',
+  upstream_packet: '收到上游报文', client_packet: '收到客户端报文'
+}
+export function endTriggerLabel(trigger) { return endTriggers[trigger] || trigger || '未提供触发来源' }
+
+const flowObservations = {
+  both_silent: '双向均静默', client_silent: '客户端侧静默', target_silent: '目标侧静默',
+  traffic_recent: '双向近期均收到包', insufficient_traffic: '流量样本不足'
+}
+export function flowObservationLabel(flow) { return flowObservations[flow] || flow || '未提供流量观察' }
+
 export function disconnectReasonLabel(reason) { return endReasons[reason] || reason || '未提供结束原因' }

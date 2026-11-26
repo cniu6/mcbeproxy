@@ -93,6 +93,7 @@ func TestLinkStallMonitorTriggersOnlyOnNewEvidence(t *testing.T) {
 		{"sampling-late", func(s *linkSample) { s.At = s.At.Add(2 * time.Second) }, "monitor_delayed"},
 		{"transport-drop", func(s *linkSample) { s.Transport[0].Dropped++ }, "transport_changed"},
 		{"control-reconnect", func(s *linkSample) { s.Transport[0].Reconnecting = true }, "transport_changed"},
+		{"association-replaced", func(s *linkSample) { s.Transport[0].AssociationGeneration++ }, "transport_changed"},
 		{"control-close", func(s *linkSample) { s.Transport[0].RemoteClosed = true }, "transport_changed"},
 		{"transport-error", func(s *linkSample) { s.Transport[0].ErrorAt = s.At }, "transport_changed"},
 		{"transport-replaced", func(s *linkSample) { s.Transport[0].ID = "new-transport" }, "transport_changed"},
@@ -257,7 +258,7 @@ func TestLinkStallMonitorPartialWindowAndBounds(t *testing.T) {
 type linkFixturePacketConn struct{ net.PacketConn }
 
 func (*linkFixturePacketConn) ConnectionDiagnostics() []ConnectionDiagnostic {
-	return []ConnectionDiagnostic{{ID: "transport-fixture", Layer: "chain_udp_buffer", PacketBuffer: &PacketBufferDiagnostic{ReceivedPackets: 123, DeliveredPackets: 120, DroppedPackets: 3, QueuePackets: 2}}}
+	return []ConnectionDiagnostic{{ID: "transport-fixture", Layer: "chain_udp_buffer", CauseScope: "shared_transport", HopIndex: 2, HopName: "fixture-hop", HopProtocol: "hysteria2", PacketBuffer: &PacketBufferDiagnostic{ReceivedPackets: 123, DeliveredPackets: 120, DroppedPackets: 3, QueuePackets: 2}}}
 }
 
 func TestLinkStallMonitorCollectsRakNetAndNetherNet(t *testing.T) {
@@ -326,10 +327,18 @@ func TestLinkStallCaptureWritesExistingLog(t *testing.T) {
 		_ = logger.Configure(&logger.LogConfig{EnableConsoleLog: true})
 	})
 	o := healthyLinkObservation(time.Unix(1700000000, 0))
+	p := &RawUDPProxy{serverID: "fixture"}
+	pc := &linkFixturePacketConn{}
+	client := &rawUDPClientInfo{targetConn: pc}
+	client.diagnostic.io.initialize()
+	o.ID, _, _, _ = client.diagnostic.io.snapshot()
+	o.Sample.Transport, o.Sample.TransportTruncated = sampleLinkTransport(pc)
 	c := linkStallCapture{Event: "fixture-event", Server: "fixture", ID: o.ID, Protocol: o.Protocol, Client: o.Client, TriggeredAt: o.Sample.At, Phase: "before", Reasons: []string{"target_silent"}, Samples: []linkSample{o.Sample}}
 	writeLinkStallCapture(c)
 	c.Phase, c.Outcome, c.Samples = "after", "session_ended", nil
 	writeLinkStallCapture(c)
+	p.reportDisconnect(o.Client, client)
+	p.reportDisconnect(o.Client, client) // a second close must not log again
 	if !logger.FlushDiagnostics(time.Second) {
 		t.Fatal("异步采样日志未排空")
 	}
@@ -342,10 +351,16 @@ func TestLinkStallCaptureWritesExistingLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("缺少前后窗口日志: %s", data)
+	if len(lines) != 3 {
+		t.Fatalf("应记录两个采样窗口和一次结束: %s", data)
 	}
-	for i, line := range lines {
+	_, encoded, ok := strings.Cut(lines[2], rawUDPDisconnectPrefix)
+	var report RawUDPDisconnectReport
+	if !ok || json.Unmarshal([]byte(encoded), &report) != nil || report.ID != o.ID ||
+		len(report.Transport) != 1 || report.Transport[0].ID != o.Sample.Transport[0].ID {
+		t.Fatalf("结束记录无法按游戏会话和传输 ID 关联: %s", lines[2])
+	}
+	for i, line := range lines[:2] {
 		_, encoded, ok := strings.Cut(line, "UDP stall_capture ")
 		if !ok {
 			t.Fatal("缺少稳定的检索标记")

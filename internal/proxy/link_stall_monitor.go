@@ -22,18 +22,24 @@ const (
 
 // 只读已有计数；不保存包内容、玩家身份或认证数据。传输计数可能由多人共享。
 type linkTransportSample struct {
-	ID           string    `json:"id"`
-	Layer        string    `json:"layer"`
-	Received     int64     `json:"received,omitempty"`
-	Delivered    int64     `json:"delivered,omitempty"`
-	Dropped      int64     `json:"dropped,omitempty"`
-	Queue        int       `json:"queue,omitempty"`
-	QueueBytes   int       `json:"queue_bytes,omitempty"`
-	RemoteClosed bool      `json:"remote_closed,omitempty"`
-	Reconnecting bool      `json:"reconnecting,omitempty"`
-	ErrorAt      time.Time `json:"error_at,omitzero"`
-	Operation    string    `json:"operation,omitempty"`
-	Error        string    `json:"error,omitempty"`
+	ID                    string    `json:"id"`
+	Layer                 string    `json:"layer"`
+	HopIndex              int       `json:"hop_index,omitempty"`
+	HopName               string    `json:"hop_name,omitempty"`
+	HopProtocol           string    `json:"hop_protocol,omitempty"`
+	CreatedAt             time.Time `json:"created_at,omitzero"`
+	CauseScope            string    `json:"cause_scope,omitempty"`
+	AssociationGeneration uint64    `json:"association_generation,omitempty"`
+	Received              int64     `json:"received,omitempty"`
+	Delivered             int64     `json:"delivered,omitempty"`
+	Dropped               int64     `json:"dropped,omitempty"`
+	Queue                 int       `json:"queue,omitempty"`
+	QueueBytes            int       `json:"queue_bytes,omitempty"`
+	RemoteClosed          bool      `json:"remote_closed,omitempty"`
+	Reconnecting          bool      `json:"reconnecting,omitempty"`
+	ErrorAt               time.Time `json:"error_at,omitzero"`
+	Operation             string    `json:"operation,omitempty"`
+	Error                 string    `json:"error,omitempty"`
 }
 
 type linkSample struct {
@@ -67,13 +73,12 @@ type linkSample struct {
 	QueueDrops          int64 `json:"queue_drops"`
 	// NetherNet 中继的客户端路径（nethernet_relay_paths.go）：通过认证的地址数、
 	// 媒体开始后的换路次数、没有打断媒体的备用对保活次数。
-	ClientPaths  int                   `json:"client_paths,omitempty"`
-	PathSwitches int64                 `json:"path_switches,omitempty"`
-	BackupChecks int64                 `json:"backup_checks,omitempty"`
-	Transport    []linkTransportSample `json:"transport,omitempty"`
-	// 上一采样以来，本会话所用传输层交付的包数（共享计数，可能含其他玩家）。
-	// 与静默配合判断：传输层仍在交付而本会话静默，说明问题在分发或目标侧；
-	// 传输层也停了，才指向链路。
+	ClientPaths        int                   `json:"client_paths,omitempty"`
+	PathSwitches       int64                 `json:"path_switches,omitempty"`
+	BackupChecks       int64                 `json:"backup_checks,omitempty"`
+	Transport          []linkTransportSample `json:"transport,omitempty"`
+	TransportTruncated bool                  `json:"transport_truncated,omitempty"`
+	// 同一批传输层计数的增长量；可包含其它玩家或同包经过多跳，不能判定根因。
 	TransportDelivered int64 `json:"transport_delivered_delta,omitempty"`
 }
 
@@ -183,7 +188,7 @@ func linkAnomalies(previous, current, baseline linkSample) []string {
 				continue
 			}
 			found = true
-			if c.Dropped > p.Dropped || (!p.RemoteClosed && c.RemoteClosed) || (!p.Reconnecting && c.Reconnecting) || c.ErrorAt.After(p.ErrorAt) {
+			if c.AssociationGeneration != p.AssociationGeneration || c.Dropped > p.Dropped || (!p.RemoteClosed && c.RemoteClosed) || (!p.Reconnecting && c.Reconnecting) || c.ErrorAt.After(p.ErrorAt) {
 				return append(reasons, "transport_changed")
 			}
 			break
@@ -195,10 +200,15 @@ func linkAnomalies(previous, current, baseline linkSample) []string {
 	return reasons
 }
 
-func deliveredTotal(ts []linkTransportSample) int64 {
+func deliveredDelta(previous, current []linkTransportSample) int64 {
 	var n int64
-	for _, t := range ts {
-		n += t.Delivered
+	for _, c := range current {
+		for _, p := range previous {
+			if c.ID != "" && c.ID == p.ID && c.Layer == p.Layer && c.CreatedAt.Equal(p.CreatedAt) {
+				n += max(c.Delivered-p.Delivered, 0)
+				break
+			}
+		}
 	}
 	return n
 }
@@ -217,7 +227,7 @@ func (m *linkStallMonitor) observe(o linkObservation) {
 		m.states[o.ID] = h
 	}
 	if !h.last.At.IsZero() {
-		s.TransportDelivered = deliveredTotal(s.Transport) - deliveredTotal(h.last.Transport)
+		s.TransportDelivered = deliveredDelta(h.last.Transport, s.Transport)
 	}
 	h.seen = s.At
 	if !h.last.At.IsZero() {
@@ -304,9 +314,24 @@ func writeLinkStallCapture(c linkStallCapture) {
 		Scope  string      `json:"scope"`
 	}
 	write := func(s *linkSample) {
-		data, err := json.Marshal(record{linkStallCapture: c, Sample: s, Scope: "local_observation_only; transport_counters_may_be_shared"})
-		if err == nil {
-			logger.Diagnostic("UDP stall_capture " + string(data))
+		const prefix = "UDP stall_capture "
+		r := record{linkStallCapture: c, Sample: s, Scope: "local_observation_only; transport_counters_may_be_shared"}
+		for {
+			data, err := json.Marshal(r)
+			if err != nil {
+				return
+			}
+			if len(prefix)+len(data) <= logger.DiagnosticMessageLimit {
+				logger.Diagnostic(prefix + string(data))
+				return
+			}
+			if r.Sample == nil || len(r.Sample.Transport) == 0 {
+				return
+			}
+			shorter := *r.Sample
+			shorter.Transport = shorter.Transport[:len(shorter.Transport)-1]
+			shorter.TransportTruncated = true
+			r.Sample = &shorter
 		}
 	}
 	if len(c.Samples) == 0 {
@@ -336,24 +361,26 @@ func monitorText(s string, limit int) string {
 	return s
 }
 
-func sampleLinkTransport(conn interface{ ConnectionDiagnostics() []ConnectionDiagnostic }) []linkTransportSample {
+func sampleLinkTransport(conn connectionDiagnosticProvider) ([]linkTransportSample, bool) {
 	if conn == nil {
-		return nil
+		return nil, false
 	}
 	var result []linkTransportSample
 	for _, d := range conn.ConnectionDiagnostics() {
-		if len(result) == 8 {
-			break
+		if len(result) == rawUDPDiagnosticLimit {
+			return result, true
 		}
 		s := linkTransportSample{ID: monitorText(d.ID, 64), Layer: monitorText(d.Layer, 48), RemoteClosed: d.RemoteClosed, Reconnecting: d.Reconnecting,
-			ErrorAt: d.LastError.At, Operation: monitorText(d.LastError.Operation, 32), Error: monitorText(d.LastError.Error, 128)}
+			HopIndex: d.HopIndex, HopName: monitorText(d.HopName, 128), HopProtocol: monitorText(d.HopProtocol, 32), CreatedAt: d.CreatedAt, CauseScope: d.CauseScope,
+			AssociationGeneration: d.AssociationGeneration,
+			ErrorAt:               d.LastError.At, Operation: monitorText(d.LastError.Operation, 32), Error: monitorText(d.LastError.Error, 128)}
 		if b := d.PacketBuffer; b != nil {
 			s.Received, s.Delivered, s.Dropped = b.ReceivedPackets, b.DeliveredPackets, b.DroppedPackets
 			s.Queue, s.QueueBytes = b.QueuePackets, b.QueueBytes
 		}
 		result = append(result, s)
 	}
-	return result
+	return result, false
 }
 
 func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
@@ -369,7 +396,7 @@ func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
 			return true
 		}
 		s := linkSample{At: now, UpPackets: c.packetsUp.Load(), DownPackets: c.packetsDown.Load(), UpBytes: c.bytesUp.Load(), DownBytes: c.bytesDown.Load(),
-			SinceClientMs: rawUDPStatAgeMsOrSince(c.lastClientPacket.Load(), c.startTime, now), SinceTargetMs: rawUDPStatAgeMsOrSince(c.lastTargetPacket.Load(), c.startTime, now),
+			SinceClientMs: rawUDPStatAgeMsOrSince(c.lastClientPacket.Load(), c.startTime, now), SinceTargetMs: rawUDPStatAgeMsOrSince(c.lastObservedTargetPacket(), c.startTime, now),
 			ClientGapMs: c.windowClientGapMs.Swap(0), TargetGapMs: c.windowTargetGapMs.Swap(0),
 			MaxClientGapMs: c.maxClientPacketGapMs.Load(), MaxTargetGapMs: c.maxTargetPacketGapMs.Load(),
 			WriteTargetMs: c.lastWriteTargetMs.Load(), WriteClientMs: c.lastWriteClientMs.Load(), MaxWriteTargetMs: c.maxWriteTargetMs.Load(), MaxWriteClientMs: c.maxWriteClientMs.Load(),
@@ -379,7 +406,7 @@ func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
 			s.Queue, s.QueueCap = len(c.upstreamWriteCh), cap(c.upstreamWriteCh)
 		}
 		if provider, ok := c.targetConn.(connectionDiagnosticProvider); ok {
-			s.Transport = sampleLinkTransport(provider)
+			s.Transport, s.TransportTruncated = sampleLinkTransport(provider)
 		}
 		m.observe(linkObservation{ID: id, Protocol: "raknet", Client: rawUDPAddrString(c.clientAddr), Route: monitorText(rawUDPRouteName(c.proxyNode), 256), Target: monitorText(rawUDPAddrString(c.targetAddr), 256), Sample: s})
 		return true
@@ -410,7 +437,7 @@ func (p *RawUDPProxy) collectLinkSamples(m *linkStallMonitor, now time.Time) {
 				WriteTargetTimeouts: c.writeTimeouts.Load(), WriteClientTimeouts: c.clientWriteTimeouts.Load(), ReadTimeouts: c.readTimeouts.Load(), Queue: len(c.writeCh), QueueCap: cap(c.writeCh), QueueDrops: c.queueDrops.Load(),
 				SlowWriteTarget: c.slowWriteTarget.Load(), SlowWriteClient: c.slowWriteClient.Load()}
 			if provider, ok := c.upstream.(connectionDiagnosticProvider); ok {
-				s.Transport = sampleLinkTransport(provider)
+				s.Transport, s.TransportTruncated = sampleLinkTransport(provider)
 			}
 			m.observe(linkObservation{ID: id, Protocol: "nethernet", Client: session.NormalizeClientAddress(addr.String()), Route: monitorText(c.route, 256), Target: monitorText(rawUDPAddrString(c.mediaAddr), 256), Sample: s})
 			return true

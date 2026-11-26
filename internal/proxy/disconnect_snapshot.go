@@ -14,6 +14,11 @@ func (p *RawUDPProxy) GetLastDisconnectReport() (RawUDPDisconnectReport, bool) {
 		last := *report.LastIO
 		copy.LastIO = &last
 	}
+	if report.TrafficAfterLastIO != nil {
+		later := *report.TrafficAfterLastIO
+		copy.TrafficAfterLastIO = &later
+	}
+	copy.RouteHops = append([]RouteDiagnosticHop(nil), report.RouteHops...)
 	copy.Transport = append([]ConnectionDiagnostic(nil), report.Transport...)
 	for i := range copy.Transport {
 		if copy.Transport[i].PacketBuffer != nil {

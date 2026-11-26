@@ -60,8 +60,19 @@ func TestChainStandardPreviousHops(t *testing.T) {
 			if err != nil || string(buf[:n]) != string(payload) {
 				t.Fatalf("UDP %q %v", buf[:n], err)
 			}
-			if previousListener != nil && pair[1] == "hysteria2" && previousListener.sharedRelay == nil {
-				t.Fatal("HY2 bypassed SOCKS5 UDP listener")
+			if previousListener != nil && pair[1] == "hysteria2" {
+				if previousListener.sharedRelay == nil {
+					t.Fatal("HY2 bypassed SOCKS5 UDP listener")
+				}
+				records := packetConnectionDiagnostics(pc)
+				route := packetRouteDiagnosticHops(pc, records)
+				if len(route) != 2 || route[0].Name != "previous" || !route[0].Observed || route[1].Name != "last" || !route[1].Observed {
+					t.Fatalf("live chain did not expose its actual hop order: %+v", route)
+				}
+				if len(records) != 3 || records[1].PacketBuffer == nil || records[1].PacketBuffer.LastReceivedAt.IsZero() ||
+					records[2].Layer != "socks5_udp" || records[2].HopIndex != 1 || records[2].CauseScope != "shared_transport" {
+					t.Fatalf("live chain did not expose shared carrier and underlay: %+v", records)
+				}
 			}
 		})
 	}

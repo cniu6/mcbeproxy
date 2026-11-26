@@ -16,7 +16,11 @@ func (*disconnectDiagnosticController) GetLastDisconnectReport(serverID string) 
 	if serverID != "fixture" {
 		return proxy.RawUDPDisconnectReport{}, false
 	}
-	return proxy.RawUDPDisconnectReport{Server: serverID, EndReason: "upstream_read_error", Client: "192.0.2.1:1234"}, true
+	return proxy.RawUDPDisconnectReport{Server: serverID, EndReason: "established_client_silence", Client: "192.0.2.1:1234",
+		EndTrigger: "cleanup_sweep", FlowObservation: "both_silent",
+		RouteHops: []proxy.RouteDiagnosticHop{{Index: 1, Name: "fixture-hop", Protocol: "hysteria2", Observed: true}},
+		Transport: []proxy.ConnectionDiagnostic{{ID: "fixture-carrier", Layer: "chain_udp_buffer", HopIndex: 1, CauseScope: "shared_transport"}},
+	}, true
 }
 
 func TestLastDisconnectDiagnosticAdminOnly(t *testing.T) {
@@ -52,8 +56,15 @@ func TestLastDisconnectDiagnosticAdminOnly(t *testing.T) {
 				t.Fatalf("汇总未保留服务器和原始诊断：%s", response.Body.String())
 			}
 		}
-		if tc.status != http.StatusOK && strings.Contains(response.Body.String(), "192.0.2.1") {
-			t.Fatal("未授权响应泄漏诊断地址")
+		if tc.status == http.StatusOK {
+			body := response.Body.String()
+			for _, field := range []string{`"end_trigger":"cleanup_sweep"`, `"flow_observation":"both_silent"`, `"name":"fixture-hop"`, `"id":"fixture-carrier"`} {
+				if !strings.Contains(body, field) {
+					t.Fatalf("%s 缺少诊断字段 %s", tc.path, field)
+				}
+			}
+		} else if strings.Contains(response.Body.String(), "192.0.2.1") || strings.Contains(response.Body.String(), "fixture-carrier") {
+			t.Fatal("未授权响应泄漏诊断地址或载体身份")
 		}
 	}
 }

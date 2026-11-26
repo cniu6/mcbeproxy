@@ -90,11 +90,14 @@ func diagnosticSink() *diagnosticWriter {
 	return diagnostics
 }
 
+// DiagnosticMessageLimit is the byte budget before the sink truncates a message.
+const DiagnosticMessageLimit = 16 << 10
+
 // Diagnostic 仅供低频、限长的结束/错误摘要；不得传入数据包或认证内容。
 func Diagnostic(message string) {
 	// 只有固定字段摘要进入队列；意外超长输入也不能形成无界内存积压。
-	if len(message) > 16384 {
-		message = message[:16384] + " [truncated]"
+	if len(message) > DiagnosticMessageLimit {
+		message = message[:DiagnosticMessageLimit] + " [truncated]"
 	}
 	diagnosticSink().enqueue(message)
 }
