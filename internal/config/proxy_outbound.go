@@ -113,6 +113,13 @@ type ProxyOutbound struct {
 	SNI         string `json:"sni,omitempty"`         // TLS SNI
 	Insecure    bool   `json:"insecure,omitempty"`    // Skip certificate verification
 	Fingerprint string `json:"fingerprint,omitempty"` // TLS fingerprint
+	// TLSCAFile is an optional path to a PEM CA bundle used to verify the
+	// proxy server certificate. Relative paths are resolved from the server
+	// working directory when the connection is established. It only applies
+	// when TLS is enabled for HTTP/SOCKS outbounds; a non-empty pool replaces
+	// system roots for that connection and must never share a TLS session
+	// cache with other trust configurations.
+	TLSCAFile string `json:"tls_ca_file,omitempty"`
 
 	// Reality specific fields (for VLESS)
 	Reality          bool   `json:"reality,omitempty"`            // Enable Reality
@@ -181,6 +188,17 @@ func (p *ProxyOutbound) Validate() error {
 	}
 	if p.Type == "" {
 		return errors.New("missing required field: type")
+	}
+	if p.TLSCAFile != "" {
+		if !strings.EqualFold(p.Type, ProtocolHTTP) || !p.TLS {
+			return errors.New("tls_ca_file is only valid for HTTPS proxy outbounds")
+		}
+		if p.Insecure {
+			return errors.New("tls_ca_file cannot be combined with insecure")
+		}
+		if strings.TrimSpace(p.TLSCAFile) == "" || strings.ContainsAny(p.TLSCAFile, "\r\n") {
+			return errors.New("tls_ca_file must be a file path")
+		}
 	}
 
 	// Chain proxy nodes are containers — their own Server/Port are not used.
@@ -444,6 +462,7 @@ func (p *ProxyOutbound) Clone() *ProxyOutbound {
 		SNI:                      p.SNI,
 		Insecure:                 p.Insecure,
 		Fingerprint:              p.Fingerprint,
+		TLSCAFile:                p.TLSCAFile,
 		Reality:                  p.Reality,
 		RealityPublicKey:         p.RealityPublicKey,
 		RealityShortID:           p.RealityShortID,
@@ -779,6 +798,7 @@ func (p *ProxyOutbound) Equal(other *ProxyOutbound) bool {
 		p.SNI == other.SNI &&
 		p.Insecure == other.Insecure &&
 		p.Fingerprint == other.Fingerprint &&
+		p.TLSCAFile == other.TLSCAFile &&
 		p.Reality == other.Reality &&
 		p.RealityPublicKey == other.RealityPublicKey &&
 		p.RealityShortID == other.RealityShortID &&

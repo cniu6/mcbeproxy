@@ -12,6 +12,7 @@ import (
 // ProxyPortType constants.
 const (
 	ProxyPortTypeHTTP   = "http"
+	ProxyPortTypeHTTPS  = "https"
 	ProxyPortTypeSocks5 = "socks5"
 	ProxyPortTypeSocks4 = "socks4"
 	ProxyPortTypeMixed  = "mixed"
@@ -28,24 +29,25 @@ const (
 // API is already admin-authenticated and the value is stored in plaintext
 // JSON on disk anyway, round-tripping the value is strictly safer.
 type ProxyPortConfig struct {
-	Secure                        *SecurePortConfig `json:"secure,omitempty"`
-	ID                            string            `json:"id"`
-	Name                          string            `json:"name"`
-	ListenAddr                    string            `json:"listen_addr"`
-	Type                          string            `json:"type"` // http, socks5, socks4, mixed
-	Enabled                       bool              `json:"enabled"`
-	Username                      string            `json:"username"`
-	Password                      string            `json:"password"`
-	ProxyOutbound                 string            `json:"proxy_outbound"`    // Proxy outbound name or "@group" or "node1,node2"
-	LoadBalance                   string            `json:"load_balance"`      // least-latency, round-robin, random, least-connections
-	LoadBalanceSort               string            `json:"load_balance_sort"` // tcp, http, udp
-	AutoPingEnabled               bool              `json:"auto_ping_enabled"`
-	AutoPingIntervalMinutes       int               `json:"auto_ping_interval_minutes"`
-	AutoPingTopCandidates         int               `json:"auto_ping_top_candidates"`
-	AutoPingFullScanMode          string            `json:"auto_ping_full_scan_mode,omitempty"`
-	AutoPingFullScanTime          string            `json:"auto_ping_full_scan_time,omitempty"`
-	AutoPingFullScanIntervalHours int               `json:"auto_ping_full_scan_interval_hours"`
-	AllowList                     []string          `json:"allow_list"` // CIDR list
+	Secure                        *SecurePortConfig   `json:"secure,omitempty"`
+	TLS                           *ProxyPortTLSConfig `json:"tls,omitempty"`
+	ID                            string              `json:"id"`
+	Name                          string              `json:"name"`
+	ListenAddr                    string              `json:"listen_addr"`
+	Type                          string              `json:"type"` // http, socks5, socks4, mixed
+	Enabled                       bool                `json:"enabled"`
+	Username                      string              `json:"username"`
+	Password                      string              `json:"password"`
+	ProxyOutbound                 string              `json:"proxy_outbound"`    // Proxy outbound name or "@group" or "node1,node2"
+	LoadBalance                   string              `json:"load_balance"`      // least-latency, round-robin, random, least-connections
+	LoadBalanceSort               string              `json:"load_balance_sort"` // tcp, http, udp
+	AutoPingEnabled               bool                `json:"auto_ping_enabled"`
+	AutoPingIntervalMinutes       int                 `json:"auto_ping_interval_minutes"`
+	AutoPingTopCandidates         int                 `json:"auto_ping_top_candidates"`
+	AutoPingFullScanMode          string              `json:"auto_ping_full_scan_mode,omitempty"`
+	AutoPingFullScanTime          string              `json:"auto_ping_full_scan_time,omitempty"`
+	AutoPingFullScanIntervalHours int                 `json:"auto_ping_full_scan_interval_hours"`
+	AllowList                     []string            `json:"allow_list"` // CIDR list
 	// IgnoreRouteRules skips the global destination rules (network page)
 	// for this port; users can override it individually.
 	IgnoreRouteRules bool `json:"ignore_route_rules,omitempty"`
@@ -103,6 +105,10 @@ func (pc *ProxyPortConfig) Clone() *ProxyPortConfig {
 	if pc.Secure != nil {
 		s := *pc.Secure
 		clone.Secure = &s
+	}
+	if pc.TLS != nil {
+		tlsConfig := *pc.TLS
+		clone.TLS = &tlsConfig
 	}
 	if pc.AllowList != nil {
 		clone.AllowList = append([]string{}, pc.AllowList...)
@@ -179,8 +185,15 @@ func (pc *ProxyPortConfig) Validate() error {
 	if err != nil || port <= 0 || port > 65535 {
 		return fmt.Errorf("listen_addr port must be between 1 and 65535, got %s", portStr)
 	}
+	if pc.TLS != nil && pc.Type != ProxyPortTypeHTTPS {
+		return errors.New("tls is only valid for HTTPS proxy ports")
+	}
 	switch pc.Type {
 	case ProxyPortTypeHTTP, ProxyPortTypeSocks5, ProxyPortTypeSocks4, ProxyPortTypeMixed:
+	case ProxyPortTypeHTTPS:
+		if err := pc.TLS.validate(); err != nil {
+			return err
+		}
 	case ProxyPortTypeHysteria2, ProxyPortTypeMieru:
 		if err := pc.ValidateSecure(); err != nil {
 			return err
