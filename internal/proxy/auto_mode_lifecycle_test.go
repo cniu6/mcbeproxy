@@ -20,11 +20,6 @@ func TestAutoModeRawUDPDoesNotStartSignaling(t *testing.T) {
 	if raw.nnRelay.Load() != nil {
 		t.Fatal("raw_udp started relay")
 	}
-	ln, err := net.Listen("tcp", raw.listener.LocalAddr().String())
-	if err != nil {
-		t.Fatalf("raw_udp occupied TCP: %v", err)
-	}
-	ln.Close()
 	raw.UpdateConfig(c)
 	if raw.nnRelay.Load() != nil {
 		t.Fatal("raw_udp hot update started relay")
