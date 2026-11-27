@@ -39,7 +39,7 @@ const makeBatchSetType = new Function(
   extract(portsSource, 'const batchSetType =', '// ----- 端口连通性测试 -----') + '; return batchSetType'
 )
 
-test('共享菜单：HTTPS 入口只在完整表单提供，快捷/批量/安全入口互不混淆', () => {
+test('入口全集七种，快捷/批量/安全入口能力互不混淆', () => {
   const values = proxyPortTypeOptions.map(o => o.value)
   assert.deepEqual(values, ['http', 'https', 'socks5', 'socks4', 'mixed', 'hysteria2', 'mieru'])
   assert.deepEqual(proxyPortQuickTypeValues, ['http', 'socks5', 'socks4', 'mixed'])
@@ -76,7 +76,7 @@ test('HTTPS 入口证书字段：文件模式四项 + PEM 模式双文本框，�
   assert.match(formSource, /v-if="isSecure"/)
   assert.match(formSource, /const isSecure = computed\(\(\) => \['hysteria2', 'mieru'\]/)
   // HTTPS 不显示安全入口的快捷导入/导出按钮
-  assert.match(formSource, /<template v-if="savedSecure">/)
+  assert.match(formSource, /<template v-if="showSecureExport">/)
   assert.doesNotMatch(formSource, /isSecure \|\| isHttps/)
 })
 
@@ -105,7 +105,7 @@ test('HTTPS 端口列表加载、编辑、保存保留全部 TLS 配置，TLS �
   assert.equal(buildPortPayload(normalizePort({ id: 's5', type: 'socks5' })).tls, undefined)
 })
 
-test('批量与行内快捷切换不能进出 HTTPS；完整表单才允许改类型', async () => {
+test('批量仍拒绝 HTTPS/安全协议，行内显示完整协议并转详细配置', async () => {
   // 批量改类型菜单不含 HTTPS
   assert.deepEqual(proxyPortQuickTypeValues, ['http', 'socks5', 'socks4', 'mixed'])
   assert.match(extract(portsSource, 'const batchTypeOptions =', 'const selectedPorts ='), /proxyPortQuickTypeValues/)
@@ -133,14 +133,12 @@ test('批量与行内快捷切换不能进出 HTTPS；完整表单才允许改�
   await makeRun([normalizePort({ id: 'h', type: 'hysteria2' })])()
   assert.equal(calls.length, 0, '安全入口仍不可批量改类型')
 
-  // 行内编辑的 HTTPS 下拉只允许保持原值，不能选择其他快捷类型
+  // 行内全部展示，需证书/身份的选项交由详情草稿处理，不再静默过滤。
   const inline = extract(portsSource, "title: '类型',", "title: '认证',")
-  assert.match(inline, /row\.type === 'https'/)
-  assert.match(inline, /disabled: true/)
-  assert.match(inline, /if \(v !== 'https'\) row\.type = v/)
-  assert.match(inline, /p\.value !== 'https'/)
-  // HTTPS 通过完整表单入口编辑，而不是行内编辑
-  assert.match(extract(portsSource, 'const portTableColumns =', 'const renderTestResultCell ='), /\[\.\.\.proxyPortSecureTypes, 'https'\]/)
+  assert.match(inline, /options: inlinePortTypeOptions/)
+  assert.match(inline, /onInlineTypeSelect\(row, v\)/)
+  assert.doesNotMatch(inline, /proxyTypeOptions\.filter|p\.value !== 'https'/)
+  assert.match(extract(portsSource, 'const portTableColumns =', 'const renderTestResultCell ='), /openPortDetail\(row\)/)
 })
 
 test('HTTPS 测试与普通端口共用测试 API，安全入口单独排除', () => {

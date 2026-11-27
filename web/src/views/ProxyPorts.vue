@@ -68,6 +68,9 @@
           <n-button size="small" quaternary @click="selectedPortIds = []">取消选中</n-button>
         </n-space>
 
+        <n-text depth="3" style="display: block; margin-top: 10px; font-size: 12px">
+          入口支持 HTTP、HTTPS、SOCKS5、SOCKS4、混合、HY2、Mieru。选择需证书或独立认证的协议会打开「详细配置」；批量操作仅支持四种普通类型。
+        </n-text>
         <n-data-table
           style="margin-top: 12px"
           :columns="portTableColumns"
@@ -79,7 +82,7 @@
           :row-props="portTableRowProps"
           :pagination="portTablePagination"
           :max-height="720"
-          :scroll-x="1860"
+          :scroll-x="1940"
           :loading="loading"
         />
       </n-card>
@@ -89,10 +92,15 @@
         preset="card"
         title="新增代理端口"
         style="width: min(760px, 98vw); max-width: 98vw"
-        @update:show="(v) => { if (!v) newPortDraft = null }"
->
+        :mask-closable="!newPortDraft?._saving"
+        :close-on-esc="!newPortDraft?._saving"
+        :closable="!newPortDraft?._saving"
+        @update:show="v => { if (!v) closeNewPortDraft() }"
+      >
+        <n-alert v-if="newPortSaveError" type="error" role="alert" style="margin-bottom: 12px">{{ newPortSaveError }}</n-alert>
         <PortEditForm
           v-if="newPortDraft"
+          ref="newPortFormRef"
           :port="newPortDraft"
           :is-mobile="isMobile"
           :proxy-type-options="proxyTypeOptions"
@@ -108,7 +116,7 @@
         />
         <template #footer>
           <n-space justify="end">
-            <n-button size="small" @click="newPortDraft = null">取消</n-button>
+            <n-button size="small" :disabled="newPortDraft?._saving" @click="closeNewPortDraft">取消</n-button>
             <n-button size="small" type="primary" :loading="newPortDraft && newPortDraft._saving" @click="saveNewPortDraft">保存</n-button>
           </n-space>
         </template>
@@ -128,6 +136,8 @@
           </n-alert>
           <PortUsersEditor
             :secure="['hysteria2', 'mieru'].includes(usersModal.port.type)"
+            :port-type="usersModal.port.type"
+            :disabled="usersModal.saving"
             :users="usersModal.users"
             :stats="usersModal.port.user_stats || []"
             :is-mobile="isMobile"
@@ -150,9 +160,44 @@
       </n-modal>
     </n-space>
 
-    <n-modal :show="!!securePort" preset="card" :title="securePort && securePort.type === 'https' ? 'HTTPS 入口配置' : '安全入口配置与导出'" style="width:min(780px,98vw)" @update:show="v => { if (!v) securePort = null }">
-      <PortEditForm v-if="securePort" :saved-secure="proxyPortSecureTypes.includes(securePort.type)" :port="securePort" :is-mobile="isMobile" :proxy-type-options="proxyTypeOptions" :load-balance-options="loadBalanceOptions" :load-balance-sort-options="loadBalanceSortOptions" :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions" :needs-load-balance="needsLoadBalance" :get-proxy-outbound-display="getProxyOutboundDisplay" @open-proxy-selector="openFormProxySelector(securePort)" @clear-proxy="clearProxySelection(securePort)" @pick-user-outbound="u => openFormProxySelector(u)" />
-      <template #footer><n-space justify="end"><n-button size="small" @click="securePort = null">关闭</n-button><n-button size="small" type="primary" :loading="securePort?._saving" @click="saveSecurePort">保存</n-button></n-space></template>
+    <n-modal
+      :show="!!detailSession"
+      preset="card"
+      :title="detailSession ? `详细配置 · ${detailSession.port.name || detailSession.port.id}` : '详细配置'"
+      style="width: min(880px, 98vw); max-width: 98vw"
+      :mask-closable="!detailSession?.port._saving"
+      :close-on-esc="!detailSession?.port._saving"
+      :closable="!detailSession?.port._saving"
+      @update:show="v => { if (!v) closePortDetail() }"
+    >
+      <template v-if="detailSession">
+        <n-alert v-if="detailSession.error" :type="detailSession.persisted ? 'warning' : 'error'" role="alert" style="margin-bottom: 12px">{{ detailSession.error }}</n-alert>
+        <PortEditForm
+          :key="detailSession.id"
+          ref="detailPortFormRef"
+          :type-locked="proxyPortSecureTypes.includes(detailSession.savedType)"
+          :show-secure-export="proxyPortSecureTypes.includes(detailSession.savedType)"
+          :saved-type="detailSession.savedType"
+          :port="detailSession.port"
+          :is-mobile="isMobile"
+          :proxy-type-options="proxyTypeOptions"
+          :load-balance-options="loadBalanceOptions"
+          :load-balance-sort-options="loadBalanceSortOptions"
+          :auto-ping-full-scan-mode-options="autoPingFullScanModeOptions"
+          :needs-load-balance="needsLoadBalance"
+          :get-proxy-outbound-display="getProxyOutboundDisplay"
+          @open-proxy-selector="openFormProxySelector(detailSession.port)"
+          @clear-proxy="clearProxySelection(detailSession.port)"
+          @pick-user-outbound="u => openFormProxySelector(u)"
+          @new-port="newPortFromDetail"
+        />
+      </template>
+      <template #footer>
+        <n-space justify="end">
+          <n-button size="small" :disabled="detailSession?.port._saving" @click="closePortDetail">关闭</n-button>
+          <n-button size="small" type="primary" :loading="detailSession?.port._saving" @click="savePortDetail">{{ detailSession?.needsRefresh ? '刷新已保存配置' : '保存' }}</n-button>
+        </n-space>
+      </template>
     </n-modal>
 
     <n-modal size="small" v-model:show="showBatchProxyModal" preset="card" :title="batchProxyModalTitle" style="width: min(520px, 98vw); max-width: 98vw">
@@ -636,7 +681,7 @@ const editableFields = [
   'proxy_outbound', 'load_balance', 'load_balance_sort',
   'auto_ping_enabled', 'auto_ping_interval_minutes', 'auto_ping_top_candidates',
   'auto_ping_full_scan_mode', 'auto_ping_full_scan_time', 'auto_ping_full_scan_interval_hours',
-  'allow_list', 'ignore_route_rules', 'users', 'secure'
+  'allow_list', 'ignore_route_rules', 'users', 'secure', 'tls'
 ]
 const cloneField = (v) => (v && typeof v === 'object' ? JSON.parse(JSON.stringify(v)) : v)
 const isEditingPort = (row) => editingRowIds.value.includes(row.id)
@@ -658,15 +703,107 @@ const cancelEditPort = (port) => {
   finishEditPort(port)
 }
 const saveEditPort = async (port) => {
-  const ok = await savePort(port)
-  if (ok) finishEditPort(port)
+  const result = await savePort(port)
+  if (result.persisted) finishEditPort(port)
 }
 
-// 新增端口时的草稿: 显示在表格下方的 dashed-border 卡片内,
-// 不污染 ports 数组, 取消不留痕迹, 保存后才追加到 ports.
+// 完整表单始终编辑独立草稿；取消不会清掉行内输入与原始快照。
 const newPortDraft = ref(null)
-const securePort = ref(null)
-const saveSecurePort = async () => { if (await savePort(securePort.value)) securePort.value = null }
+const newPortFormRef = ref(null)
+const newPortSaveError = ref('')
+const detailSession = ref(null)
+const detailPortFormRef = ref(null)
+let detailSessionId = 0
+const savedPortType = (port) => editSnapshots.get(port.id)?.type || port.type
+const closeDraftProxySelector = (draft) => {
+  if (!draft) return
+  if (activePort.value === draft || draft.users?.includes(activePort.value)) {
+    showFormProxySelector.value = false
+    activePort.value = null
+  }
+}
+const closeNewPortDraft = () => {
+  if (newPortDraft.value?._saving) return
+  closeDraftProxySelector(newPortDraft.value)
+  clearInlineTlsSecrets(newPortDraft.value)
+  newPortDraft.value = null
+  newPortSaveError.value = ''
+}
+const openPortDetail = (row, nextType) => {
+  if (!row || row._saving || detailSession.value) return
+  const savedType = savedPortType(row)
+  const port = JSON.parse(JSON.stringify(row))
+  port._saving = false
+  if (nextType && !proxyPortSecureTypes.includes(savedType)) port.type = nextType
+  if (port.type === 'https' && !port.tls) port.tls = normalizeTlsConfig()
+  detailSession.value = {
+    id: ++detailSessionId, port, savedType, sourceId: row.id,
+    fromInline: isEditingPort(row), error: '', persisted: false, needsRefresh: false
+  }
+}
+const closePortDetail = () => {
+  const session = detailSession.value
+  if (!session || session.port._saving) return
+  closeDraftProxySelector(session.port)
+  clearInlineTlsSecrets(session.port)
+  detailSession.value = null
+}
+const onInlineTypeSelect = (row, type) => {
+  if (!proxyPortTypeOptions.some(p => p.value === type) || row._saving) return
+  const savedType = savedPortType(row)
+  if (!proxyPortQuickTypeValues.includes(type) || !proxyPortQuickTypeValues.includes(savedType)) {
+    openPortDetail(row, type)
+    return
+  }
+  row.type = type
+}
+const savePortDetail = async () => {
+  const session = detailSession.value
+  if (!session || session.port._saving) return
+  if (session.needsRefresh) {
+    session.port._saving = true
+    try {
+      const refreshed = await loadPorts(session.sourceId)
+      const saved = refreshed && ports.value.find(p => p.id === session.sourceId)
+      if (!saved) return
+      closeDraftProxySelector(session.port)
+      session.port = cloneField(saved)
+      session.savedType = saved.type
+      session.needsRefresh = false
+      session.error = '已重新读取已保存配置，请核对后再保存。'
+    } catch (e) {
+      session.error = `刷新已保存配置失败：${e?.message || '网络异常'}，暂不重试保存。`
+    } finally {
+      session.port._saving = false
+    }
+    return
+  }
+  session.error = ''
+  if (detailPortFormRef.value?.validate() === false) return
+  if (session.savedType === 'https' && session.port.type !== 'https' &&
+      !window.confirm('保存后将移除此入口的 TLS 配置，客户端需要按新协议连接；服务器证书文件不会删除。确认切换协议？')) return
+  closeDraftProxySelector(session.port)
+  const result = await savePort(session.port)
+  if (detailSession.value !== session) return
+  if (result.persisted) {
+    finishEditPort({ id: session.sourceId })
+    session.savedType = session.port.type
+  }
+  if (result.ok) {
+    closePortDetail()
+  } else {
+    session.persisted = result.persisted
+    session.needsRefresh = !!result.needsRefresh
+    session.error = result.msg
+    // savePort 已用成功响应或刷新结果更新草稿；刷新失败时不能回填列表旧值。
+  }
+}
+const newPortFromDetail = () => {
+  if (detailSession.value?.port._saving) return
+  if (!window.confirm('打开新建入口将放弃当前详细配置草稿；原端口不变。继续？')) return
+  closePortDetail()
+  addPort()
+}
 
 const showBatchProxyModal = ref(false)
 const batchProxyAssignment = ref('shared')
@@ -734,6 +871,10 @@ const filterProxyModeOptions = [
 ]
 
 const proxyTypeOptions = proxyPortTypeOptions
+const inlinePortTypeOptions = proxyPortTypeOptions.map(option => ({
+  ...option,
+  label: proxyPortQuickTypeValues.includes(option.value) ? option.label : `${option.label} · 需详细配置`
+}))
 
 
 
@@ -751,7 +892,9 @@ const bulkAssignmentOptions = [
   { label: '按端口轮换单独绑定节点', value: 'rotate-single' }
 ]
 
-const isMobile = computed(() => window.innerWidth < 768)
+const viewportWidth = ref(window.innerWidth)
+const updateViewportWidth = () => { viewportWidth.value = window.innerWidth }
+const isMobile = computed(() => viewportWidth.value < 768)
 
 const needsLoadBalance = (value) => {
   if (!value) return false
@@ -1078,13 +1221,21 @@ const loadConfig = async () => {
   }
 }
 
-const loadPorts = async () => {
+const loadPorts = async (savedId) => {
   const res = await api('/api/proxy-ports')
   if (!res.success) {
     message.error(res.msg || '加载代理端口失败')
-    return
+    return false
   }
-  ports.value = (res.data || []).map(normalizePort)
+  const editing = new Map(ports.value.filter(p => isEditingPort(p) && p.id !== savedId).map(p => [p.id, p]))
+  ports.value = (res.data || []).map(value => {
+    const row = normalizePort(value)
+    const draft = editing.get(row.id)
+    if (!draft) return row
+    applyPortRuntimeSnapshot(draft, row)
+    return draft
+  })
+  return true
 }
 
 const refreshPortRuntime = async (port) => {
@@ -1160,18 +1311,30 @@ const addPort = () => {
     auto_ping_full_scan_interval_hours: autoPingDefaults.full_scan_interval_hours,
     allow_list: ['0.0.0.0/0']
   })
+  newPortSaveError.value = ''
   newPortDraft.value._new = true
 }
 
 const saveNewPortDraft = async () => {
-  if (!newPortDraft.value) return
   const draft = newPortDraft.value
-  const before = ports.value.length
-  await savePort(draft)
-  // savePort 内部会 loadPorts(). 成功时服务器返回的端口会在 ports 数组里,
-  // 长度变化说明成功; 这时清掉草稿. 失败则保留草稿供用户改动重试.
-  if (ports.value.length > before) {
-    newPortDraft.value = null
+  if (!draft || draft._saving) return
+  newPortSaveError.value = ''
+  if (newPortFormRef.value?.validate() === false) return
+  closeDraftProxySelector(draft)
+  const result = await savePort(draft)
+  if (newPortDraft.value !== draft) return
+  if (result.ok) {
+    closeNewPortDraft()
+  } else if (result.persisted) {
+    // 草稿已经由保存响应/刷新结果更新，不能取回可能过期的列表行。
+    const saved = cloneField(draft)
+    closeNewPortDraft()
+    openPortDetail(saved)
+    detailSession.value.error = result.msg
+    detailSession.value.persisted = true
+    detailSession.value.needsRefresh = !!result.needsRefresh
+  } else {
+    newPortSaveError.value = result.msg
   }
 }
 
@@ -1376,12 +1539,11 @@ const portTableColumns = computed(() => [
     render: row => isEditingPort(row)
       ? h(NSelect, {
           value: row.type, size: 'small', consistentMenuWidth: false,
-          // 行内快捷编辑没有证书输入：HTTPS 入口保留原类型，只能从完整表单改；
-          // 其他类型也不能快捷切到 HTTPS，避免创建出无证书的不可用入口。
-          options: row.type === 'https'
-            ? [{ label: 'HTTPS · TLS 代理（完整表单修改）', value: 'https', disabled: true }]
-            : proxyTypeOptions.filter(p => !proxyPortSecureTypes.includes(p.value) && p.value !== 'https'),
-          onUpdateValue: v => { if (v !== 'https') row.type = v }
+          // 需要证书/独立认证的入口可见可选，但必须在完整草稿中配置后保存。
+          options: inlinePortTypeOptions,
+          disabled: !!row._saving,
+          'aria-label': '入口协议',
+          onUpdateValue: v => onInlineTypeSelect(row, v)
         })
       : h(NTag, { size: 'small', type: 'info', bordered: false }, () => row.type === 'hysteria2' ? 'HY2 / UDP' : row.type === 'mieru' ? 'Mieru / TCP' : (row.type || '').toUpperCase() || '-')
   },
@@ -1436,12 +1598,13 @@ const portTableColumns = computed(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 320,
+    width: 400,
     fixed: 'right',
     render: row => isEditingPort(row)
       ? h(NSpace, { size: 'small' }, () => [
           h(NButton, { size: 'tiny', type: 'primary', loading: !!row._saving, onClick: () => saveEditPort(row) }, () => '保存'),
-          h(NButton, { size: 'tiny', onClick: () => cancelEditPort(row) }, () => '取消')
+          h(NButton, { size: 'tiny', disabled: !!row._saving, onClick: () => openPortDetail(row) }, () => '详细配置'),
+          h(NButton, { size: 'tiny', disabled: !!row._saving, onClick: () => cancelEditPort(row) }, () => '取消')
         ])
       : h(NSpace, { size: 'small' }, () => [
           h(NButton, {
@@ -1458,12 +1621,12 @@ const portTableColumns = computed(() => [
             size: 'tiny',
             onClick: () => togglePortEnabled(row)
           }, () => row.enabled ? '停用' : '启用'),
+          proxyPortQuickTypeValues.includes(row.type) ? h(NButton, {
+            size: 'tiny', onClick: () => startEditPort(row)
+          }, () => '快捷编辑') : null,
           h(NButton, {
-            size: 'tiny',
-            type: 'primary',
-            // HTTPS 与 HY2/Mieru 一样有独立配置块，走完整表单弹窗，避免行内快捷编辑丢证书。
-            onClick: () => [...proxyPortSecureTypes, 'https'].includes(row.type) ? (securePort.value = JSON.parse(JSON.stringify(row))) : startEditPort(row)
-          }, () => '编辑'),
+            size: 'tiny', type: 'primary', onClick: () => openPortDetail(row)
+          }, () => '详细配置'),
           h(NButton, {
             size: 'tiny',
             type: 'error',
@@ -1881,23 +2044,46 @@ const saveGlobal = async () => {
 }
 
 const savePort = async (port) => {
+  if (!port || port._saving) return { ok: false, persisted: false, msg: '正在保存，请勿重复提交' }
   port._saving = true
   try {
     const payload = buildPortPayload(port)
-
     const res = port._new
       ? await api('/api/proxy-ports', 'POST', payload)
-      : await api(`/api/proxy-ports/${port.id}`, 'PUT', payload)
-
-    if (res.success) {
-      message.success('已保存')
-      // 先清掉草稿/编辑对象里可能粘贴过的私钥正文，再按服务器响应重建端口列表。
-      clearInlineTlsSecrets(port)
-      await loadPorts()
-      return true
+      : await api(`/api/proxy-ports/${encodeURIComponent(port.id)}`, 'PUT', payload)
+    const persisted = !!res.success || (res.msg || '').includes('配置已保存，但监听未应用')
+    if (!persisted) {
+      const msg = (res.msg || '').includes('活动连接')
+        ? `未保存：${res.msg}。请等待连接结束，或先停用入口后重试。`
+        : (res.msg || '保存失败，请检查配置后重试')
+      message.error(msg)
+      return { ok: false, persisted: false, msg }
     }
-    message.error(res.msg || '保存失败')
-    return false
+    // POST 已落盘时重试必须 PUT；不要重复新建，也不保留已提交的私钥正文。
+    port._new = false
+    clearInlineTlsSecrets(port)
+    if (res.data) Object.assign(port, normalizePort(res.data), { _saving: true, _new: false })
+    let refreshed = false
+    try { refreshed = await loadPorts(port.id) } catch { /* 已保存和刷新失败是两种状态 */ }
+    const saved = refreshed ? ports.value.find(p => p.id === port.id) : null
+    if (saved) Object.assign(port, cloneField(saved), { _saving: true, _new: false })
+    const needsRefresh = !saved && !res.data
+    if (!res.success) {
+      const msg = `${res.msg}。配置已持久化，请检查端口占用、证书或日志；当前监听状态以刷新结果为准。`
+      message.warning(msg)
+      return { ok: false, persisted: true, needsRefresh, msg }
+    }
+    if (!refreshed) {
+      const msg = '配置已保存，但刷新列表失败，请刷新核对实际状态；不要重复新建入口。'
+      message.warning(msg)
+      return { ok: false, persisted: true, needsRefresh, msg }
+    }
+    message.success('已保存')
+    return { ok: true, persisted: true, msg: '' }
+  } catch (e) {
+    const msg = `请求失败，无法确认是否已保存：${e?.message || '网络异常'}。请刷新核对后再试。`
+    message.error(msg)
+    return { ok: false, persisted: false, msg }
   } finally {
     port._saving = false
   }
@@ -1980,6 +2166,7 @@ const clearBulkProxySelection = () => {
 const isPortUserTarget = (t) => !!t && !('listen_addr' in t) && 'username' in t
 
 const openFormProxySelector = async (port) => {
+  if (!port || port._saving) return
   activePort.value = port
   showFormProxySelector.value = true
 
@@ -2025,7 +2212,7 @@ const refreshFormProxyList = async () => {
 
 const confirmFormProxySelection = () => {
   const port = activePort.value
-  if (!port) return
+  if (!showFormProxySelector.value || !port || port._saving) return
 
   if (formProxyMode.value === 'direct') {
     port.proxy_outbound = isPortUserTarget(port) ? 'direct' : ''
@@ -2348,16 +2535,23 @@ const formatLatency = (latency) => {
   return `${latency}ms`
 }
 
+watch(showFormProxySelector, show => { if (!show) activePort.value = null })
+
 watch(editingRowIds, () => {
   scheduleExpandedPortRuntimePolling()
 }, { deep: true })
 
 onMounted(() => {
+  window.addEventListener('resize', updateViewportWidth)
   loadAll()
 })
 
 onBeforeUnmount(() => {
   stopExpandedPortRuntimePolling()
+  window.removeEventListener('resize', updateViewportWidth)
+  clearInlineTlsSecrets(newPortDraft.value)
+  clearInlineTlsSecrets(detailSession.value?.port)
+  activePort.value = null
 })
 </script>
 

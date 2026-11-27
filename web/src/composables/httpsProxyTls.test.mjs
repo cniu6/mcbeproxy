@@ -136,12 +136,12 @@ test('表单 MODE 切换处理器：确认取消只提示，确认切换清空�
   const script = compileScript(parse(formSource, { filename: 'PortEditForm.vue' }).descriptor, { id: 'f' })
   const setupSection = extract(script.content, 'const tlsConfig = computed({', 'watch(() => props.port.type')
   const mount = new Function(
-    'props', 'ref', 'computed', 'switchTlsMode', 'tlsModeOptions',
+    'props', 'ref', 'computed', 'switchTlsMode', 'tlsModeOptions', 'busy',
     setupSection + '; return { tlsConfig, tlsSourceError, onTlsModeChange }'
   )
   const fakeRef = v => ({ get value() { return v }, set value(next) { v = next } })
   const props = { port: { type: 'https', tls: normalizeTlsConfig({ mode: 'file', cert_file: '/a', key_file: '/b', server_name: 's.example' }) } }
-  const vm = mount(props, fakeRef, computed, switchTlsMode, tlsModeOptions)
+  const vm = mount(props, fakeRef, computed, switchTlsMode, tlsModeOptions, { value: false })
   assert.equal(typeof vm.onTlsModeChange, 'function')
 
   let confirmAnswer = false
@@ -172,21 +172,24 @@ test('页面保存成功后清理表单中的 PEM 正文，重载的端口来自
   let submitted
   let reloads = 0
   const savePort = new Function(
-    'api', 'message', 'buildPortPayload', 'clearInlineTlsSecrets', 'loadPorts',
+    'api', 'message', 'buildPortPayload', 'clearInlineTlsSecrets', 'loadPorts', 'normalizePort', 'ports', 'cloneField',
     saveSection + '; return savePort'
   )(
     async (url, method, body) => { submitted = { url, method, body }; saved.push(body); return { success: true } },
-    { success() {}, error() {} },
+    { success() {}, error() {}, warning() {} },
     buildPortPayload,
     clearInlineTlsSecrets,
-    async () => { reloads++; saved.push('reload') }
+    async () => { reloads++; saved.push('reload'); return true },
+    normalizePort,
+    { value: [] },
+    value => structuredClone(value)
   )
   const port = normalizePort({ id: 'p', type: 'https', tls: {
     mode: 'pem', server_name: 's.example', has_cert_pem: false, has_key_pem: false
   } })
   port.tls.cert_pem = 'PASTED-CERT'
   port.tls.key_pem = 'PASTED-KEY'
-  assert.equal(await savePort(port), true)
+  assert.deepEqual(await savePort(port), { ok: true, persisted: true, msg: '' })
   assert.deepEqual(submitted.body.tls, { mode: 'pem', cert_pem: 'PASTED-CERT', key_pem: 'PASTED-KEY', server_name: 's.example' })
   assert.deepEqual(saved, [submitted.body, 'reload'], '保存成功后必须重新加载')
   assert.equal(reloads, 1)
@@ -196,11 +199,11 @@ test('页面保存成功后清理表单中的 PEM 正文，重载的端口来自
 })
 
 test('重载端口列表按 API 存在标记重建 TLS 表单，不携带旧 PEM 正文', async () => {
-  const loadPortsSection = extract(portsSource, 'const loadPorts = async () => {', 'const refreshPortRuntime = async (port) => {')
+  const loadPortsSection = extract(portsSource, 'const loadPorts = async (savedId) => {', 'const refreshPortRuntime = async (port) => {')
   const ports = { value: [] }
   const message = { error: msg => assert.fail(msg) }
   const loadPorts = new Function(
-    'api', 'message', 'ports', 'normalizePort',
+    'api', 'message', 'ports', 'normalizePort', 'isEditingPort', 'applyPortRuntimeSnapshot',
     loadPortsSection + '; return loadPorts'
   )(
     async () => ({
@@ -214,7 +217,9 @@ test('重载端口列表按 API 存在标记重建 TLS 表单，不携带旧 PEM
     }),
     message,
     ports,
-    normalizePort
+    normalizePort,
+    () => false,
+    () => {}
   )
   await loadPorts()
   assert.equal(ports.value.length, 1)

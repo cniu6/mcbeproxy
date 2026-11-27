@@ -35,13 +35,16 @@ func (a *APIServer) prepareSecurePort(p *config.ProxyPortConfig) error {
 		p.Password = base64.RawURLEncoding.EncodeToString(raw)
 	}
 	if p.Type == config.ProxyPortTypeHysteria2 {
-		if p.Secure.IdentityID == "" {
+		autoIdentity := p.Secure.IdentityID == ""
+		if autoIdentity {
 			p.Secure.IdentityID = p.ID
 		}
 		ids := proxy.NewSecureIdentityStore(a.proxyPortConfigMgr.IdentityDataDir())
 		if _, _, err := ids.Load(p.Secure.IdentityID); err != nil {
-			// 仅首次创建入口时自动生成；已有入口损坏不能静默换证书。
-			if _, exists := a.proxyPortConfigMgr.GetPort(p.ID); exists || !errors.Is(err, os.ErrNotExist) {
+			old, exists := a.proxyPortConfigMgr.GetPort(p.ID)
+			// 首次创建或普通入口首次转 HY2 才自动生成；已有 HY2 的身份丢失、
+			// 损坏以及显式指定的失效引用都不能被悄悄替换。
+			if !errors.Is(err, os.ErrNotExist) || (exists && (old.Type == config.ProxyPortTypeHysteria2 || !autoIdentity)) {
 				return errors.New("HY2证书无法读取，请检查原身份文件")
 			}
 			if _, err := ids.Create(p.Secure.IdentityID); err != nil {

@@ -59,9 +59,9 @@ test('安全端口首次保存自动创建证书，前端仅复制快捷链接�
   const text = readFileSync(file, 'utf8')
   assert.equal(parse(text).errors.length, 0)
   assert.doesNotMatch(text, /@click="createIdentity"/)
-  assert.match(text, /max_connections:4096,max_udp_associations:4096/)
+  assert.match(text, /fillMissingSecureLimits\(props\.port\.secure\)/)
   assert.match(text, /高级设置（可选/)
-  assert.match(text, /v-if="savedSecure"/)
+  assert.match(text, /v-if="showSecureExport"/)
   // 第三方通用链接 / v2rayN Base64 订阅 / Clash YAML / mcproxy 内部互导。
   // 标准格式走 /share，内部互导仍走 /export?format=link，默认明文 links。
   assert.match(text, /\/share`, 'POST'/)
