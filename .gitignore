@@ -43,3 +43,5 @@ log_today*.json
 outbounds.json
 pprof_goroutines.txt
 sess_hist.json
+data.db-shm
+data.db-wal
