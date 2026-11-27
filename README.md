@@ -1171,6 +1171,11 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags=with_utls -ldflags="-s -w" 
 go test ./...
 ```
 
+### 发布工作流的 Go 工具链（更正说明）
+
+发布工作流 `.github/workflows/release.yml` 的 Go 版本说明曾被错误描述，详细的核实过程与未验证事项见：
+[docs/2026-11-27-release-go-toolchain-correction.md](docs/2026-11-27-release-go-toolchain-correction.md)
+
 ## 安全注意事项
 
 ### 1. 保护敏感信息
