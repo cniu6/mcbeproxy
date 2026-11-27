@@ -103,7 +103,17 @@ func (m *ProxyPortConfigManager) saveToFile() error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal proxy port config: %w", err)
 	}
-	if err := atomicWriteFile(m.configPath, data, 0644); err != nil {
+	perm := os.FileMode(0644)
+	for _, cfg := range ports {
+		if cfg != nil && cfg.Type == ProxyPortTypeHTTPS && ProxyPortTLSMode(cfg.TLS) == ProxyPortTLSModePEM && strings.TrimSpace(cfg.TLS.KeyPEM) != "" {
+			// Inline private keys are intentionally stored in this JSON file. Keep
+			// the file owner-readable only on POSIX; Windows ACLs remain the
+			// authoritative protection mechanism there.
+			perm = 0600
+			break
+		}
+	}
+	if err := atomicWriteFile(m.configPath, data, perm); err != nil {
 		return fmt.Errorf("failed to write proxy port config file: %w", err)
 	}
 	return nil

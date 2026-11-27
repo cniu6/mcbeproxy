@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -13,34 +14,105 @@ import (
 	"mcpeserverproxy/internal/logger"
 )
 
-// ProxyPortTLSConfig keeps the HTTPS listener's private key on the server.
-// ServerName and CAFile also tell the local connectivity probe how to verify it.
+// ProxyPortTLSConfig supports either server-side certificate files or PEM text
+// stored directly in proxy_ports.json. PEM fields are write-only at the API.
 type ProxyPortTLSConfig struct {
+	Mode       string `json:"mode,omitempty"`
 	CertFile   string `json:"cert_file"`
 	KeyFile    string `json:"key_file"`
+	CertPEM    string `json:"cert_pem,omitempty"`
+	KeyPEM     string `json:"key_pem,omitempty"`
 	ServerName string `json:"server_name"`
 	CAFile     string `json:"ca_file,omitempty"`
 }
 
-func (c *ProxyPortTLSConfig) validate() error {
-	if c == nil || strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "" {
-		return errors.New("HTTPS proxy requires tls.cert_file and tls.key_file")
+const (
+	ProxyPortTLSModeFile = "file"
+	ProxyPortTLSModePEM  = "pem"
+	maxInlineTLSPEMBytes = 4 << 20
+)
+
+// ProxyPortTLSMode reports the configured source mode, treating the legacy
+// empty value as file mode. It never mutates the config, so a read-only mode
+// check cannot change equality decisions during a runtime reload.
+func ProxyPortTLSMode(c *ProxyPortTLSConfig) string {
+	if c == nil || strings.TrimSpace(c.Mode) == "" {
+		return ProxyPortTLSModeFile
 	}
+	return strings.ToLower(strings.TrimSpace(c.Mode))
+}
+
+// Equals compares two TLS configurations by effective mode. A legacy empty
+// mode and an explicit "file" mode describe the same source and are equal;
+// the original configs are not changed.
+func (c *ProxyPortTLSConfig) Equals(other *ProxyPortTLSConfig) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+	a, b := *c, *other
+	a.Mode = ProxyPortTLSMode(c)
+	b.Mode = ProxyPortTLSMode(other)
+	return reflect.DeepEqual(a, b)
+}
+
+func (c *ProxyPortTLSConfig) validate() error {
+	if c == nil {
+		return errors.New("HTTPS proxy requires tls settings")
+	}
+	mode := ProxyPortTLSMode(c)
 	if strings.TrimSpace(c.ServerName) == "" {
 		return errors.New("HTTPS proxy requires tls.server_name")
 	}
 	if strings.ContainsAny(c.CertFile+c.KeyFile+c.CAFile, "\r\n") {
-		return errors.New("HTTPS proxy TLS settings require file paths, not PEM content")
+		return errors.New("HTTPS proxy TLS file settings require file paths")
+	}
+	switch mode {
+	case ProxyPortTLSModeFile:
+		if strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "" {
+			return errors.New("HTTPS proxy file mode requires tls.cert_file and tls.key_file")
+		}
+		if c.CertPEM != "" || c.KeyPEM != "" {
+			return errors.New("HTTPS proxy file mode cannot include PEM certificate fields")
+		}
+	case ProxyPortTLSModePEM:
+		if strings.TrimSpace(c.CertPEM) == "" || strings.TrimSpace(c.KeyPEM) == "" {
+			return errors.New("HTTPS proxy PEM mode requires tls.cert_pem and tls.key_pem")
+		}
+		if len(c.CertPEM) > maxInlineTLSPEMBytes || len(c.KeyPEM) > maxInlineTLSPEMBytes {
+			return errors.New("HTTPS proxy PEM certificate or key is too large")
+		}
+		if c.CertFile != "" || c.KeyFile != "" {
+			return errors.New("HTTPS proxy PEM mode cannot include certificate file paths")
+		}
+	default:
+		return fmt.Errorf("HTTPS proxy TLS mode must be %q or %q", ProxyPortTLSModeFile, ProxyPortTLSModePEM)
 	}
 	return nil
 }
 
-// ServerTLS validates the listener certificate and returns a config that
-// reloads the PEM pair when the files change (for example after ACME renewal).
-// A failed reload keeps serving the previous pair and logs the reason.
+// ServerTLS validates the listener certificate and returns a TLS config. File
+// mode reloads a changed pair per handshake; PEM mode is replaced on config
+// reload and therefore has no file watcher.
 func (c *ProxyPortTLSConfig) ServerTLS() (*tls.Config, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
+	}
+	if ProxyPortTLSMode(c) == ProxyPortTLSModePEM {
+		pair, err := tls.X509KeyPair([]byte(c.CertPEM), []byte(c.KeyPEM))
+		if err != nil {
+			// X509KeyPair may echo PEM block types from the caller's input. Report
+			// only a fixed reason: neither PEM bodies nor block types belong in
+			// validation errors or logs.
+			return nil, errors.New("HTTPS proxy PEM certificate/key is invalid")
+		}
+		if err := validateServerCertificate(&pair, strings.TrimSpace(c.ServerName)); err != nil {
+			return nil, err
+		}
+		return &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"http/1.1"},
+			Certificates: []tls.Certificate{pair},
+		}, nil
 	}
 	reloader := &httpsCertReloader{
 		certFile:   strings.TrimSpace(c.CertFile),
@@ -84,17 +156,27 @@ func (r *httpsCertReloader) load() (*tls.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("HTTPS proxy certificate/key: %w", err)
 	}
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("HTTPS proxy certificate: %w", err)
-	}
-	if err := leaf.VerifyHostname(r.serverName); err != nil {
-		return nil, fmt.Errorf("HTTPS proxy certificate name: %w", err)
-	}
-	if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
-		return nil, errors.New("HTTPS proxy certificate is not currently valid")
+	if err := validateServerCertificate(&pair, r.serverName); err != nil {
+		return nil, err
 	}
 	return &pair, nil
+}
+
+func validateServerCertificate(pair *tls.Certificate, serverName string) error {
+	if pair == nil || len(pair.Certificate) == 0 {
+		return errors.New("HTTPS proxy certificate is empty")
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("HTTPS proxy certificate: %w", err)
+	}
+	if err := leaf.VerifyHostname(serverName); err != nil {
+		return fmt.Errorf("HTTPS proxy certificate name: %w", err)
+	}
+	if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return errors.New("HTTPS proxy certificate is not currently valid")
+	}
+	return nil
 }
 
 // get runs per handshake. It only re-reads when the file stamp changes, so

@@ -8,6 +8,10 @@ import {
   proxyPortSecureTypes,
   proxyProtocolOptions
 } from './selectOptions.js'
+import {
+  TLS_MODE_FILE, TLS_MODE_PEM, tlsModeOptions,
+  normalizeTlsConfig, buildTlsPayload, switchTlsMode, clearInlineTlsSecrets
+} from './httpsProxyTls.js'
 
 const source = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8')
 function extract(text, start, end) {
@@ -23,13 +27,13 @@ const formSource = source('views/components/PortEditForm.vue')
 
 // 用与现有测试一致的方式抽出页面函数，注入它们真正依赖的局部助手。
 const normalizePort = new Function(
-  'applyLoadBalanceDefaults', 'applyAutoPingDefaults', 'normalizePortUser', 'portRuntimeFieldDefaults', 'applyPortRuntimeSnapshot',
+  'applyLoadBalanceDefaults', 'applyAutoPingDefaults', 'normalizePortUser', 'portRuntimeFieldDefaults', 'applyPortRuntimeSnapshot', 'normalizeTlsConfig',
   extract(portsSource, 'const normalizePort =', 'const parsePortExpression =') + '; return normalizePort'
-)(() => {}, () => {}, u => ({ ...u }), {}, () => {})
+)(() => {}, () => {}, u => ({ ...u }), {}, () => {}, normalizeTlsConfig)
 const buildPortPayload = new Function(
-  'applyLoadBalanceDefaults', 'applyAutoPingDefaults', 'getProxyPortAutoPingDefaults', 'buildUsersPayload',
+  'applyLoadBalanceDefaults', 'applyAutoPingDefaults', 'getProxyPortAutoPingDefaults', 'buildUsersPayload', 'buildTlsPayload',
   extract(portsSource, 'const buildPortPayload =', '// ----- 批量操作 -----') + '; return buildPortPayload'
-)(() => {}, () => {}, () => ({}), users => users)
+)(() => {}, () => {}, () => ({}), users => users, buildTlsPayload)
 const makeBatchSetType = new Function(
   'selectedPorts', 'proxyPortSecureTypes', 'message', 'api', 'buildPortPayload', 'loadPorts', 'batchActionRunning',
   extract(portsSource, 'const batchSetType =', '// ----- 端口连通性测试 -----') + '; return batchSetType'
@@ -49,10 +53,24 @@ test('共享菜单：HTTPS 入口只在完整表单提供，快捷/批量/安全
   assert.match(portsSource, /proxyPortQuickTypeValues\.includes\(p\.value\)/)
 })
 
-test('HTTPS 入口证书字段：完整表单包含四项，安全入口只属于 HY2/Mieru', () => {
+test('HTTPS 入口证书字段：文件模式四项 + PEM 模式双文本框，安全入口只属于 HY2/Mieru', () => {
   for (const field of ['cert_file', 'key_file', 'server_name', 'ca_file']) {
     assert.match(formSource, new RegExp(`v-model:value="tlsConfig\\.${field}"`))
   }
+  for (const field of ['cert_pem', 'key_pem']) {
+    assert.match(formSource, new RegExp(`v-model:value="tlsConfig\\.${field}"`))
+  }
+  assert.match(formSource, /:value="tlsConfig\.mode" :options="tlsModeOptions"/)
+  assert.match(formSource, /@update:value="onTlsModeChange"/)
+  assert.match(formSource, /type="textarea"/)
+  assert.match(formSource, /autocomplete="off" spellcheck="false"/)
+  assert.match(formSource, /已保存证书链；留空表示保留/)
+  assert.match(formSource, /已保存私钥；留空表示保留/)
+  assert.match(formSource, /明文写入服务器的 proxy_ports\.json/)
+  assert.match(formSource, /备份也会包含私钥/)
+  assert.match(formSource, /安全的面板连接/)
+  assert.match(formSource, /不支持内联 CA/)
+  assert.match(formSource, /switchTlsMode\(tlsConfig\.value, value\)/)
   assert.match(formSource, /const isHttps = computed\(\(\) => props\.port\.type === 'https'\)/)
   assert.match(formSource, /v-if="isHttps"/)
   assert.match(formSource, /v-if="isSecure"/)
@@ -63,16 +81,17 @@ test('HTTPS 入口证书字段：完整表单包含四项，安全入口只属�
 })
 
 test('HTTPS 端口列表加载、编辑、保存保留全部 TLS 配置，TLS 不泄漏到其他类型', () => {
-  const tls = { cert_file: '/etc/tls/fullchain.pem', key_file: '/etc/tls/privkey.pem', server_name: 'proxy.example.com', ca_file: '/etc/tls/ca.pem' }
+  const tls = { mode: 'file', cert_file: '/etc/tls/fullchain.pem', key_file: '/etc/tls/privkey.pem', server_name: 'proxy.example.com', ca_file: '/etc/tls/ca.pem' }
   const original = { id: 'https-1', type: 'https', enabled: true, tls, users: [] }
   const row = normalizePort(JSON.parse(JSON.stringify(original)))
-  assert.deepEqual(row.tls, tls)
+  assert.deepEqual(row.tls, { ...tls, saved_mode: 'file', cert_pem: '', key_pem: '', has_cert_pem: false, has_key_pem: false })
   assert.notEqual(row.tls, tls)
 
   const payload = buildPortPayload(row)
   assert.equal(payload.type, 'https')
   assert.deepEqual(payload.tls, tls)
   assert.equal('key_file' in payload.tls, true)
+  assert.equal('has_cert_pem' in payload.tls, false)
   assert.equal(payload.secure, undefined)
   assert.equal('running' in payload, false)
 
@@ -107,7 +126,7 @@ test('批量与行内快捷切换不能进出 HTTPS；完整表单才允许改�
     return () => batchSetType('http')
   }
 
-  const httpsPort = normalizePort({ id: 'https-1', type: 'https', tls: { cert_file: 'a', key_file: 'b', server_name: 'c' } })
+  const httpsPort = normalizePort({ id: 'https-1', type: 'https', tls: { mode: 'file', cert_file: 'a', key_file: 'b', server_name: 'c' } })
   await makeRun([httpsPort])()
   assert.equal(calls.length, 0, 'HTTPS 不能批量切到其他类型')
   assert.ok(warnings.some(w => w.includes('HTTPS')))

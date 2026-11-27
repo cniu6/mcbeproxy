@@ -293,7 +293,7 @@ func proxyPortRuntimeConfigEqual(a, b *config.ProxyPortConfig) bool {
 		ac.ProxyOutbound == bc.ProxyOutbound &&
 		ac.LoadBalance == bc.LoadBalance &&
 		ac.LoadBalanceSort == bc.LoadBalanceSort &&
-		reflect.DeepEqual(ac.TLS, bc.TLS) &&
+		ac.TLS.Equals(bc.TLS) &&
 		reflect.DeepEqual(ac.AllowList, bc.AllowList)
 }
 

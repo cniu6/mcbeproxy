@@ -266,11 +266,18 @@ func (a *APIServer) validateSecurePortChange(p *config.ProxyPortConfig) error {
 }
 func redactSecurePort(p *config.ProxyPortConfig) *config.ProxyPortConfig {
 	p = p.Clone()
+	if p == nil {
+		return nil
+	}
 	if p.IsSecure() {
 		p.Password = ""
 		for i := range p.Users {
 			p.Users[i].Password = ""
 		}
+	}
+	if p.TLS != nil {
+		p.TLS.CertPEM = ""
+		p.TLS.KeyPEM = ""
 	}
 	return p
 }

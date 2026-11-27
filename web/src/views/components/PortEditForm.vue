@@ -57,9 +57,32 @@
 
     <n-space v-if="isHttps" vertical style="margin-bottom:12px">
       <n-alert size="small" type="info" :show-icon="false">
-        HTTPS 入口用 TLS 保护客户端到代理这段，支持 HTTP/1.1 与 CONNECT；不解密目标站 TLS、不支持 UDP。证书/私钥只填写服务器上的文件路径，私钥正文不会进入页面或配置 API。证书文件更新后新连接自动使用新证书，无需重启；证书名不符或已过期的新文件会被拒绝，并保留上一份可用证书。
+        HTTPS 入口用 TLS 保护客户端到代理这段，支持 HTTP/1.1 与 CONNECT；不解密目标站 TLS、不支持 UDP。证书来源可选服务器上的文件路径，或直接粘贴证书链与私钥 PEM。内联 PEM 会以明文存进服务器 proxy_ports.json，普通备份也会包含私钥；请仅通过安全的面板连接操作。文件来源下更新证书文件后新连接自动使用新证书，无需重启；证书名不符或已过期的新证书会被拒绝，并保留上一份可用证书。
       </n-alert>
-      <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
+      <n-form-item label="证书来源">
+        <n-space align="center" wrap>
+          <n-select size="small" style="width: 180px" :value="tlsConfig.mode" :options="tlsModeOptions"
+            @update:value="onTlsModeChange" />
+          <n-text depth="3" style="font-size: 12px">切换会清空当前来源的表单内容；已保存的证书不会被另一种来源复用</n-text>
+        </n-space>
+      </n-form-item>
+      <template v-if="tlsConfig.mode === 'pem'">
+        <n-alert size="small" type="warning" :show-icon="false">
+          证书链与私钥会以明文写入服务器的 proxy_ports.json，服务配置备份也会包含私钥；请使用安全的面板连接，并限制能读取配置与备份的人员。
+        </n-alert>
+        <n-form-item label="证书链 PEM" required>
+          <n-input size="small" v-model:value="tlsConfig.cert_pem" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }"
+            :placeholder="tlsConfig.has_cert_pem ? '已保存证书链；留空表示保留，粘贴新内容则覆盖' : '-----BEGIN CERTIFICATE-----（可含中间证书，按顺序粘贴）'"
+            autocomplete="off" spellcheck="false" :aria-label="'证书链 PEM'" />
+        </n-form-item>
+        <n-form-item label="私钥 PEM" required>
+          <n-input size="small" v-model:value="tlsConfig.key_pem" type="textarea" :autosize="{ minRows: 3, maxRows: 8 }"
+            :placeholder="tlsConfig.has_key_pem ? '已保存私钥；留空表示保留，粘贴新内容则覆盖' : '-----BEGIN PRIVATE KEY-----'"
+            autocomplete="off" spellcheck="false" :aria-label="'私钥 PEM'" />
+        </n-form-item>
+        <n-text depth="3" style="font-size: 12px">编辑时文本框留空表示保留服务器已保存的证书/私钥，不会把私钥正文返回页面；粘贴新内容才会覆盖。切换来源不会沿用已保存的证书或私钥，需完整重新填写。</n-text>
+      </template>
+      <n-grid v-else :cols="isMobile ? 1 : 2" :x-gap="16">
         <n-gi>
           <n-form-item label="证书链文件" required>
             <n-input size="small" v-model:value="tlsConfig.cert_file" placeholder="/path/to/fullchain.pem" clearable />
@@ -70,6 +93,8 @@
             <n-input size="small" v-model:value="tlsConfig.key_file" placeholder="/path/to/privkey.pem" clearable />
           </n-form-item>
         </n-gi>
+      </n-grid>
+      <n-grid :cols="isMobile ? 1 : 2" :x-gap="16">
         <n-gi>
           <n-form-item label="证书名称" required>
             <n-input size="small" v-model:value="tlsConfig.server_name" placeholder="proxy.example.com（本机探测与证书校验用）" clearable />
@@ -81,7 +106,8 @@
           </n-form-item>
         </n-gi>
       </n-grid>
-      <n-text depth="3" style="font-size: 12px">证书名称用于本机连接测试时校验代理证书；客户端实际连接仍按自己信任的根证书验证该名称，监听 IP 与证书名不同属正常情况。</n-text>
+      <n-alert v-if="tlsSourceError" size="small" type="warning" :show-icon="false">{{ tlsSourceError }}</n-alert>
+      <n-text depth="3" style="font-size: 12px">CA 文件仍只填写服务器路径，不支持内联 CA。证书名称用于本机连接测试时校验代理证书；客户端实际连接仍按自己信任的根证书验证该名称，监听 IP 与证书名不同属正常情况。</n-text>
     </n-space>
 
     <n-space v-if="isSecure" vertical style="margin-bottom:12px">
@@ -271,6 +297,7 @@
 import { computed, ref, watch } from 'vue'
 import { api } from '../../api'
 import { defaultProxyAddress, copyShareLink } from '../../composables/secureShare.js'
+import { tlsModeOptions, switchTlsMode } from '../../composables/httpsProxyTls.js'
 import ListenAddrInput from '../../components/ListenAddrInput.vue'
 import PortUsersEditor from './PortUsersEditor.vue'
 
@@ -314,15 +341,23 @@ const props = defineProps({
 const isSecure = computed(() => ['hysteria2', 'mieru'].includes(props.port.type))
 const isHttps = computed(() => props.port.type === 'https')
 
-// tlsConfig 直接落在 port.tls 上，父组件 buildPortPayload 原样回传；切换类型时
-// 不在这里清空证书路径，避免误删后端已保存的配置。
+// tlsConfig 直接落在 port.tls 上，父组件 buildPortPayload 用白名单序列化回传；
+// API 不返回 PEM 正文，表单里只保留本次粘贴的内容，初始一律为空表示保留服务端已存值。
+// 切换来源经 httpsProxyTls.switchTlsMode 确认后清空本地输入和存在标记，不跨来源沿用。
 const tlsConfig = computed({
   get() {
-    if (!props.port.tls) props.port.tls = { cert_file: '', key_file: '', server_name: '', ca_file: '' }
+    if (!props.port.tls) {
+      props.port.tls = { mode: 'file', cert_file: '', key_file: '', cert_pem: '', key_pem: '', server_name: '', ca_file: '', has_cert_pem: false, has_key_pem: false }
+    }
     return props.port.tls
   },
   set(value) { props.port.tls = value }
 })
+const tlsSourceError = ref('')
+const onTlsModeChange = (value) => {
+  const changed = switchTlsMode(tlsConfig.value, value)
+  tlsSourceError.value = changed ? '' : '已取消切换，证书来源保持不变'
+}
 
 watch(() => props.port.type, () => {
   if (!isSecure.value) return

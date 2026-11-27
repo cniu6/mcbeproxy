@@ -65,8 +65,39 @@ type proxyPortUserStatsProvider interface {
 	GetProxyPortUserStats(portID string) []proxy.ProxyPortUserStat
 }
 
-type proxyPortListDTO struct {
+// Explicit TLS response fields keep inline certificate material write-only,
+// including on the non-admin list endpoint and create/update responses.
+type proxyPortTLSView struct {
+	Mode       string `json:"mode"`
+	CertFile   string `json:"cert_file"`
+	KeyFile    string `json:"key_file"`
+	ServerName string `json:"server_name"`
+	CAFile     string `json:"ca_file,omitempty"`
+	HasCertPEM bool   `json:"has_cert_pem"`
+	HasKeyPEM  bool   `json:"has_key_pem"`
+}
+
+type proxyPortConfigDTO struct {
 	*config.ProxyPortConfig
+	TLS *proxyPortTLSView `json:"tls,omitempty"`
+}
+
+func toProxyPortConfigDTO(port *config.ProxyPortConfig) proxyPortConfigDTO {
+	dto := proxyPortConfigDTO{ProxyPortConfig: redactSecurePort(port)}
+	if port != nil && port.TLS != nil {
+		t := port.TLS
+		dto.TLS = &proxyPortTLSView{
+			Mode: config.ProxyPortTLSMode(t), CertFile: t.CertFile, KeyFile: t.KeyFile,
+			ServerName: t.ServerName, CAFile: t.CAFile,
+			HasCertPEM: strings.TrimSpace(t.CertPEM) != "",
+			HasKeyPEM:  strings.TrimSpace(t.KeyPEM) != "",
+		}
+	}
+	return dto
+}
+
+type proxyPortListDTO struct {
+	proxyPortConfigDTO
 	proxyPortRuntimeDTO
 }
 
@@ -79,6 +110,7 @@ const defaultProxyPortTestURL = "https://www.google.com/generate_204"
 const proxyPortTestTimeout = 15 * time.Second
 
 func (a *APIServer) getProxyPorts(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
@@ -89,16 +121,16 @@ func (a *APIServer) getProxyPorts(c *gin.Context) {
 		if port == nil {
 			continue
 		}
-		clone := redactSecurePort(port)
 		dtos = append(dtos, proxyPortListDTO{
-			ProxyPortConfig:     clone,
-			proxyPortRuntimeDTO: a.buildProxyPortRuntimeSnapshot(clone),
+			proxyPortConfigDTO:  toProxyPortConfigDTO(port),
+			proxyPortRuntimeDTO: a.buildProxyPortRuntimeSnapshot(port),
 		})
 	}
 	respondSuccess(c, dtos)
 }
 
 func (a *APIServer) getProxyPortRuntime(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
@@ -159,14 +191,25 @@ func (a *APIServer) buildProxyPortRuntimeSnapshot(port *config.ProxyPortConfig) 
 	return dto
 }
 
+func bindProxyPortRequest(c *gin.Context, dest any) bool {
+	// Bound the JSON (including pasted PEM), and don't echo JSON decoder errors:
+	// malformed field types can include submitted secret values in error text.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<20)
+	if err := c.ShouldBindJSON(dest); err != nil {
+		respondError(c, http.StatusBadRequest, "Invalid request body", "expected proxy port JSON of at most 16 MiB")
+		return false
+	}
+	return true
+}
+
 func (a *APIServer) createProxyPort(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
 	}
 	var cfg config.ProxyPortConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+	if !bindProxyPortRequest(c, &cfg) {
 		return
 	}
 	if cfg.ID == "" {
@@ -191,17 +234,17 @@ func (a *APIServer) createProxyPort(c *gin.Context) {
 			return
 		}
 	}
-	respondSuccess(c, redactSecurePort(&cfg))
+	respondSuccess(c, toProxyPortConfigDTO(&cfg))
 }
 
 func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
 	}
 	var req bulkCreateProxyPortsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+	if !bindProxyPortRequest(c, &req) {
 		return
 	}
 	if len(req.Ports) == 0 {
@@ -239,13 +282,15 @@ func (a *APIServer) createProxyPortsBulk(c *gin.Context) {
 			return
 		}
 	}
-	for i, p := range prepared {
-		prepared[i] = redactSecurePort(p)
+	dtos := make([]proxyPortConfigDTO, 0, len(prepared))
+	for _, p := range prepared {
+		dtos = append(dtos, toProxyPortConfigDTO(p))
 	}
-	respondSuccess(c, prepared)
+	respondSuccess(c, dtos)
 }
 
 func (a *APIServer) updateProxyPort(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
@@ -256,8 +301,7 @@ func (a *APIServer) updateProxyPort(c *gin.Context) {
 		return
 	}
 	var cfg config.ProxyPortConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		respondError(c, http.StatusBadRequest, "Invalid request body", err.Error())
+	if !bindProxyPortRequest(c, &cfg) {
 		return
 	}
 	if cfg.ID == "" {
@@ -300,10 +344,11 @@ func (a *APIServer) updateProxyPort(c *gin.Context) {
 			return
 		}
 	}
-	respondSuccess(c, redactSecurePort(&cfg))
+	respondSuccess(c, toProxyPortConfigDTO(&cfg))
 }
 
 func (a *APIServer) deleteProxyPort(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return
@@ -341,6 +386,37 @@ func prepareHTTPSProxyPort(cfg, old *config.ProxyPortConfig) error {
 	}
 	if cfg.TLS == nil && old != nil && old.Type == config.ProxyPortTypeHTTPS {
 		cfg.TLS = old.Clone().TLS
+	} else if cfg.TLS != nil && old != nil && old.Type == config.ProxyPortTypeHTTPS && old.TLS != nil {
+		// PEM fields are write-only. An omitted/blank field in the same mode
+		// means preserve the saved value; switching modes never inherits it.
+		mode := config.ProxyPortTLSMode(cfg.TLS)
+		oldMode := config.ProxyPortTLSMode(old.TLS)
+		if mode == oldMode {
+			if mode == config.ProxyPortTLSModePEM {
+				if strings.TrimSpace(cfg.TLS.CertPEM) == "" {
+					cfg.TLS.CertPEM = old.TLS.CertPEM
+				}
+				if strings.TrimSpace(cfg.TLS.KeyPEM) == "" {
+					cfg.TLS.KeyPEM = old.TLS.KeyPEM
+				}
+			} else {
+				if strings.TrimSpace(cfg.TLS.CertFile) == "" {
+					cfg.TLS.CertFile = old.TLS.CertFile
+				}
+				if strings.TrimSpace(cfg.TLS.KeyFile) == "" {
+					cfg.TLS.KeyFile = old.TLS.KeyFile
+				}
+			}
+		} else {
+			// Explicit mode changes discard the old source and require the new
+			// source to be supplied completely by validation below.
+			if mode == config.ProxyPortTLSModePEM {
+				cfg.TLS.CertFile, cfg.TLS.KeyFile = "", ""
+			} else {
+				cfg.TLS.CertPEM, cfg.TLS.KeyPEM = "", ""
+			}
+		}
+		cfg.TLS.Mode = mode
 	}
 	// Disabling a port remains possible even when its TLS files have gone away.
 	if !cfg.Enabled {
@@ -369,6 +445,7 @@ func generateProxyPortID() string {
 // POST /api/proxy-ports/:id/test
 // Body (optional): {"url": "https://..."}
 func (a *APIServer) testProxyPort(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	if a.proxyPortConfigMgr == nil {
 		respondError(c, http.StatusInternalServerError, "Proxy port config manager not initialized", "")
 		return

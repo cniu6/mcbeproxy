@@ -536,6 +536,7 @@ import { loadBalanceOptions, loadBalanceSortOptions, autoPingFullScanModeOptions
   proxyPortTypeOptions, proxyPortSecureTypes, proxyPortQuickTypeValues } from '../composables/selectOptions.js'
 import { filterNodes } from '../composables/nodeFilters.js'
 import { copyShareLink } from '../composables/secureShare.js'
+import { normalizeTlsConfig, buildTlsPayload, clearInlineTlsSecrets } from '../composables/httpsProxyTls.js'
 
 const message = useMessage()
 const { listenHostOptions, loadInterfaces, loading: ifaceLoading } = useNetworkInterfaces()
@@ -865,7 +866,8 @@ const normalizePort = (port) => {
     ignore_route_rules: !!port.ignore_route_rules,
     users: (port.users || []).map(normalizePortUser),
     secure: port.secure ? JSON.parse(JSON.stringify(port.secure)) : undefined,
-    tls: port.tls ? JSON.parse(JSON.stringify(port.tls)) : undefined,
+    // API 不返回 PEM 正文，只给存在标记；表单模型统一归一化，旧配置默认 file 模式。
+    tls: port.tls ? normalizeTlsConfig(port.tls) : undefined,
     running: !!port.running,
     ...portRuntimeFieldDefaults
   }
@@ -1545,9 +1547,9 @@ const buildPortPayload = (port) => {
     ignore_route_rules: !!port.ignore_route_rules,
     users: buildUsersPayload(port.users),
     secure: ['hysteria2', 'mieru'].includes(port.type) ? (port.secure || { limits: {} }) : undefined,
-    // TLS 只属于 HTTPS 入口；其他类型不回传，避免后端拒绝 tls 与类型不匹配。
-    // 批量启停/改代理保持 type=https 时，证书配置随 payload 原样保留。
-    tls: port.type === 'https' ? (port.tls || {}) : undefined
+    // TLS 只属于 HTTPS 入口；白名单序列化不回传响应标记或另一种来源的字段。
+    // 批量启停/改代理保持 type=https 时，证书来源配置随 payload 保留。
+    tls: port.type === 'https' ? buildTlsPayload(port.tls) : undefined
   }
 }
 
@@ -1889,6 +1891,8 @@ const savePort = async (port) => {
 
     if (res.success) {
       message.success('已保存')
+      // 先清掉草稿/编辑对象里可能粘贴过的私钥正文，再按服务器响应重建端口列表。
+      clearInlineTlsSecrets(port)
       await loadPorts()
       return true
     }

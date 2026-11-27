@@ -537,7 +537,7 @@ flowchart TD
 | `name` | string | ✅ | 代理端口显示名称 |
 | `listen_addr` | string | ✅ | 监听地址（如 `0.0.0.0:1080`） |
 | `type` | string | ✅ | 代理类型（http/https/socks5/socks4/mixed） |
-| `tls` | object | HTTPS | `cert_file`、`key_file`、`server_name`，以及测试私有 CA 时可选的 `ca_file` |
+| `tls` | object | HTTPS | `mode: "file"`（默认）使用 `cert_file` / `key_file`；`mode: "pem"` 使用 `cert_pem` / `key_pem`。均需 `server_name`，本机测试私有 CA 时可选 `ca_file` |
 | `enabled` | bool | ✅ | 是否启用此代理端口 |
 | `proxy_outbound` | string | ⚪ | 上游节点名称、组名或节点列表 |
 | `load_balance` | string | ⚪ | 负载均衡策略 |
@@ -1037,9 +1037,33 @@ flowchart TD
 
 ### HTTPS 正向代理（TCP）
 
-在「代理端口」新增独立的 **HTTPS 代理**，保持现有 HTTP/SOCKS 端口不变。例如监听 `0.0.0.0:10821`，设置账号密码和需要的客户端 IP 白名单。填入服务器上的 PEM 证书链（certbot 等工具生成的 `fullchain.pem`，不要用只含叶子证书的 `cert.pem`）和私钥路径，以及证书覆盖的完整域名（例如 `proxy.example.com`）。文件路径以服务的工作目录为基准，建议使用绝对路径；私钥只放在服务器上；运行服务的系统用户（例如 Linux 上的 `www`）必须有权读取这两个文件。
+在「代理端口」新增独立的 **HTTPS 代理**，保持现有 HTTP/SOCKS 端口不变。例如监听 `0.0.0.0:10821`，设置账号密码和需要的客户端 IP 白名单。证书来源支持以下两种方式（每个入口选择一种，不混用）：
 
-代理监听端口**不必是 443**；客户端连接 `https://proxy.example.com:10821`，防火墙放行对应 TCP 端口即可。不方便开放 80/443 时，可通过 DNS-01 为该域名签发证书。公共证书不必填 CA 文件；如果使用私有 CA，客户端须显式信任该 CA，面板的连通性测试可通过入口的 `tls.ca_file` 指定信任。证书续期时直接覆盖同一路径的文件即可：新连接在下一次握手时自动使用新证书，无需重启，正在使用的连接不受影响。新证书若与证书名不符或已过期，会保留上一份可用证书并记录警告。
+- **服务器文件路径**：填入 PEM 证书链路径（如 certbot 的 `fullchain.pem`，公有 CA 通常需包含中间证书）及私钥路径（如 `privkey.pem`）。相对路径以服务的工作目录为基准，建议使用绝对路径；运行服务的系统用户必须有权读取两个文件。旧配置没有 `tls.mode` 时仍按此方式读取。
+- **粘贴 PEM 文本**：将证书链（含 `-----BEGIN CERTIFICATE-----` / `-----END CERTIFICATE-----`）和未加密私钥（含对应 `BEGIN` / `END` 行）的完整内容分别粘贴到两个文本框。公有 CA 证书、私有 CA 签发的证书和自签证书都能装载，但必须与私钥匹配、包含正确 SAN 且处于有效期内。只粘贴证书不能代替私钥；每个 PEM 字段最多 4 MiB。
+
+两种方式都要填证书覆盖的完整域名或 IP 作为 `server_name`；客户端连接时也需要校验正确名称。粘贴模式**直接把证书和私钥明文保存到服务器的 `proxy_ports.json`**，配置备份也包含私钥：提交时使用 HTTPS 管理面板或可信本地/SSH 通道，不要通过公网明文 HTTP 发送。含 PEM 私钥时程序以 `0600` 原子写入配置（POSIX，仅所有者可读写）；Windows 仍须用文件 ACL 限制访问。不要把配置、私钥或备份上传到公开仓库。
+
+列表、单个/批量保存响应和导出不会回显 `cert_pem` / `key_pem`，只返回 `has_cert_pem` / `has_key_pem` 状态。编辑同一 PEM 模式时，文本框留空表示保留已保存内容；也可只更新证书并保留原密钥。切换来源需要确认并提供新模式的完整证书/密钥，不会沿用另一模式的秘密。文件模式保存不返回 PEM 正文，证书路径仍可见。API 单次 JSON 请求（含批量）上限为 16 MiB。
+
+API 或配置文件中的 PEM 模式示意（`...` 需换成真实完整内容；JSON 换行写成 `\n`）：
+
+```json
+{
+  "tls": {
+    "mode": "pem",
+    "server_name": "proxy.example.com",
+    "cert_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+    "key_pem": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+  }
+}
+```
+
+文件模式使用 `"mode": "file"` 和 `"cert_file"` / `"key_file"`，不填两个 `*_pem` 字段。
+
+代理监听端口**不必是 443**；客户端连接 `https://proxy.example.com:10821`，防火墙放行对应 TCP 端口即可。不方便开放 80/443 时，可通过 DNS-01 为该域名签发证书。公共证书不必填 CA 文件；使用私有 CA/自签证书时，客户端须显式信任其签发 CA/自签证书，粘贴证书不会让客户端自动信任它。面板的连通性测试仍通过可选的服务器端 `tls.ca_file` 指定信任（此字段仅支持路径），留空使用系统根证书；不要用跳过校验代替建立信任。
+
+**更新证书**：文件模式覆盖同一路径的文件后，新连接在下一次握手时自动使用新证书，无需重启，已有连接不受影响；错误的新文件保留上一份可用证书并记录警告。PEM 模式通过编辑后保存生效，合法变更会替换该入口的监听器（已有该入口连接可能断开），不重启整个进程；启用中的入口会先检查新证书，错误的替换不会写入或停止旧监听。
 
 ```bash
 curl --proxy https://proxy.example.com:10821 \
