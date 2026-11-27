@@ -667,7 +667,15 @@ func parseClashProxy(item map[string]interface{}) (ParsedOutbound, bool) {
 	}
 	outbound.Insecure = getBoolAlt(item, "skip-cert-verify", "skip_cert_verify", "insecure")
 	outbound.ALPN = getCSVString(item, "alpn")
-	outbound.Fingerprint = firstNonEmpty(getString(item, "client-fingerprint"), getString(item, "fingerprint"))
+	// In Clash/Mihomo, "fingerprint" is a certificate pin, while
+	// "client-fingerprint" is the browser TLS fingerprint. Keep them distinct
+	// for protocols where the local parser accepts verifier settings.
+	switch outbound.Type {
+	case config.ProtocolVMess, config.ProtocolVLESS, config.ProtocolTrojan, config.ProtocolAnyTLS:
+		outbound.Fingerprint = getString(item, "client-fingerprint")
+	default:
+		outbound.Fingerprint = firstNonEmpty(getString(item, "client-fingerprint"), getString(item, "fingerprint"))
+	}
 	outbound.Network = getString(item, "network")
 	if wsOpts, ok := getMap(item, "ws-opts"); ok {
 		if getBoolAlt(item, "v2ray-http-upgrade", "v2ray_http_upgrade") {
@@ -835,7 +843,7 @@ func parseLink(link string) (ParsedOutbound, bool) {
 		return parseTUIC(trimmed)
 	case hasSchemePrefix(trimmed, "wireguard", "wg"):
 		return parseWireGuard(trimmed)
-	case hasSchemePrefix(trimmed, "naive", "naiveproxy"):
+	case hasSchemePrefix(trimmed, "naive", "naiveproxy", "naive+https", "naive+quic"):
 		return parseNaive(trimmed)
 	case hasSchemePrefix(trimmed, "vmess"):
 		return parseVmess(trimmed)
@@ -917,32 +925,52 @@ func parseTUIC(link string) (ParsedOutbound, bool) {
 	if port <= 0 {
 		return ParsedOutbound{}, false
 	}
-	query := parsed.Query()
-	uuid, password := query.Get("uuid"), query.Get("password")
+	// url.Parse has already decoded userinfo once. v2rayN exports the v5
+	// credentials as uuid%3Apassword, while some providers leave a literal ':'
+	// separator. Split at the first colon so the password itself may contain ':'.
+	uuid, password := "", ""
 	if parsed.User != nil {
-		if uuid == "" {
-			uuid = parsed.User.Username()
+		userinfo := parsed.User.Username()
+		if pw, ok := parsed.User.Password(); ok {
+			uuid, password = userinfo, pw
+		} else if before, after, found := strings.Cut(userinfo, ":"); found {
+			uuid, password = before, after
+		} else {
+			uuid = userinfo
 		}
-		if value, ok := parsed.User.Password(); ok && password == "" {
-			password = value
-		}
 	}
-	if uuid == "" {
-		uuid = query.Get("id")
+	query := parseV2rayNQuery(parsed.RawQuery)
+	if value := query.firstNonEmpty("uuid", "id"); value != "" {
+		uuid = value
 	}
-	if password == "" {
-		password = query.Get("token")
+	if value := query.firstNonEmpty("password", "token"); value != "" {
+		password = value
 	}
+	if password == "" && uuid != "" {
+		// TUIC v4 token form: userinfo is the token, not a UUID.
+		uuid, password = "", uuid
+	}
+	alpn := query.csv("alpn")
 	options := map[string]interface{}{
 		"type": "tuic", "server": parsed.Hostname(), "port": port,
-		"uuid": uuid, "password": password, "sni": firstNonEmpty(query.Get("sni"), query.Get("serverName")),
-		"udp-relay-mode":        firstNonEmpty(query.Get("udp-relay-mode"), query.Get("udp_relay_mode")),
-		"congestion-controller": firstNonEmpty(query.Get("congestion-controller"), query.Get("congestion_controller")),
+		"uuid": uuid, "password": password,
+		"sni":                   query.firstNonEmpty("sni", "serverName"),
+		"udp":                   true,
+		"udp-relay-mode":        query.firstNonEmpty("udp-relay-mode", "udp_relay_mode"),
+		"congestion-controller": query.firstNonEmpty("cc", "congestion_control", "congestion-controller", "congestion_controller"),
+	}
+	if value := options["congestion-controller"]; value == "" {
+		delete(options, "congestion-controller")
+	}
+	if len(alpn) > 0 {
+		options["alpn"] = alpn
 	}
 	outbound := &config.ProxyOutbound{
 		Name: fallbackName(parsed.Fragment, parsed.Hostname(), port), Type: config.ProtocolTUIC,
 		Server: parsed.Hostname(), Port: port, UUID: uuid, Password: password, TLS: true,
-		SNI: options["sni"].(string), ProviderOptions: options, Enabled: true,
+		SNI: query.firstNonEmpty("sni", "serverName"), ALPN: strings.Join(alpn, ","),
+		Insecure:        query.bool("allow_insecure", "allowInsecure", "insecure", "skip-cert-verify"),
+		ProviderOptions: options, Enabled: true,
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -964,6 +992,10 @@ func parseWireGuard(link string) (ParsedOutbound, bool) {
 		"type": "wireguard", "server": parsed.Hostname(), "port": port,
 		"private-key": query.Get("privatekey"), "public-key": firstNonEmpty(query.Get("publickey"), query.Get("peer-public-key")),
 		"udp": true,
+	}
+	// v2rayN calls this presharedkey; mihomo reads pre-shared-key on the peer.
+	if value := query.Get("presharedkey"); value != "" {
+		options["pre-shared-key"] = value
 	}
 	// Mihomo 使用 ip/ipv6，而不是 sing-box 风格的 local-address。
 	for _, value := range strings.Split(query.Get("address"), ",") {
@@ -1028,6 +1060,9 @@ func parseNaive(link string) (ParsedOutbound, bool) {
 		return ParsedOutbound{}, false
 	}
 	port, _ := strconv.Atoi(parsed.Port())
+	if parsed.Port() == "" {
+		port = 443
+	}
 	if port <= 0 {
 		return ParsedOutbound{}, false
 	}
@@ -1037,6 +1072,14 @@ func parseNaive(link string) (ParsedOutbound, bool) {
 		"type": "naive", "server": parsed.Hostname(), "port": port,
 		"username": parsed.User.Username(), "password": password,
 		"sni": firstNonEmpty(query.Get("sni"), query.Get("servername")),
+	}
+	if strings.EqualFold(parsed.Scheme, "naive+quic") {
+		options["quic"] = true
+	}
+	if value := query.Get("insecure-concurrency"); value != "" {
+		if concurrency, err := strconv.Atoi(value); err == nil && concurrency > 0 {
+			options["insecure-concurrency"] = concurrency
+		}
 	}
 	outbound := &config.ProxyOutbound{
 		Name: fallbackName(parsed.Fragment, parsed.Hostname(), port), Type: config.ProtocolNaive,
@@ -1053,22 +1096,24 @@ func parseVmess(link string) (ParsedOutbound, bool) {
 	payload := strings.TrimPrefix(link, "vmess://")
 	decoded, ok := decodeBase64String(payload)
 	if !ok {
-		return ParsedOutbound{}, false
+		return parseVmessURI(link)
 	}
 	var item map[string]interface{}
 	if err := json.Unmarshal([]byte(decoded), &item); err != nil {
-		return ParsedOutbound{}, false
+		// v2rayN also emits the Xray vmess://uuid@host:port?... URI form.
+		return parseVmessURI(link)
 	}
+	// v2rayN legacy JSON: host/path are the primary fields for gRPC and
+	// transport hosts; keep boundary spaces verbatim, fall back to aliases.
+	rawHost := rawStringItem(item, "host")
+	rawPath := rawStringItem(item, "path")
 	server := firstNonEmpty(getString(item, "add"), getString(item, "address"))
 	port := getIntAlt(item, "port")
 	if server == "" || port <= 0 {
 		return ParsedOutbound{}, false
 	}
-	tlsEnabled := false
 	tlsValue := strings.ToLower(getString(item, "tls"))
-	if tlsValue == "tls" || tlsValue == "1" || tlsValue == "true" {
-		tlsEnabled = true
-	}
+	tlsEnabled := tlsValue == "tls" || tlsValue == "1" || tlsValue == "true"
 	outbound := &config.ProxyOutbound{
 		Name:        fallbackName(getString(item, "ps"), server, port),
 		Type:        config.ProtocolVMess,
@@ -1080,31 +1125,129 @@ func parseVmess(link string) (ParsedOutbound, bool) {
 		TLS:         tlsEnabled,
 		SNI:         getString(item, "sni"),
 		Fingerprint: firstNonEmpty(getString(item, "fp"), getString(item, "fingerprint"), getString(item, "client-fingerprint"), getString(item, "client_fingerprint")),
+		ALPN:        getCSVString(item, "alpn"),
 		Enabled:     true,
 	}
 	if allow := getBoolAlt(item, "allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify"); allow {
 		outbound.Insecure = true
 	}
-	if strings.ToLower(getString(item, "net")) == "ws" {
+	pcs := firstNonEmpty(getString(item, "pcs"), getString(item, "pinSHA256"))
+	vcn := firstNonEmpty(getString(item, "vcn"), getString(item, "verifyPeerCertByName"))
+	verifierOpts, ok := verifierOptions(pcs, vcn)
+	if !ok {
+		return ParsedOutbound{}, false
+	}
+	if verifierOpts != nil {
+		outbound.ProviderOptions = verifierOpts
+	}
+	network := strings.ToLower(getString(item, "net"))
+	switch network {
+	case "", "tcp":
+		// v2rayN legacy JSON uses the separate "type" field for the XHTTP
+		// sub-mode and "headerType" for legacy http/h2 emulation.
+		if strings.EqualFold(getString(item, "type"), "http") || strings.EqualFold(getString(item, "headerType"), "http") {
+			return ParsedOutbound{}, false
+		}
+	case "ws":
 		outbound.Network = "ws"
-		outbound.WSPath = firstNonEmpty(getString(item, "path"), "/")
-		outbound.WSHost = getString(item, "host")
-	}
-	if netName := strings.ToLower(getString(item, "net")); netName == "httpupgrade" || netName == "http-upgrade" {
+		outbound.WSPath = rawPath
+		if strings.TrimSpace(outbound.WSPath) == "" {
+			outbound.WSPath = "/"
+		}
+		outbound.WSHost = rawHost
+	case "httpupgrade", "http-upgrade":
 		outbound.Network = "httpupgrade"
-		outbound.WSPath = firstNonEmpty(getString(item, "path"), "/")
-		outbound.WSHost = getString(item, "host")
-	}
-	if strings.ToLower(getString(item, "net")) == "xhttp" {
+		outbound.WSPath = rawPath
+		if strings.TrimSpace(outbound.WSPath) == "" {
+			outbound.WSPath = "/"
+		}
+		outbound.WSHost = rawHost
+	case "xhttp":
 		outbound.Network = "xhttp"
-		outbound.WSPath = firstNonEmpty(getString(item, "path"), "/")
-		outbound.WSHost = getString(item, "host")
-		outbound.XHTTPMode = firstNonEmpty(getString(item, "mode"), getString(item, "xhttp-mode"), getString(item, "xhttp_mode"))
-	}
-	if strings.ToLower(getString(item, "net")) == "grpc" {
+		outbound.WSPath = rawPath
+		if strings.TrimSpace(outbound.WSPath) == "" {
+			outbound.WSPath = "/"
+		}
+		outbound.WSHost = rawHost
+		outbound.XHTTPMode = firstNonEmpty(getString(item, "type"), getString(item, "mode"), getString(item, "xhttp-mode"), getString(item, "xhttp_mode"))
+	case "grpc":
 		outbound.Network = "grpc"
-		outbound.GRPCServiceName = firstNonEmpty(getString(item, "serviceName"), getString(item, "service_name"), getString(item, "path"))
-		outbound.GRPCAuthority = firstNonEmpty(getString(item, "authority"), getString(item, "grpc_authority"), getString(item, "host"))
+		// v2rayN primary keys are path=serviceName and host=:authority;
+		// serviceName/authority are retained as fallbacks for other clients.
+		outbound.GRPCServiceName = rawStringItem(item, "path", "serviceName", "service_name")
+		outbound.GRPCAuthority = rawStringItem(item, "host", "authority", "grpc_authority")
+	default:
+		return ParsedOutbound{}, false
+	}
+	if err := outbound.Validate(); err != nil {
+		return ParsedOutbound{}, false
+	}
+	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
+// parseVmessURI handles the standard Xray/v2rayN vmess://uuid@host:port?...
+// link, which sits alongside the legacy base64(JSON) form.
+func parseVmessURI(link string) (ParsedOutbound, bool) {
+	parsed, err := url.Parse(link)
+	if err != nil || parsed.Hostname() == "" {
+		return ParsedOutbound{}, false
+	}
+	port, _ := strconv.Atoi(parsed.Port())
+	if port <= 0 {
+		return ParsedOutbound{}, false
+	}
+	query := parseV2rayNQuery(parsed.RawQuery)
+	security := strings.ToLower(query.get("security"))
+	isTLS := security == "tls" || security == "reality" || strings.EqualFold(query.get("encryption"), "tls")
+	outbound := &config.ProxyOutbound{
+		Name:        fallbackName(parsed.Fragment, parsed.Hostname(), port),
+		Type:        config.ProtocolVMess,
+		Server:      parsed.Hostname(),
+		Port:        port,
+		UUID:        parsed.User.Username(),
+		AlterID:     parsePositiveInt(query.get("aid")),
+		Security:    firstNonEmpty(query.get("encryption"), "auto"),
+		TLS:         isTLS,
+		SNI:         query.firstNonEmpty("sni", "servername"),
+		ALPN:        query.get("alpn"),
+		Fingerprint: query.firstNonEmpty("fp", "fingerprint", "client-fingerprint"),
+		Enabled:     true,
+	}
+	outbound.Insecure = query.bool("allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify")
+	verifierOpts, ok := verifierOptions(
+		query.firstNonEmpty("pcs", "pinSHA256", "certFingerprint"),
+		query.firstNonEmpty("vcn", "verifyPeerCertByName"),
+	)
+	if !ok {
+		return ParsedOutbound{}, false
+	}
+	if verifierOpts != nil {
+		outbound.ProviderOptions = verifierOpts
+	}
+	switch strings.ToLower(query.get("type")) {
+	case "", "tcp":
+		if strings.EqualFold(query.get("headerType"), "http") {
+			return ParsedOutbound{}, false
+		}
+	case "ws":
+		outbound.Network = "ws"
+		outbound.WSPath = firstNonEmpty(query.get("path"), "/")
+		outbound.WSHost = query.get("host")
+	case "httpupgrade", "http-upgrade":
+		outbound.Network = "httpupgrade"
+		outbound.WSPath = firstNonEmpty(query.get("path"), "/")
+		outbound.WSHost = query.get("host")
+	case "xhttp":
+		outbound.Network = "xhttp"
+		outbound.WSPath = firstNonEmpty(query.get("path"), "/")
+		outbound.WSHost = query.get("host")
+		outbound.XHTTPMode = query.firstNonEmpty("mode", "xhttp-mode", "xhttp_mode")
+	case "grpc":
+		outbound.Network = "grpc"
+		outbound.GRPCServiceName = query.firstNonEmpty("serviceName", "service_name", "path")
+		outbound.GRPCAuthority = query.firstNonEmpty("authority", "grpc_authority")
+	default:
+		return ParsedOutbound{}, false
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -1184,43 +1327,96 @@ func parseTrojan(link string) (ParsedOutbound, bool) {
 	if server == "" || port <= 0 {
 		return ParsedOutbound{}, false
 	}
-	security := strings.ToLower(parts.Query.Get("security"))
+	security := strings.ToLower(parts.Query.get("security"))
+	isReality := security == "reality"
+	verifierOpts, ok := verifierOptions(
+		parts.Query.firstNonEmpty("pcs", "pinSHA256", "certFingerprint"),
+		parts.Query.firstNonEmpty("vcn", "verifyPeerCertByName"),
+	)
+	if !ok {
+		return ParsedOutbound{}, false
+	}
 	outbound := &config.ProxyOutbound{
 		Name:        fallbackName(parts.Fragment, server, port),
 		Type:        config.ProtocolTrojan,
 		Server:      server,
 		Port:        port,
 		Password:    parts.Username,
-		TLS:         security != "none",
-		SNI:         firstNonEmpty(parts.Query.Get("sni"), parts.Query.Get("peer"), server),
-		ALPN:        parts.Query.Get("alpn"),
-		Fingerprint: queryFingerprint(parts.Query),
+		TLS:         security != "none" || isReality,
+		SNI:         firstNonEmpty(parts.Query.get("sni"), parts.Query.get("peer"), server),
+		ALPN:        parts.Query.get("alpn"),
+		Fingerprint: parts.Query.firstNonEmpty("fp", "fingerprint", "client-fingerprint"),
+		Flow:        parts.Query.get("flow"),
 		Enabled:     true,
 	}
-	outbound.Insecure = queryAllowInsecure(parts.Query)
-	switch strings.ToLower(parts.Query.Get("type")) {
+	outbound.Insecure = parts.Query.bool("allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify")
+	if isReality {
+		outbound.Reality = true
+		outbound.RealityPublicKey = parts.Query.get("pbk")
+		outbound.RealityShortID = parts.Query.get("sid")
+		outbound.RealitySpiderX = parts.Query.firstNonEmpty("spx", "spider-x", "spider_x")
+		// Trojan Reality is only implemented by the mihomo bridge.
+		verifierOpts = ensureCoreMihomo(verifierOpts)
+	}
+	if verifierOpts != nil {
+		outbound.ProviderOptions = verifierOpts
+	}
+	switch strings.ToLower(parts.Query.get("type")) {
 	case "ws":
 		outbound.Network = "ws"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = firstNonEmpty(parts.Query.Get("host"), parts.Query.Get("wsHost"))
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.firstNonEmpty("host", "wsHost")
 	case "httpupgrade", "http-upgrade":
 		outbound.Network = "httpupgrade"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = firstNonEmpty(parts.Query.Get("host"), parts.Query.Get("wsHost"))
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.firstNonEmpty("host", "wsHost")
 	case "xhttp":
 		outbound.Network = "xhttp"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = firstNonEmpty(parts.Query.Get("host"), parts.Query.Get("wsHost"))
-		outbound.XHTTPMode = firstNonEmpty(parts.Query.Get("mode"), parts.Query.Get("xhttp-mode"), parts.Query.Get("xhttp_mode"))
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.firstNonEmpty("host", "wsHost")
+		outbound.XHTTPMode = parts.Query.firstNonEmpty("mode", "xhttp-mode", "xhttp_mode")
 	case "grpc":
 		outbound.Network = "grpc"
-		outbound.GRPCServiceName = firstNonEmpty(parts.Query.Get("serviceName"), parts.Query.Get("service_name"), parts.Query.Get("grpc_service_name"))
-		outbound.GRPCAuthority = firstNonEmpty(parts.Query.Get("authority"), parts.Query.Get("grpc_authority"))
+		outbound.GRPCServiceName = parts.Query.firstNonEmpty("serviceName", "service_name", "grpc_service_name")
+		outbound.GRPCAuthority = parts.Query.firstNonEmpty("authority", "grpc_authority")
+	default:
+		// Unimplemented transports must not be silently imported as TCP.
+		if network := parts.Query.get("type"); network != "" && !strings.EqualFold(network, "tcp") {
+			return ParsedOutbound{}, false
+		}
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
 	}
 	return ParsedOutbound{Outbound: outbound, SourceKey: computeSourceKey(outbound), BaseName: outbound.Name}, true
+}
+
+// shareLinkCredentials reads user:pass from a share link's userinfo. v2rayN
+// encodes SOCKS credentials as base64(user:pass) for values that cannot be
+// written literally; url.Parse has already percent-decoded the userinfo.
+func shareLinkCredentials(user *url.Userinfo, query url.Values) (string, string) {
+	username, password := "", ""
+	explicitPassword := false
+	if user != nil {
+		username = user.Username()
+		password, explicitPassword = user.Password()
+	}
+	if username != "" && !explicitPassword {
+		if decoded, ok := decodeBase64String(username); ok {
+			if name, pass, found := strings.Cut(decoded, ":"); found {
+				return name, pass
+			}
+		}
+	}
+	queryUser := queryFirst(query, "username", "user")
+	queryPass := queryFirst(query, "password", "pass")
+	if username == "" && strings.TrimSpace(queryUser) != "" {
+		username = queryUser
+	}
+	if password == "" && strings.TrimSpace(queryPass) != "" {
+		password = queryPass
+	}
+	return username, password
 }
 
 func parseSOCKS5(link string) (ParsedOutbound, bool) {
@@ -1233,19 +1429,17 @@ func parseSOCKS5(link string) (ParsedOutbound, bool) {
 	}
 	server := parsed.Hostname()
 	port, _ := strconv.Atoi(parsed.Port())
-	if port <= 0 {
+	if parsed.Port() == "" {
 		port = 1080
 	}
-	if server == "" {
+	if port <= 0 || server == "" {
 		return ParsedOutbound{}, false
 	}
 	query := parsed.Query()
-	username := firstNonEmpty(parsed.User.Username(), queryFirst(query, "username", "user"))
-	password, _ := parsed.User.Password()
-	password = firstNonEmpty(password, queryFirst(query, "password", "pass"))
+	username, password := shareLinkCredentials(parsed.User, query)
 	tlsEnabled := getBoolString(queryFirst(query, "tls", "secure")) || strings.EqualFold(queryFirst(query, "security"), "tls")
 	outbound := &config.ProxyOutbound{
-		Name:        fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Name:        fallbackName(parsed.Fragment, server, port),
 		Type:        config.ProtocolSOCKS5,
 		Server:      server,
 		Port:        port,
@@ -1274,25 +1468,23 @@ func parseHTTP(link string) (ParsedOutbound, bool) {
 	}
 	server := parsed.Hostname()
 	port, _ := strconv.Atoi(parsed.Port())
-	query := parsed.Query()
-	if port <= 0 {
+	if parsed.Port() == "" {
 		port = 80
-		if parsed.Scheme == "https" {
+		if strings.EqualFold(parsed.Scheme, "https") {
 			port = 443
 		}
 	}
-	if server == "" {
+	if port <= 0 || server == "" {
 		return ParsedOutbound{}, false
 	}
-	username := firstNonEmpty(parsed.User.Username(), queryFirst(query, "username", "user"))
-	password, _ := parsed.User.Password()
-	password = firstNonEmpty(password, queryFirst(query, "password", "pass"))
+	query := parsed.Query()
+	username, password := shareLinkCredentials(parsed.User, query)
 	tlsEnabled := strings.EqualFold(parsed.Scheme, "https") || strings.EqualFold(queryFirst(query, "security"), "tls")
 	if rawTLS := queryFirst(query, "tls", "secure"); rawTLS != "" {
 		tlsEnabled = getBoolString(rawTLS)
 	}
 	outbound := &config.ProxyOutbound{
-		Name:        fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Name:        fallbackName(parsed.Fragment, server, port),
 		Type:        config.ProtocolHTTP,
 		Server:      server,
 		Port:        port,
@@ -1330,33 +1522,51 @@ func parseAnyTLS(link string) (ParsedOutbound, bool) {
 	}
 	server := parsed.Hostname()
 	port, _ := strconv.Atoi(parsed.Port())
-	if server == "" || port <= 0 {
+	if parsed.Port() == "" {
+		port = 443
+	}
+	if server == "" || port <= 0 || parsed.User == nil {
 		return ParsedOutbound{}, false
 	}
-	security := strings.ToLower(parsed.Query().Get("security"))
+	query := parseV2rayNQuery(parsed.RawQuery)
+	security := strings.ToLower(query.get("security"))
 	isReality := security == "reality"
+	// AnyTLS certificate pins are not executable here: mihomo's adapter is
+	// not enabled for AnyTLS and the native dialer has no pin verifier.
+	// Reject pcs/vcn/hpkp instead of silently ignoring them.
+	if query.get("hpkp") != "" || query.firstNonEmpty("pcs", "pinSHA256", "certFingerprint", "vcn", "verifyPeerCertByName") != "" {
+		return ParsedOutbound{}, false
+	}
+	// AnyTLS uses the whole userinfo as the password. url.Parse has already
+	// percent-decoded it once; a literal 'user:pass' must keep the colon part.
+	anyTLSPassword := parsed.User.Username()
+	if value, ok := parsed.User.Password(); ok {
+		anyTLSPassword += ":" + value
+	}
 	outbound := &config.ProxyOutbound{
-		Name:                     fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Name:                     fallbackName(parsed.Fragment, server, port),
 		Type:                     config.ProtocolAnyTLS,
 		Server:                   server,
 		Port:                     port,
-		Password:                 decodePercent(parsed.User.Username()),
+		Password:                 anyTLSPassword,
 		TLS:                      true,
-		SNI:                      firstNonEmpty(parsed.Query().Get("sni"), server),
-		ALPN:                     parsed.Query().Get("alpn"),
-		Fingerprint:              queryFingerprint(parsed.Query()),
+		SNI:                      firstNonEmpty(query.firstNonEmpty("sni", "servername"), server),
+		ALPN:                     query.get("alpn"),
+		Fingerprint:              query.firstNonEmpty("fp", "fingerprint", "client-fingerprint"),
 		IdleSessionCheckInterval: idleSessionCheckInterval,
 		IdleSessionTimeout:       idleSessionTimeout,
 		MinIdleSession:           minIdleSession,
 		Enabled:                  true,
 	}
-	outbound.Insecure = queryAllowInsecure(parsed.Query())
+	outbound.Insecure = query.bool("allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify")
 	if isReality {
 		outbound.Reality = true
+		// Reality handshake authenticates the server via pbk/sid rather than
+		// public CA verification; keep the historical insecure flag here.
 		outbound.Insecure = true
-		outbound.RealityPublicKey = parsed.Query().Get("pbk")
-		outbound.RealityShortID = parsed.Query().Get("sid")
-		outbound.RealitySpiderX = querySpiderX(parsed.Query())
+		outbound.RealityPublicKey = query.get("pbk")
+		outbound.RealityShortID = query.get("sid")
+		outbound.RealitySpiderX = query.firstNonEmpty("spx", "spider-x", "spider_x")
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -1374,51 +1584,76 @@ func parseVLESS(link string) (ParsedOutbound, bool) {
 	if server == "" || port <= 0 {
 		return ParsedOutbound{}, false
 	}
-	security := strings.ToLower(parts.Query.Get("security"))
+	security := strings.ToLower(parts.Query.get("security"))
 	isReality := security == "reality"
 	isTLS := security == "tls" || isReality
+	encryption := parts.Query.get("encryption")
+	verifierOpts, ok := verifierOptions(
+		parts.Query.firstNonEmpty("pcs", "pinSHA256", "certFingerprint"),
+		parts.Query.firstNonEmpty("vcn", "verifyPeerCertByName"),
+	)
+	if !ok {
+		return ParsedOutbound{}, false
+	}
+	if strings.TrimSpace(encryption) != "" && !strings.EqualFold(encryption, "none") {
+		// Only mihomo implements non-none VLESS encryption; native VLESS
+		// would silently drop it, so force the supported engine.
+		verifierOpts = ensureCoreMihomo(verifierOpts)
+		verifierOpts["encryption"] = encryption
+	}
 	outbound := &config.ProxyOutbound{
 		Name:        fallbackName(parts.Fragment, server, port),
 		Type:        config.ProtocolVLESS,
 		Server:      server,
 		Port:        port,
 		UUID:        parts.Username,
-		Flow:        parts.Query.Get("flow"),
+		Flow:        parts.Query.get("flow"),
 		TLS:         isTLS,
-		SNI:         parts.Query.Get("sni"),
-		ALPN:        parts.Query.Get("alpn"),
-		Fingerprint: queryFingerprint(parts.Query),
+		SNI:         parts.Query.firstNonEmpty("sni", "servername"),
+		ALPN:        parts.Query.get("alpn"),
+		Fingerprint: parts.Query.firstNonEmpty("fp", "fingerprint", "client-fingerprint"),
 		Enabled:     true,
 	}
 	if !isReality && outbound.SNI == "" {
 		outbound.SNI = server
 	}
-	outbound.Insecure = queryAllowInsecure(parts.Query)
-	if isReality {
-		outbound.Reality = true
-		outbound.Insecure = true
-		outbound.RealityPublicKey = parts.Query.Get("pbk")
-		outbound.RealityShortID = parts.Query.Get("sid")
-		outbound.RealitySpiderX = querySpiderX(parts.Query)
+	if verifierOpts != nil {
+		outbound.ProviderOptions = verifierOpts
 	}
-	switch strings.ToLower(parts.Query.Get("type")) {
+	outbound.Insecure = parts.Query.bool("allowInsecure", "allow_insecure", "insecure", "skip-cert-verify", "skip_cert_verify")
+	if isReality {
+		if outbound.RealityPublicKey = parts.Query.get("pbk"); outbound.RealityPublicKey == "" {
+			return ParsedOutbound{}, false
+		}
+		outbound.Reality = true
+		outbound.RealityShortID = parts.Query.get("sid")
+		outbound.RealitySpiderX = parts.Query.firstNonEmpty("spx", "spider-x", "spider_x")
+	}
+	switch strings.ToLower(parts.Query.get("type")) {
+	case "":
+	case "tcp":
+		if strings.EqualFold(parts.Query.get("headerType"), "http") {
+			return ParsedOutbound{}, false // h2/http transport is not implemented locally
+		}
 	case "ws":
 		outbound.Network = "ws"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = parts.Query.Get("host")
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.get("host")
 	case "httpupgrade", "http-upgrade":
 		outbound.Network = "httpupgrade"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = parts.Query.Get("host")
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.get("host")
 	case "xhttp":
 		outbound.Network = "xhttp"
-		outbound.WSPath = firstNonEmpty(parts.Query.Get("path"), "/")
-		outbound.WSHost = firstNonEmpty(parts.Query.Get("host"), parts.Query.Get("wsHost"))
-		outbound.XHTTPMode = firstNonEmpty(parts.Query.Get("mode"), parts.Query.Get("xhttp-mode"), parts.Query.Get("xhttp_mode"))
+		outbound.WSPath = firstNonEmpty(parts.Query.get("path"), "/")
+		outbound.WSHost = parts.Query.firstNonEmpty("host", "wsHost")
+		outbound.XHTTPMode = parts.Query.firstNonEmpty("mode", "xhttp-mode", "xhttp_mode")
 	case "grpc":
 		outbound.Network = "grpc"
-		outbound.GRPCServiceName = firstNonEmpty(parts.Query.Get("serviceName"), parts.Query.Get("service_name"), parts.Query.Get("grpc_service_name"))
-		outbound.GRPCAuthority = firstNonEmpty(parts.Query.Get("authority"), parts.Query.Get("grpc_authority"))
+		outbound.GRPCServiceName = parts.Query.firstNonEmpty("serviceName", "service_name", "grpc_service_name")
+		outbound.GRPCAuthority = parts.Query.firstNonEmpty("authority", "grpc_authority")
+	default:
+		return ParsedOutbound{}, false // h2/kcp/unknown must not silently become TCP
 	}
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
@@ -1512,7 +1747,7 @@ func parseHysteria1(link string) (ParsedOutbound, bool) {
 	}
 
 	outbound := &config.ProxyOutbound{
-		Name:            fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Name:            fallbackName(parsed.Fragment, server, port),
 		Type:            config.ProtocolHysteria,
 		Server:          server,
 		Port:            port,
@@ -1543,32 +1778,43 @@ func parseHysteria2(link string) (ParsedOutbound, bool) {
 	}
 	server := parsed.Hostname()
 	port, _ := strconv.Atoi(parsed.Port())
+	if parsed.Port() == "" {
+		port = 443
+	}
 	if server == "" || port <= 0 {
 		return ParsedOutbound{}, false
 	}
 	password := ""
+	// url.Parse has already decoded userinfo once; the entire auth string is
+	// the password and may itself contain ':'.
 	if parsed.User != nil {
-		password = decodePercent(parsed.User.Username())
+		password = parsed.User.Username()
+		if pw, ok := parsed.User.Password(); ok {
+			password += ":" + pw
+		}
 	}
+	query := parseV2rayNQuery(parsed.RawQuery)
 	outbound := &config.ProxyOutbound{
-		Name:            fallbackName(decodeURLFragment(parsed.Fragment), server, port),
+		Name:            fallbackName(parsed.Fragment, server, port),
 		Type:            config.ProtocolHysteria2,
 		Server:          server,
 		Port:            port,
 		Password:        password,
-		Obfs:            parsed.Query().Get("obfs"),
-		ObfsPassword:    parsed.Query().Get("obfs-password"),
-		PortHopping:     firstNonEmpty(parsed.Query().Get("mport"), parsed.Query().Get("ports")),
-		ALPN:            queryFirst(parsed.Query(), "alpn"),
-		CertFingerprint: queryFirst(parsed.Query(), "pinSHA256", "pin_sha256", "cert-fingerprint", "cert_fingerprint", "certFingerprint"),
-		HopInterval:     parsePositiveInt(firstNonEmpty(queryFirst(parsed.Query(), "hop-interval", "hop_interval"))),
-		UpMbps:          parseMbps(queryFirst(parsed.Query(), "up", "up-mbps", "up_mbps")),
-		DownMbps:        parseMbps(queryFirst(parsed.Query(), "down", "down-mbps", "down_mbps")),
+		Obfs:            query.get("obfs"),
+		ObfsPassword:    query.get("obfs-password"),
+		PortHopping:     query.firstNonEmpty("mport", "ports"),
+		ALPN:            query.get("alpn"),
+		CertFingerprint: query.firstNonEmpty("pinSHA256", "pin_sha256", "cert-fingerprint", "cert_fingerprint", "certFingerprint"),
+		HopInterval:     parsePositiveInt(query.firstNonEmpty("hop-interval", "hop_interval")),
+		UpMbps:          parseMbps(query.firstNonEmpty("up", "up-mbps", "up_mbps")),
+		DownMbps:        parseMbps(query.firstNonEmpty("down", "down-mbps", "down_mbps")),
 		TLS:             true,
-		SNI:             firstNonEmpty(parsed.Query().Get("sni"), server),
+		SNI:             firstNonEmpty(query.firstNonEmpty("sni", "servername"), server),
 		Enabled:         true,
 	}
-	outbound.Insecure = queryAllowInsecure(parsed.Query())
+	// A pin is a stricter check than ordinary verification. It must never
+	// implicitly enable skip-cert-verify; only an explicit insecure flag does.
+	outbound.Insecure = query.bool("insecure", "allowInsecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify")
 	if err := outbound.Validate(); err != nil {
 		return ParsedOutbound{}, false
 	}
@@ -1685,7 +1931,7 @@ type customLinkParts struct {
 	Hostname string
 	Port     int
 	Fragment string
-	Query    url.Values
+	Query    v2rayNQuery
 }
 
 func parseCustomLinkParts(link string, scheme string) (*customLinkParts, bool) {
@@ -1697,16 +1943,13 @@ func parseCustomLinkParts(link string, scheme string) (*customLinkParts, bool) {
 	raw := strings.TrimSpace(link[len(prefix):])
 	fragment := ""
 	if idx := strings.Index(raw, "#"); idx >= 0 {
-		fragment = decodeURLFragment(raw[idx+1:])
+		fragment = shareFragmentDecode(raw[idx+1:])
 		raw = raw[:idx]
 	}
 
-	query := url.Values{}
+	query := v2rayNQuery{}
 	if idx := strings.Index(raw, "?"); idx >= 0 {
-		parsedQuery, err := url.ParseQuery(raw[idx+1:])
-		if err == nil {
-			query = parsedQuery
-		}
+		query = parseV2rayNQuery(raw[idx+1:])
 		raw = raw[:idx]
 	}
 
@@ -1715,7 +1958,7 @@ func parseCustomLinkParts(link string, scheme string) (*customLinkParts, bool) {
 		return nil, false
 	}
 
-	username := decodePercent(raw[:at])
+	username := sharePercentDecode(raw[:at])
 	hostname, port := splitHostPort(raw[at+1:])
 	if hostname == "" || port <= 0 {
 		return nil, false
@@ -1867,6 +2110,15 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func rawStringItem(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := m[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func getString(m map[string]interface{}, key string) string {
 	if m == nil {
 		return ""
@@ -2013,6 +2265,126 @@ func getBoolDefault(m map[string]interface{}, key string, fallback bool) bool {
 func getBoolString(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+// v2rayNQuery is a case-insensitive, RFC3986-style share-link query. v2rayN
+// and xray keep '+' literal and decode %XX exactly once; url.ParseQuery uses
+// form semantics ('+' -> space) and is therefore only used for YAML/legacy
+// helpers in this file.
+type v2rayNQuery map[string]string
+
+func parseV2rayNQuery(raw string) v2rayNQuery {
+	query := make(v2rayNQuery)
+	for _, pair := range strings.Split(raw, "&") {
+		if pair == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(pair, "=")
+		key = strings.ToLower(strings.TrimSpace(sharePercentDecode(key)))
+		if key == "" {
+			continue
+		}
+		if _, exists := query[key]; exists {
+			continue // first duplicate wins
+		}
+		query[key] = sharePercentDecode(value)
+	}
+	return query
+}
+
+func (q v2rayNQuery) get(keys ...string) string {
+	for _, key := range keys {
+		if value, ok := q[strings.ToLower(strings.TrimSpace(key))]; ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func (q v2rayNQuery) firstNonEmpty(keys ...string) string {
+	for _, key := range keys {
+		value := q.get(key)
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (q v2rayNQuery) bool(keys ...string) bool {
+	for _, key := range keys {
+		if value, ok := q[strings.ToLower(strings.TrimSpace(key))]; ok {
+			return getBoolString(value)
+		}
+	}
+	return false
+}
+
+func (q v2rayNQuery) csv(keys ...string) []string {
+	value := strings.TrimSpace(q.firstNonEmpty(keys...))
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// sharePercentDecode performs one RFC3986 percent-decode and keeps literal '+'.
+func sharePercentDecode(value string) string {
+	if !strings.Contains(value, "%") {
+		return value
+	}
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func shareFragmentDecode(value string) string {
+	return sharePercentDecode(value)
+}
+
+func isPinSHA256(value string) bool {
+	decoded, err := hex.DecodeString(strings.ReplaceAll(strings.TrimSpace(value), ":", ""))
+	return err == nil && len(decoded) == 32
+}
+
+func ensureCoreMihomo(options map[string]interface{}) map[string]interface{} {
+	if options == nil {
+		options = make(map[string]interface{})
+	}
+	options["core"] = "mihomo"
+	return options
+}
+
+// verifierOptions maps v2rayN pcs/vcn into options that mihomo actually
+// enforces. Either field alone is sufficient: ca.GetTLSConfig installs
+// VerifyConnection for fingerprint and/or name-cert-verify. The native dialer
+// has no verifier for either, so the node is pinned to the mihomo engine.
+func verifierOptions(pcs, vcn string) (map[string]interface{}, bool) {
+	trimmedPin := strings.TrimSpace(pcs)
+	trimmedName := strings.TrimSpace(vcn)
+	if trimmedPin == "" && trimmedName == "" {
+		return nil, true
+	}
+	if trimmedPin != "" && !isPinSHA256(trimmedPin) {
+		return nil, false
+	}
+	options := map[string]interface{}{"core": "mihomo"}
+	if trimmedPin != "" {
+		options["fingerprint"] = trimmedPin
+	}
+	if trimmedName != "" {
+		options["name-cert-verify"] = vcn
+	}
+	return options, true
 }
 
 func getMap(m map[string]interface{}, key string) (map[string]interface{}, bool) {

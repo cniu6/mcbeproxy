@@ -16,6 +16,9 @@
         <n-dropdown v-if="checkedRowKeys.length > 0 && !batchTesting" trigger="click" :options="batchTestOptions" @select="handleBatchTestSelect">
           <n-button size="small" type="info" secondary>批量测试 ({{ checkedRowKeys.length }})</n-button>
         </n-dropdown>
+        <n-dropdown v-if="checkedRowKeys.length > 0" trigger="click" :options="exportFormatOptions" @select="format => exportNodes(checkedRowKeys, format)">
+          <n-button size="small" type="warning" secondary :loading="exportBusy">批量导出 ({{ checkedRowKeys.length }})</n-button>
+        </n-dropdown>
         <n-button size="small" v-if="batchTesting" type="info" :loading="true" secondary>
           测试中 {{ batchTestProgress.current }}/{{ batchTestProgress.total }}
         </n-button>
@@ -668,6 +671,44 @@
       </template>
     </n-modal>
 
+    <!-- 导出结果 Modal -->
+    <n-modal size="small" v-model:show="showExportModal" preset="card" title="导出节点 · 第三方客户端通用格式" style="width: min(700px, 98vw); max-width: 98vw">
+      <n-space vertical :size="10">
+        <n-alert size="small" type="info" :show-icon="false">
+          <template v-if="exportResult.format === 'clash'">
+            Clash / mihomo 节点文件。可用作代理提供者文件，或将条目合并到现有配置的 <code>proxies:</code> 列表。
+          </template>
+          <template v-else-if="exportResult.format === 'share'">
+            v2rayN Base64 订阅内容，不是订阅网址。HTTP(S)、Hysteria v1 及无法保留关键参数的节点会跳过并说明原因。Clash / mihomo 请使用 YAML。
+          </template>
+          <template v-else>
+            每行一个标准分享链接（ss:// vmess:// vless:// trojan:// hysteria2:// anytls:// tuic://）。逐条复制到第三方客户端，或粘贴进支持批量导入的工具。
+          </template>
+        </n-alert>
+        <n-alert v-if="exportResult.skipped.length > 0" size="small" type="warning" :show-icon="false">
+          以下 {{ exportResult.skipped.length }} 个节点被跳过（无法以标准格式表达）：
+          <div v-for="item in exportResult.skipped" :key="item.name" style="font-size: 12px; margin-top: 4px">
+            · {{ item.name }} — {{ item.reason }}
+          </div>
+        </n-alert>
+        <n-input
+          :value="exportResult.content"
+          type="textarea"
+          :autosize="{ minRows: 8, maxRows: 18 }"
+          readonly
+          aria-label="导出内容"
+        />
+        <n-text depth="3" style="font-size: 12px">共 {{ exportResult.count }} 个节点。内容含节点密码，仅通过可信渠道传递。</n-text>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button size="small" @click="showExportModal = false">关闭</n-button>
+          <n-button size="small" @click="downloadExportContent">下载文件</n-button>
+          <n-button size="small" type="primary" @click="copyExportContent">复制内容</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
     <!-- 导入 Modal -->
     <n-modal size="small" v-model:show="showImportModal" preset="card" title="导入代理节点" style="width: min(700px, 98vw); max-width: 98vw">
       <n-alert size="small" type="info" style="margin-bottom: 12px">
@@ -982,7 +1023,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount, h, watch, nextTick } from 'vue'
-import { NTag, NButton, NSpace, NPopconfirm, NIcon, useMessage } from 'naive-ui'
+import { NTag, NButton, NSpace, NPopconfirm, NIcon, NDropdown, useMessage } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
 import NodeFilters from '../components/NodeFilters.vue'
 import { emptyNodeFilter, filterNodes, nodeGroupOptions } from '../composables/nodeFilters.js'
@@ -2432,6 +2473,13 @@ const renderProxyRowActions = (row) => {
   return h(NSpace, { size: 4, wrap: false, align: 'center', class: 'proxy-row-actions' }, () => [
     renderRowInlineTestButtons(row),
     h(NButton, { size: 'tiny', type: 'info', ghost: true, onClick: (e) => { e?.stopPropagation?.(); openTestOptions(row.name) } }, () => '详测'),
+    h(NDropdown, {
+      trigger: 'click',
+      options: exportFormatOptions,
+      onSelect: (format) => exportNodes([row.name], format)
+    }, {
+      default: () => h(NButton, { size: 'tiny', tertiary: true, onClick: (e) => { e?.stopPropagation?.() } }, () => '导出')
+    }),
     h(NButton, { size: 'tiny', onClick: (e) => { e?.stopPropagation?.(); openEditModal(row) } }, () => '编辑'),
     row.auto_select_blocked
       ? h(NPopconfirm, { onPositiveClick: () => clearAutoSelectBlock(row.name) }, {
@@ -3109,6 +3157,87 @@ const batchTestOptions = [
   { label: 'HTTP 测试', key: 'http' },
   { label: 'UDP 测试 (MCBE)', key: 'udp' }
 ]
+
+// 节点导出：标准第三方格式（Clash.Meta/mihomo YAML、base64 分享订阅、明文链接）。
+// 格式规范与 internal/config/share_export.go 的注释一致。
+const exportFormatOptions = [
+  { label: 'Clash / mihomo YAML', key: 'clash' },
+  { label: 'v2rayN 订阅 (Base64)', key: 'share' },
+  { label: '明文链接 (一行一个)', key: 'links' }
+]
+
+const showExportModal = ref(false)
+const exportResult = ref({ format: '', content: '', count: 0, skipped: [] })
+const exportBusy = ref(false)
+
+const exportNodes = async (names, format) => {
+  names = (names || []).filter(Boolean)
+  if (names.length === 0) {
+    message.warning('请先勾选要导出的节点')
+    return
+  }
+  exportBusy.value = true
+  try {
+    const res = await api('/api/proxy-outbounds/export', 'POST', { names, format })
+    if (!res.success) {
+      message.error(res.msg || '导出失败')
+      return
+    }
+    const data = res.data || {}
+    exportResult.value = {
+      format: data.format || format,
+      content: data.content || '',
+      count: data.count || 0,
+      skipped: data.skipped || []
+    }
+    showExportModal.value = true
+    if (data.skipped && data.skipped.length > 0) {
+      message.warning(`${data.count} 个节点已导出，${data.skipped.length} 个被跳过（不支持标准格式）`)
+    }
+  } catch (e) {
+    message.error('导出失败: ' + (e?.message || '未知错误'))
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+const copyExportContent = async () => {
+  const text = exportResult.value.content
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success('已复制到剪贴板')
+  } catch {
+    // HTTP 环境剪贴板受限时的兜底
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    try {
+      document.execCommand('copy')
+      message.success('已复制到剪贴板')
+    } catch {
+      message.error('复制失败，请手动全选复制')
+    }
+    area.remove()
+  }
+}
+
+const downloadExportContent = () => {
+  const text = exportResult.value.content
+  if (!text) return
+  const isYaml = exportResult.value.format === 'clash'
+  const blob = new Blob([text], { type: isYaml ? 'text/yaml' : 'text/plain' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = isYaml ? 'proxies.yaml' : 'subscription.txt'
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 
 // 批量测试配置
 const showBatchTestModal = ref(false)

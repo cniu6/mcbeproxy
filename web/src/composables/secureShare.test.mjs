@@ -62,7 +62,14 @@ test('安全端口首次保存自动创建证书，前端仅复制快捷链接�
   assert.match(text, /max_connections:4096,max_udp_associations:4096/)
   assert.match(text, /高级设置（可选/)
   assert.match(text, /v-if="savedSecure"/)
-  assert.match(text, /\/export\?format=link/)
+  // 第三方通用链接 / v2rayN Base64 订阅 / Clash YAML / mcproxy 内部互导。
+  // 标准格式走 /share，内部互导仍走 /export?format=link，默认明文 links。
+  assert.match(text, /\/share`, 'POST'/)
+  assert.match(text, /export\?format=link/)
+  assert.match(text, /exportFormat = ref\('links'\)/)
+  assert.match(text, /v2rayN 订阅 \(Base64\)/)
+  assert.match(text, /不是订阅网址/)
+  assert.match(text, /pinSHA256 证书钉扎/)
   assert.doesNotMatch(text, /JSON.stringify\(res.data/)
   const users = readFileSync(new URL('../views/components/PortUsersEditor.vue', import.meta.url), 'utf8')
   assert.equal(parse(users).errors.length, 0)

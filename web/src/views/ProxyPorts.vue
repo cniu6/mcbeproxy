@@ -53,6 +53,7 @@
           <n-button size="small" type="success" ghost @click="batchSetEnabled(true)" :loading="batchActionRunning">批量启用</n-button>
           <n-button size="small" ghost @click="batchSetEnabled(false)" :loading="batchActionRunning">批量停用</n-button>
           <n-button size="small" type="info" ghost @click="batchTestSelected" :loading="batchTestRunning">批量测试</n-button>
+          <n-button size="small" type="warning" ghost @click="openPortShare(selectedPorts, true)">批量导出</n-button>
           <n-button size="small" type="primary" ghost @click="openBatchProxyModal('shared')">批量设置代理</n-button>
           <n-button size="small" type="warning" ghost @click="openBatchProxyModal('rotate')">节点轮换分配</n-button>
           <n-dropdown trigger="click" :options="batchTypeOptions" @select="batchSetType">
@@ -332,6 +333,66 @@
       </template>
     </n-modal>
 
+    <n-modal size="small"
+      :show="showPortShareModal"
+      preset="card"
+      :title="portShareTitle"
+      style="width: min(720px, 98vw); max-width: 98vw"
+      :mask-closable="!portShareBusy"
+      :close-on-esc="!portShareBusy"
+      :closable="!portShareBusy"
+      @update:show="v => { if (!v) closePortShare() }"
+    >
+      <n-form v-if="!portShareResult" size="small">
+        <n-form-item label="导出格式">
+          <n-select v-model:value="portShareFormat" :options="portShareFormatOptions" :disabled="portShareBusy" />
+        </n-form-item>
+        <n-form-item label="客户端连接地址">
+          <n-input v-model:value="portShareHost" :disabled="portShareBusy"
+            :placeholder="portShareBulk ? '服务器 IP 或域名（不含端口）' : '服务器 IP 或域名，也可指定端口'" />
+        </n-form-item>
+        <n-text depth="3">留空使用面板访问主机和各入口的监听端口。批量导出会展开默认账号及所有未禁用、未过期用户。</n-text>
+        <n-form-item v-if="portShareUsers.length" label="连接账号" style="margin-top: 8px">
+          <n-select v-model:value="portShareUser" :options="portShareUsers" :disabled="portShareBusy" placeholder="请选择账号" />
+        </n-form-item>
+        <n-alert v-if="portShareError" size="small" type="error" role="alert">{{ portShareError }}</n-alert>
+      </n-form>
+      <div v-else ref="portShareContentRef">
+      <n-space vertical :size="10">
+        <n-alert size="small" type="info" :show-icon="false">
+          <template v-if="portShareResult.format === 'clash'">
+            可用作 Clash / mihomo 的代理提供者文件，或将条目合并到现有配置的 <code>proxies:</code> 列表。
+          </template>
+          <template v-else-if="portShareResult.format === 'share'">
+            这是 v2rayN Base64 订阅内容，不是订阅网址。HTTP(S) 和 Mieru 入口不进入此格式，请选择 Clash YAML；其他客户端对凭据和 TLS 参数可能有不同解析规则。
+          </template>
+          <template v-else>
+            每行一条标准链接（socks5:// · http:// · https:// · hysteria2://）。逐条复制到第三方客户端。
+          </template>
+        </n-alert>
+        <n-alert v-if="portShareResult.skipped.length > 0" size="small" type="warning" :show-icon="false">
+          以下 {{ portShareResult.skipped.length }} 个端口被跳过：
+          <div v-for="item in portShareResult.skipped" :key="item.name" style="font-size: 12px; margin-top: 4px">
+            · {{ item.name }} — {{ item.reason }}
+          </div>
+        </n-alert>
+        <n-input :value="portShareResult.content" type="textarea" :autosize="{ minRows: 8, maxRows: 18 }" readonly aria-label="导出内容" />
+        <n-text depth="3" style="font-size: 12px">共 {{ portShareResult.count }} 条连接配置。内容含账号密码，仅通过可信渠道传递。</n-text>
+      </n-space>
+      </div>
+      <template #footer>
+        <n-space justify="end">
+          <n-button size="small" :disabled="portShareBusy" @click="closePortShare">关闭</n-button>
+          <template v-if="portShareResult">
+            <n-button size="small" @click="downloadPortShareContent">下载文件</n-button>
+            <n-button size="small" type="primary" @click="copyPortShareContent">复制内容</n-button>
+          </template>
+          <n-button v-else size="small" type="primary" :loading="portShareBusy"
+            :disabled="portShareUser === null" @click="submitPortShare">生成导出内容</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
     <n-modal class="app-modal-workspace" size="small" v-model:show="showBulkCreate" preset="card" title="批量新增代理端口" style="width: min(1800px, 98vw); max-width: 98vw">
       <n-space vertical size="small">
         <n-alert size="small" type="info" :show-icon="false">
@@ -474,6 +535,7 @@ import { useNetworkInterfaces } from '../composables/useNetworkInterfaces'
 import { loadBalanceOptions, loadBalanceSortOptions, autoPingFullScanModeOptions, proxyProtocolOptions,
   proxyPortTypeOptions, proxyPortSecureTypes, proxyPortQuickTypeValues } from '../composables/selectOptions.js'
 import { filterNodes } from '../composables/nodeFilters.js'
+import { copyShareLink } from '../composables/secureShare.js'
 
 const message = useMessage()
 const { listenHostOptions, loadInterfaces, loading: ifaceLoading } = useNetworkInterfaces()
@@ -1372,7 +1434,7 @@ const portTableColumns = computed(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 270,
+    width: 320,
     fixed: 'right',
     render: row => isEditingPort(row)
       ? h(NSpace, { size: 'small' }, () => [
@@ -1387,7 +1449,9 @@ const portTableColumns = computed(() => [
             loading: testResults[row.id]?.status === 'running',
             onClick: () => runSinglePortTest(row)
           }, () => '测试'),
-          ['hysteria2', 'mieru'].includes(row.type) ? h(NButton, { size: 'tiny', onClick: () => { securePort.value = JSON.parse(JSON.stringify(row)) } }, () => '导出') : null,
+          !['socks4', 'sock'].includes(row.type) ? h(NButton, {
+            size: 'tiny', tertiary: true, onClick: () => openPortShare([row])
+          }, () => '导出') : null,
           h(NButton, {
             size: 'tiny',
             onClick: () => togglePortEnabled(row)
@@ -1702,6 +1766,99 @@ const batchDelete = async () => {
   } finally {
     batchActionRunning.value = false
   }
+}
+
+// 导出只提交入口 ID 和选择项，凭据由后端从已保存配置读取。
+const portShareFormats = [
+  { label: 'Clash / mihomo YAML', value: 'clash' },
+  { label: 'v2rayN 订阅 (Base64)', value: 'share' },
+  { label: '明文链接 (一行一个)', value: 'links' }
+]
+const showPortShareModal = ref(false)
+const portShareResult = ref(null)
+const portShareBusy = ref(false)
+const portShareError = ref('')
+const portShareContentRef = ref(null)
+const portShareIds = ref([])
+const portShareTitle = ref('')
+const portShareBulk = ref(false)
+const portShareHost = ref('')
+const portShareFormat = ref('clash')
+const portShareFormatOptions = ref(portShareFormats)
+const portShareUser = ref('')
+const portShareUsers = ref([])
+
+const openPortShare = (targets, bulk = false) => {
+  if (!targets.length) return
+  const port = targets[0]
+  portShareIds.value = targets.map(p => p.id)
+  portShareBulk.value = bulk
+  portShareHost.value = ''
+  portShareTitle.value = bulk ? `批量导出 ${targets.length} 个端口` : `导出 · ${port.name || port.id}`
+  portShareFormat.value = 'clash'
+  portShareFormatOptions.value = targets.some(p => !['mieru', 'socks4', 'sock'].includes(p.type))
+    ? portShareFormats : portShareFormats.slice(0, 1)
+  portShareUsers.value = []
+  portShareUser.value = ''
+  if (!bulk && port.users?.length) {
+    const users = port.users.filter(u => !u.disabled).map(u => ({ label: u.username, value: u.username }))
+    const hasDefault = Boolean(port.username || port.password)
+    portShareUsers.value = hasDefault ? [{ label: '默认账号', value: '' }, ...users] : users
+    portShareUser.value = hasDefault ? '' : null
+  }
+  portShareError.value = portShareUser.value === null && !portShareUsers.value.length ? '该入口没有可导出的账号' : ''
+  portShareResult.value = null
+  showPortShareModal.value = true
+}
+
+const closePortShare = () => {
+  if (portShareBusy.value) return
+  showPortShareModal.value = false
+  portShareResult.value = null
+}
+
+const submitPortShare = async () => {
+  if (portShareBusy.value || portShareUser.value === null) return
+  portShareBusy.value = true
+  portShareError.value = ''
+  try {
+    const format = portShareFormat.value
+    const host = portShareHost.value.trim()
+    const res = portShareBulk.value
+      ? await api('/api/proxy-ports/bulk-share', 'POST', { ids: portShareIds.value, format, host })
+      : await api(`/api/proxy-ports/${encodeURIComponent(portShareIds.value[0])}/share`, 'POST', { format, address: host, username: portShareUser.value })
+    if (!res.success) {
+      portShareError.value = res.msg || '导出失败'
+      return
+    }
+    portShareResult.value = res.data
+  } catch (e) {
+    portShareError.value = '导出失败: ' + (e?.message || '未知错误')
+  } finally {
+    portShareBusy.value = false
+  }
+}
+
+const copyPortShareContent = async () => {
+  if (await copyShareLink(portShareResult.value.content, portShareContentRef.value)) {
+    message.success('已复制到剪贴板')
+  } else {
+    message.error('复制失败，请手动全选复制')
+  }
+}
+
+const downloadPortShareContent = () => {
+  const text = portShareResult.value.content
+  if (!text) return
+  const format = portShareResult.value.format
+  const isYaml = format === 'clash'
+  const blob = new Blob([text], { type: isYaml ? 'text/yaml' : 'text/plain' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = isYaml ? 'proxy-ports.yaml' : format === 'share' ? 'subscription.txt' : 'proxy-links.txt'
+  a.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 

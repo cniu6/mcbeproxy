@@ -98,7 +98,17 @@
       <template v-if="savedSecure">
         <n-form-item label="导入后的节点名称"><n-input v-model:value="exportName" placeholder="自定义名称，默认使用端口名称" /></n-form-item>
         <n-form-item v-if="port.users?.length" label="连接账号"><n-select v-model:value="exportUser" :options="exportUserOptions" /></n-form-item>
-        <n-button size="small" :loading="secureBusy" @click="exportProfile">复制快捷导入链接</n-button>
+        <n-form-item label="导出格式">
+          <n-space align="center" wrap>
+            <n-radio-group v-model:value="exportFormat" size="small">
+              <n-radio-button value="links" :disabled="isMieru">明文链接 (hysteria2://)</n-radio-button>
+              <n-radio-button value="share" :disabled="isMieru">v2rayN 订阅 (Base64)</n-radio-button>
+              <n-radio-button value="clash">Clash / mihomo YAML</n-radio-button>
+              <n-radio-button value="link">mcproxy 内部互导</n-radio-button>
+            </n-radio-group>
+          </n-space>
+        </n-form-item>
+        <n-button size="small" type="primary" :loading="secureBusy" @click="exportProfile">复制导出内容</n-button>
         <n-collapse><n-collapse-item title="连接地址（自动填写，仅映射地址不同时修改）" name="address">
           <n-form-item label="服务器地址"><n-input v-model:value="publicAddress" :placeholder="defaultProxyAddress(port.listen_addr) || '例如 proxy.example.com:18443'" /></n-form-item>
           <n-text depth="3">默认使用当前面板主机 + 代理端口。可只填 IP/域名；映射端口不同时填 proxy.example.com:18443。监听所有网卡不代表防火墙或 NAT 已放行，CDN/反代域名不通时改用服务器直连地址。</n-text>
@@ -106,7 +116,22 @@
       </template>
       <n-text v-else depth="3">保存后可直接复制连接链接，账号密码留空会自动生成。</n-text>
       <n-alert v-if="secureError" type="error" :show-icon="false">{{ secureError }}</n-alert>
-      <template v-if="secureProfile"><n-alert type="warning" :show-icon="false">含密码，仅通过可信渠道传递；不包含服务私钥。</n-alert><n-input :value="secureProfile" type="textarea" :rows="3" readonly aria-label="快捷导入链接" /><n-text depth="3">mcproxy:// 供本项目两端快捷导入；编码不是加密，不是所有第三方客户端通用链接。</n-text></template>
+      <template v-if="secureProfile">
+        <n-alert type="warning" :show-icon="false">含密码，仅通过可信渠道传递；不包含服务私钥。</n-alert>
+        <n-input :value="secureProfile" type="textarea" :rows="secureProfileRows" readonly aria-label="导出内容" />
+        <n-text depth="3" v-if="exportFormat === 'links'">
+          每行一条 hysteria2:// 链接，带 pinSHA256 证书钉扎。客户端必须保留并校验该摘要；v2rayN 可能显示允许不安全，但仍需使用钉扎验证服务器身份。Clash / mihomo 请优先使用 YAML。
+        </n-text>
+        <n-text depth="3" v-else-if="exportFormat === 'share'">
+          v2rayN Base64 订阅内容，不是订阅网址；保留 HY2 完整认证串与证书钉扎。Clash / mihomo 请优先使用 YAML。
+        </n-text>
+        <n-text depth="3" v-else-if="exportFormat === 'clash'">
+          mihomo (Clash.Meta) 格式 YAML，证书用 fingerprint 钉扎。粘贴进 Clash 配置的 proxies: 段，或保存为 .yaml 由 mihomo 系客户端导入。
+        </n-text>
+        <n-text depth="3" v-else>
+          mcproxy:// 仅本项目两端快捷导入；编码不是加密。要发给第三方客户端请改用其它格式。
+        </n-text>
+      </template>
     </n-space>
 
     <n-form-item label="代理节点">
@@ -305,6 +330,11 @@ watch(() => props.port.type, () => {
   props.port.secure.limits = { max_connections:4096,max_udp_associations:4096,handshake_seconds:10,idle_seconds:300,...props.port.secure.limits }
 }, {immediate:true})
 const secureBusy = ref(false), secureError = ref(''), secureProfile = ref(''), publicAddress = ref(''), exportUser = ref(''), exportName = ref('')
+// Mieru 没有公开的分享链接标准，只能用 Clash YAML 或内部互导。
+const exportFormat = ref('links')
+const isMieru = computed(() => props.port.type === 'mieru')
+watch(isMieru, m => { if (m && (exportFormat.value === 'links' || exportFormat.value === 'share')) exportFormat.value = 'clash' }, { immediate: true })
+const secureProfileRows = computed(() => exportFormat.value === 'clash' ? 10 : 4)
 const exportUserOptions = computed(() => [
   { label: `默认账号 · ${props.port.username}`, value: '' },
   ...(props.port.users || []).filter(u => !u.disabled).map(u => ({ label: u.username, value: u.username }))
@@ -315,7 +345,24 @@ watch(() => [props.port.id, props.port.listen_addr], () => {
 }, { immediate: true })
 async function exportProfile() {
   secureBusy.value = true; secureError.value = ''; secureProfile.value = ''
-  try { const res = await api(`/api/proxy-ports/${encodeURIComponent(props.port.id)}/export?format=link`, 'POST', { address: publicAddress.value, username: exportUser.value, name: exportName.value }); if (!res.success) throw new Error(res.msg || '导出失败'); secureProfile.value = res.data.link; await copyShareLink(secureProfile.value) } catch (e) { secureError.value = e.message } finally { secureBusy.value = false }
+  try {
+    const format = exportFormat.value
+    const body = { address: publicAddress.value, username: exportUser.value, name: exportName.value }
+    // 内部互导走旧的 /export?format=link；标准格式统一走 /share（明文链接 / Base64 订阅 / Clash）。
+    const res = format === 'link'
+      ? await api(`/api/proxy-ports/${encodeURIComponent(props.port.id)}/export?format=link`, 'POST', body)
+      : await api(`/api/proxy-ports/${encodeURIComponent(props.port.id)}/share`, 'POST', { ...body, format })
+    if (!res.success) throw new Error(res.msg || res.error || '导出失败')
+    let content = ''
+    if (format === 'link') {
+      content = res.data.link || ''
+    } else {
+      content = res.data.content || ''
+    }
+    if (!content) throw new Error('导出内容为空')
+    secureProfile.value = content
+    await copyShareLink(content)
+  } catch (e) { secureError.value = e.message } finally { secureBusy.value = false }
 }
 defineEmits(['open-proxy-selector', 'clear-proxy', 'refresh-runtime', 'pick-user-outbound'])
 </script>
