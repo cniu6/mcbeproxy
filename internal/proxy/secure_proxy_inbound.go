@@ -25,6 +25,7 @@ import (
 	mt "github.com/metacubex/tls"
 	"google.golang.org/protobuf/proto"
 	"mcpeserverproxy/internal/config"
+	"mcpeserverproxy/internal/logger"
 )
 
 var ErrSecureProxyBusy = errors.New("入口有活动连接，请等待空闲或显式停用后修改")
@@ -62,10 +63,12 @@ func (r *securePortRuntime) Start() error {
 		}
 		users, passwords := r.credentials()
 		service.UpdateUsers(users, passwords)
-		socket, err := net.ListenPacket("udp", cfg.ListenAddr)
+		network := listenNetworkForAddress("udp", cfg.ListenAddr)
+		socket, err := net.ListenPacket(network, cfg.ListenAddr)
 		if err != nil {
 			return err
 		}
+		logger.Info("SecurePort: HY2 packet listener bound: id=%s, listen=%s, bound=%s, network=%s", cfg.ID, cfg.ListenAddr, socket.LocalAddr(), network)
 		if err := service.Start(socket); err != nil {
 			socket.Close()
 			return err

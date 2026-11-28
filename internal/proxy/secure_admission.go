@@ -52,7 +52,8 @@ func (g *secureAdmission) tlsConfig(hello *mt.ClientHelloInfo) (*mt.Config, erro
 }
 func (g *secureAdmission) Listen(ctx context.Context, network, address string) (net.Listener, error) {
 	var lc net.ListenConfig
-	l, err := lc.Listen(ctx, network, address)
+	listenNetwork := listenNetworkForAddress(network, address)
+	l, err := lc.Listen(ctx, listenNetwork, address)
 	if err != nil {
 		return nil, err
 	}

@@ -14,9 +14,9 @@ import (
 
 	"mcpeserverproxy/internal/config"
 	"mcpeserverproxy/internal/logger"
+	"mcpeserverproxy/internal/netroute"
 	"mcpeserverproxy/internal/protocol"
 	"mcpeserverproxy/internal/session"
-	"mcpeserverproxy/internal/netroute"
 
 	"github.com/sandertv/go-raknet"
 )
@@ -96,12 +96,13 @@ func NewUDPListener(
 
 // Start begins listening for UDP packets on the configured address.
 func (l *UDPListener) Start() error {
-	addr, err := net.ResolveUDPAddr("udp", l.config.ListenAddr)
+	network := listenNetworkForAddress("udp", l.config.ListenAddr)
+	addr, err := net.ResolveUDPAddr(network, l.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve listen address %s: %w", l.config.ListenAddr, err)
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP(network, addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", l.config.ListenAddr, err)
 	}
@@ -109,6 +110,7 @@ func (l *UDPListener) Start() error {
 
 	l.conn = conn
 	l.closed.Store(false)
+	logger.Info("UDP listener started: id=%s, listen=%s, bound=%s, network=%s", l.serverID, l.config.ListenAddr, conn.LocalAddr(), network)
 	return nil
 }
 

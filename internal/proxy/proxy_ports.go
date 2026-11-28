@@ -499,13 +499,15 @@ func (l *proxyPortListener) start(tlsConfig *tls.Config) error {
 			return err
 		}
 	}
-	ln, err := net.Listen("tcp", l.cfg.ListenAddr)
+	network := listenNetworkForAddress("tcp", l.cfg.ListenAddr)
+	ln, err := net.Listen(network, l.cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
 	if tlsConfig != nil {
 		ln = tls.NewListener(ln, tlsConfig)
 	}
+	logger.Info("ProxyPort: listener bound: id=%s, listen=%s, bound=%s, network=%s, type=%s", l.cfg.ID, l.cfg.ListenAddr, ln.Addr(), network, l.cfg.Type)
 	l.listener = ln
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 	l.activeConnsMu.Lock()
@@ -1460,7 +1462,10 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 	}
 
 	relayAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	// 跟随 TCP 入口实际绑定的地址族：IPv4 字面地址用 udp4，其他情况保留通用双栈。
+	relayNetwork := "udp"
 	if l.listener != nil {
+		relayNetwork = listenNetworkForAddress("udp", l.listener.Addr().String())
 		if _, portStr, err := net.SplitHostPort(l.listener.Addr().String()); err == nil {
 			if port, err := strconv.Atoi(portStr); err == nil && port > 0 {
 				relayAddr.Port = port
@@ -1468,11 +1473,14 @@ func (l *proxyPortListener) getOrCreateSharedUDPRelay() (*sharedUDPRelay, error)
 		}
 	}
 
-	conn, err := net.ListenUDP("udp", relayAddr)
+	conn, err := net.ListenUDP(relayNetwork, relayAddr)
 	if err != nil && relayAddr.Port > 0 {
-		logger.Warn("SOCKS5 UDP: failed to bind relay to TCP port %d, using random port: %v (proxy_port=%s)",
-			relayAddr.Port, err, l.cfg.ID)
-		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		logger.Warn("SOCKS5 UDP: failed to bind relay to TCP port %d, using random port: %v (proxy_port=%s, network=%s)",
+			relayAddr.Port, err, l.cfg.ID, relayNetwork)
+		conn, err = net.ListenUDP(relayNetwork, &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	if err == nil {
+		logger.Info("SOCKS5 UDP: relay bound: id=%s, bound=%s, network=%s", l.cfg.ID, conn.LocalAddr(), relayNetwork)
 	}
 	if err != nil {
 		return nil, err

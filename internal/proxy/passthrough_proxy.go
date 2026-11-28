@@ -181,7 +181,7 @@ func (p *PassthroughProxy) Start() error {
 	// 上游代理通过 ProxyDialer 集成在 handleConnection 中完成。
 	p.useRawCompat = false
 
-	listener, err := raknet.Listen(p.config.ListenAddr)
+	listener, err := listenRakNet(p.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start RakNet listener: %w", err)
 	}
@@ -195,7 +195,7 @@ func (p *PassthroughProxy) Start() error {
 	// Set pong data for server list
 	p.updatePongData()
 
-	logger.Info("Passthrough proxy started: id=%s, listen=%s", p.serverID, p.config.ListenAddr)
+	logger.Info("Passthrough proxy started: id=%s, listen=%s, bound=%s, network=%s", p.serverID, p.config.ListenAddr, listener.Addr(), listenNetworkForAddress("udp", p.config.ListenAddr))
 	return nil
 }
 

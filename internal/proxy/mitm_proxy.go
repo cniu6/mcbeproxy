@@ -19,6 +19,7 @@ import (
 	"mcpeserverproxy/internal/logger"
 	"mcpeserverproxy/internal/session"
 
+	"github.com/sandertv/go-raknet"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
@@ -89,7 +90,8 @@ func (p *MITMProxy) Start() error {
 		AuthenticationDisabled: true,
 	}
 
-	listener, err := listenerCfg.Listen("raknet", p.config.ListenAddr)
+	network := rakNetListenNetwork{raknet.Dialer{UpstreamDialer: &directUpstreamDialer{cfg: p.config}}}
+	listener, err := listenerCfg.ListenNetwork(network, p.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start MITM listener: %w", err)
 	}
@@ -97,7 +99,7 @@ func (p *MITMProxy) Start() error {
 	p.listener = listener
 	p.closed.Store(false)
 
-	logger.Info("MITM proxy started: id=%s, listen=%s", p.serverID, p.config.ListenAddr)
+	logger.Info("MITM proxy started: id=%s, listen=%s, bound=%s, network=%s", p.serverID, p.config.ListenAddr, listener.Addr(), listenNetworkForAddress("udp", p.config.ListenAddr))
 	return nil
 }
 

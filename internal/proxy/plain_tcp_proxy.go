@@ -50,12 +50,14 @@ func (p *PlainTCPProxy) UpdateConfig(cfg *config.ServerConfig) {
 }
 
 func (p *PlainTCPProxy) Start() error {
-	ln, err := net.Listen("tcp", p.config.ListenAddr)
+	network := listenNetworkForAddress("tcp", p.config.ListenAddr)
+	ln, err := net.Listen(network, p.config.ListenAddr)
 	if err != nil {
 		return err
 	}
 	p.listener = ln
 	p.closed.Store(false)
+	logger.Info("Plain TCP listener started: id=%s, listen=%s, bound=%s, network=%s", p.serverID, p.config.ListenAddr, ln.Addr(), network)
 	return nil
 }
 

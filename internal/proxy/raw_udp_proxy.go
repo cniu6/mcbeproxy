@@ -1050,6 +1050,7 @@ type RawUDPProxy struct {
 	transportChanging atomic.Bool
 	identityVerifier  netherNetIdentityVerifier
 	nnRelay           atomic.Pointer[netherNetRelay] // 自动NetherNet媒体与RakNet共用监听；TCP入口启动失败时为nil
+	nnRelayRecovery   netherNetRelayRecovery         // bounded retries for a missing TCP signaling twin
 	targets           atomic.Pointer[rawUDPTargets]  // resolved target, swapped by UpdateConfig
 	clients           sync.Map                       // map[string]*rawUDPClientInfo (clientAddr.String() -> info)
 	bannedIPs         sync.Map                       // map[string]*bannedIPInfo (IP without port -> ban info)
@@ -1278,8 +1279,12 @@ func (p *RawUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
 	if p.conf() != nil && p.conf().IsShowRealLatency() {
 		p.maybeRefreshPingCacheAsync(true)
 	}
-	if cfg.SupportsNetherNetRelay() {
-		syncNetherNetRelay(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load, netherNetRelayDependencies{p.identityVerifier, p.sessionMgr})
+	// A tcp_udp listener owns the TCP socket on the shared port; never try to
+	// bind a second signaling listener there. Raw UDP auto mode keeps its relay.
+	if netherNetRelayAllowed(cfg) {
+		syncNetherNetRelayWithRecovery(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load, &p.nnRelayRecovery, netherNetRelayDependencies{p.identityVerifier, p.sessionMgr})
+	} else {
+		p.nnRelayRecovery.disable()
 	}
 
 	logger.Debug("RawUDPProxy config updated for server %s", p.serverID)
@@ -1290,7 +1295,9 @@ func (p *RawUDPProxy) Start() error {
 	p.updateTimeouts()
 
 	// Parse listen address
-	listenAddr, err := net.ResolveUDPAddr("udp", p.conf().ListenAddr)
+	configuredAddr := p.conf().ListenAddr
+	network := listenNetworkForAddress("udp", configuredAddr)
+	listenAddr, err := net.ResolveUDPAddr(network, configuredAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve listen address: %w", err)
 	}
@@ -1300,7 +1307,7 @@ func (p *RawUDPProxy) Start() error {
 	}
 
 	// Create UDP listener
-	listener, err := net.ListenUDP("udp", listenAddr)
+	listener, err := net.ListenUDP(network, listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start UDP listener: %w", err)
 	}
@@ -1314,9 +1321,18 @@ func (p *RawUDPProxy) Start() error {
 
 	// Create cancellable context before any background work can observe it.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	if p.conf().SupportsNetherNetRelay() {
-		p.nnRelay.Store(startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, listener, netherNetRelayDependencies{p.identityVerifier, p.sessionMgr}))
+	// Raw UDP auto mode starts the automatic NetherNet relay on the TCP twin;
+	// tcp_udp hands the TCP port to PlainTCPProxy and must not start a twin.
+	if netherNetRelayAllowed(p.conf()) {
+		r := startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, listener, netherNetRelayDependencies{p.identityVerifier, p.sessionMgr})
+		p.nnRelay.Store(r)
+		if r == nil && !p.closed.Load() {
+			p.nnRelayRecovery.failed(time.Now())
+		} else if r != nil {
+			p.nnRelayRecovery.succeeded()
+		}
 	} else {
+		p.nnRelayRecovery.disable()
 		logger.Info("raw_udp serves RakNet only; select auto explicitly for NetherNet: server=%s", p.serverID)
 	}
 
@@ -1341,11 +1357,11 @@ func (p *RawUDPProxy) Start() error {
 
 	// Log proxy mode
 	if p.shouldUseProxy() {
-		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (via proxy: %s, kick_strategy: %s)",
-			p.serverID, p.conf().ListenAddr, p.conf().GetTargetAddr(), p.conf().GetProxyOutbound(), p.conf().GetRawUDPKickStrategy())
+		logger.Info("Raw UDP proxy started: id=%s, listen=%s, bound=%s, network=%s, target=%s (via proxy: %s, kick_strategy: %s)",
+			p.serverID, configuredAddr, listener.LocalAddr(), network, p.conf().GetTargetAddr(), p.conf().GetProxyOutbound(), p.conf().GetRawUDPKickStrategy())
 	} else {
-		logger.Info("Raw UDP proxy started: id=%s, listen=%s, target=%s (direct, kick_strategy: %s)",
-			p.serverID, p.conf().ListenAddr, p.conf().GetTargetAddr(), p.conf().GetRawUDPKickStrategy())
+		logger.Info("Raw UDP proxy started: id=%s, listen=%s, bound=%s, network=%s, target=%s (direct, kick_strategy: %s)",
+			p.serverID, configuredAddr, listener.LocalAddr(), network, p.conf().GetTargetAddr(), p.conf().GetRawUDPKickStrategy())
 	}
 
 	return nil
@@ -3009,11 +3025,33 @@ func (p *RawUDPProxy) updateTimeouts() {
 	p.clientInactiveTimeoutNs.Store(int64(timeout))
 }
 
+// RecoverMissingNetherNetRelay retries only the signaling TCP twin that
+// failed to bind. The UDP listener stays bound; a live relay is left alone
+// (no re-probe, no replay of a healthy TCP bind).
+func (p *RawUDPProxy) RecoverMissingNetherNetRelay() {
+	if p == nil || p.closed.Load() {
+		return
+	}
+	if !netherNetRelayAllowed(p.conf()) {
+		p.nnRelayRecovery.disable()
+		return
+	}
+	if p.nnRelay.Load() != nil {
+		p.nnRelayRecovery.succeeded()
+		return
+	}
+	if !p.nnRelayRecovery.claimDue(time.Now()) {
+		return
+	}
+	syncNetherNetRelayWithRecovery(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load, &p.nnRelayRecovery, netherNetRelayDependencies{p.identityVerifier, p.sessionMgr})
+}
+
 // Stop stops the proxy and closes all connections.
 func (p *RawUDPProxy) Stop() error {
 	if p.closed.Swap(true) {
 		return nil // Already closed
 	}
+	p.nnRelayRecovery.disable()
 
 	// Cancel context
 	if p.cancel != nil {

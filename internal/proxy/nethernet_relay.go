@@ -196,7 +196,8 @@ func newNetherNetRelay(serverID string, conf func() *config.ServerConfig, outbou
 		return nil, fmt.Errorf("nethernet relay: unexpected udp address %v", udp.LocalAddr())
 	}
 	tcpAddr := &net.TCPAddr{IP: udpAddr.IP, Port: udpAddr.Port, Zone: udpAddr.Zone}
-	ln, err := net.ListenTCP("tcp", tcpAddr)
+	tcpNetwork := listenNetworkForAddress("tcp", tcpAddr.String())
+	ln, err := net.Listen(tcpNetwork, tcpAddr.String())
 	if err != nil {
 		return nil, fmt.Errorf("nethernet relay: listen tcp %s: %w", tcpAddr, err)
 	}
@@ -1176,6 +1177,142 @@ func (c *rejectTLSConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
+const netherNetRelayRecoveryFirstDelay = 5 * time.Second
+const netherNetRelayRecoveryMaxDelay = 60 * time.Second
+
+// netherNetRelayRecovery tracks only the retry schedule for a signaling TCP
+// twin that failed to bind. Healthy relays are untouched: neither the UDP
+// socket nor the upstream probe is reopened by these retries.
+type netherNetRelayRecovery struct {
+	mu       sync.Mutex
+	nextTry  time.Time
+	delay    time.Duration
+	disabled bool // proxy stopped or tcp_udp owns the TCP port
+}
+
+func (r *netherNetRelayRecovery) reset() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.nextTry = time.Time{}
+	r.delay = 0
+	r.disabled = false
+	r.mu.Unlock()
+}
+
+// disable stops future relay retries without disturbing a relay already live.
+func (r *netherNetRelayRecovery) disable() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.disabled = true
+	r.nextTry = time.Time{}
+	r.delay = 0
+	r.mu.Unlock()
+}
+
+// failed schedules the next retry with exponential backoff and reports
+// whether this failure was the one that started the retry schedule.
+func (r *netherNetRelayRecovery) failed(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.disabled {
+		return false
+	}
+	first := r.delay == 0
+	if first {
+		r.delay = netherNetRelayRecoveryFirstDelay
+	} else if r.delay < netherNetRelayRecoveryMaxDelay {
+		r.delay *= 2
+		if r.delay > netherNetRelayRecoveryMaxDelay {
+			r.delay = netherNetRelayRecoveryMaxDelay
+		}
+	}
+	r.nextTry = now.Add(r.delay)
+	return first
+}
+
+// claimDue returns true when a retry is due, marking it in-flight so only one
+// retry runs per tick even with concurrent recovery callers.
+func (r *netherNetRelayRecovery) claimDue(now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.disabled || r.delay == 0 || r.nextTry.After(now) {
+		return false
+	}
+	// Re-arm only after the attempt reports its outcome via failed/succeeded.
+	// A zero nextTry here prevents a second caller from claiming the same retry.
+	r.nextTry = time.Time{}
+	return true
+}
+
+func (r *netherNetRelayRecovery) succeeded() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.nextTry = time.Time{}
+	r.delay = 0
+	r.mu.Unlock()
+}
+
+// tcp_udp owns the TCP listener on the shared port: a NetherNet signaling
+// twin there would conflict with PlainTCPProxy. Standalone udp (and auto on
+// raw UDP) keep their automatic relay.
+func netherNetRelayAllowed(cfg *config.ServerConfig) bool {
+	if cfg == nil || cfg.ListenAddr == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(cfg.Protocol), "tcp_udp") {
+		return false
+	}
+	return cfg.SupportsNetherNetRelay()
+}
+
+// plainUDPRelayAllowed applies the same tcp_udp gate to plain UDP, which
+// otherwise always offers automatic NetherNet signaling alongside UDP.
+func plainUDPRelayAllowed(cfg *config.ServerConfig) bool {
+	if cfg == nil || cfg.ListenAddr == "" {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(cfg.Protocol), "tcp_udp")
+}
+
+// syncNetherNetRelayWithRecovery reports the attempt outcome to the caller's
+// retry tracker so a missing TCP twin can be retried at a bounded rate.
+func syncNetherNetRelayWithRecovery(slot *atomic.Pointer[netherNetRelay], serverID string, conf func() *config.ServerConfig,
+	outboundMgr OutboundManager, udp *net.UDPConn, closed func() bool, recovery *netherNetRelayRecovery, deps ...netherNetRelayDependencies) {
+	if udp == nil || closed() {
+		return
+	}
+	if cur := slot.Load(); cur != nil {
+		cur.configChanged()
+		recovery.succeeded()
+		return
+	}
+	r := startNetherNetRelay(serverID, conf, outboundMgr, udp, deps...)
+	if r == nil {
+		if !closed() {
+			recovery.failed(time.Now())
+		}
+		return
+	}
+	if !slot.CompareAndSwap(nil, r) || closed() {
+		slot.CompareAndSwap(r, nil)
+		_ = r.Close()
+		return
+	}
+	recovery.succeeded()
+}
+
 // 透明UDP监听自动附带同号TCP信令；端口冲突只影响NetherNet入口，不关闭原UDP。
 func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outboundMgr OutboundManager, udp *net.UDPConn, deps ...netherNetRelayDependencies) *netherNetRelay {
 	if conf() == nil || udp == nil {
@@ -1183,7 +1320,7 @@ func startNetherNetRelay(serverID string, conf func() *config.ServerConfig, outb
 	}
 	r, err := newNetherNetRelay(serverID, conf, outboundMgr, udp, deps...)
 	if err != nil {
-		logger.Error("NetherNet relay unavailable for server %s: %v", serverID, err)
+		logger.Warn("NetherNet relay unavailable for server %s: %v", serverID, err)
 		return nil
 	}
 	return r

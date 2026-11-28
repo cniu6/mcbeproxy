@@ -812,6 +812,22 @@ func (p *ProxyServer) recoverEnabledListeners() {
 		return
 	}
 
+	// A healthy UDP listener may still be missing its NetherNet TCP signaling
+	// twin (e.g. a stale process held that port at start). Give running
+	// listeners a bounded, rate-limited chance to recover just that twin
+	// without reopening UDP or replaying the upstream probe.
+	p.listenersMu.RLock()
+	runningListeners := make(map[string]Listener, len(p.listeners))
+	for id, l := range p.listeners {
+		runningListeners[id] = l
+	}
+	p.listenersMu.RUnlock()
+	for _, l := range runningListeners {
+		if rec, ok := l.(interface{ RecoverMissingNetherNetRelay() }); ok {
+			rec.RecoverMissingNetherNetRelay()
+		}
+	}
+
 	for _, serverCfg := range p.configMgr.GetAllServers() {
 		if !p.shouldAutoRecoverServer(serverCfg) {
 			continue

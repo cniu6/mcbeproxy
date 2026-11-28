@@ -8,7 +8,7 @@
 - **多协议支持**: Shadowsocks / ShadowsocksR / VMess / VLESS / Trojan / Hysteria2 / AnyTLS / TUIC / WireGuard / Naive / SOCKS5 / HTTP
 - **链式代理**: 支持多级代理嵌套（A → B → C），自动展开嵌套链，内置循环引用检测
 - **智能负载均衡**: 支持按组/节点列表做负载均衡与自动故障切换
-- **多种代理模式**: transparent / raknet / passthrough / raw_udp / mitm / nethernet；Raw UDP 自动兼容 RakNet 与 NetherNet（不解密、不转换协议）
+- **多种代理模式**: auto / transparent / raknet / passthrough / raw_udp / mitm / nethernet；`auto` 自动兼容 RakNet 与 NetherNet（不解密、不转换协议）
 - **实时延迟检测**: 自动选择最优节点，确保最佳游戏体验
 - **节点订阅**: 支持 Clash/Mihomo 订阅链接（`proxy_subscriptions.json`），可定时自动更新节点
 - **网络路由**: `network.json` 提供 Proxifier 式目的地址规则 + 全局出口网卡绑定
@@ -356,7 +356,7 @@ flowchart TD
 | `target` | string | ✅* | 目标服务器地址（域名或 IP；nethernet 模式可留空） |
 | `target_ip` | string | ⚪ | 固定上游 IP（多 IP/GeoDNS 场景跳过 DNS，直连/代理都拨此 IP） |
 | `port` | int | ✅ | 目标服务器端口（通常为 19132） |
-| `listen_addr` | string | ✅ | 监听地址（如 `0.0.0.0:19132`） |
+| `listen_addr` | string | ✅ | 监听地址。`0.0.0.0:19132` 使用原生 IPv4 监听；需要双栈时使用 `[::]:19132`，由系统的双栈支持决定。 |
 | `protocol` | string | ✅ | 协议类型：`raknet`（MCBE）/ `udp` / `tcp` / `tcp_udp` |
 | `enabled` | bool | ✅ | 是否启用此服务器 |
 | `hidden` | bool | ⚪ | 是否在公开状态页隐藏（不影响连接；旧字段 `disabled` 已迁移为 hidden） |
@@ -535,7 +535,7 @@ flowchart TD
 |------|------|------|------|
 | `id` | string | ✅ | 代理端口唯一标识符 |
 | `name` | string | ✅ | 代理端口显示名称 |
-| `listen_addr` | string | ✅ | 监听地址（如 `0.0.0.0:1080`） |
+| `listen_addr` | string | ✅ | 监听地址。`0.0.0.0:1080` 只监听 IPv4；需要双栈时使用 `[::]:1080`，由系统的双栈支持决定。 |
 | `type` | string | ✅ | 代理类型（http/https/socks5/socks4/mixed） |
 | `tls` | object | HTTPS | `mode: "file"`（默认）使用 `cert_file` / `key_file`；`mode: "pem"` 使用 `cert_pem` / `key_pem`。均需 `server_name`，本机测试私有 CA 时可选 `ca_file` |
 | `enabled` | bool | ✅ | 是否启用此代理端口 |
@@ -774,14 +774,14 @@ flowchart TD
 
 ### NetherNet 自动转发
 
-保持面板「RakNet → Raw UDP」（`protocol=raknet`、`proxy_mode=raw_udp`）即可**自动同时提供 RakNet 与 NetherNet 透明转发**，无需额外参数或开关。普通 `protocol=udp` 也使用同一自动入口。客户端根据目标能力选择传输，代理按信令/数据报分流，不把两种协议互相转换，也不是 `proxy_mode=nethernet` 的双端协议终止。
+`protocol=raknet`、`proxy_mode=auto` 可**同时提供 RakNet 与 NetherNet 透明转发**；`proxy_mode=raw_udp` 只转发 RakNet。独立的 `protocol=udp` 也会启用同号 TCP 信令。客户端根据目标能力选择传输，代理按信令/数据报分流，不把两种协议互相转换，也不是 `proxy_mode=nethernet` 的双端协议终止。
 
 - 在客户端入口的**同号 TCP 端口**接收 HTTP 信令，媒体与旧 RakNet 共用该数字的 UDP 端口。例如入口是 20002，就需要放行 TCP/20002 和 UDP/20002，而不是只放行 UDP。
 - 后台按目标的 HTTPS/HTTP 信令探测能力；GET `/v1/join` 的成功状态、内容类型和元数据原样从目标缓存返回，不伪造 `protocol` / `version`。初探中的首次 GET 最多额外等 200ms；慢目标可能仍暂时返回 503，不能把它直接解释为目标永久不支持。
 - POST `/v1/join/{networkId}` 转发原始 SDP offer；NetworkID 当作不透明字符串交给目标验证，目标的非 2xx 错误原样返回，2xx SDP answer 只替换 ICE candidates。
 - DTLS 指纹、`a=identity`、ICE 凭据保持不变；后续 STUN/DTLS/SCTP UDP 字节只转发、不解密，不重新编码游戏包，也不做版本转换。该路径不能解析明文玩家名/XUID；不能假定依赖这些字段的 ACL 仍能在中继中执行。
 - 没有可用上游信令时返回非 2xx，不假装支持。旧 RakNet 仍可按原路径转发，但**是否回退取决于客户端和目标服实际支持**，不保证 26.60 构建都保留回退。
-- Raw UDP / 普通 UDP 的入口随监听启动和停止，热更新只重新探测目标，不维护独立开关。旧 JSON 中多余的开关字段会被忽略，保存或 API 输出时不再携带。不自动修改 `raknet` / `passthrough` / `mitm` 等其他模式。同号 TCP 端口被其他服务占用时记录错误，不抢占服务，旧 UDP 路径继续运行，但此时 NetherNet 信令不可用。
+- TCP 信令随自动入口启动和停止。同号 TCP 被其他服务占用时不抢占端口，原 UDP 转发继续运行；端口释放后会补绑信令，不重启 UDP。`protocol=tcp_udp` 已把 TCP 留给普通转发，不再额外绑定 NetherNet 信令。
 
 示例中的目标、端口和对外地址应替换为实际部署值；这里不指定上游代理节点时是直连：
 
@@ -793,7 +793,7 @@ flowchart TD
   "port": 19132,
   "listen_addr": "0.0.0.0:20002",
   "protocol": "raknet",
-  "proxy_mode": "raw_udp",
+  "proxy_mode": "auto",
   "nethernet_public_addr": "203.0.113.5:20002"
 }
 ```

@@ -101,7 +101,7 @@ func (p *RakNetProxy) UpdateConfig(cfg *config.ServerConfig) {
 // Start begins listening for RakNet connections.
 func (p *RakNetProxy) Start() error {
 	// Create RakNet listener
-	listener, err := raknet.Listen(p.config.ListenAddr)
+	listener, err := listenRakNet(p.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to start RakNet listener: %w", err)
 	}
@@ -115,7 +115,7 @@ func (p *RakNetProxy) Start() error {
 	// Set pong data for server list
 	p.updatePongData()
 
-	logger.Info("RakNet proxy started: id=%s, listen=%s", p.serverID, p.config.ListenAddr)
+	logger.Info("RakNet proxy started: id=%s, listen=%s, bound=%s, network=%s", p.serverID, p.config.ListenAddr, listener.Addr(), listenNetworkForAddress("udp", p.config.ListenAddr))
 	return nil
 }
 

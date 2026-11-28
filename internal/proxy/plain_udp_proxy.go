@@ -150,17 +150,18 @@ func (c *plainUDPClient) drainUpstreamWriteQueue(bp *BufferPool) {
 }
 
 type PlainUDPProxy struct {
-	serverID    string
-	cfgPtr      atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
-	outboundMgr OutboundManager
-	listener    *net.UDPConn
-	nnRelay     atomic.Pointer[netherNetRelay] // 自动NetherNet入口；TCP监听启动失败时为nil
-	targetPtr   atomic.Pointer[plainUDPTarget] // resolved target, swapped by UpdateConfig
-	clients     sync.Map
-	closed      atomic.Bool
-	wg          sync.WaitGroup
-	bufferPool  atomic.Pointer[BufferPool] // read via pool(); swapped when buffer_size changes
-	idleTimeout atomic.Int64               // time.Duration; -1 = never
+	serverID        string
+	cfgPtr          atomic.Pointer[config.ServerConfig] // read via conf(); swapped by UpdateConfig while forwarding
+	outboundMgr     OutboundManager
+	listener        *net.UDPConn
+	nnRelay         atomic.Pointer[netherNetRelay] // 自动NetherNet入口；TCP监听启动失败时为nil
+	nnRelayRecovery netherNetRelayRecovery         // bounded retries for a missing TCP signaling twin
+	targetPtr       atomic.Pointer[plainUDPTarget] // resolved target, swapped by UpdateConfig
+	clients         sync.Map
+	closed          atomic.Bool
+	wg              sync.WaitGroup
+	bufferPool      atomic.Pointer[BufferPool] // read via pool(); swapped when buffer_size changes
+	idleTimeout     atomic.Int64               // time.Duration; -1 = never
 
 	// ctx/cancel are owned internally (created in Start(), cancelled in
 	// Stop()) and used for background dials and per-client goroutines —
@@ -222,20 +223,29 @@ func (p *PlainUDPProxy) UpdateConfig(cfg *config.ServerConfig) {
 	if size := p.effectiveBufferSize(); p.pool() == nil || p.pool().Size() != size {
 		p.bufferPool.Store(NewBufferPool(size))
 	}
-	syncNetherNetRelay(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load)
+	// Standalone udp keeps the automatic signaling twin; tcp_udp owns the TCP
+	// socket through PlainTCPProxy and must not bind a second listener there.
+	if plainUDPRelayAllowed(cfg) {
+		syncNetherNetRelayWithRecovery(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load, &p.nnRelayRecovery)
+	} else {
+		p.nnRelayRecovery.disable()
+	}
 }
 
 func (p *PlainUDPProxy) Start() error {
-	addr, err := net.ResolveUDPAddr("udp", p.conf().ListenAddr)
+	configuredAddr := p.conf().ListenAddr
+	network := listenNetworkForAddress("udp", configuredAddr)
+	addr, err := net.ResolveUDPAddr(network, configuredAddr)
 	if err != nil {
-		return fmt.Errorf("failed to resolve listen address %s: %w", p.conf().ListenAddr, err)
+		return fmt.Errorf("failed to resolve listen address %s: %w", configuredAddr, err)
 	}
 
-	conn, err := net.ListenUDP("udp", addr)
+	conn, err := net.ListenUDP(network, addr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", p.conf().ListenAddr, err)
+		return fmt.Errorf("failed to listen on %s: %w", configuredAddr, err)
 	}
 	tuneUDPSocketForServer(conn, p.conf(), "plain_udp:"+p.serverID)
+	logger.Info("Plain UDP listener started: id=%s, listen=%s, bound=%s, network=%s", p.serverID, configuredAddr, conn.LocalAddr(), network)
 	p.listener = conn
 	p.closed.Store(false)
 	p.refreshTargetAddr()
@@ -246,7 +256,17 @@ func (p *PlainUDPProxy) Start() error {
 	// Own lifecycle context, created before any background work can observe
 	// it — see the PlainUDPProxy.ctx doc comment.
 	p.ctx, p.cancel = context.WithCancel(context.Background())
-	p.nnRelay.Store(startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, conn))
+	if plainUDPRelayAllowed(p.conf()) {
+		r := startNetherNetRelay(p.serverID, p.conf, p.outboundMgr, conn)
+		p.nnRelay.Store(r)
+		if r == nil && !p.closed.Load() {
+			p.nnRelayRecovery.failed(time.Now())
+		} else if r != nil {
+			p.nnRelayRecovery.succeeded()
+		}
+	} else {
+		p.nnRelayRecovery.disable()
+	}
 
 	return nil
 }
@@ -306,8 +326,29 @@ func (p *PlainUDPProxy) Listen(ctx context.Context) error {
 	}
 }
 
+// RecoverMissingNetherNetRelay retries only the signaling TCP twin that
+// failed to bind; the UDP listener and any existing relay are left intact.
+func (p *PlainUDPProxy) RecoverMissingNetherNetRelay() {
+	if p == nil || p.closed.Load() {
+		return
+	}
+	if !plainUDPRelayAllowed(p.conf()) {
+		p.nnRelayRecovery.disable()
+		return
+	}
+	if p.nnRelay.Load() != nil {
+		p.nnRelayRecovery.succeeded()
+		return
+	}
+	if !p.nnRelayRecovery.claimDue(time.Now()) {
+		return
+	}
+	syncNetherNetRelayWithRecovery(&p.nnRelay, p.serverID, p.conf, p.outboundMgr, p.listener, p.closed.Load, &p.nnRelayRecovery)
+}
+
 func (p *PlainUDPProxy) Stop() error {
 	p.closed.Store(true)
+	p.nnRelayRecovery.disable()
 	// Cancel the internal lifecycle context first so any in-flight async
 	// proxy dial (see createPendingClientAndDialAsync) unblocks promptly
 	// instead of holding up p.wg.Wait() below indefinitely.
